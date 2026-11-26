@@ -1,6 +1,7 @@
 //! Reuses what memory holds along straight-line code: a load of the bytes an earlier load or store on the same path read or wrote, with no write of unknown reach between them, takes that value.
 
 mod caller_loc;
+mod caller_loc_sink;
 mod coalesce;
 mod dom;
 mod elide;
@@ -407,7 +408,7 @@ fn scan(
                         }
                         changed = true;
                     } else if !skip_far
-                        && let Some(fwd) = try_join_phi_forward(func, (block, inst, loc, ty, result), state, known, join, &clobbers_seen)
+                        && let Some(fwd) = try_join_phi_forward(func, (block, inst, loc, ty, result), state, known, join, (&clobbers_seen, &bufs.kept))
                     {
                         forwarded = fwd;
                         changed = true;

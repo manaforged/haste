@@ -1,7 +1,9 @@
 mod emit;
 mod shrink;
+mod tail;
 pub(crate) use emit::{emit_body, stack_zero_store};
 pub(crate) use shrink::{ShrinkWrap, shrink_wrap};
+pub(crate) use tail::{find_tail_calls, is_tail, needs_frame_without_tails};
 use emit::mark_line;
 
 use crate::alloc::{Location, Plan, Regs};
@@ -34,7 +36,7 @@ pub(crate) const fn save_offset(index: usize) -> i32 {
     -((WORD as i32) * (index as i32 + 1))
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Loc<R> {
     Int(R),
     Pair(R, R),
@@ -136,6 +138,11 @@ fn alloc_scratch(busy: &mut Vec<bool>) -> usize {
     }
 }
 
+fn reads_home<R: Copy + PartialEq>(locations: &[Location<R>], values: &[i32], src: Value, dst: Value) -> bool {
+    same_home(locations, values, src, dst)
+        || matches!((locations[src.index()], locations[dst.index()]), (Location::Offset(x, _), Location::Reg(y)) if x == y)
+}
+
 pub(crate) fn edge_steps<R: Copy + PartialEq>(
     func: &Function,
     locations: &[Location<R>],
@@ -152,7 +159,7 @@ pub(crate) fn edge_steps<R: Copy + PartialEq>(
     let mut steps = Vec::with_capacity(pending.len());
     let mut busy = [Vec::new(), Vec::new(), Vec::new()];
     while !pending.is_empty() {
-        let read = |at: usize| pending.iter().enumerate().any(|(other, (source, _))| other != at && matches!(source, Source::Value(arg) if same_home(locations, values, *arg, pending[at].1)));
+        let read = |at: usize| pending.iter().enumerate().any(|(other, (source, _))| other != at && matches!(source, Source::Value(arg) if reads_home(locations, values, *arg, pending[at].1)));
         if let Some(at) = (0..pending.len()).find(|at| !read(*at)) {
             steps.push(match pending.remove(at) {
                 (Source::Value(arg), param) => Step::Move(arg, param),
@@ -247,11 +254,20 @@ pub(crate) struct Frame<R> {
     pub saves: Vec<R>,
     pub float_saves: Vec<u8>,
     pub wide: bool,
+    cursor: u32,
+    outgoing: u32,
 }
 
 impl<R> Frame<R> {
     pub(crate) fn edge_slot(&self, index: usize) -> i32 {
         self.scratch + (edge_bytes(self.wide) as usize * index) as i32
+    }
+
+    /// Reserves an additional `bytes`-aligned local slot above outgoing arguments and returns its frame-pointer offset.
+    pub(crate) fn add_slot(&mut self, bytes: u32) -> i32 {
+        self.cursor = round(self.cursor, bytes) + bytes;
+        self.size = round(self.cursor + self.outgoing, 16);
+        -(self.cursor as i32)
     }
 }
 
@@ -406,7 +422,7 @@ fn collect_value_homes<R: Copy + PartialEq>(
     let mut shared_vals: Vec<(usize, usize)> = Vec::new();
     for v in order {
         let reg_unhomed = matches!(locations[v], Location::Reg(_) | Location::Float(_)) && homed.get(v) != Some(&true);
-        if !present[v] || elided.get(v) == Some(&true) || locations[v].is_static() || reg_unhomed {
+        if !present[v] || elided.get(v) == Some(&true) || locations[v].is_static() || matches!(locations[v], Location::Offset(..)) || reg_unhomed {
             continue;
         }
         let bytes = func.types[v].bytes();
@@ -494,7 +510,7 @@ pub(crate) fn layout<R: Copy + PartialEq>(
     if crate::trace::enabled() {
         crate::trace::on_frame(func, (&values, &slots), size);
     }
-    Ok(Frame { values, slots, scratch, size, saves, float_saves, wide })
+    Ok(Frame { values, slots, scratch, size, saves, float_saves, wide, cursor, outgoing })
 }
 
 pub(crate) struct Prepared<R> {
@@ -536,21 +552,20 @@ pub(crate) fn repack_after_elide<R: Copy + PartialEq>(
 pub(crate) fn prepare_split<R: Copy + PartialEq>(
     func: &Function,
     regs: &Regs<R>,
-    weighed: bool,
+    (weighed, preserve_tc): (bool, bool),
     classify: impl Fn(&Signature) -> Result<Abi<R>, String>,
 ) -> Result<(Option<Function>, Prepared<R>), String> {
-    let first = prepare(func, regs, weighed, &classify, &[])?;
+    let first = prepare(func, regs, (weighed, preserve_tc), &classify)?;
     if !weighed {
         return Ok((None, first));
     }
     let plan = &first.plan;
-    let carried = |made: &[(Value, Value, Block)]| -> Vec<(Value, u64)> { made.iter().map(|&(param, origin, _)| (param, plan.density.get(origin.index()).copied().unwrap_or(0))).collect() };
     let mut split = func.clone();
     let made = crate::loopargs::run(&mut split, |_, v| v.index() < plan.locations.len() && matches!(plan.location(v), Location::Slot) && !plan.elided[v.index()] && !plan.fused[v.index()]);
     if made.is_empty() {
         return Ok((None, first));
     }
-    let second = prepare(&split, regs, weighed, &classify, &carried(&made))?;
+    let second = prepare(&split, regs, (weighed, preserve_tc), &classify)?;
     let kept: Vec<(Block, Value)> = made.iter().filter(|&&(param, _, _)| matches!(second.plan.location(param), Location::Reg(_) | Location::Float(_))).map(|&(_, origin, head)| (head, origin)).collect();
     if crate::trace::enabled() {
         crate::trace::on_split(&made, &kept);
@@ -562,22 +577,21 @@ pub(crate) fn prepare_split<R: Copy + PartialEq>(
         return Ok((None, first));
     }
     let mut pruned = func.clone();
-    let made = crate::loopargs::run(&mut pruned, |head, v| kept.contains(&(head, v)));
-    let third = prepare(&pruned, regs, weighed, &classify, &carried(&made))?;
+    let _ = crate::loopargs::run(&mut pruned, |head, v| kept.contains(&(head, v)));
+    let third = prepare(&pruned, regs, (weighed, preserve_tc), &classify)?;
     Ok(if third.plan.spill_cost < first.plan.spill_cost { (Some(pruned), third) } else { (None, first) })
 }
 
 pub(crate) fn prepare<R: Copy + PartialEq>(
     func: &Function,
     regs: &Regs<R>,
-    weighed: bool,
+    (weighed, preserve_tc): (bool, bool),
     classify: impl Fn(&Signature) -> Result<Abi<R>, String>,
-    split: &[(Value, u64)],
 ) -> Result<Prepared<R>, String> {
-    let order = crate::live::order(func);
-    let copied = crate::live::copied_tests(func, &order);
+    let order = if weighed { crate::live::order(func) } else { crate::live::quick_order(func) };
+    let copied = if weighed { crate::live::copied_tests(func, &order) } else { vec![false; func.insts.len()] };
     let abi = classify(&func.signature)?;
-    let plan = crate::alloc::plan(func, regs, (&order, &copied, weighed), (&abi.params, split), &classify);
+    let plan = crate::alloc::plan(func, regs, (&order, &copied, weighed, preserve_tc), &abi.params, &classify);
     let saves = saved(func, &plan.used, regs.saved);
     let float_saves = saved(func, &plan.used_floats, regs.saved_float);
     let (frame, framed) = build_frame(func, (saves, float_saves), &plan, &abi, &classify)?;
@@ -621,6 +635,10 @@ pub(crate) trait Emitter<'a>: Sized {
     }
 
     fn emit_zero_frame(&mut self, _offset: i32, _bytes: u32) {}
+
+    fn try_tail_call(&mut self, _inst: Inst) -> Result<bool, String> {
+        Ok(false)
+    }
 }
 
 fn entry_has_preds(func: &Function, order: &[Block], entry: Block) -> bool {

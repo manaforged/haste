@@ -51,23 +51,32 @@ impl<'a> Infer<'_, 'a> {
     }
 
     fn cached_selection(&self, key: Option<&SelectionKey>, local_key: Option<&SelectionKey>) -> Option<Option<(ImplRef, Substs)>> {
-        key.and_then(|k| self.cx.store.lookups.selections.get(k)).or_else(|| local_key.and_then(|k| self.local_selections.get(k).copied()))
+        key.and_then(|k| self.cx.selection(k)).or_else(|| local_key.and_then(|k| self.local_selections.get(k).copied()))
     }
 
     fn store_selection(&mut self, key: Option<SelectionKey>, local_key: Option<SelectionKey>, picked: Option<&Picked>, state: (((usize, usize), usize, usize), u32)) {
         if self.cache_state() != state { return; }
         let Some((k, local)) = key.map(|k| (k, false)).or_else(|| local_key.map(|k| (k, true))) else { return; };
         let Some(kept) = (match picked { None => Some(None), Some((b, a)) => (if local { self.locally_closed_substs(a) } else { self.closed_substs(a) }).map(|a| Some((*b, a))) }) else { return; };
-        if local { self.local_selections.insert(k, kept); } else { self.cx.store.lookups.selections.insert(k, kept); }
+        if local { self.local_selections.insert(k, kept); } else { self.cx.set_selection(k, kept); }
     }
 
     pub(super) fn substs_if(&mut self, tys: &[Ty], ok: fn(&Self, Ty) -> bool) -> Option<Substs> {
-        tys.iter().all(|&ty| ok(self, ty)).then(|| { let sub: Vec<Ty> = tys.iter().map(|&ty| self.substitute(ty)).collect(); self.cx.types.intern_substs(&sub) })
+        if tys.is_empty() { return Some(Substs::EMPTY); }
+        if !tys.iter().all(|&ty| ok(self, ty)) { return None; }
+        if tys.len() <= 8 {
+            let mut buf = [Ty::NONE; 8];
+            for (dst, &ty) in buf.iter_mut().zip(tys) { *dst = self.substitute(ty); }
+            return Some(self.cx.types.intern_substs(&buf[..tys.len()]));
+        }
+        let sub: Vec<Ty> = tys.iter().map(|&ty| self.substitute(ty)).collect();
+        Some(self.cx.types.intern_substs(&sub))
     }
     pub(super) fn closed_substs(&mut self, tys: &[Ty]) -> Option<Substs> { self.substs_if(tys, Self::closed) }
     pub(super) fn locally_closed_substs(&mut self, tys: &[Ty]) -> Option<Substs> { self.substs_if(tys, Self::locally_closed) }
 
     fn selection_keys(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> (Option<SelectionKey>, Option<SelectionKey>) {
+        if args.is_empty() && self.cx.types.is_ground(self_ty) { return (Some((of, self_ty, Substs::EMPTY)), None); }
         let build = |this: &mut Self, ok: fn(&Self, Ty) -> bool| ok(this, self_ty).then(|| this.substs_if(args, ok)).flatten().map(|a| (of, this.substitute(self_ty), a));
         if let Some(k) = build(self, Self::closed) { (Some(k), None) } else { (None, build(self, Self::locally_closed)) }
     }
@@ -78,11 +87,14 @@ impl<'a> Infer<'_, 'a> {
 
     fn closed_at(&self, mut ty: Ty, depth: u32, local: bool, check_trail: bool) -> bool {
         if depth > 24 || ty == Ty::NONE { return false; }
+        if self.cx.types.is_ground(ty) { return true; }
+        if !local && self.cx.types.has_closure(ty) { return false; }
         while let Some(index) = self.var_of(ty) {
             let Some(bound) = self.vars.get(index as usize).copied().flatten() else { break };
             if check_trail && self.trail_depth > 0 && self.var_trail.iter().any(|&(i, _)| i == index) { return false; }
             ty = bound;
         }
+        if self.cx.types.is_ground(ty) { return true; }
         if self.has_params(ty) { return false; }
         let kind = self.cx.types.kind(ty);
         if matches!(kind, Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)) || (!local && matches!(kind, Kind::Closure(..))) { return false; }
@@ -100,7 +112,7 @@ impl<'a> Infer<'_, 'a> {
 
     fn select_at(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty], depth: u32) -> Result<Option<Picked>> {
         let query = self.query(of, self_ty, args);
-        if self.selecting.contains(&query) {
+        if self.selecting.len() > crate::RECURSION_LIMIT || self.selecting.contains(&query) {
             self.cycle_hits += 1;
             return Ok(None);
         }
@@ -126,14 +138,19 @@ impl<'a> Infer<'_, 'a> {
 
     pub(super) fn applicable(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty], depth: u32) -> Result<Vec<(Picked, Vars)>> {
         let self_ty = self.resolve(self_ty);
-        if depth as usize > crate::RECURSION_LIMIT || (matches!(self.cx.types.kind(self_ty), Kind::Var(_)) && !self.is_pending_opaque(self_ty)) {
+        if depth as usize + self.selecting.len() > crate::RECURSION_LIMIT
+            || (matches!(self.cx.types.kind(self_ty), Kind::Var(_)) && !self.is_pending_opaque(self_ty))
+        {
             return Ok(Vec::new());
         }
         let mut found = self.impl_candidates(of, self_ty, args, depth)?;
-        if found.len() > 1 && !self.obligation_open(self_ty, args) {
+        let open = found.len() > 1 && self.obligation_open(self_ty, args);
+        let outline = self.cx.outline;
+        let non_sysroot = |b: ImplRef| !outline.is_sysroot(match b { ImplRef::Module { krate, .. } => krate, ImplRef::Body(i) => i.krate });
+        if found.len() > 1 && !open {
             let mut kept = Vec::new();
             for entry in &found {
-                if !self.blanket(entry.0.0)? {
+                if non_sysroot(entry.0.0) || !self.blanket(entry.0.0)? {
                     kept.push(entry.clone());
                 }
             }
@@ -143,6 +160,9 @@ impl<'a> Infer<'_, 'a> {
         }
         if found.len() > 1 && self.same_trait_args(&found, args) {
             found = self.most_specialized(found)?;
+            if found.len() > 1 && !open && found.iter().any(|((b, _), _)| non_sysroot(*b)) {
+                bail!("conflicting implementations of trait `{}`", self.cx.name(of));
+            }
         }
         Ok(found)
     }
@@ -152,7 +172,6 @@ impl<'a> Infer<'_, 'a> {
         let blocks = self.cx.trait_impls(of, head(self.cx.types.kind(self_ty)), &holders);
         let opaque_var = matches!(self.cx.types.kind(self_ty), Kind::Var(_));
         let mut found = Vec::new();
-        let blocks: Vec<ImplRef> = blocks.into_iter().filter(|&block| !self.cx.reserved(block)).collect();
         for block in blocks {
             if opaque_var && !self.blanket(block)? { continue; }
             let mark = (self.mark_vars(), self.projections.len(), self.obligations.len());
@@ -167,10 +186,7 @@ impl<'a> Infer<'_, 'a> {
                     found.push(((block, impl_args), Vars { base_len, updates, added, diverges, projections, obligations }));
                 }
                 Ok(Some(_)) | Ok(None) => self.rollback_vars(mark.0),
-                Err(err) => {
-                    self.rollback_vars(mark.0);
-                    return Err(err);
-                }
+                Err(err) => { self.rollback_vars(mark.0); return Err(err); }
             }
         }
         Ok(found)
@@ -496,7 +512,7 @@ impl<'a> Infer<'_, 'a> {
     /// Whether an impl proves `ty: of<args>` for the bound at `path`, where an obligation that repeats an enclosing one is a cycle.
     fn impl_holds(&mut self, (arena, home, path): (&Body, ModRef, PathId), (of, ty, args): (ItemRef, Ty, &[Ty]), depth: u32) -> Result<bool> {
         let query = self.query(of, ty, args);
-        if self.selecting.contains(&query) {
+        if self.selecting.len() > crate::RECURSION_LIMIT || self.selecting.contains(&query) {
             self.cycle_hits += 1;
             return Ok(self.obligation_open(ty, args));
         }
@@ -581,20 +597,23 @@ impl<'a> Infer<'_, 'a> {
 
     /// The obligation `ty: of<args>` hashed with every unbound inference variable of a kind alike, so a nested obligation that repeats an enclosing one is a cycle.
     fn query(&self, of: ItemRef, ty: Ty, args: &[Ty]) -> u64 {
-        let (mut hasher, mut seen) = (rustc_hash::FxHasher::default(), rustc_hash::FxHashMap::default());
+        let (mut hasher, mut seen) = (rustc_hash::FxHasher::default(), ([Ty::NONE; 16], 0usize, Vec::new()));
         of.hash(&mut hasher);
         self.hash_canonical(ty, &mut hasher, &mut seen);
         self.hash_list(args, &mut hasher, &mut seen);
         hasher.finish()
     }
 
-    fn hash_canonical(&self, ty: Ty, hasher: &mut rustc_hash::FxHasher, seen: &mut rustc_hash::FxHashMap<Ty, u32>) {
+    fn hash_canonical(&self, ty: Ty, hasher: &mut rustc_hash::FxHasher, seen: &mut ([Ty; 16], usize, Vec<Ty>)) {
         let ty = self.resolve(ty);
         let kind = self.cx.types.kind(ty);
         let compound = !matches!(kind, Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) | Kind::Never | Kind::Prim(_) | Kind::Value(_) | Kind::Param(_));
         if compound {
-            if let Some(&id) = seen.get(&ty) { (0xFFu8, id).hash(hasher); return; }
-            seen.insert(ty, seen.len() as u32);
+            let (buf, len, extra) = seen;
+            if let Some(pos) = buf[..(*len).min(16)].iter().position(|&t| t == ty) { (0xFFu8, pos as u32).hash(hasher); return; }
+            if *len > 16 && let Some(pos) = extra.iter().position(|&t| t == ty) { (0xFFu8, (16 + pos) as u32).hash(hasher); return; }
+            if *len < 16 { buf[*len] = ty; } else { extra.push(ty); }
+            *len += 1;
         }
         std::mem::discriminant(kind).hash(hasher);
         match kind {
@@ -610,12 +629,12 @@ impl<'a> Infer<'_, 'a> {
             Kind::Adt(item, items) | Kind::FnDef(item, items) => { item.hash(hasher); self.hash_list(self.cx.types.substs(*items), hasher, seen); }
             Kind::FnPtr(params, ret) => { self.hash_list(self.cx.types.substs(*params), hasher, seen); self.hash_canonical(*ret, hasher, seen); }
             Kind::Closure(item, items, id) => { (item, id).hash(hasher); self.hash_list(self.cx.types.substs(*items), hasher, seen); }
-            Kind::Dyn(of, items, members, autos) => { (of, members, autos).hash(hasher); self.hash_list(self.cx.types.substs(*items), hasher, seen); }
-            Kind::Pat(base, start, end) => { (start, end).hash(hasher); self.hash_canonical(*base, hasher, seen); }
+            Kind::Dyn(of, items, members, autos) => { (of, self.cx.types.items(*members), self.cx.types.items(*autos)).hash(hasher); self.hash_list(self.cx.types.substs(*items), hasher, seen); }
+            Kind::Pat(base, range) => { self.cx.types.pat(*range).hash(hasher); self.hash_canonical(*base, hasher, seen); }
         }
     }
 
-    fn hash_list(&self, items: &[Ty], hasher: &mut rustc_hash::FxHasher, seen: &mut rustc_hash::FxHashMap<Ty, u32>) {
+    fn hash_list(&self, items: &[Ty], hasher: &mut rustc_hash::FxHasher, seen: &mut ([Ty; 16], usize, Vec<Ty>)) {
         items.len().hash(hasher);
         for &item in items {
             self.hash_canonical(item, hasher, seen);
@@ -643,8 +662,8 @@ impl<'a> Infer<'_, 'a> {
 
     /// Whether the trait object `ty` implements trait `of` at `args` by being an object of it, or none when `ty` is not a trait object; an impl written for the object type can still hold when this is false.
     pub(in crate::sema) fn object_holds(&mut self, of: ItemRef, ty: Ty, args: &[Ty]) -> Option<bool> {
-        let Kind::Dyn(object, parts, members, _) = self.cx.types.kind(self.resolve(ty)).clone() else { return None };
-        let given = super::super::ty::object_parts(self.cx.types.substs(parts), &members).0.to_vec();
+        let Kind::Dyn(object, parts, members, _) = *self.cx.types.kind(self.resolve(ty)) else { return None };
+        let given = super::super::ty::object_parts(self.cx.types.substs(parts), self.cx.types.items(members)).0.to_vec();
         let same_family = (self.is_sync_callable_trait(object) && self.is_sync_callable_trait(of))
             || (self.is_async_callable_trait(object) && self.is_async_callable_trait(of));
         if object != of && same_family {
@@ -756,29 +775,6 @@ impl<'a> Infer<'_, 'a> {
             _ => None,
         }
     }
-
-    fn collect_header_traits(&mut self, item: ItemRef) -> Result<Vec<ItemRef>> {
-        self.frame_item = Some(item);
-        self.block = self.cx.owner_impl(item);
-        let mut direct = Vec::new();
-        direct.extend(self.cx.owner_trait(item));
-        direct.extend(self.block.and_then(|block| self.cx.impl_trait(block)));
-        for (header, src, home) in self.headers()? {
-            let (arena, generics, predicates) = header.parts();
-            let bounds: Vec<u32> = type_params(generics).flat_map(|g| arena.list(g.bounds).iter().copied()).chain(predicates.iter().flat_map(|p| arena.list(p.bounds).iter().copied())).collect();
-            let found = self.in_source_home(src, home, |inner| Ok(bounds.into_iter().filter_map(|b| inner.bound_trait_at(arena, b, home)).map(|(of, _)| of).collect::<Vec<_>>()))?;
-            direct.extend(found);
-        }
-        self.implied_traits(direct)
-    }
-}
-
-/// The traits declared in `item`'s header and any enclosing impl or trait header, with every supertrait they imply.
-pub fn header_bound_traits(cx: &mut super::super::Context<'_>, item: ItemRef) -> Vec<ItemRef> {
-    if !matches!(cx.item(item).1.kind, ItemKind::Fn | ItemKind::Struct | ItemKind::Enum | ItemKind::Union | ItemKind::Type) {
-        return Vec::new();
-    }
-    super::detached(cx, item, |infer| infer.collect_header_traits(item)).unwrap_or_default()
 }
 
 /// What ranks one applicable impl against another under specialization: whether it has `default` items, the traits its bounds name, and those with every supertrait.

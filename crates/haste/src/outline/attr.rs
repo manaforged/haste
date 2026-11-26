@@ -198,13 +198,29 @@ pub fn attrs(src: &Source, mut at: u32, inner: bool, into: &mut Vec<Attr>) -> Re
     }
 }
 
-/// The bits of the `MARKED` attributes that `attrs` name, directly or inside a `cfg_attr` whatever its condition.
-pub fn marks(src: &Source, attrs: &[Attr]) -> u8 {
-    attrs.iter().fold(0, |bits, attr| {
-        bits | match attr {
-            Attr::Other(at) => mark(src.text(*at)),
-            Attr::CfgAttr(_, inner) => marks(src, inner),
-            _ => 0,
+/// The bits of the marked attributes that `attrs` name, directly or inside a `cfg_attr` whatever its condition.
+pub fn marks(src: &Source, attrs: &[Attr]) -> u16 {
+    let inline_bit = mark("inline");
+    let mut bits = 0u16;
+    let mut has_cfg = false;
+    for attr in attrs {
+        match attr {
+            Attr::Other(at) => {
+                let b = mark(src.text(*at));
+                bits |= b;
+                if b == inline_bit && src.kind(*at + 1) == TokenKind::OpenParen {
+                    bits |= super::item::MARK_INLINE_SPEC;
+                }
+            }
+            Attr::CfgAttr(_, inner) => {
+                has_cfg = true;
+                bits |= marks(src, inner);
+            }
+            _ => {}
         }
-    })
+    }
+    if bits != 0 && has_cfg {
+        bits |= super::item::MARK_CFG_ATTR;
+    }
+    bits
 }

@@ -8,7 +8,7 @@ Use **haste** for instant local edit-run-test cycles, live hot-reloading, and ze
 - **Live hot-reloading:** `haste run --watch` watches workspace source files and patches changed function bodies directly into the running process.
 - **Zero-linker 6-target AOT cross-compilation:** `haste --release build -o ./app --target TRIPLE` emits standalone ELF, Mach-O, and PE32+ executables for Linux, macOS, and Windows (x86-64 & ARM64) with no Docker and no external cross-linker.
 - **Self-hosting:** Compiles its own 86-package, ~178k-function workspace (including `serde`, `serde_derive`, `toml`, `syn`, `tracing`, `anyhow`, `indexmap`, `memchr`) in **10.3–10.8 s** (`0` failed; `13.1 s` end-to-end vs `23.9 s` for cold `cargo build` on macOS ARM64).
-- **Not a toy backend:** Matches or beats `rustc -C opt-level=3` on **3 of 4** AOT compute kernels on both ARM64 (`sha256` **0.80x**, `sieve` **0.94x**, `sort` **1.00x**, `scan` **1.01x**) and x86-64 (`sha256` **0.89x**, `sieve` **0.93x**, `scan` **0.95x**, `sort` **1.02x**, `scripts/bench.sh`, bit-identical outputs), and passes **645/645** differential tests, **95/95** async tests, **15/15** proc-macro tests, **17/17** crate probes (`jit+aot`), and **259/259 (100.0%)** single-file edition-2021 `rust-lang/rust` `tests/ui/` `run-pass` tests (`jit+aot`).
+- **Not a toy backend:** On four standalone AOT compute kernels (`scripts/bench.sh`, bit-identical outputs), matches or beats `rustc -C opt-level=3` on **3 of 4** on x86-64 (`sha256` **0.89x**, `sieve` **0.93x**, `scan` **0.95x**, `sort` **1.02x**) and **3 of 4** on ARM64 (`sha256` **0.80x**, `sieve` **0.94x**, `sort` **1.00x**, `scan` **1.01x**). Passes **129 differential test functions** (× 5 inputs = 645 checks), **19 async functions** (× 5 = 95 checks), **3 proc-macro functions** (× 5 = 15 checks), **17 standalone crate probes** (`jit+aot`), and on filtered single-file edition-2021 `rust-lang/rust` `tests/ui/` passes **259/259 (100.0%)** `run-pass` tests (`jit+aot`) and rejects **172/341 (50.4%)** negative `tests/ui/borrowck/` tests (see Limits below).
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the compiler pipeline and module tour.
 
@@ -53,7 +53,7 @@ haste -V|--version | -h|--help
 | --- | --- |
 | `run [PATH] [--] [ARGS...]` | Runs the workspace binary or `--example` `main` with `ARGS`. |
 | `test [PATH] [--] [FILTER...]` | Runs unit and integration (`tests/*.rs`) `#[test]` functions (with `#[cfg(test)]`, `[dev-dependencies]`, `#[ignore]`, and `#[should_panic]`), or `fn(i64) -> i64` `case_*` harness functions when no `#[test]` functions are present. |
-| `build [-o PATH] [PATH]` | Type-checks the workspace and lowers reached code, or writes a standalone executable when `-o PATH` is given. |
+| `build [-o PATH] [PATH]` | Type-checks and lowers reached functions in the workspace, or writes a standalone executable when `-o PATH` is given. |
 | `serve [PATH]` | Keeps the workspace loaded in memory and answers `build`, `test`, and `run` requests for `PATH`, rebuilding only what edited files affect. |
 | `prep [PATH]` | Pre-compiles dependencies that `main` reaches into the prepared library cache for `--prepared` (**x86-64 Linux only**). |
 | `clean` | Removes the haste cache directory (`$HASTE_HOME`, `$XDG_CACHE_HOME/haste`, or `~/.cache/haste`). |
@@ -104,6 +104,7 @@ haste -V|--version | -h|--help
 | `HASTE_DICT_MIN_FANOUT` | `8` | Minimum monomorphization fanout before sharing a dictionary body. |
 | `HASTE_JIT_TIER_UP` | `64` | Call count threshold before a hot dictionary function specializes in JIT mode (`0` disables tier-up). |
 | `HASTE_VERIFY_STENCIL` | Unset (`0`) | Set to `1` to verify stencil instantiations against concrete lowering. |
+| `HASTE_VERIFY_PASSES` | Unset (`0`) | Set to `1` to run the full SSA dominance and CFG IR verifier after every mutating codegen pass. |
 | `HASTE_TRACE` | Unset (`0`) | Function substring filter (`1` matches all) for printing codegen pass summaries. |
 | `HASTE_TRACE_IR` | Unset (`0`) | Set to `1` with `HASTE_TRACE` to dump IR after each codegen pass, or `passes` for pass-by-pass summaries. |
 | `HASTE_MISSED` | Unset (`0`) | Set to `1` to print aggregated codegen pass timings and stencil cache counters. |
@@ -136,11 +137,11 @@ Run `bash scripts/bench.sh` to reproduce the build-speed and AOT runtime tables 
 `tests/diff`, `tests/async`, and `tests/proc-macro` hold `case_*` suites, and `tests/probes` holds standalone crates. `scripts/check.sh` compares `cargo run` against both `haste test` (JIT) and `haste --release build -o` (standalone AOT).
 
 ```bash
-bash scripts/check.sh                   # 645/645 differential cases (jit+aot) vs rustc
-bash scripts/check.sh tests/async       # 95/95 async cases (jit+aot)
-bash scripts/check.sh tests/proc-macro  # 15/15 proc-macro cases (jit+aot)
-bash scripts/probes.sh                  # 17/17 standalone crate probes (jit+aot) vs rustc
-bash scripts/bench.sh                   # Build speed & AOT runtime benchmarks vs rustc -O3
+bash scripts/check.sh                   # 129 differential functions x 5 inputs (645 checks, jit+aot) vs rustc
+bash scripts/check.sh tests/async       # 19 async functions x 5 inputs (95 checks, jit+aot)
+bash scripts/check.sh tests/proc-macro  # 3 proc-macro functions x 5 inputs (15 checks, jit+aot)
+bash scripts/probes.sh                  # 17 standalone crate probes (jit+aot) vs rustc
+bash scripts/bench.sh                   # Build speed & 4-kernel AOT runtime benchmarks vs rustc -O3
 bash scripts/rustc-ui.sh                # Official rust-lang/rust tests/ui/ conformance suite
 ```
 

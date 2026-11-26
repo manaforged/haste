@@ -199,7 +199,7 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     /// Runs `work` on each shard in a scoped thread of its own with one of `forks`, returning each thread's value or its panic payload message.
     pub(super) fn run_shards<'a, T: Send>(&self, forks: Vec<Context<'a>>, shards: &[Vec<Vec<usize>>], work: impl Fn(Context<'a>, &[Vec<usize>]) -> T + Sync) -> Vec<Result<T, String>> {
         let work = &work;
-        std::thread::scope(|scope| {
+        crate::sync::scope(|scope| {
             let handles: Vec<_> = forks.into_iter().zip(shards).map(|(fork, shard)| scope.spawn(move || work(fork, shard))).collect();
             handles.into_iter().map(|handle| handle.join().map_err(Self::panic_message)).collect()
         })
@@ -323,7 +323,7 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 
     fn run_aot_workers(&self, cx: &Context<'_>, reached: &Reached, queue: &AotQueue, jobs: usize, plan: Plan) -> Vec<Option<WorkerOutput>> {
         let forks: Vec<Context<'_>> = (0..jobs).map(|_| cx.fork()).collect();
-        std::thread::scope(|scope| {
+        crate::sync::scope(|scope| {
             let handles: Vec<_> = forks.into_iter().map(|fork| scope.spawn(move || self.aot_worker_loop(fork, reached, queue, plan))).collect();
             handles.into_iter().map(|handle| handle.join().map_or(None, Some)).collect()
         })
@@ -712,7 +712,7 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
         let valid_relocs = if is_dict {
             code.relocs().iter().all(|r| r.as_runtime().is_some())
         } else {
-            code.relocs().iter().all(|r| r.symbol_index().is_some() || (self.backend.is_aot() && r.as_runtime().is_some()))
+            code.relocs().iter().all(|r| r.symbol_index().is_some() || ((self.backend.is_aot() || self.backend.is_lazy_jit()) && r.as_runtime().is_some()))
         };
         if !cx.deferred_evals.is_empty() {
             return tally(Tally::FreezeDeferred);
@@ -720,8 +720,8 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
         let Some((is_sysroot, direct_key, fp_bits)) = valid_relocs.then(|| self.frozen_stencil_key(cx, reached, index, fp)).flatten() else {
             return tally(Tally::FreezeSkipped);
         };
-        let needs_plan = is_dict || code.relocs().iter().any(|r| r.symbol_index().is_some());
-        let (store_sysroot, plan_bytes) = if self.backend.is_aot() && needs_plan {
+        let needs_plan = is_dict || code.relocs().iter().any(|r| r.symbol_index().is_some()) || !code.unwind_drops().is_empty();
+        let (store_sysroot, plan_bytes) = if (self.backend.is_aot() || self.backend.is_lazy_jit()) && needs_plan {
             let Some(pair) = self.encode_frozen_plan(cx, reached, is_sysroot, plan) else {
                 return tally(if is_dict { Tally::FreezeSkipped } else { Tally::FreezePlanless });
             };

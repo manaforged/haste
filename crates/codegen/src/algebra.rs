@@ -284,7 +284,7 @@ fn simplify_icmp(cx: &mut RewriteCx, res: Option<Value>, cc: IntCC, x: Value, y:
     }
     if matches!(cc, IntCC::Equal | IntCC::NotEqual)
         && let Some(op) = [(x, y), (y, x)].into_iter().find_map(|(m, z)| {
-            (cx.sconst(z) == Some(0)).then(|| match_swar_msb_broadcast(cx, m)).flatten().map(|w| Op::Icmp(cc, w, z))
+            (cx.sconst(z) == Some(0)).then(|| icmp::strip_zero_test(cx, m)).flatten().map(|w| Op::Icmp(cc, w, z))
         })
     {
         return Some(op);
@@ -380,8 +380,9 @@ fn simplify_convert(cx: &mut RewriteCx, res: Option<Value>, kind: Convert, x: Va
         (Convert::Sextend, &Op::Convert(Convert::Sextend, inner)) if cx.func.ty(inner).is_small_int() => Some(Op::Convert(Convert::Sextend, inner)),
         (Convert::Uextend, &Op::Convert(Convert::Ireduce, inner)) if cx.func.ty(inner) == dst => {
             let hi = dst.unsigned_max() & !src.unsigned_max();
-            if (cx.known(inner).0 & hi) == hi { cx.alias(res, inner); }
-            None
+            if (cx.known(inner).0 & hi) == hi { cx.alias(res, inner); return None; }
+            let mask = cx.emit(dst, Op::Const(extend(src.unsigned_max() as i64, dst, true)));
+            Some(Op::Binary(Binary::Band, inner, mask))
         }
         _ => None,
     }
@@ -678,7 +679,7 @@ fn simplify_inst(cx: &mut RewriteCx, fits_used: &[bool], block_udivs: &mut Vec<(
         Op::Binary(bin, a, b) => {
             if res.is_some_and(|r| cx.func.ty(r).is_vector()) {
                 vec::simplify_vec_binary(cx, res, bin, a, b)
-            } else if bin == Binary::Bor && let Some(op) = vec::merge_movemasks(cx, a, b) {
+            } else if matches!(bin, Binary::Band | Binary::Bor | Binary::Bxor) && let Some(op) = vec::merge_vec_bitwise(cx, bin, a, b) {
                 Some(op)
             } else {
                 simplify_binary(cx, fits_used, block_udivs, res, (bin, a, b))
@@ -695,8 +696,8 @@ fn simplify_inst(cx: &mut RewriteCx, fits_used: &[bool], block_udivs: &mut Vec<(
             let (ta, ea) = (ta.clone(), ea.clone());
             match select::tested_select(cx, cond) {
                 Some((test, true)) => Some(Op::Brif(test, tb, ta, eb, ea)),
-                Some((test, false)) => Some(Op::Brif(test, eb, ea, tb, ta)),
-                None => known_cond(cx, cond).or_else(|| match_swar_msb_broadcast(cx, cond)).or_else(|| { let inner = cx.unwrap_uextend(cond); (inner != cond).then_some(inner) }).map(|c| Op::Brif(c, tb, ta, eb, ea)),
+                Some((test, false)) => { cx.func.bump_cfg(); Some(Op::Brif(test, eb, ea, tb, ta)) }
+                None => known_cond(cx, cond).or_else(|| icmp::strip_zero_test(cx, cond)).or_else(|| { let inner = cx.unwrap_uextend(cond); (inner != cond).then_some(inner) }).map(|c| Op::Brif(c, tb, ta, eb, ea)),
             }
         }
         Op::Load(addr, off) => {

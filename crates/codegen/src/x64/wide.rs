@@ -1,8 +1,8 @@
 use super::Emit;
 use crate::frame::Ext;
 use super::asm::{Alu, Cond, Count, Group3, Reg, Rm, Shift, Size};
-use crate::ir::{Binary, Function, IntCC, Op, TargetOpId, Type, Unary, Value};
-use crate::wide::half_score;
+use crate::ir::{Binary, Function, Inst, IntCC, Op, TargetOpId, Type, Unary, Value};
+use crate::wide::{WideCtx, half_score};
 
 /// The registers 128-bit rotates use as scratch besides rax, rcx and rdx.
 pub(super) const WIDE_SCRATCH: [Reg; 3] = [Reg::R8, Reg::R9, Reg::R10];
@@ -33,14 +33,13 @@ fn carry_op(op: &Op) -> Option<(TargetOpId, &[Value])> {
 }
 
 /// Marks each carry out whose every use is the carry operand of the next carry pair in its block, with only register loads and stores between, so the carry flag hands it over and no register needs it.
-pub(super) fn flag_carries(func: &Function, plan: &crate::alloc::Plan<Reg>) -> Vec<bool> {
+pub(super) fn flag_carries(func: &Function, plan: &crate::alloc::Plan<Reg>, defs: &[Option<Inst>]) -> Vec<bool> {
     let mut uses = vec![0_u32; func.types.len()];
     for inst in func.blocks.iter().flat_map(|block| &block.insts) {
         func.insts[inst.index()].op.for_operands(|value| uses[value.index()] += 1);
     }
     let held = |value: Value| !plan.elided[value.index()] && matches!(plan.locations[value.index()], crate::alloc::Location::Reg(_));
     let moved = |value: Value| !plan.elided[value.index()] && matches!(plan.locations[value.index()], crate::alloc::Location::Reg(_) | crate::alloc::Location::Slot);
-    let defs = crate::fold::defs(func);
     let in_memory = |value: Value| {
         plan.elided[value.index()]
             && defs[value.index()].is_some_and(|inst| match func.insts[inst.index()].op {
@@ -280,23 +279,15 @@ impl Emit<'_> {
         };
         self.overflow_held(left, right).then_some(cond)
     }
+}
 
-    fn const_halves(&self, v: Value) -> (Option<i64>, Option<i64>) {
-        crate::wide::const_halves(self.func, &self.plan, &self.defs, v)
+impl WideCtx<Reg> for Emit<'_> {
+    fn wide_ctx(&self) -> (&crate::ir::Function, &crate::alloc::Plan<Reg>, &[Option<crate::ir::Inst>]) {
+        (self.func, &self.plan, &self.defs)
     }
+}
 
-    fn has_zero_high(&self, v: Value) -> bool {
-        crate::wide::has_zero_high(self.func, &self.plan, &self.defs, v)
-    }
-
-    fn known_halves(&self, v: Value) -> (Option<i64>, Option<i64>) {
-        crate::wide::known_halves(self.func, &self.plan, &self.defs, v)
-    }
-
-    fn shift_const(&self, y: Value) -> Option<u8> {
-        crate::wide::shift_const(self.func, &self.plan, &self.defs, y)
-    }
-
+impl Emit<'_> {
     fn load_half(&mut self, high: bool, reg: Reg, value: Value) {
         let half = if high { self.known_halves(value).1 } else { self.const_halves(value).0 };
         if let Some(imm) = half {

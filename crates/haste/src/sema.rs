@@ -62,6 +62,22 @@ pub struct Context<'a> {
     pub(super) drop_stack: Vec<ty::Ty>,
     pub(super) form_stack: Vec<(infer::Form, usize)>,
     global_asm: Option<Arc<global_asm::Table>>,
+    langs: Option<Arc<traits::Langs>>,
+    lang_map: std::cell::OnceCell<Arc<lookups::LangMap>>,
+    crate_owners: Vec<Option<Arc<HashMap<(u32, Option<u32>), u32>>>>,
+    crate_modules: Vec<Option<Arc<HashMap<(u32, u32), u32>>>>,
+    crate_heads: Vec<Option<Arc<impls::Index>>>,
+    headers_local: HashMap<impls::ImplRef, Arc<sig::ImplHeader>>,
+    trait_members_local: std::cell::RefCell<HashMap<ItemRef, Arc<HashMap<&'a str, ItemRef>>>>,
+    impl_members_local: std::cell::RefCell<HashMap<impls::ImplRef, Arc<HashMap<&'a str, ItemRef>>>>,
+    intrinsics_local: std::cell::RefCell<HashMap<ItemRef, Option<intrinsic::Intrinsic>>>,
+    type_defs_local: std::cell::RefCell<HashMap<(TypeScope, SegKey), crate::names::Def>>,
+    type_defs_single: std::cell::RefCell<HashMap<(ModRef, crate::names::Sym), crate::names::Def>>,
+    selections_local: std::cell::RefCell<HashMap<(ItemRef, ty::Ty, substs::Substs), Option<(impls::ImplRef, substs::Substs)>>>,
+    scope_traits_local: std::cell::RefCell<HashMap<ModRef, Arc<[ItemRef]>>>,
+    pub(super) glues_local: HashMap<ty::Ty, Option<infer::Res>>,
+    pub(super) drops_local: HashMap<ty::Ty, bool>,
+    pub(crate) ty_facts: HashMap<ty::Ty, u128>,
 }
 
 /// A parsed type alias: its type parameters, its generics and where clause, and its target type.
@@ -82,24 +98,23 @@ impl<'a> Context<'a> {
         &self.store
     }
 
-    /// Drops cached reach-only tables and sysroot bodies to cut RSS before one-shot codegen.
+    /// Drops cached reach-only tables to cut RSS before one-shot codegen while keeping caches codegen reads.
     pub(crate) fn compact_for_oneshot_codegen(&mut self) {
         self.store.finals.clear();
-        self.store.bodies.retain(|item, _| !self.outline.is_fixed(item.krate));
         self.store.lookups.summaries = table::Flight::default();
         self.store.lookups.selections.clear();
         self.store.lookups.projections.clear();
         self.store.lookups.trait_calls.clear();
         self.store.lookups.assoc_types.clear();
         self.store.lookups.type_defs.clear();
+        self.type_defs_local.borrow_mut().clear();
+        self.type_defs_single.borrow_mut().clear();
+        self.selections_local.borrow_mut().clear();
+        self.scope_traits_local.borrow_mut().clear();
         self.store.lookups.scope_traits.clear();
         self.store.lookups.reveals = table::Flight::default();
         self.store.lookups.futures.clear();
         self.store.lookups.forms.clear();
-        self.store.lookups.file_index = Arc::new(std::sync::OnceLock::new());
-        self.kids.clear();
-        self.trait_members.clear();
-        self.impl_members.clear();
         self.aliases.clear();
         self.eval_errors.clear();
     }
@@ -126,11 +141,28 @@ impl<'a> Context<'a> {
             drop_stack: Vec::new(),
             form_stack: Vec::new(),
             global_asm: None,
+            langs: None,
+            lang_map: std::cell::OnceCell::new(),
+            crate_owners: vec![None; outline.crates.len()],
+            crate_modules: vec![None; outline.crates.len()],
+            crate_heads: vec![None; outline.crates.len()],
+            headers_local: HashMap::default(),
+            trait_members_local: std::cell::RefCell::new(HashMap::default()),
+            impl_members_local: std::cell::RefCell::new(HashMap::default()),
+            intrinsics_local: std::cell::RefCell::new(HashMap::default()),
+            type_defs_local: std::cell::RefCell::new(HashMap::default()),
+            type_defs_single: std::cell::RefCell::new(HashMap::default()),
+            selections_local: std::cell::RefCell::new(HashMap::default()),
+            scope_traits_local: std::cell::RefCell::new(HashMap::default()),
+            glues_local: HashMap::default(),
+            drops_local: HashMap::default(),
+            ty_facts: HashMap::default(),
         }
     }
 
     /// A sibling context over the same outline, names, types and caches, with its own empty request list so a worker thread can run without contending on asks.
     pub fn fork(&self) -> Context<'a> {
+        let crates = self.outline.crates.len();
         Context {
             outline: self.outline,
             names: self.names,
@@ -148,6 +180,22 @@ impl<'a> Context<'a> {
             drop_stack: Vec::new(),
             form_stack: Vec::new(),
             global_asm: self.global_asm.clone(),
+            langs: self.langs.clone(),
+            lang_map: std::cell::OnceCell::new(),
+            crate_owners: vec![None; crates],
+            crate_modules: vec![None; crates],
+            crate_heads: vec![None; crates],
+            headers_local: HashMap::default(),
+            trait_members_local: std::cell::RefCell::new(HashMap::default()),
+            impl_members_local: std::cell::RefCell::new(HashMap::default()),
+            intrinsics_local: std::cell::RefCell::new(HashMap::default()),
+            type_defs_local: std::cell::RefCell::new(HashMap::default()),
+            type_defs_single: std::cell::RefCell::new(HashMap::default()),
+            selections_local: std::cell::RefCell::new(HashMap::default()),
+            scope_traits_local: std::cell::RefCell::new(HashMap::default()),
+            glues_local: HashMap::default(),
+            drops_local: HashMap::default(),
+            ty_facts: HashMap::default(),
         }
     }
 
@@ -174,15 +222,53 @@ impl<'a> Context<'a> {
 
     /// The cached type-namespace definition for `segments` in `scope`.
     pub fn type_def(&self, scope: TypeScope, segments: &[crate::names::Sym]) -> Option<crate::names::Def> {
-        self.store.lookups.type_defs.get(&(scope, SegKey::from_slice(segments)))
+        if let (&[sym], (home, None, None, false, None)) = (segments, scope) {
+            if let Some(&found) = self.type_defs_single.borrow().get(&(home, sym)) {
+                return Some(found);
+            }
+            let key = (scope, SegKey::from_slice(segments));
+            let found = self.store.lookups.type_defs.get(&key)?;
+            self.type_defs_single.borrow_mut().insert((home, sym), found);
+            return Some(found);
+        }
+        let key = (scope, SegKey::from_slice(segments));
+        if let Some(&found) = self.type_defs_local.borrow().get(&key) {
+            return Some(found);
+        }
+        let found = self.store.lookups.type_defs.get(&key)?;
+        self.type_defs_local.borrow_mut().insert(key, found);
+        Some(found)
     }
 
     /// Caches `def` as the type-namespace definition for `segments` in `scope`.
     pub fn set_type_def(&self, scope: TypeScope, segments: &[crate::names::Sym], def: crate::names::Def) {
-        self.store.lookups.type_defs.insert((scope, SegKey::from_slice(segments)), def);
+        let key = (scope, SegKey::from_slice(segments));
+        self.store.lookups.type_defs.insert(key.clone(), def);
+        if let (&[sym], (home, None, None, false, None)) = (segments, scope) {
+            self.type_defs_single.borrow_mut().insert((home, sym), def);
+        } else {
+            self.type_defs_local.borrow_mut().insert(key, def);
+        }
+    }
+
+    /// The cached closed trait selection for `key`, backed by a per-context cache over the shared table.
+    pub(super) fn selection(&self, key: &(ItemRef, ty::Ty, substs::Substs)) -> Option<Option<(impls::ImplRef, substs::Substs)>> {
+        if let Some(&found) = self.selections_local.borrow().get(key) {
+            return Some(found);
+        }
+        let found = self.store.lookups.selections.get(key)?;
+        self.selections_local.borrow_mut().insert(*key, found);
+        Some(found)
+    }
+
+    /// Caches `picked` as the closed trait selection for `key`.
+    pub(super) fn set_selection(&self, key: (ItemRef, ty::Ty, substs::Substs), picked: Option<(impls::ImplRef, substs::Substs)>) {
+        self.store.lookups.selections.insert(key, picked);
+        self.selections_local.borrow_mut().insert(key, picked);
     }
 
     /// The source file and outline entry of `item`.
+    #[inline]
     pub fn item(&self, item: ItemRef) -> (&'a Source, &'a Item) {
         let file = self.file(item);
         let index = item.outer().map_or(item.item, |(_, index)| index);
@@ -381,11 +467,17 @@ impl<'a> Context<'a> {
     }
 
     /// The outline file that holds `item`, or the expansion of the body that declares it.
+    #[inline]
     pub fn file(&self, item: ItemRef) -> &'a crate::outline::tree::File {
         match item.outer() {
-            Some((outer, _)) => &self.expansion(outer).expect("a body that declares items is read").file,
+            Some((outer, _)) => self.expanded_file(outer),
             None => &self.outline.crates[item.krate as usize].files[item.file as usize],
         }
+    }
+
+    #[cold]
+    fn expanded_file(&self, outer: ItemRef) -> &'a crate::outline::tree::File {
+        &self.expansion(outer).expect("a body that declares items is read").file
     }
 
     /// Path resolution inside crate `krate`, recording what it finds not loaded yet.
@@ -424,7 +516,6 @@ impl<'a> Context<'a> {
         if let Some(of) = self.owner_trait(item) {
             return self.module_of(of);
         }
-        let map = self.modules_of(item.krate);
         let (_, mut entry) = self.item(item);
         let mut top = item.item;
         let file = &self.outline.crates[item.krate as usize].files[item.file as usize];
@@ -432,15 +523,18 @@ impl<'a> Context<'a> {
             top = parent;
             entry = &file.items.items[parent as usize];
         }
-        let module = map.get(&(item.file, top)).copied().with_context(|| format!("no module holds item {item:?}"))?;
+        let module = self.modules_of(item.krate).get(&(item.file, top)).copied().with_context(|| format!("no module holds item {item:?}"))?;
         Ok(ModRef { krate: item.krate, module })
     }
 
-    fn modules_of(&mut self, krate: u32) -> Arc<HashMap<(u32, u32), u32>> {
+    fn modules_of(&mut self, krate: u32) -> &HashMap<(u32, u32), u32> {
         let tree = &self.outline.crates[krate as usize];
-        self.store.lookups.modules.get_or_insert_with(krate, || {
-            let pairs = (0..tree.modules.len()).flat_map(|module| items_of(tree, module).into_iter().map(move |pair| (pair, module as u32)));
-            Arc::new(pairs.collect())
+        let store = &self.store.lookups.modules;
+        self.crate_modules[krate as usize].get_or_insert_with(|| {
+            store.get_or_insert_with(krate, || {
+                let pairs = (0..tree.modules.len()).flat_map(|module| items_of(tree, module).into_iter().map(move |pair| (pair, module as u32)));
+                Arc::new(pairs.collect())
+            })
         })
     }
 

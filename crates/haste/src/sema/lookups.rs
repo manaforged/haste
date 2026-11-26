@@ -95,9 +95,62 @@ impl ActiveAttrs {
     }
 }
 
+pub(super) struct LangMap {
+    pub(super) map: HashMap<ItemRef, Box<str>>,
+    bloom: [u64; 64],
+    crates_lo: u64,
+    crates_hi: u64,
+    any_high: bool,
+}
+
+impl LangMap {
+    #[inline]
+    fn bloom_bits(item: ItemRef) -> (usize, u64, usize, u64) {
+        let h1 = item.file.wrapping_mul(0x9E37_79B1) ^ item.item.wrapping_mul(0x85EB_CA77);
+        let h2 = item.file.wrapping_mul(0xC2B2_AE35) ^ item.item.wrapping_mul(0x27D4_EB2F);
+        let b1 = ((h1 ^ (h1 >> 16)) as usize) & 4095;
+        let b2 = ((h2 ^ (h2 >> 16)) as usize) & 4095;
+        (b1 >> 6, 1u64 << (b1 & 63), b2 >> 6, 1u64 << (b2 & 63))
+    }
+
+    pub(super) fn from_map(map: HashMap<ItemRef, Box<str>>) -> Self {
+        let (mut crates_lo, mut crates_hi, mut any_high) = (0u64, 0u64, false);
+        let mut bloom = [0u64; 64];
+        for &item in map.keys() {
+            if item.krate < 64 {
+                crates_lo |= 1u64 << item.krate;
+            } else if item.krate < 128 {
+                crates_hi |= 1u64 << (item.krate - 64);
+            } else {
+                any_high = true;
+            }
+            let (w1, m1, w2, m2) = Self::bloom_bits(item);
+            bloom[w1] |= m1;
+            bloom[w2] |= m2;
+        }
+        Self { map, bloom, crates_lo, crates_hi, any_high }
+    }
+
+    #[inline]
+    pub(super) fn may_contain(&self, item: ItemRef) -> bool {
+        let has_krate = if item.krate < 64 {
+            self.crates_lo & (1u64 << item.krate) != 0
+        } else if item.krate < 128 {
+            self.crates_hi & (1u64 << (item.krate - 64)) != 0
+        } else {
+            self.any_high
+        };
+        if !has_krate {
+            return false;
+        }
+        let (w1, m1, w2, m2) = Self::bloom_bits(item);
+        (self.bloom[w1] & m1) != 0 && (self.bloom[w2] & m2) != 0
+    }
+}
+
 #[derive(Default)]
 pub(super) struct OutlineState {
-    pub(super) langs: RwLock<Option<traits::Langs>>,
+    pub(super) langs: RwLock<Option<Arc<traits::Langs>>>,
     pub(super) global_allocator: RwLock<Option<Option<ItemRef>>>,
     pub(super) loaded: RwLock<Vec<crate::outline::tree::CrateExtent>>,
     pub(super) primitives: RwLock<Option<Arc<[u32]>>>,
@@ -114,6 +167,7 @@ pub(super) struct Lookups {
     pub(super) attrs: Table<ItemRef, ActiveAttrs>,
     pub(super) state: Arc<OutlineState>,
     pub(super) drops: Table<ty::Ty, bool>,
+    pub(super) own_drops: Table<ty::Ty, bool>,
     pub(super) unpins: Table<ty::Ty, (bool, u32)>,
     pub(super) freezes: Table<ty::Ty, (bool, u32)>,
     pub(super) glues: Table<ty::Ty, Option<infer::Res>>,
@@ -137,7 +191,7 @@ pub(super) struct Lookups {
     pub(super) has_new_sysroot_instances: Arc<AtomicBool>,
     pub(super) substrate: Option<Arc<crate::substrate::Substrate>>,
     pub(super) file_index: Arc<std::sync::OnceLock<Arc<summary::codec::FileIndex>>>,
-    pub(super) lang_items: Arc<std::sync::OnceLock<HashMap<ItemRef, u32>>>,
+    pub(super) lang_items: Arc<std::sync::OnceLock<Arc<LangMap>>>,
     pub(super) skip_warm_sysroot_bodies: bool,
 }
 
@@ -255,6 +309,11 @@ fn lang_files_changed(
 }
 
 impl Cache {
+    /// Returns the reconciled file index for `outline`, building it lazily on first use.
+    pub(crate) fn file_index(&self, outline: &Outline) -> &summary::codec::FileIndex {
+        self.lookups.file_index.get_or_init(|| Arc::new(summary::codec::FileIndex::build(outline)))
+    }
+
     /// Attaches a frozen sysroot substrate to serve pre-computed `PolySummary` entries.
     pub fn set_substrate(&mut self, substrate: Option<Arc<crate::substrate::Substrate>>) {
         self.lookups.substrate = substrate;
@@ -371,6 +430,7 @@ impl Cache {
 impl Lookups {
     fn forget_edited<F: Fn(ItemRef) -> bool>(&mut self, edited: Edited<'_>, naming: &mut Naming<'_, F>, mine: &F, block_kept: &dyn Fn(&impls::ImplRef) -> bool) {
         self.drops.retain(|ty, _| !naming.names(*ty));
+        self.own_drops.retain(|ty, _| !naming.names(*ty));
         self.unpins.retain(|ty, _| !naming.names(*ty));
         self.freezes.retain(|ty, _| !naming.names(*ty));
         self.glues.retain(|ty, _| !naming.names(*ty));

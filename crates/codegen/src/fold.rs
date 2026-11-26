@@ -169,6 +169,7 @@ pub(crate) fn known_bits(func: &Function, def_of: &dyn Fn(Value) -> Option<Inst>
         Op::Binary(Binary::Bor, a, b) => { let ((za, oa), (zb, ob)) = (rec(a), rec(b)); (za & zb & w, (oa | ob) & w) }
         Op::Binary(Binary::Bxor, a, b) => { let ((za, oa), (zb, ob)) = (rec(a), rec(b)); (((za & zb) | (oa & ob)) & w, ((za & ob) | (oa & zb)) & w) }
         Op::Binary(op @ (Binary::Ushr | Binary::Ishl), a, sh) => known(sh).map_or((0, 0), |c| known_shift_bits(op, ty, rec(a), c)),
+        Op::Binary(Binary::Imul, a, b) => { let tz = (rec(a).0.trailing_ones() + rec(b).0.trailing_ones()).min(ty.bits()); (if tz == 64 { u64::MAX } else { ((1_u64 << tz) - 1) & w }, 0) }
         Op::Convert(Convert::Uextend, a) if func.ty(a).is_small_int() => { let ((za, oa), aw) = (rec(a), func.ty(a).unsigned_max()); ((za | !aw) & w, oa & aw) }
         Op::Convert(Convert::Ireduce, a) if func.ty(a).is_small_int() => { let (za, oa) = rec(a); (za & w, oa & w) }
         Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..) => (w & !1, 0),
@@ -452,7 +453,7 @@ impl Fold {
             let non_null_br = through.is_none() && matches!(func.insts[last.index()].op, Op::Brif(cond, ..) if self.non_null(func, at, cond));
             if let Some((inner, swap)) = through && let Op::Brif(cond, then, then_args, otherwise, else_args) = &mut func.insts[last.index()].op {
                 *cond = inner;
-                if swap { std::mem::swap(then, otherwise); std::mem::swap(then_args, else_args); }
+                if swap { std::mem::swap(then, otherwise); std::mem::swap(then_args, else_args); cfg_dirty = true; }
                 changed = true;
             }
             if self.decide(&func.types, non_null_br, &mut func.insts[last.index()].op) || self.exits(func, last) {
@@ -697,9 +698,6 @@ pub(crate) fn for_edges<'a>(func: &'a Function, block: usize, mut f: impl FnMut(
     match &func.insts[last.index()].op { Op::Jump(target, args) => f(*target, args), Op::Brif(_, then, then_args, otherwise, else_args) => { f(*then, then_args); f(*otherwise, else_args); } _ => {} }
 }
 
-fn pinned(func: &Function, entry: Block) -> Vec<bool> { unused::pinned(func, entry) }
-fn drop_params(func: &mut Function, fold: &Fold) -> bool { unused::drop_params(func, &fold.subst) }
-
 /// The instruction in a block that defines each value.
 pub(crate) fn defs(func: &Function) -> Vec<Option<Inst>> {
     let mut defs = vec![None; func.types.len()];
@@ -785,14 +783,18 @@ pub(crate) fn run(func: &mut Function, effort: crate::Effort) -> Domain {
     let Some(entry) = func.entry else { return Domain::NONE };
     let count = func.types.len();
     let mut fold = Fold { consts: vec![None; count], subst: (0..count as u32).map(Value).collect(), incoming: Vec::new(), mixed: Vec::new(), defs: defs(func) };
-    let pinned = pinned(func, entry);
+    let pinned = unused::pinned(func, entry);
     let (mut changed, mut cfg_changed) = settle_cfg_and_params(func, &mut fold, entry, effort, &pinned);
-    let (dropped_params, mut body_changed) = (drop_params(func, &fold), false);
+    let (dropped_params, mut body_changed) = (unused::drop_params(func, &fold.subst), false);
     for b in 0..func.blocks.len() { for idx in 0..func.blocks[b].insts.len() { body_changed |= rewrite_folded_inst(func, &fold, func.blocks[b].insts[idx]); } }
-    body_changed |= crate::algebra::rewrite(func, &fold.defs) | crate::algebra::invert(func) | vector::fold_bitcast_loads(func) | unused::run(func, &pinned) | unused::dead(func);
-    changed |= body_changed;
+    let rev_before = func.cfg_rev;
+    if effort == crate::Effort::Full {
+        body_changed |= crate::algebra::rewrite(func, &fold.defs) | crate::algebra::invert(func) | vector::fold_bitcast_loads(func);
+    }
+    body_changed |= unused::run(func, &pinned) | unused::dead(func);
+    (changed, cfg_changed) = (changed | body_changed, cfg_changed | (func.cfg_rev != rev_before));
     if (body_changed || dropped_params) && (fold.thread(func, &pinned) | fold.branches(func)) { func.bump_cfg(); unused::prune_changed(func, entry, false); unused::dead(func); (changed, cfg_changed) = (true, true); }
-    if crate::algebra::devirt_vtables(func, &fold.defs) | crate::algebra::fold_bxor_conds(func) | range::fold_range_checks(func) { unused::dead(func); changed = true; }
+    if effort == crate::Effort::Full && (crate::algebra::devirt_vtables(func, &fold.defs) | crate::algebra::fold_bxor_conds(func) | range::fold_range_checks(func)) { unused::dead(func); changed = true; }
     if !changed { Domain::NONE } else if cfg_changed { Domain::VALUES | Domain::CFG } else { Domain::VALUES }
 }
 pub(crate) use crate::ir::compact;

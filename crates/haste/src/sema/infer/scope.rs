@@ -45,6 +45,22 @@ impl Form {
     }
 }
 
+fn instantiate_ty(mut types: &super::super::ty::Types, ty: Ty, args: &[Ty]) -> Ty {
+    if !types.has_params(ty) {
+        return ty;
+    }
+    if let Kind::Param(index) = *types.kind(ty) {
+        return args.get(index as usize).copied().unwrap_or(ty);
+    }
+    let Ok(mapped) = super::super::ty::try_map_children::<_, std::convert::Infallible>(
+        &mut types,
+        ty,
+        |t| *t,
+        &mut |t, inner| Ok(instantiate_ty(*t, inner, args)),
+    );
+    mapped
+}
+
 /// The names of the type parameters of `params` in `src`, each paired with its argument in `args`.
 pub fn named_args<'a>(src: &'a Source, params: &[Generic], args: &[Ty]) -> Vec<(&'a str, Ty)> {
     type_params(params).map(|generic| src.text(generic.name)).zip(args.iter().copied()).collect()
@@ -168,7 +184,7 @@ impl<'a> Infer<'_, 'a> {
 
     /// How many type arguments impl `block` takes.
     pub fn impl_params(&mut self, block: ImplRef) -> Result<usize> {
-        Ok(type_params(&self.cx.impl_header(block)?.generics).count())
+        Ok(type_params(&self.cx.impl_header_ref(block)?.generics).count())
     }
 
     /// The type parameters of impl `block` set to `args`, and its self type at them.
@@ -229,20 +245,12 @@ impl<'a> Infer<'_, 'a> {
             return true;
         }
         let quiet = self.items.is_empty() && self.const_args.is_empty() && self.evaluating.is_empty() && self.selecting.is_empty();
-        quiet && root.is_none() && self.instance.as_ref().is_none_or(|(at, _)| self.cx.attr_at(*at, "define_opaque").is_none())
+        quiet && root.is_none() && self.instance.as_ref().is_none_or(|(at, _)| !self.cx.has_attr(*at, "define_opaque"))
     }
 
     /// `ty` of a generic form with each rigid parameter `index` replaced by `args[index]`.
-    pub(super) fn instantiate(&mut self, ty: Ty, args: &[Ty]) -> Ty {
-        if !self.cx.types.has_params(ty) {
-            return ty;
-        }
-        if let Kind::Param(index) = *self.cx.types.kind(ty) {
-            return args.get(index as usize).copied().unwrap_or(ty);
-        }
-        let kind = self.cx.types.kind(ty).clone();
-        let mapped = self.map_kind(&kind, |this, inner| this.instantiate(inner, args));
-        self.cx.types.intern(mapped)
+    pub(super) fn instantiate(&self, ty: Ty, args: &[Ty]) -> Ty {
+        instantiate_ty(&self.cx.types, ty, args)
     }
 
     /// The headers whose generic parameters and where clauses the frame's type parameters come from: the item's own, its impl's, and its trait's.
@@ -430,4 +438,33 @@ impl<'a> Infer<'_, 'a> {
         let (_, self_ty) = self.impl_frame(block, &args).ok()?;
         self.unifies(self_ty, ty).then_some(args)
     }
+
+    fn collect_header_traits(&mut self, item: ItemRef) -> Result<Vec<ItemRef>> {
+        self.frame_item = Some(item);
+        self.block = self.cx.owner_impl(item);
+        let mut direct = Vec::new();
+        direct.extend(self.cx.owner_trait(item));
+        direct.extend(self.block.and_then(|block| self.cx.impl_trait(block)));
+        for (header, src, home) in self.headers()? {
+            let (arena, generics, predicates) = header.parts();
+            let bounds: Vec<u32> = type_params(generics)
+                .flat_map(|g| arena.list(g.bounds).iter().copied())
+                .chain(predicates.iter().flat_map(|p| arena.list(p.bounds).iter().copied()))
+                .collect();
+            let found = self.in_source_home(src, home, |inner| {
+                Ok(bounds.into_iter().filter_map(|b| inner.bound_trait_at(arena, b, home)).map(|(of, _)| of).collect::<Vec<_>>())
+            })?;
+            direct.extend(found);
+        }
+        self.implied_traits(direct)
+    }
+}
+
+/// The traits declared in `item`'s header and any enclosing impl or trait header, with every supertrait they imply.
+pub fn header_bound_traits(cx: &mut super::super::Context<'_>, item: ItemRef) -> Vec<ItemRef> {
+    use crate::outline::item::ItemKind;
+    if !matches!(cx.item(item).1.kind, ItemKind::Fn | ItemKind::Struct | ItemKind::Enum | ItemKind::Union | ItemKind::Type) {
+        return Vec::new();
+    }
+    super::detached(cx, item, |infer| infer.collect_header_traits(item)).unwrap_or_default()
 }

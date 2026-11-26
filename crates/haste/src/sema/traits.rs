@@ -1,25 +1,7 @@
-use std::cell::Cell;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use rustc_hash::FxHashMap as HashMap;
-
-#[derive(Clone, Copy)]
-struct MemberSlot {
-    file_ptr: usize,
-    of: ItemRef,
-    len: u8,
-    bytes: [u8; 23],
-    found: Option<ItemRef>,
-}
-
-impl MemberSlot {
-    const EMPTY: Self = Self { file_ptr: 0, of: ItemRef { krate: 0, file: 0, item: 0 }, len: 0, bytes: [0; 23], found: None };
-}
-
-thread_local! {
-    static TRAIT_MEMBER_L1: [Cell<MemberSlot>; 64] = [const { Cell::new(MemberSlot::EMPTY) }; 64];
-}
 
 use crate::body::Body;
 use crate::body::sig::{self, Generics};
@@ -39,6 +21,27 @@ pub struct Langs {
     partial: Vec<u32>,
     /// The standard crates whose files the table was built from.
     pub(super) crates: Arc<[u32]>,
+    hot: [Option<ItemRef>; 10],
+}
+
+impl Langs {
+    #[inline]
+    fn get(&self, name: &str) -> Option<ItemRef> {
+        let idx = match name {
+            "drop" => 0,
+            "copy" => 1,
+            "sized" => 2,
+            "fn_once" => 3,
+            "fn_mut" => 4,
+            "fn" => 5,
+            "drop_glue" => 6,
+            "future_trait" => 7,
+            "owned_box" => 8,
+            "manually_drop" => 9,
+            _ => return self.table.get(name).copied(),
+        };
+        self.hot[idx]
+    }
 }
 
 /// Which allocator shim function (`__rust_alloc`, `__rust_alloc_zeroed`, `__rust_dealloc`, `__rust_realloc`) dispatches to `#[global_allocator]`.
@@ -96,17 +99,8 @@ impl<'a> Context<'a> {
 
     /// The member of trait `of` named `name`.
     pub fn trait_member(&self, of: ItemRef, name: &str) -> Option<ItemRef> {
-        let nb = name.as_bytes();
-        let file_ptr = self.outline.crates.get(of.krate as usize).and_then(|c| c.files.get(of.file as usize)).map_or(0, |f| Arc::as_ptr(f) as usize);
-        let idx = ((of.krate as usize).wrapping_mul(31) ^ (of.file as usize).wrapping_mul(17) ^ (of.item as usize) ^ usize::from(nb.first().copied().unwrap_or(0)).wrapping_shl(3) ^ nb.len()) & 63;
-        if file_ptr != 0 && nb.len() <= 23 {
-            let hit = TRAIT_MEMBER_L1.with(|tls| {
-                let slot = tls[idx].get();
-                (slot.file_ptr == file_ptr && slot.of == of && usize::from(slot.len) == nb.len() && &slot.bytes[..nb.len()] == nb).then_some(slot.found)
-            });
-            if let Some(found) = hit {
-                return found;
-            }
+        if let Some(members) = self.trait_members_local.borrow().get(&of) {
+            return members.get(name).copied();
         }
         let members = self.trait_members.get_or_insert_with(of, || {
             let mut map = HashMap::default();
@@ -116,13 +110,7 @@ impl<'a> Context<'a> {
             Arc::new(map)
         });
         let found = members.get(name).copied();
-        if file_ptr != 0 && nb.len() <= 23 {
-            TRAIT_MEMBER_L1.with(|tls| {
-                let mut bytes = [0u8; 23];
-                bytes[..nb.len()].copy_from_slice(nb);
-                tls[idx].set(MemberSlot { file_ptr, of, len: nb.len() as u8, bytes, found });
-            });
-        }
+        self.trait_members_local.borrow_mut().insert(of, members);
         found
     }
 
@@ -159,15 +147,20 @@ impl<'a> Context<'a> {
         Ok(super::infer::type_params(&self.trait_generics(of)?.1.params).next().is_some())
     }
 
-    /// The traits in scope in module `home`.
-    pub fn traits_in_scope(&self, home: ModRef) -> Vec<ItemRef> {
+    /// The traits in scope in module `home`, returned as a shared slice from a per-context cache.
+    pub fn traits_in_scope(&self, home: ModRef) -> Arc<[ItemRef]> {
+        if let Some(known) = self.scope_traits_local.borrow().get(&home) {
+            return Arc::clone(known);
+        }
         if let Some(known) = self.store.lookups.scope_traits.get(&home) {
-            return known.to_vec();
+            self.scope_traits_local.borrow_mut().insert(home, Arc::clone(&known));
+            return known;
         }
         let before = self.quiet_mark();
-        let found = self.paths(home.krate).traits_in(home);
+        let found: Arc<[ItemRef]> = self.paths(home.krate).traits_in(home).into();
         if self.quiet_mark() == before {
-            self.store.lookups.scope_traits.insert(home, Arc::from(found.as_slice()));
+            self.store.lookups.scope_traits.insert(home, Arc::clone(&found));
+            self.scope_traits_local.borrow_mut().insert(home, Arc::clone(&found));
         }
         found
     }
@@ -204,7 +197,7 @@ impl<'a> Context<'a> {
                         continue;
                     }
                     let item = ItemRef { krate: krate as u32, file: file as u32, item: at };
-                    if self.attr_at(item, "global_allocator").is_some() {
+                    if self.has_attr(item, "global_allocator") {
                         found = Some(item);
                         break;
                     }
@@ -240,15 +233,23 @@ impl<'a> Context<'a> {
 
     /// The item that `#[lang = "name"]` marks in the standard crates.
     pub fn lang_item(&mut self, name: &str) -> Option<ItemRef> {
-        if let Some(langs) = read_lock(&self.store.lookups.state.langs).as_ref() {
+        let langs = match &self.langs {
+            Some(langs) => langs,
+            None => {
+                let loaded = if let Some(langs) = read_lock(&self.store.lookups.state.langs).as_ref() {
+                    Arc::clone(langs)
+                } else {
+                    let built = Arc::new(self.lang_table());
+                    let mut guard = write_lock(&self.store.lookups.state.langs);
+                    Arc::clone(guard.get_or_insert(built))
+                };
+                self.langs.insert(loaded)
+            }
+        };
+        if !langs.partial.is_empty() {
             self.asks.crates.borrow_mut().extend(langs.partial.iter().copied());
-            return langs.table.get(name).copied();
         }
-        let built = self.lang_table();
-        let mut guard = write_lock(&self.store.lookups.state.langs);
-        let langs = guard.get_or_insert(built);
-        self.asks.crates.borrow_mut().extend(langs.partial.iter().copied());
-        langs.table.get(name).copied()
+        langs.get(name)
     }
 
     fn lang_table(&self) -> Langs {
@@ -265,12 +266,24 @@ impl<'a> Context<'a> {
                     let item = ItemRef { krate, file: file as u32, item: at };
                     if let Some(lang) = self.lang(item) {
                         table.insert(lang.to_owned(), item);
-                    } else if std && entry.items.items[at as usize].kind == ItemKind::Fn && self.attr_at(item, "panic_handler").is_some() {
+                    } else if std && entry.items.items[at as usize].kind == ItemKind::Fn && self.has_attr(item, "panic_handler") {
                         table.insert(PANIC_HANDLER.to_owned(), item);
                     }
                 }
             }
         }
-        Langs { table, partial, crates }
+        let hot = [
+            table.get("drop").copied(),
+            table.get("copy").copied(),
+            table.get("sized").copied(),
+            table.get("fn_once").copied(),
+            table.get("fn_mut").copied(),
+            table.get("fn").copied(),
+            table.get("drop_glue").copied(),
+            table.get("future_trait").copied(),
+            table.get("owned_box").copied(),
+            table.get("manually_drop").copied(),
+        ];
+        Langs { table, partial, crates, hot }
     }
 }

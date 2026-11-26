@@ -2,7 +2,7 @@ use super::Emit;
 use super::asm::{Alu, Cond, Group3, Mem, Reg, Rm, Shift, Size};
 use crate::alloc::Location;
 use crate::frame::Ext;
-use crate::ir::{AtomicRmwOp, Binary, Block, Function, Op, Type, Value};
+use crate::ir::{AtomicRmwOp, Binary, Function, Op, Type, Value};
 
 /// The masks and shifts of the bit-parallel steps that reverse and count the bits of a word.
 const BIT_STEPS: [(u64, u8); 3] = [(0x5555_5555_5555_5555, 1), (0x3333_3333_3333_3333, 2), (0x0F0F_0F0F_0F0F_0F0F, 4)];
@@ -34,22 +34,24 @@ pub(super) fn lock_bt_shift_bit(
     bounded.then_some((opcode, bit))
 }
 
+/// Unwraps an elided constant-offset `Iadd`/`Isub` address feeding an atomic op into `(base, disp)`.
+pub(super) fn atomic_addr_base(func: &Function, plan: &crate::alloc::Plan<Reg>, defs: &[Option<crate::ir::Inst>], addr: Value) -> Option<(Value, i32)> {
+    if !plan.elided[addr.index()] || plan.sib[addr.index()].is_some() {
+        return None;
+    }
+    let inst = defs[addr.index()]?;
+    let (base, delta) = crate::alloc::iadd_sub_const(&func.insts[inst.index()].op, |v| {
+        plan.const_of(v).or_else(|| match defs[v.index()].map(|i| &func.insts[i.index()].op) {
+            Some(&Op::Const(imm)) => Some(imm),
+            _ => None,
+        })
+    })?;
+    i32::try_from(delta).ok().map(|disp| (base, disp))
+}
+
 impl Emit<'_> {
     fn atomic_offset(&self, addr: Value) -> (Value, i32) {
-        if self.plan.elided[addr.index()]
-            && self.plan.sib[addr.index()].is_none()
-            && let Some(inst) = self.defs[addr.index()]
-            && let Some((base, delta)) = crate::alloc::iadd_sub_const(&self.func.insts[inst.index()].op, |v| {
-                self.const_of(v).or_else(|| match self.defs[v.index()].map(|i| &self.func.insts[i.index()].op) {
-                    Some(&Op::Const(imm)) => Some(imm),
-                    _ => None,
-                })
-            })
-            && let Ok(disp) = i32::try_from(delta)
-        {
-            return (base, disp);
-        }
-        (addr, 0)
+        atomic_addr_base(self.func, &self.plan, &self.defs, addr).unwrap_or((addr, 0))
     }
 
     /// The memory at `addr`: folds elided constant offsets and stack frames, using the register holding the base unless the operation writes it, else `scratch`.
@@ -447,27 +449,4 @@ impl Emit<'_> {
             self.asm.alu_mem_reg(size, alu, to, self.reg_of(other).expect("invariant: fuse_mem_rmw checked reg"));
         }
     }
-}
-
-/// Each block's predecessor when it has exactly one and that predecessor's body is never copied into another block's tail.
-pub(super) fn sole_preds(func: &Function, copied: &[bool]) -> Vec<Option<Block>> {
-    let mut cloned = vec![false; func.blocks.len()];
-    for data in &func.blocks {
-        if let Some(&last) = data.insts.last()
-            && copied.get(last.index()) == Some(&true)
-            && let Op::Jump(head, _) = &func.insts[last.index()].op
-        {
-            cloned[head.index()] = true;
-        }
-    }
-    let mut preds: Vec<(u32, Option<Block>)> = vec![(0, None); func.blocks.len()];
-    for at in 0..func.blocks.len() {
-        let from = Block(at as u32);
-        for next in func.successors(from) {
-            let entry = &mut preds[next.index()];
-            entry.0 += 1;
-            entry.1 = Some(from);
-        }
-    }
-    preds.into_iter().map(|(count, from)| from.filter(|from| count == 1 && !cloned[from.index()])).collect()
 }

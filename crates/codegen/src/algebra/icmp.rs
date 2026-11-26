@@ -1,6 +1,6 @@
 use crate::cse::flip_int_cc;
 use crate::fold::{Before, extend, holds, known_bits, non_null_at};
-use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, Type, Value};
+use crate::ir::{Binary, Convert, Function, Inst, IntCC, Op, Type, Unary, Value};
 
 use super::{RewriteCx, const_u128, op_of};
 
@@ -529,19 +529,50 @@ fn emit_cmp_const(cx: &mut RewriteCx, cc: IntCC, lhs: Value, c: i64) -> Op {
     Op::Icmp(cc, lhs, rhs)
 }
 
-/// Folds an equality compare of `x + c` or `x - c` against `x` for a nonzero constant `c`, which never holds even when the add wraps.
-pub(super) fn offset_self(cx: &RewriteCx, cc: IntCC, x: Value, y: Value) -> Option<Op> {
+/// Peels zero-preserving ops (`x * odd`, exact `x >> k` / `x << k`, `-x`) from a small-int value tested only against zero.
+pub(super) fn strip_zero_test(cx: &RewriteCx, v: Value) -> Option<Value> {
+    let ty = cx.func.ty(v);
+    if !ty.is_small_int() { return None; }
+    let (bits, w) = (ty.bits(), ty.unsigned_max());
+    let mut cur = v;
+    for _ in 0..4 {
+        let next = match cx.op(cur)? {
+            Op::Binary(Binary::Imul, a, b) => [(*a, *b), (*b, *a)].into_iter().find_map(|(x, k)| {
+                cx.uconst(k, ty).filter(|&c| (c & 1) == 1).map(|_| x)
+            }),
+            Op::Binary(Binary::Ushr, a, sh) => cx.count(*sh, ty).filter(|&k| k > 0 && k < bits).and_then(|k| {
+                let lo = (1_u64 << k) - 1;
+                ((cx.known(*a).0 & lo) == lo).then_some(*a)
+            }),
+            Op::Binary(Binary::Ishl, a, sh) => cx.count(*sh, ty).filter(|&k| k > 0 && k < bits).and_then(|k| {
+                let hi = w & !((1_u64 << (bits - k)) - 1);
+                ((cx.known(*a).0 & hi) == hi).then_some(*a)
+            }),
+            Op::Unary(Unary::Ineg, a) => Some(*a),
+            _ => None,
+        };
+        let Some(inner) = next else { break };
+        cur = inner;
+    }
+    (cur != v).then_some(cur)
+}
+
+/// Simplifies an equality compare of `x + y` or `x - y` against `x`: folds constant `y` and rewrites variable `y` to `y == 0` / `y != 0`.
+pub(super) fn offset_self(cx: &mut RewriteCx, cc: IntCC, x: Value, y: Value) -> Option<Op> {
     if !matches!(cc, IntCC::Equal | IntCC::NotEqual) { return None; }
     let ty = cx.func.ty(x);
-    [(x, y), (y, x)].into_iter().find_map(|(moved, base)| {
-        let step = match *cx.op(moved)? {
-            Op::Binary(Binary::Iadd, p, q) if p == base => q,
-            Op::Binary(Binary::Iadd, p, q) if q == base => p,
-            Op::Binary(Binary::Isub, p, q) if p == base => q,
-            _ => return None,
-        };
-        cx.uconst(step, ty).filter(|&c| c != 0).map(|_| Op::Const(i64::from(cc == IntCC::NotEqual)))
-    })
+    if !ty.is_small_int() { return None; }
+    let step = [(x, y), (y, x)].into_iter().find_map(|(moved, base)| match *cx.op(moved)? {
+        Op::Binary(Binary::Iadd, p, q) if p == base => Some(q),
+        Op::Binary(Binary::Iadd, p, q) if q == base => Some(p),
+        Op::Binary(Binary::Isub, p, q) if p == base => Some(q),
+        _ => None,
+    })?;
+    if let Some(c) = cx.uconst(step, ty) {
+        return Some(Op::Const(i64::from((c != 0) == (cc == IntCC::NotEqual))));
+    }
+    let zero = cx.emit(ty, Op::Const(0));
+    Some(Op::Icmp(cc, step, zero))
 }
 
 /// Rewrites an unsigned compare of a single-use `x + c1` against `c2` into `x` against `c2 - c1` when `x + c1` cannot wrap.
@@ -727,11 +758,38 @@ fn finish_fused(cx: &mut RewriteCx, res: Option<Value>, ext_a: bool, fused: Fuse
     }
 }
 
+fn eq_zero_sub(cx: &RewriteCx, v: Value) -> Option<(IntCC, Value, Value)> {
+    let &Op::Icmp(cc @ (IntCC::Equal | IntCC::NotEqual), x, y) = cx.op(v)? else { return None };
+    let sub = (cx.sconst(y) == Some(0)).then_some(x).or_else(|| (cx.sconst(x) == Some(0)).then_some(y));
+    if let Some(&Op::Binary(Binary::Isub, p, q)) = sub.and_then(|d| cx.op(d)) { return Some((cc, p, q)); }
+    Some((cc, x, y))
+}
+
+fn fuse_strict_cmp(cx: &RewriteCx, is_and: bool, a: Value, b: Value) -> Option<FusedCmp> {
+    use IntCC::*;
+    const PAIRS: [(IntCC, IntCC); 4] = [
+        (UnsignedLessThanOrEqual, UnsignedLessThan), (UnsignedGreaterThanOrEqual, UnsignedGreaterThan),
+        (SignedLessThanOrEqual, SignedLessThan), (SignedGreaterThanOrEqual, SignedGreaterThan),
+    ];
+    let want_eq = if is_and { NotEqual } else { Equal };
+    for (ord_v, eq_v) in [(a, b), (b, a)] {
+        let Some(&Op::Icmp(ord_cc, p, q)) = cx.op(ord_v) else { continue };
+        let Some((eq_cc, ep, eq)) = eq_zero_sub(cx, eq_v) else { continue };
+        if eq_cc != want_eq || !((ep == p && eq == q) || (ep == q && eq == p)) { continue; }
+        for (weak, strict) in PAIRS {
+            if ord_cc == if is_and { weak } else { strict } { return Some(FusedCmp::Op(Op::Icmp(if is_and { strict } else { weak }, p, q))); }
+            if ord_cc == if is_and { strict } else { weak } { return Some(FusedCmp::Alias(ord_v)); }
+        }
+    }
+    None
+}
+
 pub(super) fn fuse_cmp_ops(cx: &mut RewriteCx, res: Option<Value>, is_and: bool, raw_a: Value, raw_b: Value) -> Option<Op> {
     let ((a, ext_a), (b, ext_b)) = (peel_uext_i8(cx, raw_a), peel_uext_i8(cx, raw_b));
     if ext_a != ext_b { return None; }
     let pair_single = cx.single_use(raw_a) && cx.single_use(raw_b) && (!ext_a || (cx.single_use(a) && cx.single_use(b)));
-    let fused = fuse_dual_ranges(cx, pair_single, is_and, a, b)
+    let fused = fuse_strict_cmp(cx, is_and, a, b)
+        .or_else(|| fuse_dual_ranges(cx, pair_single, is_and, a, b))
         .or_else(|| fuse_range_adj_eq(cx, pair_single, is_and, a, b))
         .or_else(|| {
             let (cmp1, cmp2) = (cmp_const(cx, a)?, cmp_const(cx, b)?);

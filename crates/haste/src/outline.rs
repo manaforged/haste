@@ -209,7 +209,7 @@ fn unit_pin(workspace: &Workspace, unit: usize, extra: &[u64], memo: &mut [Optio
     let entry = &workspace.graph.units[unit];
     let deps: Vec<(&str, u64)> = entry.deps.iter().filter(|(_, _, kind)| *kind == Kind::Normal).map(|(key, dep, _)| (key.as_str(), unit_pin(workspace, *dep, extra, memo))).collect();
     let locked = &workspace.packages[entry.package].locked;
-    let cfgs = entry.script.as_ref().map(|out| (&out.names, &out.pairs, &out.vars));
+    let cfgs = entry.script.as_deref().map(crate::graph::script::Output::key_parts);
     let hash = rustc_hash::FxBuildHasher.hash_one((&locked.name, locked.version.to_string(), &locked.source, &entry.features, entry.side == crate::graph::Side::Host, cfgs, extra, deps));
     memo[unit] = Some(hash);
     hash

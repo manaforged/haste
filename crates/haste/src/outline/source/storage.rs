@@ -7,54 +7,54 @@ use std::sync::{Arc, OnceLock};
 use anyhow::{Context as _, Result, bail};
 
 use crate::substrate::Backing;
-use crate::substrate::sysroot::tokens::{TOKEN_WIRE_LEN, decode_tokens_slice};
+use crate::substrate::sysroot::tokens::{TOKEN_WIRE_LEN, decode_token_at, decode_tokens_slice, token_raw_span_at};
 
 use super::Token;
 
-enum TextRepr {
-    Owned(String),
-    Mapped {
-        backing: Arc<Backing>,
-        start: usize,
-        end: usize,
-    },
+#[allow(dead_code, reason = "keeps backing allocation alive for SourceText::ptr")]
+enum TextOwner {
+    Owned(Box<str>),
+    Mapped(Arc<Backing>),
 }
 
-/// Source text stored either as an owned `String` or a zero-copy UTF-8 slice of a memory-mapped backing.
-pub struct SourceText(TextRepr);
+/// Source text stored either as an owned string or a zero-copy UTF-8 slice of a memory-mapped backing.
+pub struct SourceText {
+    ptr: *const u8,
+    len: usize,
+    _owner: TextOwner,
+}
+
+// SAFETY: `SourceText` holds an immutable UTF-8 slice backed by `Box<str>` or read-only `Arc<Backing>` for its entire lifetime.
+unsafe impl Send for SourceText {}
+// SAFETY: `SourceText` is immutable after construction and safe to share across threads.
+unsafe impl Sync for SourceText {}
 
 impl SourceText {
     /// Wraps an owned `String` as source text.
     pub fn owned(text: String) -> Self {
-        Self(TextRepr::Owned(text))
+        let boxed = text.into_boxed_str();
+        let (ptr, len) = (boxed.as_ptr(), boxed.len());
+        Self { ptr, len, _owner: TextOwner::Owned(boxed) }
     }
 
-    /// Creates zero-copy mapped source text from `backing[start..end]` after validating UTF-8 and bounds.
-    pub fn mapped(backing: Arc<Backing>, start: usize, end: usize) -> Result<Self> {
+    /// Creates zero-copy mapped source text from trusted cache bytes `backing[start..end]` after checking bounds.
+    pub fn mapped_trusted(backing: Arc<Backing>, start: usize, end: usize) -> Result<Self> {
         let slice = backing.as_slice().get(start..end).context("mapped source text out of bounds")?;
-        std::str::from_utf8(slice).context("invalid utf-8 in mapped source text")?;
-        Ok(Self(TextRepr::Mapped { backing, start, end }))
+        let (ptr, len) = (slice.as_ptr(), slice.len());
+        Ok(Self { ptr, len, _owner: TextOwner::Mapped(backing) })
     }
 
     /// Returns the source text as a string slice.
     #[inline]
     pub fn as_str(&self) -> &str {
-        match &self.0 {
-            TextRepr::Owned(text) => text.as_str(),
-            TextRepr::Mapped { backing, start, end } => {
-                // SAFETY: `start..end` was bounds-checked and validated as UTF-8 in `SourceText::mapped`.
-                unsafe { std::str::from_utf8_unchecked(&backing.as_slice()[*start..*end]) }
-            }
-        }
+        // SAFETY: `ptr..ptr + len` is a valid immutable UTF-8 slice owned by `_owner` for the lifetime of `self`.
+        unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(self.ptr, self.len)) }
     }
 
     /// Returns the byte length of the source text.
     #[inline]
     pub fn len(&self) -> usize {
-        match &self.0 {
-            TextRepr::Owned(text) => text.len(),
-            TextRepr::Mapped { start, end, .. } => *end - *start,
-        }
+        self.len
     }
 }
 
@@ -145,13 +145,18 @@ impl Hash for SourceText {
 enum TokensRepr {
     Eager(Vec<Token>),
     Lazy {
-        backing: Arc<Backing>,
-        start: usize,
-        end: usize,
+        _backing: Arc<Backing>,
+        ptr: *const u8,
+        byte_len: usize,
         count: usize,
         decoded: OnceLock<Vec<Token>>,
     },
 }
+
+// SAFETY: `TokensRepr::Lazy::ptr` points into immutable read-only bytes kept alive by `_backing`.
+unsafe impl Send for TokensRepr {}
+// SAFETY: `TokensRepr` exposes only immutable reads and synchronized `OnceLock` initialization.
+unsafe impl Sync for TokensRepr {}
 
 /// Source token stream stored either eagerly or decoded on demand from a memory-mapped backing.
 pub struct SourceTokens(TokensRepr);
@@ -169,7 +174,8 @@ impl SourceTokens {
         if slice.len() != expected {
             bail!("lazy source tokens byte length mismatch");
         }
-        Ok(Self(TokensRepr::Lazy { backing, start, end, count, decoded: OnceLock::new() }))
+        let (ptr, byte_len) = (slice.as_ptr(), slice.len());
+        Ok(Self(TokensRepr::Lazy { _backing: backing, ptr, byte_len, count, decoded: OnceLock::new() }))
     }
 
     /// Returns the number of tokens without forcing lazy decoding.
@@ -181,13 +187,47 @@ impl SourceTokens {
         }
     }
 
+    /// Returns token `index` in O(1), decoding only that 14-byte record from mmap when lazy.
+    #[inline]
+    pub fn at(&self, index: usize) -> Option<Token> {
+        match &self.0 {
+            TokensRepr::Eager(tokens) => tokens.get(index).copied(),
+            TokensRepr::Lazy { ptr, byte_len, count, .. } => {
+                if index >= *count {
+                    return None;
+                }
+                // SAFETY: `ptr` is valid for `byte_len == count * TOKEN_WIRE_LEN` immutable bytes kept alive by `_backing`.
+                let bytes = unsafe { std::slice::from_raw_parts(*ptr, *byte_len) };
+                Some(decode_token_at(bytes, index * TOKEN_WIRE_LEN))
+            }
+        }
+    }
+
+    /// Returns `(start, raw_len)` of token `index` in O(1) without decoding its `TokenKind`.
+    #[inline]
+    pub fn raw_span(&self, index: usize) -> Option<(u32, u32)> {
+        match &self.0 {
+            TokensRepr::Eager(tokens) => tokens.get(index).map(|t| (t.start, t.raw().0)),
+            TokensRepr::Lazy { ptr, byte_len, count, .. } => {
+                if index >= *count {
+                    return None;
+                }
+                // SAFETY: `ptr` is valid for `byte_len == count * TOKEN_WIRE_LEN` immutable bytes kept alive by `_backing`.
+                let bytes = unsafe { std::slice::from_raw_parts(*ptr, *byte_len) };
+                Some(token_raw_span_at(bytes, index * TOKEN_WIRE_LEN))
+            }
+        }
+    }
+
     /// Returns the decoded token slice, decoding on first access if backed lazily.
     #[inline]
     pub fn as_slice(&self) -> &[Token] {
         match &self.0 {
             TokensRepr::Eager(tokens) => tokens.as_slice(),
-            TokensRepr::Lazy { backing, start, end, count, decoded } => decoded.get_or_init(|| {
-                decode_tokens_slice(&backing.as_slice()[*start..*end], *count).expect("valid sysroot token stream")
+            TokensRepr::Lazy { ptr, byte_len, count, decoded, .. } => decoded.get_or_init(|| {
+                // SAFETY: `ptr` is valid for `byte_len == count * TOKEN_WIRE_LEN` immutable bytes kept alive by `_backing`.
+                let bytes = unsafe { std::slice::from_raw_parts(*ptr, *byte_len) };
+                decode_tokens_slice(bytes, *count).expect("valid sysroot token stream")
             }),
         }
     }

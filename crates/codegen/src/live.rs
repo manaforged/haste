@@ -177,6 +177,34 @@ pub(crate) fn cold_and_detours(func: &Function, cfg: &Cfg, loops: &crate::cfg::L
     (cold, deferred)
 }
 
+/// Fast reverse-postorder block layout for `Effort::Quick`, skipping CFG dominators, loops, and cold-block partitioning.
+pub(crate) fn quick_order(func: &Function) -> Vec<Block> {
+    let Some(entry) = func.entry else { return Vec::new() };
+    let n = func.blocks.len();
+    let mut visited = vec![false; n];
+    let mut post = Vec::with_capacity(n);
+    let mut stack = vec![(entry, false)];
+    while let Some((block, done)) = stack.pop() {
+        if done {
+            post.push(block);
+            continue;
+        }
+        if std::mem::replace(&mut visited[block.index()], true) {
+            continue;
+        }
+        stack.push((block, true));
+        for succ in func.successors(block) {
+            if !visited[succ.index()] {
+                stack.push((succ, false));
+            }
+        }
+    }
+    post.reverse();
+    post.retain(|block| *block == entry || !func.blocks[block.index()].insts.is_empty());
+    post.extend((0..n as u32).map(Block).filter(|b| !visited[b.index()] && !func.blocks[b.index()].insts.is_empty()));
+    post
+}
+
 pub(crate) fn order(func: &Function) -> Vec<Block> {
     let Some(entry) = func.entry else { return Vec::new() };
     let cfg = func.cfg();
@@ -317,6 +345,7 @@ pub(crate) struct Live {
     pub defs: Vec<u32>,
     pub unwinds: Vec<u32>,
     pub calls: Vec<u32>,
+    pub preserved_calls: Vec<u32>,
     pub sites: Vec<(Inst, Block)>,
     pub spans: Vec<(u32, u32)>,
 }
@@ -557,7 +586,7 @@ fn push_range(out: &mut [Vec<Range>], value: usize, start: u32, end: u32) {
     }
 }
 
-pub(crate) fn live(func: &Function, order: &[Block], copied: &[bool], wanted: &[bool], eff: Elided<'_>) -> Live {
+pub(crate) fn live(func: &Function, order: &[Block], copied: &[bool], wanted: &[bool], eff: Elided<'_>, preserved_tc: &[bool]) -> Live {
     let count = func.types.len();
     let (dense, crossing) = crossing(func, wanted, eff);
     let live_in = live_in(func, order, &dense, crossing.len(), eff);
@@ -565,7 +594,7 @@ pub(crate) fn live(func: &Function, order: &[Block], copied: &[bool], wanted: &[
     let mut open: Vec<Option<(u32, u32)>> = vec![None; count];
     let mut touched: Vec<usize> = Vec::new();
     let mut defs = vec![0; count];
-    let (mut unwinds, mut calls, mut sites) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut unwinds, mut calls, mut preserved_calls, mut sites) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut at = 0_u32;
     let mut spans = vec![(0, 0); func.blocks.len()];
     for &block in order {
@@ -657,7 +686,9 @@ pub(crate) fn live(func: &Function, order: &[Block], copied: &[bool], wanted: &[
                     unwinds.push(at);
                 }
                 let traps = insts.get(place + 1).is_some_and(|next| matches!(func.insts[next.index()].op, Op::Trap));
-                if !(traps && matches!(data.op, Op::Call { .. })) {
+                if preserved_tc.get(inst.index()) == Some(&true) {
+                    preserved_calls.push(at);
+                } else if !(traps && matches!(data.op, Op::Call { .. })) {
                     calls.push(at);
                     sites.push((inst, block));
                 }
@@ -702,7 +733,7 @@ pub(crate) fn live(func: &Function, order: &[Block], copied: &[bool], wanted: &[
         ranges.extend(list);
         slice.push((off, len));
     }
-    Live { ranges, slice, defs, unwinds, calls, sites, spans }
+    Live { ranges, slice, defs, unwinds, calls, preserved_calls, sites, spans }
 }
 
 pub(crate) fn results(data: &InstData) -> impl Iterator<Item = Value> + '_ {

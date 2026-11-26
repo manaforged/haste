@@ -4,6 +4,7 @@ use crate::names::ItemRef;
 use crate::outline::item::ItemKind;
 
 use super::super::Context;
+use super::super::impls::Head;
 use super::super::ty::{Kind, Mut, Ty};
 use super::select::Picked;
 use super::{Infer, Local, Res, Shape, Typed, detached};
@@ -16,7 +17,11 @@ impl Infer<'_, '_> {
             return self.parts_need_drop(ty);
         }
         let ty = self.substitute(ty);
+        if let Some(&known) = self.cx.drops_local.get(&ty) {
+            return Ok(known);
+        }
         if let Some(known) = self.cx.store.lookups.drops.get(&ty) {
+            self.cx.drops_local.insert(ty, known);
             return Ok(known);
         }
         if self.cx.drop_stack.contains(&ty) {
@@ -32,6 +37,7 @@ impl Infer<'_, '_> {
             && (needs || (self.cx.drop_stack.is_empty() && !has_uninferred_closure(self.cx, ty)))
         {
             self.cx.store.lookups.drops.insert(ty, needs);
+            self.cx.drops_local.insert(ty, needs);
         }
         Ok(needs)
     }
@@ -107,6 +113,10 @@ impl Infer<'_, '_> {
 
     /// The `Drop` impl of `ty` itself.
     pub fn drop_impl(&mut self, ty: Ty) -> Result<Option<Picked>> {
+        let ty = self.resolve(ty);
+        if !adt_may_have_drop(self.cx, ty)? {
+            return Ok(None);
+        }
         let Some(drop) = self.cx.lang_item("drop") else { bail!("core has no `Drop` trait") };
         self.select(drop, ty, &[])
     }
@@ -166,7 +176,11 @@ fn has_uninferred_closure(cx: &Context<'_>, ty: Ty) -> bool {
 
 /// The call of the drop glue of `ty`, when dropping a value of `ty` runs code.
 pub fn glue_call(cx: &mut Context<'_>, ty: Ty) -> Result<Option<Res>> {
+    if let Some(&cached) = cx.glues_local.get(&ty) {
+        return Ok(cached);
+    }
     if let Some(cached) = cx.store.lookups.glues.get(&ty) {
+        cx.glues_local.insert(ty, cached);
         return Ok(cached);
     }
     let before = cx.quiet_mark();
@@ -181,8 +195,49 @@ pub fn glue_call(cx: &mut Context<'_>, ty: Ty) -> Result<Option<Res>> {
         && (call.is_some() || (cx.drop_stack.is_empty() && !has_uninferred_closure(cx, ty)))
     {
         cx.store.lookups.glues.insert(ty, call);
+        cx.glues_local.insert(ty, call);
     }
     Ok(call)
+}
+
+/// The drop glue calls for a closure body, reusing its parent's settled drop list when available.
+pub(super) fn closure_drop_calls(cx: &mut Context<'_>, typed: &Typed, info: &super::closure::ClosureInfo) -> Result<Vec<Res>> {
+    let Some(parent) = info.parent_drops.get() else {
+        return drop_calls(cx, typed);
+    };
+    let mut drops = parent.to_vec();
+    for ty in typed.locals[info.typed.locals.len()..].iter().map(|local| local.ty).chain(typed.ret) {
+        if ty != Ty::NONE
+            && let Some(call) = glue_call(cx, ty)?
+            && !drops.contains(&call)
+        {
+            drops.push(call);
+        }
+    }
+    Ok(drops)
+}
+
+fn first_closure_info(cx: &Context<'_>, (parent, substs): (ItemRef, super::super::substs::Substs), typed: &Typed) -> Option<std::sync::Arc<super::closure::ClosureInfo>> {
+    if !typed.has_closures() {
+        return None;
+    }
+    let scoped = typed.scoped(&cx.types);
+    let &(at, _) = scoped.closures.as_slice().first()?;
+    cx.closure(cx.types.intern(Kind::Closure(parent, substs, at.0)))
+}
+
+/// Records `typed.drops` on the shared closure metadata of `(parent, substs)`.
+pub(in crate::sema) fn record_parent_drops(cx: &Context<'_>, instance: (ItemRef, super::super::substs::Substs), typed: &Typed) {
+    if let Some(info) = first_closure_info(cx, instance, typed) {
+        let _ = info.parent_drops.set(typed.drops.clone().into_boxed_slice());
+    }
+}
+
+/// Marks the shared closure metadata of `(parent, substs)` as having laid out the parent body.
+pub(in crate::sema) fn mark_parent_laid(cx: &Context<'_>, instance: (ItemRef, super::super::substs::Substs), typed: &Typed) {
+    if let Some(info) = first_closure_info(cx, instance, typed) {
+        info.parent_laid.store(true, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// The drop glue calls for every type that a local or an expression of `typed` holds and that needs drop.
@@ -278,15 +333,40 @@ pub fn needs_drop(cx: &mut Context<'_>, ty: Ty) -> Result<bool> {
     with_drop(cx, |infer| infer.needs_drop(ty))
 }
 
+fn adt_may_have_drop(cx: &mut Context<'_>, ty: Ty) -> Result<bool> {
+    let Kind::Adt(def, _) = *cx.types.kind(ty) else {
+        return Ok(matches!(cx.types.kind(ty), Kind::Param(_) | Kind::Proj(_) | Kind::Var(_)));
+    };
+    let Some(drop) = cx.lang_item("drop") else { bail!("core has no `Drop` trait") };
+    let two;
+    let one;
+    let holders: &[u32] = if def.krate == drop.krate {
+        one = [def.krate];
+        &one
+    } else {
+        two = [def.krate, drop.krate];
+        &two
+    };
+    Ok(cx.has_trait_impl_for_head(drop, Head::Adt(def), holders))
+}
+
 /// Whether `ty` has a `Drop` impl of its own, which forbids moving out of its parts.
 pub fn has_drop_impl(cx: &mut Context<'_>, ty: Ty) -> Result<bool> {
-    if ty == Ty::NONE {
+    if ty == Ty::NONE || !matches!(cx.types.kind(ty), Kind::Adt(..) | Kind::Param(_) | Kind::Proj(_) | Kind::Var(_)) {
         return Ok(false);
     }
-    if !matches!(cx.types.kind(ty), Kind::Adt(..) | Kind::Param(_) | Kind::Proj(_) | Kind::Var(_)) {
-        return Ok(false);
+    let cacheable = !cx.types.has_var_flag(ty) && !cx.types.has_params(ty);
+    if cacheable
+        && let Some(known) = cx.store.lookups.own_drops.get(&ty)
+    {
+        return Ok(known);
     }
-    with_drop(cx, |infer| infer.drop_impl(ty).map(|found| found.is_some()))
+    let before = cx.quiet_mark();
+    let has = adt_may_have_drop(cx, ty)? && with_drop(cx, |infer| infer.drop_impl(ty).map(|found| found.is_some()))?;
+    if cacheable && cx.quiet_mark() == before {
+        cx.store.lookups.own_drops.insert(ty, has);
+    }
+    Ok(has)
 }
 
 /// The `Drop::drop` of `ty`'s own `Drop` impl, which for a `Box` frees the allocation without dropping what it owns.

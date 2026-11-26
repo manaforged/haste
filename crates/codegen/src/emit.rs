@@ -45,6 +45,9 @@ pub(crate) trait Backend<'a, R: Copy + PartialEq, L: Copy>: Emitter<'a> {
     fn put_exception(&mut self, value: Value);
     fn push_site(&mut self, site: Site);
     fn tails(&mut self) -> &mut Tails<'a, L>;
+    fn spill_cache(&self) -> crate::spills::SpillCache<R>;
+    fn set_spill_cache(&mut self, cache: crate::spills::SpillCache<R>);
+    fn record_edge_spill(&mut self, target: Block, cache: crate::spills::SpillCache<R>);
     /// Places a branch island here when pending short branches near their range.
     fn island(&mut self) -> Result<(), String> { Ok(()) }
 }
@@ -177,6 +180,8 @@ fn set_aside<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     let label = push_stub(emit, cold.0, cold.1, StubKind::Plain);
     emit.branch_cond(condition, invert, label);
     emit.edge(hot.0, hot.1)?;
+    let cache = emit.spill_cache();
+    emit.record_edge_spill(hot.0, cache);
     emit_goto(emit, hot.0, true);
     Ok(true)
 }
@@ -283,6 +288,9 @@ fn hoist_moves<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     emit.edge(moved.0, moved.1)?;
     let target = emit.block_label(emit.func().jump_target(moved.0));
     emit.branch_cond(condition, !to_then, target);
+    let cache = emit.spill_cache();
+    emit.record_edge_spill(moved.0, cache);
+    emit.record_edge_spill(plain, cache);
     emit_goto(emit, plain, true);
     Ok(true)
 }
@@ -303,6 +311,8 @@ pub(crate) fn emit_brif<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
             emit.prologue();
         }
         emit.edge(block, args)?;
+        let cache = emit.spill_cache();
+        emit.record_edge_spill(block, cache);
         emit_goto(emit, block, true);
         return Ok(());
     }
@@ -387,6 +397,8 @@ pub(crate) fn emit_brif<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
         let label = push_stub(emit, then.0, then.1, StubKind::Plain);
         emit.branch_cond(condition, false, label);
         emit.edge(otherwise.0, otherwise.1)?;
+        let cache = emit.spill_cache();
+        emit.record_edge_spill(otherwise.0, cache);
         emit_goto(emit, otherwise.0, true);
         return Ok(());
     }
@@ -399,27 +411,41 @@ pub(crate) fn emit_brif<'a, R: Copy + PartialEq, L: Copy, E: Backend<'a, R, L>>(
     if !else_moves && (then_moves || falls(emit, then.0)) {
         let target = emit.block_label(emit.func().jump_target(otherwise.0));
         emit.branch_cond(condition, true, target);
+        let pre = emit.spill_cache();
+        emit.record_edge_spill(otherwise.0, pre);
         if then_moves {
             emit.edge(then.0, then.1)?;
         }
+        let post = emit.spill_cache();
+        emit.record_edge_spill(then.0, post);
         emit_goto(emit, then.0, true);
         return Ok(());
     }
     if !then_moves {
         let target = emit.block_label(emit.func().jump_target(then.0));
         emit.branch_cond(condition, false, target);
+        let pre = emit.spill_cache();
+        emit.record_edge_spill(then.0, pre);
         if else_moves {
             emit.edge(otherwise.0, otherwise.1)?;
         }
+        let post = emit.spill_cache();
+        emit.record_edge_spill(otherwise.0, post);
         emit_goto(emit, otherwise.0, true);
         return Ok(());
     }
     let other = emit.new_label();
     emit.branch_cond(condition, true, other);
+    let pre = emit.spill_cache();
     emit.edge(then.0, then.1)?;
+    let then_post = emit.spill_cache();
+    emit.record_edge_spill(then.0, then_post);
     emit_goto(emit, then.0, false);
+    emit.set_spill_cache(pre);
     emit.bind_label(other);
     emit.edge(otherwise.0, otherwise.1)?;
+    let else_post = emit.spill_cache();
+    emit.record_edge_spill(otherwise.0, else_post);
     emit_goto(emit, otherwise.0, true);
     Ok(())
 }
@@ -483,16 +509,18 @@ pub(crate) fn preserved<R: Copy + PartialEq + 'static>(func: &Function, (plan, r
     if end - start > max_span {
         return false;
     }
-    let (reg, slot_id) = match plan.location(val) {
-        Location::Reg(reg) => (Some(reg), None),
+    let (reg, freg, slot_id) = match plan.location(val) {
+        Location::Reg(reg) => (Some(reg), None, None),
+        Location::Float(f) => (None, Some(f), None),
         Location::Slot => {
             let Some(id) = plan.shared.get(val.index()).copied().flatten() else { return true };
-            (None, Some(id))
+            (None, None, Some(id))
         }
         _ => return false,
     };
     let clobbers = |r: Value| {
         reg.is_some_and(|reg| plan.reg_of(r) == Some(reg))
+            || freg.is_some_and(|f| plan.float_of(r) == Some(f))
             || slot_id.is_some_and(|id| matches!(plan.location(r), Location::Slot) && plan.shared.get(r.index()).copied().flatten() == Some(id))
     };
     for pos in (start + 1..end).filter(|&pos| !skip(pos)) {
@@ -500,7 +528,7 @@ pub(crate) fn preserved<R: Copy + PartialEq + 'static>(func: &Function, (plan, r
         if data.result.is_some_and(|r| plan.elided[r.index()] || plan.deferred[r.index()]) {
             continue;
         }
-        if (reg.is_some() && matches!(data.op, Op::Call { .. } | Op::TryCall { .. }))
+        if ((reg.is_some() || freg.is_some()) && matches!(data.op, Op::Call { .. } | Op::TryCall { .. }))
             || reg.is_some_and(|reg| regs.scratches(func, data, reg))
             || data.result.and_then(|r| plan.pairs[r.index()]).is_some_and(clobbers)
             || crate::live::results(data).any(clobbers)

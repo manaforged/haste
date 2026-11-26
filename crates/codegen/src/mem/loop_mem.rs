@@ -355,8 +355,19 @@ fn param_span_deref_ok(func: &Function, param: u16, span: (i128, i128)) -> bool 
     span.0 >= 0 && span.1 <= i128::from(deref_bytes)
 }
 
+fn is_pure_loop_call(func: &Function, zeros: &[bool], op: &Op) -> bool {
+    match op {
+        Op::Call { callee, .. } => {
+            func.is_fresh_alloc(*callee)
+                || (!zeros.is_empty() && func.pure_thread_cell_result(op, |v| zeros.get(v.index()) == Some(&true)).is_some())
+        }
+        _ => false,
+    }
+}
+
 impl LoopMem {
     pub(crate) fn analyze(func: &Function, each: &Loop, prov: &Provenance) -> Self {
+        let zeros = func.thread_cell_zeros();
         let mut fx = Self {
             writes: false,
             unknown_mem_writes: false,
@@ -373,11 +384,11 @@ impl LoopMem {
             copy_locs: Vec::new(),
         };
         for inst in (0..each.body.len()).filter(|b| each.body[*b]).flat_map(|b| &func.blocks[b].insts) {
-            fx.analyze_op(func, prov, &func.insts[inst.index()].op);
+            fx.analyze_op(func, prov, &zeros, &func.insts[inst.index()].op);
         }
         for &inst in &func.blocks[each.head.index()].insts {
             let data = &func.insts[inst.index()];
-            if fx.record_head_noalias(func, prov, &data.op, data.result) {
+            if fx.record_head_noalias(func, prov, &zeros, &data.op, data.result) {
                 break;
             }
         }
@@ -398,8 +409,8 @@ impl LoopMem {
         }
     }
 
-    fn record_head_noalias(&mut self, func: &Function, prov: &Provenance, op: &Op, res: Option<Value>) -> bool {
-        if is_atomic_barrier(op) || matches!(op, Op::Call { .. } | Op::TryCall { .. }) {
+    fn record_head_noalias(&mut self, func: &Function, prov: &Provenance, zeros: &[bool], op: &Op, res: Option<Value>) -> bool {
+        if is_atomic_barrier(op) || (matches!(op, Op::Call { .. } | Op::TryCall { .. }) && !is_pure_loop_call(func, zeros, op)) {
             return true;
         }
         match *op {
@@ -432,15 +443,17 @@ impl LoopMem {
         }
     }
 
-    fn analyze_op(&mut self, func: &Function, prov: &Provenance, op: &Op) {
+    fn analyze_op(&mut self, func: &Function, prov: &Provenance, zeros: &[bool], op: &Op) {
         let is_atomic = is_atomic_barrier(op);
         let is_try_call = matches!(op, Op::TryCall { .. });
         let is_call = is_try_call || matches!(op, Op::Call { .. });
+        let pure_call = is_call && !is_try_call && is_pure_loop_call(func, zeros, op);
+        let mem_call = is_call && !pure_call;
         self.calls |= is_call;
         self.try_calls |= is_try_call;
         self.atomics |= is_atomic;
-        self.unknown_mem_writes |= is_atomic || is_call;
-        self.writes |= is_atomic || is_call || matches!(op, Op::Store(..) | Op::StackStore(..) | Op::Copy(..) | Op::Move(..));
+        self.unknown_mem_writes |= is_atomic || mem_call;
+        self.writes |= is_atomic || mem_call || matches!(op, Op::Store(..) | Op::StackStore(..) | Op::Copy(..) | Op::Move(..));
         match *op {
             Op::StackStore(val, slot, off) => self.slot_writes.record(slot.index(), i64::from(off), func.ty(val).bytes()),
             Op::Store(val, addr, off) => self.record_loc(func, prov, prov.loc(addr, i64::from(off), func.ty(val).bytes())),
@@ -458,7 +471,7 @@ impl LoopMem {
                 self.copy_locs.push(dloc);
                 self.copy_locs.push(prov.loc(src, 0, u32::MAX));
             }
-            Op::Call { sig, ref args, .. } | Op::TryCall { sig, ref args, .. } => {
+            Op::Call { sig, ref args, .. } | Op::TryCall { sig, ref args, .. } if mem_call => {
                 self.record_call_noalias(func, prov, sig, args);
             }
             _ => {}

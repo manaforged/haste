@@ -636,6 +636,28 @@ pub(super) fn resolve_addrs(func: &Function, consts: &[Option<i64>]) -> (Vec<Opt
     (addrs, addr_insts)
 }
 
+/// Returns which stack slots still have live address operands outside `dropped` and `addr_insts`.
+pub(super) fn live_addr_slots(func: &Function, addrs: &[Option<(StackSlot, i64)>], addr_insts: &[(Inst, StackSlot)], dropped: &[bool]) -> Vec<bool> {
+    let mut is_addr = vec![false; func.insts.len()];
+    for &(inst, _) in addr_insts {
+        is_addr[inst.index()] = true;
+    }
+    let mut live = vec![false; func.slots.len()];
+    for block in &func.blocks {
+        for &inst in &block.insts {
+            if dropped[inst.index()] || is_addr[inst.index()] {
+                continue;
+            }
+            func.insts[inst.index()].op.for_operands(|v| {
+                if let Some((slot, _)) = addrs.get(v.index()).copied().flatten() {
+                    live[slot.index()] = true;
+                }
+            });
+        }
+    }
+    live
+}
+
 /// Coalesces disjoint arm-local slots at block joins and folds slot-select loads.
 pub(super) fn run(func: &mut Function) -> bool {
     let mut changed = false;

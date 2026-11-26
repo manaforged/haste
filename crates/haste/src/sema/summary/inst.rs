@@ -92,32 +92,13 @@ pub(super) fn fold_ty<F: TyFolder>(folder: &mut F, ty: Ty) -> Result<Ty, F::Erro
     if let Some(cached) = folder.get_cached(ty) {
         return Ok(cached);
     }
-    let kind = folder.types().kind(ty).clone();
-    let mapped = match kind {
+    let mapped = match *folder.types().kind(ty) {
         Kind::Param(idx) => *folder.args().get(idx as usize).ok_or_else(|| folder.param_oob(idx))?,
         Kind::Proj(id) => folder.fold_proj(id)?,
-        ref compound => fold_compound(folder, compound)?,
+        _ => super::super::ty::try_map_children(folder, ty, |f| f.types(), &mut fold_ty)?,
     };
     folder.set_cached(ty, mapped);
     Ok(mapped)
-}
-
-fn fold_compound<F: TyFolder>(folder: &mut F, kind: &Kind) -> Result<Ty, F::Error> {
-    let pools = folder.types().pools();
-    let mut err: Option<F::Error> = None;
-    let next = kind.map_pool(&pools, |child| match fold_ty(folder, child) {
-        Ok(found) => found,
-        Err(e) => {
-            if err.is_none() {
-                err = Some(e);
-            }
-            child
-        }
-    });
-    if let Some(e) = err {
-        return Err(e);
-    }
-    Ok(folder.types().intern(next))
 }
 
 /// Folds every type inside `substs` via `folder`, preserving identity when no parameters exist.
@@ -125,12 +106,7 @@ pub(super) fn fold_substs<F: TyFolder>(folder: &mut F, substs: Substs) -> Result
     if !folder.types().substs_have_params(substs) {
         return Ok(substs);
     }
-    let slice = folder.types().substs(substs).to_vec();
-    let mut mapped = Vec::with_capacity(slice.len());
-    for ty in slice {
-        mapped.push(fold_ty(folder, ty)?);
-    }
-    Ok(folder.types().intern_substs(&mapped))
+    super::super::ty::try_map_substs(folder, substs, |f| f.types(), &mut fold_ty)
 }
 
 struct InstFolder<'a> {
@@ -297,7 +273,7 @@ impl PolyInst {
         match *r {
             Res::Local(l) => Res::Local(l),
             Res::Const(ty) => Res::Const(self.sub_ty_cached(types, cache, ty)),
-            Res::Ctor(i, v, s) => Res::Ctor(i, v, types.pool().map(s, &mut |t| self.sub_ty_cached(types, cache, t))),
+            Res::Ctor(i, v, s) => Res::Ctor(i, v, types.map_substs(s, &mut |t| self.sub_ty_cached(types, cache, t))),
             Res::Fn(i, s) if !types.substs_have_params(s) => Res::Fn(i, s),
             Res::Fn(..) => {
                 let Some((ri, rs)) = self.site_fn(key) else { unreachable!() };

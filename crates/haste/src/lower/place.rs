@@ -243,8 +243,21 @@ impl Lower<'_, '_> {
         let repr = self.coerced_repr(expr, coerced)?;
         let value = self.expr(expr)?;
         let copy_mem = matches!(self.cx.types.kind(self.ty_of(expr)), Kind::Ref(..));
+        let expr_ty = self.ty_of(expr);
         let place = match (repr, value) {
-            (Repr::Mem { .. }, Some(addr)) if !copy_mem => Some(Place { base: Base::Addr(addr), offset: 0, repr }),
+            (Repr::Mem { .. }, Some(addr)) if !copy_mem => {
+                if let Some((slot, offset)) = self.b.func.stack_addr_of(addr) {
+                    Some(Place { base: Base::Slot(slot), offset, repr })
+                } else if crate::sema::infer::needs_drop(self.cx, expr_ty)? {
+                    self.slot(repr).map(|slot| {
+                        let place = Place::slot(slot, repr);
+                        self.write(place, addr);
+                        place
+                    })
+                } else {
+                    Some(Place { base: Base::Addr(addr), offset: 0, repr })
+                }
+            }
             (_, Some(value)) => self.slot(repr).map(|slot| {
                 let place = Place::slot(slot, repr);
                 self.write(place, value);
@@ -253,7 +266,7 @@ impl Lower<'_, '_> {
             _ => None,
         };
         if self.open && (place.is_some() || (repr == Repr::Zst && !self.is_uncaptured_local(expr))) {
-            self.own(super::moves::Root::Temp(expr), self.ty_of(expr), place, true)?;
+            self.own(super::moves::Root::Temp(expr), expr_ty, place, true)?;
         }
         Ok(place)
     }

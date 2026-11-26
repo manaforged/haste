@@ -83,14 +83,14 @@ fn load_with_sysroot(workspace: &Workspace, targets: &Targets, scripts: &[usize]
     let mut compilation = Compilation { outline, names, expander: None, substrate };
     for (krate, &on) in selected.iter().enumerate() {
         if on {
-            compilation.names.crates[krate].eager = true;
+            compilation.names.crates[krate].set_eager();
         }
     }
     resolve(&mut compilation)?;
     if let (Some(slot), Some(expander)) = (macro_slot, &compilation.expander) {
-        crate::with_host_target(|| crate::build::substrate::save_macro_summaries(&compilation.outline, expander.jit.store(), slot));
+        crate::with_host_target(|| crate::build::substrate::save_jit_substrate(&compilation.outline, expander.jit.store(), expander.jit.image(), slot));
     }
-    if was_miss {
+    if was_miss && crate::scripts::sysroot_scripts_settled(workspace) {
         crate::substrate::sysroot::save(workspace, targets, &compilation);
     }
     let errors = compilation.outline.local_errors(workspace);
@@ -369,8 +369,16 @@ fn run(compilation: &mut Compilation, bound: &[Call], inputs: &[Vec<String>]) ->
         .iter()
         .zip(inputs)
         .map(|(&(call, _, caller), texts)| {
-            let caller_pin = if caller == usize::MAX { Some(0) } else { outline.pins[caller] };
-            Some(store::Expansion::new((outline.pins[call.krate as usize]?, caller_pin?), &macro_name(outline, call), texts))
+            let macro_pin = outline.pins[call.krate as usize]?;
+            let caller_pin = if caller == usize::MAX {
+                0
+            } else if let Some(pin) = outline.pins[caller] {
+                pin
+            } else {
+                use std::hash::BuildHasher as _;
+                rustc_hash::FxBuildHasher.hash_one((0x6c6f_6361_6c5f_7069_u64, caller_vars(outline, caller)))
+            };
+            Some(store::Expansion::new((macro_pin, caller_pin), &macro_name(outline, call), texts))
         })
         .collect();
     let mut results: Vec<Option<Result<String, String>>> = vec![None; keys.len()];
@@ -439,7 +447,7 @@ fn preload_macro_crates(compilation: &mut Compilation, roots: &[usize]) -> Resul
     compilation.outline.load_selected(&selected)?;
     for (krate, &on) in selected.iter().enumerate() {
         if on {
-            compilation.names.crates[krate].eager = true;
+            compilation.names.crates[krate].set_eager();
         }
     }
     compilation.names.resolve(&mut compilation.outline)

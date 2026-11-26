@@ -117,29 +117,30 @@ fn hash_ty(outline: &Outline, types: &Types, ty: Ty, key_of: &mut impl FnMut(&Ou
         0u8.hash(hasher);
         return Some(());
     }
-    match types.kind(ty).clone() {
-        Kind::Prim(p) => { 1u8.hash(hasher); (p as u8).hash(hasher); }
+    match types.kind(ty) {
+        Kind::Prim(p) => { 1u8.hash(hasher); (*p as u8).hash(hasher); }
         Kind::Never => { 2u8.hash(hasher); }
-        Kind::Tuple(s) => { 3u8.hash(hasher); hash_substs(outline, types, s, key_of, hasher, closures)?; }
-        Kind::Ref(m, i) => { 4u8.hash(hasher); (m == Mut::Mut).hash(hasher); hash_ty(outline, types, i, key_of, hasher, closures)?; }
-        Kind::Ptr(m, i) => { 5u8.hash(hasher); (m == Mut::Mut).hash(hasher); hash_ty(outline, types, i, key_of, hasher, closures)?; }
-        Kind::Array(e, l) => { 6u8.hash(hasher); hash_ty(outline, types, e, key_of, hasher, closures)?; hash_ty(outline, types, l, key_of, hasher, closures)?; }
-        Kind::Slice(e) => { 7u8.hash(hasher); hash_ty(outline, types, e, key_of, hasher, closures)?; }
-        Kind::Adt(i, s) => { 8u8.hash(hasher); key_of(outline, i)?.hash(hasher); hash_substs(outline, types, s, key_of, hasher, closures)?; }
-        Kind::FnDef(i, s) => { 9u8.hash(hasher); key_of(outline, i)?.hash(hasher); hash_substs(outline, types, s, key_of, hasher, closures)?; }
-        Kind::FnPtr(p, r) => { 10u8.hash(hasher); hash_substs(outline, types, p, key_of, hasher, closures)?; hash_ty(outline, types, r, key_of, hasher, closures)?; }
+        Kind::Tuple(s) => { 3u8.hash(hasher); hash_substs(outline, types, *s, key_of, hasher, closures)?; }
+        Kind::Ref(m, i) => { 4u8.hash(hasher); (*m == Mut::Mut).hash(hasher); hash_ty(outline, types, *i, key_of, hasher, closures)?; }
+        Kind::Ptr(m, i) => { 5u8.hash(hasher); (*m == Mut::Mut).hash(hasher); hash_ty(outline, types, *i, key_of, hasher, closures)?; }
+        Kind::Array(e, l) => { 6u8.hash(hasher); hash_ty(outline, types, *e, key_of, hasher, closures)?; hash_ty(outline, types, *l, key_of, hasher, closures)?; }
+        Kind::Slice(e) => { 7u8.hash(hasher); hash_ty(outline, types, *e, key_of, hasher, closures)?; }
+        Kind::Adt(i, s) => { 8u8.hash(hasher); key_of(outline, *i)?.hash(hasher); hash_substs(outline, types, *s, key_of, hasher, closures)?; }
+        Kind::FnDef(i, s) => { 9u8.hash(hasher); key_of(outline, *i)?.hash(hasher); hash_substs(outline, types, *s, key_of, hasher, closures)?; }
+        Kind::FnPtr(p, r) => { 10u8.hash(hasher); hash_substs(outline, types, *p, key_of, hasher, closures)?; hash_ty(outline, types, *r, key_of, hasher, closures)?; }
         Kind::Dyn(o, s, m, a) => {
             12u8.hash(hasher);
-            key_of(outline, o)?.hash(hasher);
-            hash_substs(outline, types, s, key_of, hasher, closures)?;
-            m.len().hash(hasher);
-            for x in m { key_of(outline, x)?.hash(hasher); }
-            a.len().hash(hasher);
-            for x in a { key_of(outline, x)?.hash(hasher); }
+            key_of(outline, *o)?.hash(hasher);
+            hash_substs(outline, types, *s, key_of, hasher, closures)?;
+            let (ms, aus) = (types.items(*m), types.items(*a));
+            ms.len().hash(hasher);
+            for &x in ms { key_of(outline, x)?.hash(hasher); }
+            aus.len().hash(hasher);
+            for &x in aus { key_of(outline, x)?.hash(hasher); }
         }
-        Kind::Pat(b, lo, hi) => { 13u8.hash(hasher); lo.hash(hasher); hi.hash(hasher); hash_ty(outline, types, b, key_of, hasher, closures)?; }
+        Kind::Pat(b, range) => { let (lo, hi) = types.pat(*range); 13u8.hash(hasher); lo.hash(hasher); hi.hash(hasher); hash_ty(outline, types, *b, key_of, hasher, closures)?; }
         Kind::Value(v) => { 14u8.hash(hasher); v.hash(hasher); }
-        Kind::Closure(parent, s, at) if closures => { 11u8.hash(hasher); key_of(outline, parent)?.hash(hasher); at.hash(hasher); hash_substs(outline, types, s, key_of, hasher, closures)?; }
+        Kind::Closure(parent, s, at) if closures => { 11u8.hash(hasher); key_of(outline, *parent)?.hash(hasher); at.hash(hasher); hash_substs(outline, types, *s, key_of, hasher, closures)?; }
         Kind::Closure(..) | Kind::Param(_) | Kind::Proj(_) | Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => return None,
     }
     Some(())
@@ -202,11 +203,12 @@ impl<F: FnMut(&Outline, ItemRef) -> Option<u64>> Encoder<'_, F> {
             Kind::Closure(p, s, at) => { rec.push(10); write_u32(&mut rec, self.item_id(p)?); write_u32s(&mut rec, &self.substs_ids(s)?); write_u32(&mut rec, at); }
             Kind::Dyn(o, s, m, a) => {
                 rec.push(11); write_u32(&mut rec, self.item_id(o)?); write_u32s(&mut rec, &self.substs_ids(s)?);
-                let ms = m.into_iter().map(|x| self.item_id(x)).collect::<Option<Vec<_>>>()?;
-                let aus = a.into_iter().map(|x| self.item_id(x)).collect::<Option<Vec<_>>>()?;
+                let (m_vec, a_vec) = (self.types.items(m).to_vec(), self.types.items(a).to_vec());
+                let ms = m_vec.into_iter().map(|x| self.item_id(x)).collect::<Option<Vec<_>>>()?;
+                let aus = a_vec.into_iter().map(|x| self.item_id(x)).collect::<Option<Vec<_>>>()?;
                 write_u32s(&mut rec, &ms); write_u32s(&mut rec, &aus);
             }
-            Kind::Pat(b, lo, hi) => { rec.push(12); write_u32(&mut rec, self.ty_id(b)?); write_u128(&mut rec, lo); write_u128(&mut rec, hi); }
+            Kind::Pat(b, range) => { let (lo, hi) = self.types.pat(range); rec.push(12); write_u32(&mut rec, self.ty_id(b)?); write_u128(&mut rec, lo); write_u128(&mut rec, hi); }
             Kind::Value(v) => { rec.push(13); write_u128(&mut rec, v); }
             Kind::Param(p) => { rec.push(14); write_u16(&mut rec, p); }
             Kind::Proj(id) => {
@@ -639,9 +641,9 @@ fn read_ty(cur: &mut Cursor<'_>, types: &Types, items: &[ItemRef], tys: &[Ty]) -
             let (of, s) = (item_at(cur.u32()?)?, substs_of(cur)?);
             let members = cur.u32s()?.into_iter().map(item_at).collect::<Result<Vec<_>>>()?;
             let autos = cur.u32s()?.into_iter().map(item_at).collect::<Result<Vec<_>>>()?;
-            Kind::Dyn(of, s, members, autos)
+            Kind::Dyn(of, s, types.intern_items(&members), types.intern_items(&autos))
         }
-        12 => Kind::Pat(ty_at(cur.u32()?)?, cur.u128()?, cur.u128()?),
+        12 => Kind::Pat(ty_at(cur.u32()?)?, types.intern_pat((cur.u128()?, cur.u128()?))),
         13 => Kind::Value(cur.u128()?),
         14 => Kind::Param(cur.u16()?),
         15 => Kind::Proj(types.intern_proj(ProjDef {

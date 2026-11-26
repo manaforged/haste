@@ -13,18 +13,58 @@ use super::super::substs::Substs;
 use super::super::ty::{Kind, Mut, Ty};
 use super::{Infer, Res};
 
+/// Stack-inline path segment symbols avoiding heap allocation for paths of up to 4 segments.
+pub struct PathSyms {
+    inline: [Sym; 4],
+    len: u8,
+    overflow: Vec<Sym>,
+}
+
+impl PathSyms {
+    /// An empty segment list.
+    pub const EMPTY: Self = Self { inline: [Sym(0); 4], len: 0, overflow: Vec::new() };
+
+    /// Shortens the segment list to at most `len` elements.
+    pub fn truncate(&mut self, len: usize) {
+        if self.len == u8::MAX {
+            self.overflow.truncate(len);
+        } else if len < usize::from(self.len) {
+            self.len = len as u8;
+        }
+    }
+}
+
+impl std::ops::Deref for PathSyms {
+    type Target = [Sym];
+
+    #[inline]
+    fn deref(&self) -> &[Sym] {
+        if self.len == u8::MAX { &self.overflow } else { &self.inline[..usize::from(self.len)] }
+    }
+}
+
 /// The interned segments of `path` in `arena`, whether it starts with `::`, and the crate a leading `$crate` names.
-pub fn segments(symbols: &Symbols, src: &Source, arena: &Body, path: PathId) -> (Vec<Sym>, bool, Option<u32>) {
+#[inline]
+pub fn segments(symbols: &Symbols, src: &Source, arena: &Body, path: PathId) -> (PathSyms, bool, Option<u32>) {
     let path = arena.path(path);
     let syms = arena.syms(symbols, src);
-    let segments: Vec<Sym> = arena.list(path.segments).iter().map(|&at| syms[at as usize]).collect();
-    let first = arena.list(path.segments).first().map(|&at| arena.segments[at as usize].name).unwrap_or(0);
+    let list = arena.list(path.segments);
+    let segments = if list.len() <= 4 {
+        let mut inline = [Sym(0); 4];
+        for (slot, &at) in inline.iter_mut().zip(list) {
+            *slot = syms[at as usize];
+        }
+        PathSyms { inline, len: list.len() as u8, overflow: Vec::new() }
+    } else {
+        PathSyms { inline: [Sym(0); 4], len: u8::MAX, overflow: list.iter().map(|&at| syms[at as usize]).collect() }
+    };
+    let first = list.first().map(|&at| arena.segments[at as usize].name).unwrap_or(0);
     let dollar = first.checked_sub(1).and_then(|at| src.dollar(at));
     (segments, path.global, dollar)
 }
 
 impl<'a> Infer<'_, 'a> {
-    pub(super) fn segments(&self, arena: &Body, path: PathId) -> (Vec<Sym>, bool, Option<u32>) {
+    pub(super) fn segments(&self, arena: &Body, path: PathId) -> (PathSyms, bool, Option<u32>) {
         segments(&self.cx.names.symbols, self.src, arena, path)
     }
 
@@ -480,7 +520,8 @@ impl<'a> Infer<'_, 'a> {
                 bail!("a trait object with no trait");
             }
             let first = autos.remove(0);
-            return Ok(Kind::Dyn(first, Substs::EMPTY, Vec::new(), autos));
+            let autos = self.cx.types.intern_items(&autos);
+            return Ok(Kind::Dyn(first, Substs::EMPTY, super::super::substs::ItemList::EMPTY, autos));
         };
         let count = arena.list(arena.path(path).segments).len();
         let given = self.segment_args(arena, path, count)?;
@@ -498,7 +539,8 @@ impl<'a> Infer<'_, 'a> {
         bound.sort_by_key(|(member, _)| (member.krate, member.file, member.item));
         let (members, tys): (Vec<ItemRef>, Vec<Ty>) = bound.into_iter().unzip();
         let parts: Vec<Ty> = given.into_iter().chain(tys).collect();
-        Ok(Kind::Dyn(of, self.cx.types.intern_substs(&parts), members, autos))
+        let (parts, members, autos) = (self.cx.types.intern_substs(&parts), self.cx.types.intern_items(&members), self.cx.types.intern_items(&autos));
+        Ok(Kind::Dyn(of, parts, members, autos))
     }
 
     /// The type that the associated type `name` of impl `block` is, read in the current frame over the alias's own source, when the impl has one.
@@ -596,7 +638,7 @@ impl<'a> Infer<'_, 'a> {
         }
         let owner = match *arena.ty(inner) {
             syntax::Ty::Path(named) if arena.path(named).qself.is_none() => self.segments(arena, named).0,
-            _ => Vec::new(),
+            _ => PathSyms::EMPTY,
         };
         let name = self.segments(arena, path).0;
         if let ([owner], [name]) = (&owner[..], &name[..])
@@ -643,13 +685,26 @@ impl<'a> Infer<'_, 'a> {
 
     /// The type that `segments` names through the frame: `Self`, a type parameter, or an associated type `Param::Name` of one.
     fn scoped_ty(&mut self, segments: &[Sym]) -> Result<Option<Ty>> {
+        if self.self_ty.is_none() && self.generics.is_empty() {
+            return Ok(None);
+        }
         let symbols = &self.cx.names.symbols;
         match *segments {
-            [one] if symbols.text(one) == "Self" && self.self_ty.is_some() => Ok(self.self_ty),
-            [one] => Ok(self.generics.iter().find(|(generic, _)| *generic == symbols.text(one)).map(|&(_, ty)| ty)),
-            [param, name] if symbols.text(param) == "Self" || self.generics.iter().any(|(generic, _)| *generic == symbols.text(param)) => {
-                let (param, name) = (symbols.text(param).to_string(), symbols.text(name).to_string());
-                self.param_projection(&param, &name)
+            [one] => {
+                let text = symbols.text(one);
+                if text == "Self" && self.self_ty.is_some() {
+                    return Ok(self.self_ty);
+                }
+                Ok(self.generics.iter().find(|(generic, _)| *generic == text).map(|&(_, ty)| ty))
+            }
+            [param, name] => {
+                let param_text = symbols.text(param);
+                if param_text == "Self" || self.generics.iter().any(|(generic, _)| *generic == param_text) {
+                    let (param, name) = (param_text.to_string(), symbols.text(name).to_string());
+                    self.param_projection(&param, &name)
+                } else {
+                    Ok(None)
+                }
             }
             _ => Ok(None),
         }

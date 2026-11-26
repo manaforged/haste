@@ -6,6 +6,14 @@ use super::{Crate, Def, ModRef, Names, Sym};
 use crate::outline::Outline;
 
 impl Crate {
+    /// Marks this crate eager and activates any imports already collected before it became eager.
+    pub fn set_eager(&mut self) {
+        self.eager = true;
+        for pending in &mut self.pending {
+            pending.active = true;
+        }
+    }
+
     /// Adds imports found by collection, active at once in an eager crate or where a lookup already asked for their name.
     pub fn add_pending(&mut self, found: Vec<Pending>) {
         for mut pending in found {

@@ -258,6 +258,30 @@ pub(super) fn write_tokens(out: &mut Vec<u8>, tokens: &[Token]) -> Option<()> {
     Some(())
 }
 
+/// Decodes one wire-encoded token from `bytes[offset..offset + TOKEN_WIRE_LEN]`.
+#[inline]
+pub(crate) fn decode_token_at(bytes: &[u8], offset: usize) -> Token {
+    let c = &bytes[offset..offset + TOKEN_WIRE_LEN];
+    let code = u16::from_le_bytes([c[0], c[1]]);
+    let tag = (code & 0x3f) as usize;
+    let start = u32_le(c, 2);
+    let len = u32_le(c, 6);
+    let extra = u32_le(c, 10);
+    if tag < SIMPLE_TOKENS.len() {
+        Token::from_raw(SIMPLE_TOKENS[tag], start, len, extra)
+    } else {
+        let kind = decode_complex_token(tag, code >> 6, extra).expect("valid sysroot token kind");
+        Token::from_raw(kind, start, len, u32::MAX)
+    }
+}
+
+/// Reads `(start, raw_len)` of one wire-encoded token without decoding its `TokenKind`.
+#[inline]
+pub(crate) fn token_raw_span_at(bytes: &[u8], offset: usize) -> (u32, u32) {
+    let c = &bytes[offset..offset + 10];
+    (u32_le(c, 2), u32_le(c, 6))
+}
+
 /// Decodes `count` wire-encoded tokens from `bytes`.
 pub(crate) fn decode_tokens_slice(bytes: &[u8], count: usize) -> Result<Vec<Token>> {
     let expected = count.checked_mul(TOKEN_WIRE_LEN).context("token stream overflow")?;
@@ -545,10 +569,10 @@ pub(super) fn write_items(out: &mut Vec<u8>, items: &Items) -> Option<()> {
         }
     }
     write_usize(out, items.marks.len())?;
-    out.reserve(items.marks.len() * 5);
+    out.reserve(items.marks.len() * 6);
     for &(at, bits) in &items.marks {
         write_u32(out, at);
-        out.push(bits);
+        out.extend_from_slice(&bits.to_le_bytes());
     }
     Some(())
 }
@@ -613,8 +637,8 @@ pub(super) fn read_items(cur: &mut Cursor<'_>) -> Result<Items> {
         bail!("trailing bytes in import paths");
     }
     let mark_count = cur.count()?;
-    let mark_bytes = cur.take(mark_count.checked_mul(5).context("item marks overflow")?)?;
-    let marks = mark_bytes.chunks_exact(5).map(|c| (u32_le(c, 0), c[4])).collect();
+    let mark_bytes = cur.take(mark_count.checked_mul(6).context("item marks overflow")?)?;
+    let marks = mark_bytes.chunks_exact(6).map(|c| (u32_le(c, 0), u16::from_le_bytes([c[4], c[5]]))).collect();
     Ok(Items { inner, items, imports, marks })
 }
 

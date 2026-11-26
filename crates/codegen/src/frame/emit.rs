@@ -25,6 +25,14 @@ fn emit_zero_interval<'a, E: Emitter<'a>>(emit: &mut E, start: i32, stop: i32) {
             emit.emit_zero_frame(cur, 2);
             emit.emit_zero_frame(cur + 2, 1);
         }
+        6 if (cur & 3) == 2 => {
+            emit.emit_zero_frame(cur, 2);
+            emit.emit_zero_frame(cur + 2, 4);
+        }
+        6 if (cur & 3) == 0 => {
+            emit.emit_zero_frame(cur, 4);
+            emit.emit_zero_frame(cur + 4, 2);
+        }
         5..=7 => {
             emit.emit_zero_frame(cur, 4);
             emit.emit_zero_frame(stop - 4, 4);
@@ -95,6 +103,9 @@ pub(crate) fn emit_body<'a, E: Emitter<'a>>(emit: &mut E, block: crate::ir::Bloc
         if let Some(next_k) = try_emit_zero_run(emit, insts, k) {
             k = next_k;
             continue;
+        }
+        if emit.try_tail_call(inst)? {
+            return Ok(());
         }
         emit.inst(inst)?;
         k += 1;

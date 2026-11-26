@@ -78,7 +78,7 @@ impl Emit<'_> {
         let bits = ty.bits();
         match *op {
             Op::Const(imm) => imm_within(imm, expect_bits),
-            Op::Load(..) | Op::StackLoad(..) | Op::AtomicLoad(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) => bits <= expect_bits,
+            Op::Load(..) | Op::VolatileLoad(..) | Op::StackLoad(..) | Op::AtomicLoad(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) => bits <= expect_bits,
             Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..) => expect_bits >= 1,
             Op::Extract(..) | Op::Reduce(..) => ty.is_small_int() && bits <= expect_bits,
             Op::Unary(u, a) => self.unary_zext_within(u, a, (bits, expect_bits, d)),
@@ -93,6 +93,7 @@ impl Emit<'_> {
     fn is_zext_within(&self, val: Value, expect_bits: u32, depth: u8) -> bool {
         if matches!(self.plan.location(val), Location::Float(_)) { return false; }
         let ty = self.ty(val);
+        if u32::from(self.plan.clean_bits[val.index()]) <= expect_bits { return true; }
         if self.plan.zero_ext[val.index()] && ty.bits() <= expect_bits { return true; }
         if let Location::Imm(imm) = self.plan.location(val) { return imm_within(imm, expect_bits); }
         let Some(inst) = (depth > 0).then(|| self.defs[val.index()]).flatten() else { return false };
@@ -346,10 +347,11 @@ impl Emit<'_> {
             { let cond = self.compare(cc, a, b); self.asm.csinv(size, cond.invert(), dst, ZR, ZR); return Ok(()); }
             if matches!(alu, Alu::Add | Alu::Sub) && matches!(ty, Type::I32 | Type::I64) {
                 let ext_of = |v: Value| super::fuse::ext_parts(self.func, &self.plan, ty, v, |d| self.defs[d.index()]);
+                let other_ok = |other: Value| !self.plan.elided[other.index()] || self.peel_uextend(other) != other;
                 let ext = if alu == Alu::Add && super::fuse::ext_swapped(self.func, &self.plan, (x, y), &|v| self.defs[v.index()]) {
                     ext_of(x).map(|e| (y, e))
                 } else {
-                    ext_of(y).map(|e| (x, e)).or_else(|| (alu == Alu::Add).then(|| ext_of(x).map(|e| (y, e))).flatten())
+                    ext_of(y).filter(|_| other_ok(x)).map(|e| (x, e)).or_else(|| (alu == Alu::Add).then(|| ext_of(x).filter(|_| other_ok(y)).map(|e| (y, e))).flatten())
                 };
                 if let Some((other, (ext_op, shift, inner))) = ext {
                     let (left, right) = self.bits_pair(self.peel_uextend(other), inner); self.asm.alu_extended(alu, size, ext_op, shift, dst, left, right); return Ok(());
@@ -563,17 +565,18 @@ impl Emit<'_> {
 
     fn shift_by(&mut self, op: Binary, (x, y): (Value, Value), bits: u8, dst: Reg) {
         let alu = match op { Binary::Ishl => Alu::Lslv, Binary::Ushr => Alu::Lsrv, _ => Alu::Asrv };
+        let peeled = if bits >= 32 && matches!(op, Binary::Ishl | Binary::Ushr) { self.peel_uextend(x) } else { x };
         if let Some(count) = self.plan.const_of(y) {
             let count = (count as u8) & (bits - 1);
-            if bits == 32 && op == Binary::Ushr && count != 0 { let value = self.bits(x, A); return self.asm.shift32_imm(false, dst, value, count); }
-            let value = self.shift_src(op, x);
+            if bits == 32 && op == Binary::Ushr && count != 0 { let value = if peeled != x { self.zext_src(peeled, A) } else { self.bits(x, A) }; return self.asm.shift32_imm(false, dst, value, count); }
+            let value = if peeled != x { self.zext_src(peeled, A) } else { self.shift_src(op, x) };
             if count == 0 { self.asm.mov(dst, value); return; }
             match alu { Alu::Lslv => self.asm.lsl_imm(dst, value, count), Alu::Lsrv => self.asm.lsr_imm(dst, value, count), _ => self.asm.asr_imm(dst, value, count) }
             return;
         }
         let y = self.unwrap_shift_mask(y, bits);
         if bits >= 32 {
-            let (value, count) = self.bits_pair(x, y);
+            let (value, count) = if peeled != x { (self.zext_src(peeled, A), self.bits(y, C)) } else { self.bits_pair(x, y) };
             return self.asm.alu(alu, if bits == 32 { Size::W } else { Size::X }, dst, value, count);
         }
         let (value, count) = (self.shift_src(op, x), self.bits(y, C));
@@ -725,7 +728,6 @@ impl Emit<'_> {
     pub(super) fn fits(&mut self, op: Binary, signed: bool, (x, y): (Value, Value), result: Value) -> Result<(), String> {
         let pair = self.plan.pairs[result.index()];
         if self.plan.is_static(result) && pair.is_none() { return Ok(()); }
-        self.invalidate_spills();
         let bits = self.ty(x).bits() as u8;
         let reg = pair.and_then(|sum| self.plan.reg_of(sum)).unwrap_or(IP);
         let ok = match (op, bits) {
@@ -749,6 +751,7 @@ impl Emit<'_> {
                 }
                 self.asm.extend(signed, u32::from(bits) / 8, A, reg);
                 self.asm.alu(Alu::Subs, Size::X, ZR, reg, A);
+                self.clobber_reg(A);
                 Cond::Eq
             }
             (Binary::Imul, _) => {
@@ -757,11 +760,12 @@ impl Emit<'_> {
                 self.asm.madd(false, Size::X, reg, (left, right), ZR);
                 let expected = if signed { self.asm.asr_imm(A, reg, 63); A } else { ZR };
                 self.asm.alu(Alu::Subs, Size::X, ZR, T, expected);
+                self.clobber_regs(&[A, T]);
                 Cond::Eq
             }
             (other, _) => return Err(format!("{other:?} has no overflow check")),
         };
-        if let Some(sum) = pair { self.put(sum, reg); }
+        if let Some(sum) = pair { self.put(sum, reg); } else { self.clobber_reg(reg); }
         self.set_flag(result, ok);
         Ok(())
     }

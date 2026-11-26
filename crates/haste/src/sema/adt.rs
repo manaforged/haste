@@ -8,7 +8,7 @@ use rustc_index::{Idx, IndexVec};
 
 use crate::names::{ItemRef, Primitive};
 use crate::outline::attr::{repr_words, split_commas};
-use crate::outline::item::{Attr, ItemKind, mark};
+use crate::outline::item::{Attr, ItemKind, MARK_CFG_ATTR, MARK_INLINE_SPEC, mark};
 use crate::outline::source::Source;
 use crate::outline::tree::{Env, Truth};
 
@@ -46,7 +46,7 @@ impl<'a> Context<'a> {
     /// The `#[repr]` options of `item`, written directly or through a `cfg_attr` that holds.
     pub fn repr(&self, item: ItemRef) -> ReprOptions {
         let (src, entry) = self.item(item);
-        if entry.attrs.is_empty() {
+        if entry.attrs.is_empty() || !self.has_mark(item, "repr") {
             return ReprOptions::default();
         }
         self.store.lookups.reprs.get_or_insert_with(item, || {
@@ -56,10 +56,12 @@ impl<'a> Context<'a> {
         })
     }
 
-
     /// The argument positions that `#[rustc_legacy_const_generics(..)]` on the function `item` gives its const generics, in order.
     pub fn legacy_const_args(&self, item: ItemRef) -> Vec<usize> {
         let (src, entry) = self.item(item);
+        if entry.attrs.is_empty() || !self.has_mark(item, "rustc_legacy_const_generics") {
+            return Vec::new();
+        }
         let named = entry.attrs.iter().find_map(|attr| match *attr {
             Attr::Other(at) if src.text(at) == "rustc_legacy_const_generics" && src.kind(at + 1) == rustc_lexer::TokenKind::OpenParen => Some(at),
             _ => None,
@@ -69,18 +71,23 @@ impl<'a> Context<'a> {
     }
 
     /// The value of `#[lang = "..."]` on `item`.
-    pub fn lang(&self, item: ItemRef) -> Option<&'a str> {
+    pub fn lang(&self, item: ItemRef) -> Option<&str> {
         if item.outer().is_some() {
             let (src, entry) = self.item(item);
+            if entry.attrs.is_empty() {
+                return None;
+            }
             let at = active_attr_at(&self.outline.crates[item.krate as usize].env, src, &entry.attrs, "lang")?;
             return Some(src.text(at + 2).trim_matches('"'));
         }
-        let map = self.store.lookups.lang_items.get_or_init(|| self.build_lang_map());
-        let &val = map.get(&item)?;
-        Some(self.file(item).source.text(val).trim_matches('"'))
+        let langs = self.lang_map.get_or_init(|| Arc::clone(self.store.lookups.lang_items.get_or_init(|| Arc::new(self.build_lang_map()))));
+        if !langs.may_contain(item) {
+            return None;
+        }
+        langs.map.get(&item).map(Box::as_ref)
     }
 
-    fn build_lang_map(&self) -> HashMap<ItemRef, u32> {
+    fn build_lang_map(&self) -> super::lookups::LangMap {
         let mut map = HashMap::default();
         let lang_bit = mark("lang");
         for (krate, tree) in self.outline.crates.iter().enumerate() {
@@ -89,12 +96,12 @@ impl<'a> Context<'a> {
                     if bits & lang_bit != 0
                         && let Some(attr_tok) = active_attr_at(&tree.env, &entry.source, &entry.items.items[at as usize].attrs, "lang")
                     {
-                        map.insert(ItemRef { krate: krate as u32, file: file as u32, item: at }, attr_tok + 2);
+                        map.insert(ItemRef { krate: krate as u32, file: file as u32, item: at }, entry.source.text(attr_tok + 2).trim_matches('"').into());
                     }
                 }
             }
         }
-        map
+        super::lookups::LangMap::from_map(map)
     }
 
     /// The symbol that the foreign `item` links to: its `#[link_name]` with escapes read and without the leading `\u{1}` that asks for the name verbatim, else its own name.
@@ -105,6 +112,23 @@ impl<'a> Context<'a> {
         Some(text.strip_prefix('\u{1}').map(str::to_owned).unwrap_or(text))
     }
 
+    /// The value of `#[inline]` on `item`, returning `Some("")` for plain `#[inline]` without scanning attributes.
+    pub fn inline_attr(&self, item: ItemRef) -> Option<&'a str> {
+        let (_, entry) = self.item(item);
+        if entry.attrs.is_empty() {
+            return None;
+        }
+        if let Some(bits) = self.item_marks(item) {
+            if bits & mark("inline") == 0 {
+                return None;
+            }
+            if bits & (MARK_CFG_ATTR | MARK_INLINE_SPEC) == 0 {
+                return Some("");
+            }
+        }
+        self.attr_value(item, "inline")
+    }
+
     /// The value of the name-value attribute `#[key = "..."]` on `item`, written directly or through a `cfg_attr` that holds.
     pub fn attr_value(&self, item: ItemRef, key: &str) -> Option<&'a str> {
         let at = self.attr_at(item, key)?;
@@ -113,7 +137,7 @@ impl<'a> Context<'a> {
 
     /// Whether the static `item` is `#[thread_local]`, with one cell per thread.
     pub fn thread_local(&self, item: ItemRef) -> bool {
-        self.attr_at(item, "thread_local").is_some()
+        self.has_attr(item, "thread_local")
     }
 
     /// Whether arithmetic overflow checks are enabled for crate `krate`.
@@ -123,7 +147,7 @@ impl<'a> Context<'a> {
 
     /// Whether the function `item` carries `#[track_caller]`, directly or inherited from its trait method declaration.
     pub fn track_caller(&mut self, item: ItemRef) -> bool {
-        if self.attr_at(item, "track_caller").is_some() {
+        if self.has_attr(item, "track_caller") {
             return true;
         }
         let Some(block) = self.owner_impl(item) else {
@@ -135,12 +159,46 @@ impl<'a> Context<'a> {
         let Some(member) = self.trait_member(tr, self.plain_name(item)) else {
             return false;
         };
-        self.attr_at(member, "track_caller").is_some()
+        self.has_attr(member, "track_caller")
     }
 
     /// Whether the const function `item` is `#[rustc_promotable]`, so a reference to its call on promotable arguments lives for the whole program.
     pub fn rustc_promotable(&self, item: ItemRef) -> bool {
-        self.attr_at(item, "rustc_promotable").is_some()
+        self.has_attr(item, "rustc_promotable")
+    }
+
+    #[inline]
+    fn item_marks(&self, item: ItemRef) -> Option<u16> {
+        if item.outer().is_some() {
+            return None;
+        }
+        let marks = &self.file(item).items.marks;
+        Some(marks.binary_search_by_key(&item.item, |(at, _)| *at).map_or(0, |pos| marks[pos].1))
+    }
+
+    fn has_mark(&self, item: ItemRef, key: &str) -> bool {
+        let bit = mark(key);
+        bit == 0 || self.item_marks(item).is_none_or(|bits| bits & bit != 0)
+    }
+
+    /// Whether `item` carries attribute `key`, directly or through an active `cfg_attr`.
+    pub fn has_attr(&self, item: ItemRef, key: &str) -> bool {
+        let (_, entry) = self.item(item);
+        if entry.attrs.is_empty() {
+            return false;
+        }
+        let bit = mark(key);
+        if bit != 0
+            && let Some(bits) = self.item_marks(item)
+        {
+            if bits & bit == 0 {
+                return false;
+            }
+            if bits & MARK_CFG_ATTR == 0 {
+                return true;
+            }
+        }
+        self.attr_at(item, key).is_some()
     }
 
     /// The token of the attribute `key` that `item` carries, through `cfg_attr` whose cfg holds.
@@ -149,16 +207,18 @@ impl<'a> Context<'a> {
         if entry.attrs.is_empty() {
             return None;
         }
-        if item.outer().is_none() {
-            let bit = mark(key);
-            if bit != 0 {
-                let marks = &self.file(item).items.marks;
-                if !marks.binary_search_by_key(&item.item, |(at, _)| *at).is_ok_and(|pos| marks[pos].1 & bit != 0) {
-                    return None;
-                }
+        let bit = mark(key);
+        let no_cfg = if bit != 0
+            && let Some(bits) = self.item_marks(item)
+        {
+            if bits & bit == 0 {
+                return None;
             }
-        }
-        if !entry.attrs.iter().any(|attr| matches!(attr, Attr::CfgAttr(..))) {
+            bits & MARK_CFG_ATTR == 0
+        } else {
+            !entry.attrs.iter().any(|attr| matches!(attr, Attr::CfgAttr(..)))
+        };
+        if no_cfg {
             return entry.attrs.iter().find_map(|attr| match *attr {
                 Attr::Other(at) if src.text(at) == key => Some(at),
                 _ => None,

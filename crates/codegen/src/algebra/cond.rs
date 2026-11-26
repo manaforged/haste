@@ -179,6 +179,7 @@ pub(crate) fn invert(func: &mut Function) -> bool {
         }
     }
     let changed = !edits.is_empty();
+    let mut swapped = false;
     for edit in edits {
         match edit {
             InvertEdit::Replace(inst, op) => func.insts[inst.index()].op = op,
@@ -188,10 +189,14 @@ pub(crate) fn invert(func: &mut Function) -> bool {
                     if swap_arms {
                         std::mem::swap(then, otherwise);
                         std::mem::swap(then_args, else_args);
+                        swapped = true;
                     }
                 }
             }
         }
+    }
+    if swapped {
+        func.bump_cfg();
     }
     changed | crate::schedule::sink_compares(func)
 }

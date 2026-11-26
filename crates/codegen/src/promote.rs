@@ -600,15 +600,19 @@ impl Pass {
         self.promoted_vars[var] = true;
     }
 
-    fn dropped(&self, count: usize) -> Vec<bool> {
-        let mut dropped = vec![false; count];
+    fn dropped(&self, func: &Function) -> Vec<bool> {
+        let mut dropped = vec![false; func.insts.len()];
         for access in &self.scan.accesses {
             if self.promoted_vars[access.var] && !self.kept[access.inst.index()] {
                 dropped[access.inst.index()] = true;
             }
         }
+        let live_addr_slot = join_slots::live_addr_slots(func, &self.scan.addrs, &self.scan.addr_insts, &dropped);
         let all_promoted = |slot: usize| {
-            !self.scan.escaped[slot] && !self.scan.slot_vars[slot].is_empty() && self.scan.slot_vars[slot].iter().all(|&var| self.promoted_vars[var])
+            !self.scan.escaped[slot]
+                && !live_addr_slot[slot]
+                && !self.scan.slot_vars[slot].is_empty()
+                && self.scan.slot_vars[slot].iter().all(|&var| self.promoted_vars[var])
         };
         for (inst, slot) in &self.scan.addr_insts {
             if all_promoted(slot.index()) {
@@ -620,7 +624,7 @@ impl Pass {
 
     fn finish(mut self, func: &mut Function, entry: Block) {
         func.types.extend(&self.fresh.types);
-        let dropped = self.dropped(func.insts.len());
+        let dropped = self.dropped(func);
         for block in &mut func.blocks {
             block.insts.retain(|inst| !dropped[inst.index()]);
         }
@@ -735,13 +739,14 @@ fn run_slot_splits(func: &mut Function, scan: &mut Scan, moves: Moves) -> bool {
     split_changed
 }
 
-pub(crate) fn step(func: &mut Function, moves: Moves) -> Domain {
+pub(crate) fn step(func: &mut Function, moves: Moves, effort: crate::Effort) -> Domain {
     let Some(entry) = func.entry.filter(|_| !func.slots.is_empty()) else {
         return Domain::NONE;
     };
-    let params = crate::copy::forward_param_slots(func);
-    let returned = crate::copy::forward_sret_slot(func);
-    let join_changed = pre_split(func, moves) | cold_copy::run(func);
+    let opt = effort == crate::Effort::Full;
+    let params = opt && crate::copy::forward_param_slots(func);
+    let returned = opt && crate::copy::forward_sret_slot(func);
+    let join_changed = pre_split(func, moves) | (opt && cold_copy::run(func));
     let mut scan = Scan::new(func);
     let (mut splits, mut copy_splits, mut dropped_zero) = (Vec::new(), Vec::new(), false);
     if has_open_move(func, &scan) {
@@ -753,7 +758,7 @@ pub(crate) fn step(func: &mut Function, moves: Moves) -> Domain {
     }
     let split_changed = run_slot_splits(func, &mut scan, moves);
     let changed = (scan.any_promotable() && promote(func, entry, scan)) || join_changed || split_changed || dropped_zero;
-    crate::copy::rejoin(func, &splits);
+    crate::copy::rejoin(func, &splits, opt);
     let all_copies_rejoined = subword::rejoin_copies(func, &copy_splits);
     let cfg = if returned { Domain::CFG } else { Domain::NONE };
     if changed || returned || params || !all_copies_rejoined { Domain::MEM | Domain::VALUES | cfg } else { Domain::NONE }

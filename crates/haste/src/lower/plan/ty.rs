@@ -215,10 +215,28 @@ pub(super) fn hash_num_tag(cx: &Context<'_>, mix: &mut HashMix, ty: Ty) {
 }
 
 pub(super) fn hash_ty_facts(cx: &mut Context<'_>, mix: &mut HashMix, ty: Ty) -> Result<()> {
-    hash_ty_facts_depth(cx, mix, ty, 0)?;
-    if ty != Ty::NONE && !cx.types.has_params(ty) && matches!(needs_drop(cx, ty), Ok(true)) {
-        hash_nested_drop_facts(cx, mix, ty, 0, &mut FxHashSet::default());
+    if ty == Ty::NONE {
+        mix.byte(0);
+        return Ok(());
     }
+    let cacheable = !cx.types.has_var_flag(ty) && !cx.types.has_params(ty);
+    if cacheable
+        && let Some(&bits) = cx.ty_facts.get(&ty)
+    {
+        mix.footprint(FootprintId(bits));
+        return Ok(());
+    }
+    let before = cx.quiet_mark();
+    let mut sub = HashMix::new(0x51a7_7f01);
+    hash_ty_facts_depth(cx, &mut sub, ty, 0)?;
+    if !cx.types.has_params(ty) && matches!(needs_drop(cx, ty), Ok(true)) {
+        hash_nested_drop_facts(cx, &mut sub, ty, 0, &mut FxHashSet::default());
+    }
+    let fp = sub.finish();
+    if cacheable && cx.quiet_mark() == before {
+        cx.ty_facts.insert(ty, fp.0);
+    }
+    mix.footprint(fp);
     Ok(())
 }
 
@@ -387,7 +405,8 @@ fn hash_ty_facts_depth(cx: &mut Context<'_>, mix: &mut HashMix, ty: Ty, depth: u
             mix.byte(0x1b);
             hash_dyn_facts(cx, mix, ty, of)?;
         }
-        Kind::Pat(inner, start, end) => {
+        Kind::Pat(inner, range) => {
+            let (start, end) = cx.types.pat(range);
             mix.byte(0x1c);
             mix.u128(start);
             mix.u128(end);

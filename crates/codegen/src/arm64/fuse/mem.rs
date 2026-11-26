@@ -446,7 +446,7 @@ struct PairHalf {
     addr_elide: Option<Value>,
 }
 
-pub(super) fn const_splat(func: &Function, plan: &Plan<Reg>, pos_of: &[Option<(usize, usize, Inst)>], res: Value) -> Option<(Value, i64)> {
+fn splat_insert(func: &Function, pos_of: &[Option<(usize, usize, Inst)>], res: Value) -> Option<(Value, Value)> {
     let Op::Shuffle(a, b, ShuffleMask::Const(m)) = func.insts[def_inst(pos_of, res)?.index()].op else { return None };
     let Type::Vec { lane, count } = func.ty(res) else { return None };
     let (count, first) = (usize::from(count), usize::from(m[0]));
@@ -455,24 +455,23 @@ pub(super) fn const_splat(func: &Function, plan: &Plan<Reg>, pos_of: &[Option<(u
     }
     let src = if first < count { a } else { b };
     let Op::Insert(_, scalar, idx) = func.insts[def_inst(pos_of, src)?.index()].op else { return None };
-    (usize::from(idx) == first % count).then(|| const_of(func, plan, scalar, |v| def_inst(pos_of, v)).map(|imm| (src, imm))).flatten()
+    (usize::from(idx) == first % count).then_some((src, scalar))
 }
 
-fn try_fuse_splat_shuffle(
-    func: &Function,
-    plan: &mut Plan<Reg>,
-    (uses, pos_of): (&[u32], &[Option<(usize, usize, Inst)>]),
-    res: Value,
-    (a, b): (Value, Value),
-) {
+pub(super) fn const_splat(func: &Function, plan: &Plan<Reg>, pos_of: &[Option<(usize, usize, Inst)>], res: Value) -> Option<(Value, i64)> {
+    let (src, scalar) = splat_insert(func, pos_of, res)?;
+    const_of(func, plan, scalar, |v| def_inst(pos_of, v)).map(|imm| (src, imm))
+}
+
+fn try_fuse_splat_shuffle(func: &Function, plan: &mut Plan<Reg>, (uses, pos_of): (&[u32], &[Option<(usize, usize, Inst)>]), (b_idx, pos, res): (usize, usize, Value), (a, b): (Value, Value)) {
     let Type::Vec { lane, count } = func.ty(res) else { return };
-    let Some((src, imm)) = const_splat(func, plan, pos_of, res) else { return };
-    if uses[src.index()] == u32::from(a == src) + u32::from(b == src)
-        && !plan.elided[src.index()]
-        && encode_neon_movi(u32::from(lane.bytes() * u32::from(count) == 16), splat_pattern64(lane, imm)).is_some()
-    {
-        plan.elided[src.index()] = true;
-    }
+    let Some((src, scalar)) = splat_insert(func, pos_of, res) else { return };
+    if uses[src.index()] != u32::from(a == src) + u32::from(b == src) || plan.elided[src.index()] { return; }
+    let movi_ok = const_of(func, plan, scalar, |v| def_inst(pos_of, v))
+        .is_some_and(|imm| encode_neon_movi(u32::from(lane.bytes() * u32::from(count) == 16), splat_pattern64(lane, imm)).is_some());
+    let gpr_ok = lane.is_int() && count > 1
+        && def_entry(pos_of, src).is_some_and(|(sb, spos, _)| sb == b_idx && spos < pos && preserved(func, plan, b_idx, spos, pos, None, scalar));
+    if movi_ok || gpr_ok { plan.elided[src.index()] = true; }
 }
 
 fn unwrap_iadd_const(
@@ -500,6 +499,8 @@ fn is_mem_barrier(op: &Op) -> bool {
             | Op::StackStore(..)
             | Op::Call { .. }
             | Op::TryCall { .. }
+            | Op::VolatileLoad(..)
+            | Op::VolatileStore(..)
             | Op::AtomicLoad(..)
             | Op::AtomicStore(..)
             | Op::AtomicRmw(..)
@@ -625,7 +626,7 @@ pub(super) fn try_fuse_vec_op(
     op: &Op,
 ) -> bool {
     match *op {
-        Op::Shuffle(a, b, ShuffleMask::Const(_)) => try_fuse_splat_shuffle(func, plan, ctx, res, (a, b)),
+        Op::Shuffle(a, b, ShuffleMask::Const(_)) => try_fuse_splat_shuffle(func, plan, ctx, (b_idx, pos, res), (a, b)),
         Op::Insert(vec, val, idx) => try_fuse_vec_insert(func, plan, ctx, (b_idx, pos, res), (vec, val, idx)),
         _ => return false,
     }
@@ -731,19 +732,12 @@ fn narrow_store_ok(func: &Function, plan: &Plan<Reg>, uses: &[u32], (b_idx, pos,
     store.is_some_and(|at| super::elided_use_end(func, plan, insts, at, inner).is_some() && preserved(func, plan, b_idx, pos, at, None, inner))
 }
 
-pub(super) fn fuse_relaxed_atomic_addrs(func: &Function, plan: &mut Plan<Reg>, (uses, pos_of): (&[u32], &[Option<(usize, usize, Inst)>])) {
+pub(super) fn fuse_atomic_addrs(func: &Function, plan: &mut Plan<Reg>, rcpc2: bool, (uses, pos_of): (&[u32], &[Option<(usize, usize, Inst)>])) {
     let mut info: Vec<(u32, usize, usize, u8)> = vec![(0, usize::MAX, 0, 0); func.types.len()];
     for (b_idx, block) in func.blocks.iter().enumerate() {
         for (pos, &inst) in block.insts.iter().enumerate() {
-            let data = &func.insts[inst.index()];
-            let hit = match (&data.op, data.result) {
-                (&Op::AtomicLoad(addr, ord), Some(r)) if !ord.has_acquire() => Some((addr, func.ty(r).bytes())),
-                (&Op::AtomicStore(val, addr, ord), _) if !ord.has_release() && val != addr => Some((addr, func.ty(val).bytes())),
-                _ => None,
-            };
-            if let Some((addr, bytes)) = hit && matches!(bytes, 1 | 2 | 4 | 8) {
+            if let Some((addr, mask)) = crate::alloc::rcpc2_atomic_site(func, &func.insts[inst.index()], rcpc2) {
                 let entry = &mut info[addr.index()];
-                let mask = bytes as u8;
                 if entry.0 == 0 {
                     *entry = (1, b_idx, pos, mask);
                 } else if entry.1 == b_idx {
@@ -765,7 +759,7 @@ pub(super) fn fuse_relaxed_atomic_addrs(func: &Function, plan: &mut Plan<Reg>, (
         let Some((base, delta)) = parse_sib_base_op(func, plan, pos_of, &func.insts[inst.index()].op) else { continue };
         if plan.elided[base.index()] || plan.sib[base.index()].is_some() { continue; }
         if count > 1 && plan.reg_of(base).is_none() && !matches!(plan.location(base), Location::Frame(..)) { continue; }
-        if ![1u8, 2, 4, 8].into_iter().filter(|&b| mask & b != 0).all(|b| mem_imm_fits(delta, u32::from(b))) { continue; }
+        if delta == 0 || !crate::alloc::rcpc2_delta_fits(i64::from(delta), mask) { continue; }
         if preserved(func, plan, block, start, max_end, None, base) {
             plan.elided[v] = true;
         }

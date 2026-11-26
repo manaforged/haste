@@ -45,19 +45,46 @@ impl PreBuilders {
     }
 }
 
-pub(crate) fn open_batch_substrate(workspace: &graph::Workspace) -> Option<SubstrateSlot> {
+fn cache_from_slot(slot: Option<SubstrateSlot>, warm_sysroot_bodies: bool) -> (Option<SubstrateSlot>, Cache) {
+    let mut cache = Cache::default();
+    cache.set_warm_sysroot_bodies(warm_sysroot_bodies);
+    if let Some(sub) = slot.as_ref().and_then(SubstrateSlot::top) {
+        cache.set_substrate(Some(sub));
+    }
+    (slot, cache)
+}
+
+pub(crate) fn cache_with_substrate(workspace: &graph::Workspace, warm_sysroot_bodies: bool) -> (Option<SubstrateSlot>, Cache) {
+    cache_from_slot(open_batch_substrate(workspace), warm_sysroot_bodies)
+}
+
+pub(crate) fn cache_with_toolchain_substrate(workspace: &graph::Workspace) -> (Option<SubstrateSlot>, Cache) {
+    cache_from_slot(open_toolchain_substrate(workspace), true)
+}
+
+fn open_toolchain_layer(workspace: &graph::Workspace) -> Option<(u64, u64, haste_codegen::Target, Option<Arc<Substrate>>)> {
     if !enabled() {
         return None;
     }
     let target = crate::host_target();
     let toolchain_key = toolchain_key(workspace, &target);
     let target_key = target_hash(&target);
-    let deps_key = deps_key(workspace, &target, toolchain_key);
-    let workspace_key = workspace_key(workspace, &target, toolchain_key);
     let toolchain = match Substrate::open_toolchain(toolchain_key) {
         Ok(sub) if sub.toolchain_hash() == toolchain_key && sub.target_hash() == target_key => Some(Arc::new(sub)),
         _ => None,
     };
+    Some((toolchain_key, target_key, target, toolchain))
+}
+
+pub(crate) fn open_toolchain_substrate(workspace: &graph::Workspace) -> Option<SubstrateSlot> {
+    let (toolchain_key, target_key, _, toolchain) = open_toolchain_layer(workspace)?;
+    Some(SubstrateSlot { toolchain_key, deps_key: None, workspace_key: None, target_key, toolchain, deps: None, workspace: None })
+}
+
+pub(crate) fn open_batch_substrate(workspace: &graph::Workspace) -> Option<SubstrateSlot> {
+    let (toolchain_key, target_key, target, toolchain) = open_toolchain_layer(workspace)?;
+    let deps_key = deps_key(workspace, &target, toolchain_key);
+    let workspace_key = workspace_key(workspace, &target, toolchain_key);
     let deps = deps_key.and_then(|dk| match Substrate::open_deps(dk, target_key) {
         Ok(sub) => Some(Arc::new(match &toolchain {
             Some(tc) => sub.with_parent(Arc::clone(tc)),
@@ -135,13 +162,23 @@ fn export_and_save_layers((outline, store): (&outline::Outline, &mut Cache), ima
     save_substrate_layer(builders.toolchain, (workspace, kind), slot.toolchain.take(), SubstrateBuilder::save_toolchain)
 }
 
-pub(crate) fn save_macro_summaries(outline: &outline::Outline, store: &Cache, mut slot: SubstrateSlot) {
-    if !store.has_new_sysroot_summaries() {
+pub(crate) fn save_jit_substrate(outline: &outline::Outline, store: &Cache, image: &Image, mut slot: SubstrateSlot) {
+    let has_summaries = store.has_new_sysroot_summaries();
+    let has_stencils = image.has_new_frozen_stencils();
+    if !has_summaries && !has_stencils {
         return;
     }
     let mut builders = make_builders(&slot);
-    if let Err(error) = store.export_sysroot_summaries(outline, Some(&mut builders.toolchain), builders.deps.as_mut()) {
-        eprintln!("haste: cannot export macro summaries: {error:#}");
+    if has_summaries
+        && let Err(error) = store.export_sysroot_summaries(outline, Some(&mut builders.toolchain), builders.deps.as_mut())
+    {
+        eprintln!("haste: cannot export jit summaries: {error:#}");
+        return;
+    }
+    if has_stencils
+        && let Err(error) = image.export_sysroot_stencils(Some(&mut builders.toolchain), builders.deps.as_mut())
+    {
+        eprintln!("haste: cannot export jit stencils: {error:#}");
         return;
     }
     let workspace = slot.workspace_key.or(slot.deps_key).unwrap_or(slot.toolchain_key);
@@ -152,7 +189,7 @@ pub(crate) fn save_macro_summaries(outline: &outline::Outline, store: &Cache, mu
         save_substrate_layer(builders.toolchain, (workspace, BatchKind::MainAot), slot.toolchain.take(), SubstrateBuilder::save_toolchain)
     };
     if let Err(error) = save() {
-        eprintln!("haste: cannot save macro substrate: {error:#}");
+        eprintln!("haste: cannot save jit substrate: {error:#}");
     }
 }
 

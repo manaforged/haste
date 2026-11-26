@@ -273,15 +273,17 @@ impl Emit<'_> {
                 return Ok(dst);
             }
             if matches!(alu, Alu::And)
-                && let Some(narrow) = self.const_of(y).and_then(|mask| match mask {
-                    0xFF => Some(Size::B),
-                    0xFFFF => Some(Size::W),
-                    0xFFFF_FFFF => Some(Size::D),
-                    _ => None,
+                && let Some((src_v, narrow)) = [(x, y), (y, x)].into_iter().find_map(|(v, m)| {
+                    self.const_of(m).and_then(|mask| match mask {
+                        0xFF => Some((v, Size::B)),
+                        0xFFFF => Some((v, Size::W)),
+                        0xFFFF_FFFF => Some((v, Size::D)),
+                        _ => None,
+                    })
                 })
             {
                 self.flags = saved_flags;
-                let source = self.operand(x);
+                let source = self.operand(src_v);
                 self.asm.load(narrow, dst, source);
                 return Ok(dst);
             }

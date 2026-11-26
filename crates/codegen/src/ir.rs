@@ -361,6 +361,8 @@ pub(crate) enum Op {
     Select(Value, Value, Value),
     Load(Value, i32),
     Store(Value, Value, i32),
+    VolatileLoad(Value, i32),
+    VolatileStore(Value, Value, i32),
     StackAddr(StackSlot, i32),
     StackLoad(StackSlot, i32),
     StackStore(Value, StackSlot, i32),
@@ -425,11 +427,8 @@ impl Op {
     pub(crate) fn for_operands(&self, mut f: impl FnMut(Value)) {
         match self {
             Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::StackAddr(..) | Op::StackLoad(..) | Op::Fence(_) | Op::FramePointer | Op::Trap => {}
-            Op::Unary(_, x) | Op::Convert(_, x) | Op::Extract(x, _) | Op::Reduce(_, x) | Op::Load(x, _) | Op::StackStore(x, ..) | Op::AtomicLoad(x, _) | Op::Trapz(x) | Op::Assume(x) => f(*x),
-            Op::Binary(_, x, y) | Op::Icmp(_, x, y) | Op::Fits(_, _, x, y) | Op::Fcmp(_, x, y) | Op::Insert(x, y, _) | Op::Store(x, y, _) | Op::AtomicStore(x, y, _) | Op::AtomicRmw(_, _, x, y) | Op::Move(x, y, _) => {
-                f(*x);
-                f(*y);
-            }
+            Op::Unary(_, x) | Op::Convert(_, x) | Op::Extract(x, _) | Op::Reduce(_, x) | Op::Load(x, _) | Op::VolatileLoad(x, _) | Op::StackStore(x, ..) | Op::AtomicLoad(x, _) | Op::Trapz(x) | Op::Assume(x) => f(*x),
+            Op::Binary(_, x, y) | Op::Icmp(_, x, y) | Op::Fits(_, _, x, y) | Op::Fcmp(_, x, y) | Op::Insert(x, y, _) | Op::Store(x, y, _) | Op::VolatileStore(x, y, _) | Op::AtomicStore(x, y, _) | Op::AtomicRmw(_, _, x, y) | Op::Move(x, y, _) => { f(*x); f(*y); }
             Op::Shuffle(a, b, mask) => {
                 f(*a);
                 f(*b);
@@ -460,7 +459,7 @@ impl Op {
     pub(crate) fn map_operands(&mut self, mut f: impl FnMut(Value) -> Value) {
         match self {
             Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::StackAddr(..) | Op::StackLoad(..) | Op::Fence(_) | Op::FramePointer | Op::Trap => {}
-            Op::Unary(_, x) | Op::Convert(_, x) | Op::Extract(x, _) | Op::Reduce(_, x) | Op::Load(x, _) | Op::StackStore(x, ..) | Op::AtomicLoad(x, _) | Op::Trapz(x) | Op::Assume(x) => {
+            Op::Unary(_, x) | Op::Convert(_, x) | Op::Extract(x, _) | Op::Reduce(_, x) | Op::Load(x, _) | Op::VolatileLoad(x, _) | Op::StackStore(x, ..) | Op::AtomicLoad(x, _) | Op::Trapz(x) | Op::Assume(x) => {
                 *x = f(*x);
             }
             Op::Binary(_, x, y)
@@ -469,6 +468,7 @@ impl Op {
             | Op::Fcmp(_, x, y)
             | Op::Insert(x, y, _)
             | Op::Store(x, y, _)
+            | Op::VolatileStore(x, y, _)
             | Op::AtomicStore(x, y, _)
             | Op::AtomicRmw(_, _, x, y)
             | Op::Move(x, y, _) => {
@@ -592,9 +592,13 @@ impl Function {
         !self.vtable_slots.is_empty()
     }
 
+    pub(crate) fn block_has_call(&self, block: Block) -> bool {
+        self.blocks[block.index()].insts.iter().any(|&i| matches!(self.insts[i.index()].op, Op::Call { .. } | Op::TryCall { .. }))
+    }
+
     /// Whether this function contains any `Call` or `TryCall` instruction.
     pub fn has_call(&self) -> bool {
-        self.blocks.iter().any(|b| b.insts.iter().any(|&i| matches!(self.insts[i.index()].op, Op::Call { .. } | Op::TryCall { .. })))
+        (0..self.blocks.len()).any(|b| self.block_has_call(Block(b as u32)))
     }
 
     /// Marks relocation symbol `sym` as guaranteed not to unwind.

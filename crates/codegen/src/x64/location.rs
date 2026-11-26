@@ -84,7 +84,7 @@ impl Emit<'_> {
 
     pub(super) fn has_elided_mem(&self, value: Value) -> bool {
         self.plan.elided[value.index()]
-            && self.defs[value.index()].is_some_and(|inst| matches!(self.func.insts[inst.index()].op, Op::Load(..) | Op::StackLoad(..)))
+            && self.defs[value.index()].is_some_and(|inst| matches!(self.func.insts[inst.index()].op, Op::Load(..) | Op::StackLoad(..) | Op::AtomicLoad(..)))
     }
 
     pub(super) fn elided_mem(&mut self, value: Value) -> Option<Mem> {
@@ -95,6 +95,13 @@ impl Emit<'_> {
         match self.func.insts[inst.index()].op {
             Op::Load(addr, off) => Some(self.address(addr, off)),
             Op::StackLoad(slot, off) => Some(self.slot(slot, off)),
+            Op::AtomicLoad(addr, _) => Some(if let Some(sym) = self.image_sym(addr) {
+                Mem::rip(sym, 0)
+            } else if self.plan.elided[addr.index()] && self.plan.sib[addr.index()].is_some() {
+                self.address(addr, 0)
+            } else {
+                self.atomic_target(addr, Reg::Rcx, &[])
+            }),
             _ => None,
         }
     }
@@ -251,6 +258,11 @@ impl Emit<'_> {
         if let Some(reg) = self.reg_of(addr) {
             return Mem::new(reg, offset);
         }
+        if let Location::Offset(base, base_off) = self.location(addr)
+            && let Some(disp) = base_off.checked_add(offset)
+        {
+            return Mem::new(base, disp);
+        }
         if let Some(sym) = self.image_sym(addr) {
             return Mem::rip(sym, offset);
         }
@@ -285,7 +297,7 @@ impl Emit<'_> {
                 self.asm.mov_imm(reg, extend(imm, ty, ext));
                 self.clobber_reg(reg);
             }
-            Location::SlotAddr(_) | Location::Symbol(_) | Location::Frame(..) => self.raw(reg, value),
+            Location::SlotAddr(_) | Location::Symbol(_) | Location::Frame(..) | Location::Offset(..) => self.raw(reg, value),
             Location::Float(from) => {
                 self.asm.movq_out(reg, Xmm(from));
                 if full {
@@ -351,6 +363,7 @@ impl Emit<'_> {
                 let at = self.slot(slot, offset);
                 self.asm.lea(reg, at);
             }
+            Location::Offset(base, offset) => self.asm.lea(reg, Mem::new(base, offset)),
             Location::Reg(from) if from == reg => return,
             Location::Reg(from) => self.asm.mov(reg, from),
             Location::Float(from) => self.asm.movq_out(reg, Xmm(from)),
@@ -448,10 +461,7 @@ impl Emit<'_> {
             Location::Slot => {
                 let disp = self.frame.values[value.index()];
                 debug_assert_ne!(disp, 0, "unhomed value {value:?} in fget()");
-                if let Some((cached_disp, cached_reg, cached_ty)) = self.last_fspill
-                    && cached_disp == disp
-                    && cached_ty == ty
-                {
+                if let Some(cached_reg) = self.spills.cached_fspill(disp, ty) {
                     if cached_reg != xmm {
                         self.fmov(ty, xmm, cached_reg);
                         self.clobber_xmm(xmm);
@@ -459,7 +469,7 @@ impl Emit<'_> {
                 } else {
                     self.xmm_load(ty, xmm, self.frame_mem(disp));
                     self.clobber_xmm(xmm);
-                    self.last_fspill = Some((disp, xmm, ty));
+                    self.spills.fspill = Some((disp, xmm, ty));
                 }
             }
             _ => {
@@ -625,8 +635,7 @@ impl Emit<'_> {
     pub(super) fn store_xmm_home(&mut self, to: Mem, xmm: Xmm, ty: Type) {
         self.xmm_store(ty, to, xmm);
         if let Some(disp) = self.frame_disp(to) {
-            self.invalidate_disp(disp);
-            self.last_fspill = Some((disp, xmm, ty));
+            self.spills.write_fspill(disp, xmm, ty);
         }
     }
 
@@ -658,7 +667,7 @@ impl Emit<'_> {
                 let at = self.asm.store_slot_reloc(to);
                 self.relocs.push(StencilReloc::symbol(at, sym, RelocKind::Abs32));
             }
-            Location::Imm(_) | Location::Frame(..) | Location::SlotAddr(_) | Location::Symbol(_) => {
+            Location::Imm(_) | Location::Frame(..) | Location::SlotAddr(_) | Location::Symbol(_) | Location::Offset(..) => {
                 self.raw(Reg::Rax, value);
                 self.asm.store(Size::Q, to, Reg::Rax);
             }
@@ -668,11 +677,8 @@ impl Emit<'_> {
                 if ty.bytes() <= 8 && let Some(cached_reg) = self.cached_spill(value) {
                     return self.store_reg_home(to, cached_reg, ty.bytes());
                 }
-                if let Some((cached_disp, cached_reg, cached_ty)) = self.last_fspill
-                    && cached_disp == self.frame.values[value.index()]
-                    && cached_ty == ty
-                {
-                    return self.store_xmm_home(to, cached_reg, cached_ty);
+                if let Some(cached_reg) = self.spills.cached_fspill(self.frame.values[value.index()], ty) {
+                    return self.store_xmm_home(to, cached_reg, ty);
                 }
                 return self.copy_to(to, self.at(value), ty, X2);
             }

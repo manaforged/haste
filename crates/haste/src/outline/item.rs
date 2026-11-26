@@ -90,12 +90,31 @@ pub struct Import {
     pub leaf: Leaf,
 }
 
-/// The attributes that `Items::marks` records per item, so that asking an item for one it does not name scans none of its attributes.
-pub const MARKED: [&str; 8] = ["lang", "panic_handler", "inline", "thread_local", "link_name", "linkage", "define_opaque", "global_allocator"];
+/// Bit set in `Items::marks` alongside `inline` when `#[inline(...)]` carries a parenthesized argument.
+pub const MARK_INLINE_SPEC: u16 = 1 << 14;
+/// Bit set in `Items::marks` alongside any marked attribute when the item also carries a `cfg_attr`.
+pub const MARK_CFG_ATTR: u16 = 1 << 15;
 
-/// The bit that `Items::marks` sets for attribute `key`, or 0 when `key` is not one of `MARKED`.
-pub fn mark(key: &str) -> u8 {
-    MARKED.iter().position(|name| *name == key).map_or(0, |bit| 1 << bit)
+/// The bit that `Items::marks` sets for attribute `key`, or 0 when `key` is not marked.
+#[inline]
+pub fn mark(key: &str) -> u16 {
+    match key {
+        "lang" => 1 << 0,
+        "panic_handler" => 1 << 1,
+        "inline" => 1 << 2,
+        "thread_local" => 1 << 3,
+        "link_name" => 1 << 4,
+        "linkage" => 1 << 5,
+        "define_opaque" => 1 << 6,
+        "global_allocator" => 1 << 7,
+        "track_caller" => 1 << 8,
+        "rustc_promotable" => 1 << 9,
+        "fundamental" => 1 << 10,
+        "repr" => 1 << 11,
+        "rustc_legacy_const_generics" => 1 << 12,
+        "cold" => 1 << 13,
+        _ => 0,
+    }
 }
 
 /// The items of one file.
@@ -105,5 +124,5 @@ pub struct Items {
     pub items: Vec<Item>,
     pub imports: Vec<Import>,
     /// Each item whose attributes name one of `MARKED`, directly or inside a `cfg_attr` whatever its condition, with those names' bits, in item order.
-    pub marks: Vec<(u32, u8)>,
+    pub marks: Vec<(u32, u16)>,
 }

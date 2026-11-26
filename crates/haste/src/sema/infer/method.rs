@@ -242,7 +242,7 @@ impl<'a> Infer<'_, 'a> {
     }
 
     fn next_step(&mut self, expr: ExprId, derefs: u32, step: Ty) -> Result<Option<Ty>> {
-        let next = match self.cx.types.kind(step).clone() {
+        let next = match *self.cx.types.kind(step) {
             Kind::Array(element, _) => return Ok(Some(self.cx.types.intern(Kind::Slice(element)))),
             Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) | Kind::Ptr(..) | Kind::Slice(_) => None,
             _ => match self.builtin_deref(step) {
@@ -276,24 +276,23 @@ impl<'a> Infer<'_, 'a> {
 
     fn trait_candidates(&mut self, name: &str, steps: &[Ty]) -> Result<Vec<TraitCandidate>> {
         let mut found = Vec::new();
-        let mut traits = self.cx.traits_in_scope(self.home);
-        let principals: Vec<ItemRef> = steps
-            .iter()
-            .filter_map(|&step| match self.cx.types.kind(step) {
-                Kind::Dyn(of, ..) => Some(*of),
-                _ => None,
-            })
-            .collect();
+        let in_scope = self.cx.traits_in_scope(self.home);
         let bounded = self.bound_candidates(name, steps)?;
+        let mut extra_scoped = Vec::new();
         let current = self.current_trait();
-        for local in self.body_traits().into_iter().chain(principals).chain(current) {
-            if !traits.contains(&local) {
-                traits.push(local);
+        for local in self.body_traits().into_iter().chain(steps.iter().filter_map(|&step| match *self.cx.types.kind(step) { Kind::Dyn(of, ..) => Some(of), _ => None })).chain(current) {
+            if !in_scope.contains(&local) && !extra_scoped.contains(&local) {
+                extra_scoped.push(local);
             }
         }
-        let scoped = traits.len();
-        traits.extend(bounded.iter().map(|&(of, _)| of).filter(|of| !traits[..scoped].contains(of)).collect::<Vec<_>>());
-        for (at, of) in traits.into_iter().enumerate() {
+        let mut extra_bounded = Vec::new();
+        for &(of, _) in &bounded {
+            if !in_scope.contains(&of) && !extra_scoped.contains(&of) && !extra_bounded.contains(&of) {
+                extra_bounded.push(of);
+            }
+        }
+        let scoped_len = in_scope.len() + extra_scoped.len();
+        for (at, of) in in_scope.iter().copied().chain(extra_scoped).chain(extra_bounded).enumerate() {
             let Some(item) = self.cx.trait_member(of, name) else {
                 continue;
             };
@@ -303,7 +302,7 @@ impl<'a> Infer<'_, 'a> {
             if let Some(&(_, param)) = bounded.iter().find(|&&(bounded, _)| bounded == of) {
                 found.push(TraitCandidate { of, item, kind, bound: Some(param) });
             }
-            if at < scoped {
+            if at < scoped_len {
                 found.push(TraitCandidate { of, item, kind, bound: None });
             }
         }
@@ -328,12 +327,23 @@ impl<'a> Infer<'_, 'a> {
     }
 
     fn bound_candidates(&mut self, name: &str, steps: &[Ty]) -> Result<Vec<(ItemRef, Ty)>> {
-        let steps: Vec<Ty> = steps.iter().map(|&step| self.substitute(step)).collect();
-        let params: Vec<(&str, Ty)> = self.generics.clone().into_iter().filter(|&(_, ty)| steps.contains(&self.substitute(ty))).collect();
+        let mut sub_buf = [Ty::NONE; 8];
+        let sub_vec;
+        let steps: &[Ty] = if steps.len() <= 8 {
+            for (dst, &step) in sub_buf.iter_mut().zip(steps) { *dst = self.substitute(step); }
+            &sub_buf[..steps.len()]
+        } else {
+            sub_vec = steps.iter().map(|&step| self.substitute(step)).collect::<Vec<_>>();
+            &sub_vec
+        };
         let mut found = Vec::new();
-        for param in params {
-            if let Some((of, _)) = self.bound_trait(param, name, Self::reaches_member)? {
-                let ty = self.substitute(param.1);
+        for idx in 0..self.generics.len() {
+            let (param_name, param_ty) = self.generics[idx];
+            let sub_ty = self.substitute(param_ty);
+            if steps.contains(&sub_ty)
+                && let Some((of, _)) = self.bound_trait((param_name, param_ty), name, Self::reaches_member)?
+            {
+                let ty = self.substitute(param_ty);
                 found.extend(self.implied_traits(vec![of])?.into_iter().map(|of| (of, ty)));
             }
         }

@@ -83,6 +83,8 @@ pub enum Intrinsic {
     OffsetFrom(bool),
     Read,
     Write,
+    VolatileRead,
+    VolatileWrite,
     WriteBox,
     MemCopy(bool),
     WriteBytes,
@@ -275,9 +277,9 @@ const NAMES: &[(&str, Intrinsic)] = {
         ("ptr_offset_from", OffsetFrom(true)),
         ("ptr_offset_from_unsigned", OffsetFrom(false)),
         ("read_via_copy", Read),
-        ("volatile_load", Read),
+        ("volatile_load", VolatileRead),
         ("write_via_move", Write),
-        ("volatile_store", Write),
+        ("volatile_store", VolatileWrite),
         ("write_box_via_move", WriteBox),
         ("copy_nonoverlapping", MemCopy(false)),
         ("copy", MemCopy(true)),
@@ -367,25 +369,44 @@ const NAMES: &[(&str, Intrinsic)] = {
 impl Context<'_> {
     /// The intrinsic that the function `item` is, when it carries `#[rustc_intrinsic]` and lowering knows it, or when it is the panic handler. `Trap` stands for the panic runtime, which is not lowered yet. `Unreachable` also stands for `core::hint::unreachable_unchecked` where its precondition check is compiled out.
     pub fn intrinsic(&self, item: ItemRef) -> Option<Intrinsic> {
+        if let Some(&cached) = self.intrinsics_local.borrow().get(&item) {
+            return cached;
+        }
+        let found = self.compute_intrinsic(item);
+        self.intrinsics_local.borrow_mut().insert(item, found);
+        found
+    }
+
+    fn compute_intrinsic(&self, item: ItemRef) -> Option<Intrinsic> {
         let (src, entry) = self.item(item);
-        match self.lang(item) {
-            Some("panic_impl") => return Some(Intrinsic::Trap),
-            Some("fn_ptr_addr") => return Some(Intrinsic::FnAddr),
-            _ => {}
+        if entry.kind != ItemKind::Fn {
+            return None;
         }
-        let marked = self.rustc_intrinsic(item);
+        let has_attrs = !entry.attrs.is_empty();
+        if has_attrs {
+            match self.lang(item) {
+                Some("panic_impl") => return Some(Intrinsic::Trap),
+                Some("fn_ptr_addr") => return Some(Intrinsic::FnAddr),
+                _ => {}
+            }
+            if entry.body.is_none()
+                && let Some(link) = self.attr_value(item, "link_name")
+            {
+                if let Some(&(_, which)) = LLVM.iter().find(|(known, _)| *known == link) {
+                    return Some(which);
+                }
+                if let Some(x86) = crate::host::X86Symbol::from_link(link) {
+                    return Some(Intrinsic::X86(x86));
+                }
+            }
+        }
+        let marked = has_attrs && entry.attrs.iter().any(|attr| matches!(attr, Attr::Other(at) if src.text(*at) == "rustc_intrinsic"));
+        let is_core = self.outline.is_sysroot(item.krate) && self.outline.roots[item.krate as usize].name == "core";
+        if !marked && !is_core {
+            return None;
+        }
         let name = src.text(entry.name?);
-        if let Some(link) = self.attr_value(item, "link_name")
-            && let Some(&(_, which)) = LLVM.iter().find(|(known, _)| *known == link)
-        {
-            return Some(which);
-        }
-        if let Some(link) = self.attr_value(item, "link_name")
-            && let Some(x86) = crate::host::X86Symbol::from_link(link)
-        {
-            return Some(Intrinsic::X86(x86));
-        }
-        if entry.kind == ItemKind::Fn && self.outline.roots[item.krate as usize].name == "core" {
+        if is_core {
             match name {
                 "__cpuid_count" => return Some(Intrinsic::Cpuid),
                 "unreachable_unchecked" if crate::profile() == Profile::Release => return Some(Intrinsic::Unreachable),

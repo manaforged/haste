@@ -185,7 +185,10 @@ impl Context<'_> {
             Kind::FnPtr(..) => Layout::scalar(dl, pointer_scalar(dl, true)),
             Kind::Ref(_, pointee) => self.pointer(dl, true, pointee)?,
             Kind::Ptr(_, pointee) => self.pointer(dl, false, pointee)?,
-            Kind::Pat(base, start, end) => self.pattern(dl, base, WrappingRange { start, end })?,
+            Kind::Pat(base, range) => {
+                let (start, end) = self.types.pat(range);
+                self.pattern(dl, base, WrappingRange { start, end })?
+            }
             _ => return Ok(None),
         }))
     }

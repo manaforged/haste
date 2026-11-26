@@ -273,7 +273,7 @@ fn compute_tracked_roots(func: &Function, cfg: &Cfg, affine: &[(Value, i64)]) ->
                     }
                 }
                 (op, Some(res)) if func.ty(res) == Type::I64 => {
-                    if matches!(*op, Op::Load(..) | Op::AtomicLoad(..) | Op::AtomicRmw(..) | Op::AtomicCas(..)) {
+                    if matches!(*op, Op::Load(..) | Op::VolatileLoad(..) | Op::AtomicLoad(..) | Op::AtomicRmw(..) | Op::AtomicCas(..)) {
                         has_mem = true;
                     } else if matches!(*op, Op::Select(..))
                         || (matches!(*op, Op::Binary(Binary::Iadd | Binary::Isub, ..)) && affine[res.index()].0 == res)
@@ -287,7 +287,7 @@ fn compute_tracked_roots(func: &Function, cfg: &Cfg, affine: &[(Value, i64)]) ->
                         tracked[res.index()] = step_track(op, Type::I64, &tracked);
                     }
                 }
-                (Op::Load(..) | Op::Store(..) | Op::Move(..) | Op::Copy(..) | Op::AtomicLoad(..) | Op::AtomicStore(..) | Op::AtomicRmw(..) | Op::AtomicCas(..), _) => {
+                (Op::Load(..) | Op::Store(..) | Op::VolatileLoad(..) | Op::VolatileStore(..) | Op::Move(..) | Op::Copy(..) | Op::AtomicLoad(..) | Op::AtomicStore(..) | Op::AtomicRmw(..) | Op::AtomicCas(..), _) => {
                     has_mem = true;
                 }
                 _ => {}
@@ -643,9 +643,9 @@ pub(crate) fn stack_store_overlaps(func: &Function, op: &Op, slot: StackSlot, (o
     Some(wslot == slot && MemLoc::slot(slot, i64::from(off), bytes).overlaps(MemLoc::slot(wslot, i64::from(woff), func.ty(val).bytes())))
 }
 
-/// Whether `op` is an atomic memory op or fence.
+/// Whether `op` is a volatile or atomic memory op or fence.
 pub(crate) fn is_atomic_barrier(op: &Op) -> bool {
-    matches!(op, Op::AtomicLoad(..) | Op::AtomicStore(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) | Op::Fence(..))
+    matches!(op, Op::VolatileLoad(..) | Op::VolatileStore(..) | Op::AtomicLoad(..) | Op::AtomicStore(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) | Op::Fence(..))
 }
 
 /// Whether `op` prevents hoisting, sinking, or rematerializing memory accesses across it.

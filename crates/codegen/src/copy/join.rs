@@ -13,7 +13,7 @@ pub(super) fn hoist(func: &mut Function, entry: Block, sret_ptr: Value, bytes: u
     let info = collect_sret_info(func, entry);
     let mut plans: Vec<(Block, Inst, Vec<(Block, Edge, Option<Value>)>)> = Vec::new();
     let mut reads = Vec::new();
-    for &(join, pos, copy) in &info.uses_by_val[sret_ptr.index()] {
+    for &(join, pos, copy) in info.uses_of(sret_ptr) {
         let Some(param) = move_to_sret_src(func, &info.defs, copy, sret_ptr, bytes) else { continue };
         let block = &func.blocks[join.index()];
         if join == entry || !block.params.contains(&param) || !block.insts[..pos].iter().all(|&inst| pure(&func.insts[inst.index()].op)) {
@@ -22,7 +22,7 @@ pub(super) fn hoist(func: &mut Function, entry: Block, sret_ptr: Value, bytes: u
         let Some(loads) = later_loads(func, &info, (join, pos), param, copy) else { continue };
         let at = block.params.iter().position(|&p| p == param).unwrap_or(usize::MAX);
         let mut edges = Vec::new();
-        for &pred in &info.preds[join.index()] {
+        for &pred in info.preds_of(join) {
             let found = match func.last(pred) {
                 Some(Op::Jump(target, args)) if *target == join => vec![(Edge::Jump, args.get(at).copied())],
                 Some(Op::Brif(_, then, then_args, other, other_args)) => {
@@ -62,7 +62,7 @@ pub(super) fn hoist(func: &mut Function, entry: Block, sret_ptr: Value, bytes: u
 fn later_loads(func: &Function, info: &super::SretUseInfo, (join, pos): (Block, usize), param: Value, copy: Inst) -> Option<Vec<Inst>> {
     let insts = &func.blocks[join.index()].insts;
     let mut loads = Vec::new();
-    for &(block, at, user) in &info.uses_by_val[param.index()] {
+    for &(block, at, user) in info.uses_of(param) {
         if user == copy {
             continue;
         }

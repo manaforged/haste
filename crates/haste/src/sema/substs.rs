@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::names::ItemRef;
-use crate::sync::Interner;
+use crate::sync::{AtomicU32Slab, Interner};
 
 use super::table::SHARDS;
 use super::ty::Ty;
@@ -37,15 +37,24 @@ impl Substs {
 #[derive(Clone, Default)]
 pub struct SubstsPool {
     inner: Arc<Interner<Arc<[Ty]>, SHARDS, SUBSTS_SLAB, SUBSTS_SLABS>>,
+    singles: Arc<AtomicU32Slab<SUBSTS_SLAB, SUBSTS_SLABS>>,
 }
 
 impl SubstsPool {
     /// Interns `slice` and returns its handle, returning `Substs::EMPTY` without locking when empty.
     pub fn intern(&self, slice: &[Ty]) -> Substs {
-        if slice.is_empty() {
-            return Substs::EMPTY;
+        match slice {
+            [] => Substs::EMPTY,
+            &[ty] if ty != Ty::NONE => {
+                if let Some(cached) = self.singles.get(ty.0 as usize) {
+                    return Substs(cached);
+                }
+                let id = Substs(handle(self.inner.intern(slice, |slice, _| Arc::from(slice))));
+                self.singles.set(ty.0 as usize, id.0);
+                id
+            }
+            _ => Substs(handle(self.inner.intern(slice, |slice, _| Arc::from(slice)))),
         }
-        Substs(handle(self.inner.intern(slice, |slice, _| Arc::from(slice))))
     }
 
     /// The slice of type arguments that `id` names.
@@ -60,9 +69,22 @@ impl SubstsPool {
             return Substs::EMPTY;
         }
         let slice = self.get(id);
+        if let &[ty] = slice {
+            let mapped = f(ty);
+            return if mapped == ty { id } else { self.intern(&[mapped]) };
+        }
         for (idx, &ty) in slice.iter().enumerate() {
             let mapped = f(ty);
             if mapped != ty {
+                if slice.len() <= 8 {
+                    let mut buf = [Ty::NONE; 8];
+                    buf[..idx].copy_from_slice(&slice[..idx]);
+                    buf[idx] = mapped;
+                    for (slot, &rest) in buf[idx + 1..slice.len()].iter_mut().zip(&slice[idx + 1..]) {
+                        *slot = f(rest);
+                    }
+                    return self.intern(&buf[..slice.len()]);
+                }
                 let mut out = Vec::with_capacity(slice.len());
                 out.extend_from_slice(&slice[..idx]);
                 out.push(mapped);
@@ -106,11 +128,57 @@ impl ProjPool {
     }
 }
 
-/// Cloned handles to the slice and projection interners of `Types`.
+/// An interned slice of item references, such as trait object associated types or auto traits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ItemList(pub u32);
+
+impl ItemList {
+    /// The empty slice of item references.
+    pub const EMPTY: ItemList = ItemList(0);
+}
+
+/// A sharded thread-safe interner of `[ItemRef]` slices with lock-free reads.
 #[derive(Clone, Default)]
-pub struct Pools {
-    pub substs: SubstsPool,
-    pub projs: ProjPool,
+pub struct ItemListPool {
+    inner: Arc<Interner<Arc<[ItemRef]>, SHARDS, PROJ_SLAB, PROJ_SLABS>>,
+}
+
+impl ItemListPool {
+    /// Interns `slice` and returns its handle, returning `ItemList::EMPTY` without locking when empty.
+    pub fn intern(&self, slice: &[ItemRef]) -> ItemList {
+        if slice.is_empty() {
+            return ItemList::EMPTY;
+        }
+        ItemList(handle(self.inner.intern(slice, |slice, _| Arc::from(slice))))
+    }
+
+    /// The slice of item references that `id` names.
+    pub fn get(&self, id: ItemList) -> &[ItemRef] {
+        let Some(slot) = slot(id.0) else { return &[] };
+        self.inner.get(slot)
+    }
+}
+
+/// An interned valid range `(start, end)` for a pattern type.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PatRange(pub u32);
+
+/// A sharded thread-safe interner of `(u128, u128)` pattern ranges with lock-free reads.
+#[derive(Clone, Default)]
+pub struct PatPool {
+    inner: Arc<Interner<(u128, u128), SHARDS, PROJ_SLAB, PROJ_SLABS>>,
+}
+
+impl PatPool {
+    /// Interns `range` and returns its handle.
+    pub fn intern(&self, range: (u128, u128)) -> PatRange {
+        PatRange(handle(self.inner.intern(&range, |range, _| *range)))
+    }
+
+    /// The `(start, end)` range that `id` names.
+    pub fn get(&self, id: PatRange) -> (u128, u128) {
+        *self.inner.get(slot(id.0).expect("interned pattern range"))
+    }
 }
 
 /// A sorted immutable key-value table backed by a single boxed slice.

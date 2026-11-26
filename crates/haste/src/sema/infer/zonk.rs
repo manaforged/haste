@@ -105,28 +105,37 @@ impl Infer<'_, '_> {
     }
 
     fn fill(&mut self, ty: Ty, fall_back: bool) -> Ty {
+        if !self.cx.types.has_var_flag(ty) {
+            return ty;
+        }
         let ty = self.resolve(ty);
-        let kind = self.cx.types.kind(ty).clone();
-        let fallback = match kind {
-            Kind::IntVar(_) => self.cx.types.prim(Primitive::I32),
-            Kind::FloatVar(_) => self.cx.types.prim(Primitive::F64),
-            Kind::Var(_) => self.cx.types.unit(),
+        if !self.cx.types.has_var_flag(ty) {
+            return ty;
+        }
+        match self.cx.types.kind(ty) {
+            Kind::IntVar(_) => if fall_back { self.cx.types.prim(Primitive::I32) } else { ty },
+            Kind::FloatVar(_) => if fall_back { self.cx.types.prim(Primitive::F64) } else { ty },
+            Kind::Var(_) => if fall_back { self.cx.types.unit() } else { ty },
             _ => {
-                let kind = self.map_kind(&kind, |this, item| this.fill(item, fall_back));
-                return self.cx.types.intern(kind);
+                let Ok(mapped) = super::super::ty::try_map_children::<_, std::convert::Infallible>(
+                    self,
+                    ty,
+                    |this| &this.cx.types,
+                    &mut |this, item| Ok(this.fill(item, fall_back)),
+                );
+                mapped
             }
-        };
-        if fall_back { fallback } else { ty }
+        }
     }
 
     pub(super) fn map_substs(&mut self, id: super::super::substs::Substs, mut f: impl FnMut(&mut Self, Ty) -> Ty) -> super::super::substs::Substs {
-        let pool = self.cx.types.pool();
-        pool.map(id, &mut |ty| f(self, ty))
-    }
-
-    pub(super) fn map_kind(&mut self, kind: &Kind, mut f: impl FnMut(&mut Self, Ty) -> Ty) -> Kind {
-        let pools = self.cx.types.pools();
-        kind.map_pool(&pools, |ty| f(self, ty))
+        let Ok(mapped) = super::super::ty::try_map_substs::<_, std::convert::Infallible>(
+            self,
+            id,
+            |this| &this.cx.types,
+            &mut |this, ty| Ok(f(this, ty)),
+        );
+        mapped
     }
 
     fn settle_all(&mut self) -> Result<()> {
@@ -230,8 +239,12 @@ impl Infer<'_, '_> {
     }
 
     fn fall_back_numbers(&mut self) -> Result<()> {
-        let exprs = self.out.exprs.iter().copied().filter(|ty| *ty != Ty::NONE);
-        let roots: Vec<Ty> = exprs.chain(self.out.locals.iter().map(|local| local.ty)).collect();
+        let exprs = self.out.exprs.iter().copied().filter(|&ty| ty != Ty::NONE && self.cx.types.has_var_flag(ty));
+        let locals = self.out.locals.iter().map(|local| local.ty).filter(|&ty| self.cx.types.has_var_flag(ty));
+        let roots: Vec<Ty> = exprs.chain(locals).collect();
+        if roots.is_empty() {
+            return Ok(());
+        }
         self.fall_back_in(roots)
     }
 
@@ -239,8 +252,11 @@ impl Infer<'_, '_> {
     pub(super) fn fall_back_in(&mut self, mut stack: Vec<Ty>) -> Result<()> {
         let mut seen = HashSet::default();
         while let Some(ty) = stack.pop() {
+            if !self.cx.types.has_var_flag(ty) {
+                continue;
+            }
             let ty = self.resolve(ty);
-            if !seen.insert(ty) {
+            if !self.cx.types.has_var_flag(ty) || !seen.insert(ty) {
                 continue;
             }
             let fallback = match self.cx.types.kind(ty) {
@@ -535,8 +551,11 @@ impl Infer<'_, '_> {
     }
 
     fn check_no_type_vars(&self, ty: Ty, seen: &mut HashSet<Ty>) -> Result<()> {
+        if !self.cx.types.has_var_flag(ty) {
+            return Ok(());
+        }
         let ty = self.resolve(ty);
-        if !seen.insert(ty) {
+        if !self.cx.types.has_var_flag(ty) || !seen.insert(ty) {
             return Ok(());
         }
         match self.cx.types.kind(ty) {
@@ -574,11 +593,31 @@ impl Infer<'_, '_> {
             other => Ok(other),
         }
     }
+    pub(super) fn init_poly_for_item(&mut self, item: ItemRef, param_count: u16) -> Result<()> {
+        let args: Vec<Ty> = (0..param_count).map(|idx| self.cx.types.intern(Kind::Param(idx))).collect();
+        let substs = self.cx.types.intern_substs(&args);
+        let root = Some(item.body_owner());
+        (self.root, self.instance) = (root, Some((item, substs)));
+        self.poly = Some(Box::new(super::poly::PolyState::default()));
+        let mut frame = self.frame(item, &args)?;
+        (frame.src, frame.root) = (self.cx.body_src(item), root);
+        self.swap_frame(frame);
+        self.init_poly_env(item)
+    }
 }
 
 /// Whether `ty` implements `Copy` in the context of `item`.
 pub fn is_copy(cx: &mut Context<'_>, item: ItemRef, ty: Ty) -> Result<bool> {
-    detached(cx, item, |infer| infer.is_copy(ty))
+    detached(cx, item, |infer| {
+        if infer.cx.types.has_params(ty)
+            && let Some(count) = super::super::summary::expected_param_count(infer.cx, item)
+            && count > 0
+            && count <= u16::MAX as usize
+        {
+            let _ = infer.init_poly_for_item(item, count as u16);
+        }
+        infer.is_copy(ty)
+    })
 }
 
 /// Whether `item` is a non-generic synchronous `fn(i64) -> i64` suitable as a JIT test case.
@@ -612,8 +651,8 @@ pub fn test_sig(cx: &mut Context<'_>, item: ItemRef) -> Option<bool> {
     .flatten()
 }
 
-/// Whether `item` is a non-generic free function suitable as a root for library `haste build`.
+/// Whether `item` is a non-generic function suitable as a root for `haste build`.
 pub fn is_concrete_fn(cx: &mut Context<'_>, item: ItemRef) -> bool {
     let Ok(sig) = cx.signature(item) else { return false };
-    sig.receiver.is_none() && !sig.variadic && !sig.opaque && scope::type_params(&sig.generics).next().is_none()
+    !sig.variadic && super::super::summary::expected_param_count(cx, item) == Some(0)
 }

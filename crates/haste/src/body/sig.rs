@@ -55,6 +55,10 @@ pub struct Signature {
     pub opaque: bool,
     /// Whether the function is `async`, so it returns a future of its declared return type.
     pub is_async: bool,
+    /// Whether the function header carries `unsafe`.
+    pub is_unsafe: bool,
+    /// Whether the function header carries `safe` (e.g. inside an `unsafe extern` block).
+    pub is_safe: bool,
     /// The first token of each parameter's pattern.
     pub param_starts: Vec<u32>,
 }
@@ -205,10 +209,19 @@ impl Cursor<'_> {
 pub fn signature(src: &Source, from: u32, to: u32, config: super::Config<'_>) -> Result<Signature> {
     let mut cursor = Cursor::new(src, from, to);
     cursor.config = config;
+    cursor.skip_attrs()?;
     let mut is_async = false;
+    let mut is_unsafe = false;
+    let mut is_safe = false;
     while !cursor.done() && !cursor.is_word("fn") {
         is_async |= cursor.is_word("async");
-        cursor.at += if cursor.kind() == TokenKind::OpenParen { cursor.src.pair(cursor.at) + 1 - cursor.at } else { 1 };
+        is_unsafe |= cursor.is_word("unsafe");
+        is_safe |= cursor.is_word("safe");
+        cursor.at += if matches!(cursor.kind(), TokenKind::OpenParen | TokenKind::OpenBracket) {
+            cursor.src.pair(cursor.at) + 1 - cursor.at
+        } else {
+            1
+        };
     }
     cursor.at += 1;
     cursor.name()?;
@@ -225,6 +238,8 @@ pub fn signature(src: &Source, from: u32, to: u32, config: super::Config<'_>) ->
     sig.ret = if cursor.eat("->") { Some(cursor.ty()?) } else { None };
     sig.opaque = is_async || cursor.body.tys[ret_first..].iter().any(|ty| matches!(ty, super::Ty::ImplTrait(..)));
     sig.is_async = is_async;
+    sig.is_unsafe = is_unsafe;
+    sig.is_safe = is_safe;
     sig.predicates = cursor.where_clause()?;
     sig.body = cursor.body;
     Ok(sig)

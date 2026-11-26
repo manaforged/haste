@@ -38,7 +38,7 @@ pub(super) fn load_selected(outline: &mut Outline, workers: usize, selected: &[b
     let board = Board::new(std::mem::take(&mut outline.crates), selected);
     let shared = Shared { cache: &outline.cache, deps: &outline.deps, reads: reads(&outline.deps) };
     let lock: Lock = (Mutex::new(board), Condvar::new());
-    std::thread::scope(|scope| {
+    crate::sync::scope(|scope| {
         for _ in 1..workers {
             scope.spawn(|| work(&lock, &shared));
         }

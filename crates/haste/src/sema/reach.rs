@@ -7,10 +7,10 @@ use crate::names::ItemRef;
 use crate::names::path::Requests;
 
 use super::Context;
-use super::infer::{Res, Typed, infer, register};
+use super::infer::{Res, Typed, mark_parent_laid, record_parent_drops, register};
 use super::substs::Substs;
 use super::summary::thaw;
-mod filter;
+pub(in crate::sema) mod filter;
 mod order;
 mod unwind;
 mod wave;
@@ -286,7 +286,7 @@ impl Reached {
                 }
                 local
             };
-            let (own, joined) = std::thread::scope(|scope| {
+            let (own, joined) = crate::sync::scope(|scope| {
                 let handles: Vec<_> = (1..workers).map(|_| scope.spawn(worker)).collect();
                 (worker(), handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect::<Vec<_>>())
             });
@@ -559,7 +559,7 @@ fn run_deferred(cx: &mut Context<'_>, (reached, wave, workers, check_undeclared)
 }
 
 pub(super) fn run_scoped<'a>(cx: &mut Context<'a>, forks: Vec<Context<'a>>, reached: &Reached, (wave, next, check_undeclared): (&[usize], &AtomicUsize, bool)) -> (Vec<WaveItem>, Vec<Option<WorkerOut>>) {
-    std::thread::scope(|scope| {
+    crate::sync::scope(|scope| {
         let handles: Vec<_> = forks
             .into_iter()
             .map(|mut fork| {
@@ -670,6 +670,8 @@ pub(crate) fn typed_once(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut
         && let Some(typed) = cx.store.finals.get(instance).filter(|t| cx.store.lookups.skip_warm_sysroot_bodies || !matches!(&t.tables, super::infer::LazyTables::CheckOnly(_)))
     {
         register(cx, *instance, &typed);
+        record_parent_drops(cx, *instance, &typed);
+        mark_parent_laid(cx, *instance, &typed);
         return Ok(typed);
     }
     if !is_alloc_shim
@@ -686,17 +688,48 @@ pub(crate) fn typed_once(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut
 
 fn typed_fresh(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<String>) -> Result<Arc<Typed>, String> {
     let _guard = InferGuard::enter(*instance);
+    let before = cx.quiet_mark();
+    match super::infer::compiler_made(cx, instance.0, instance.1) {
+        Ok(Some(typed)) => {
+            let typed = Arc::new(typed);
+            thaw::keep_laid(cx, *instance, &typed, unlaid, before);
+            return Ok(typed);
+        }
+        Err(error) => return Err(format!("{}: {error:#}", cx.name(instance.0))),
+        Ok(None) => {}
+    }
     if let Some(result) = super::summary::typed_once_poly(cx, instance, unlaid) {
         return result;
     }
-    let before = cx.quiet_mark();
-    let typed = Arc::new(infer(cx, instance.0, instance.1).map_err(|error| format!("{}: {error:#}", cx.name(instance.0)))?);
+    let typed = Arc::new(super::infer::infer_after_compiler_made(cx, instance.0, instance.1, None).map_err(|error| format!("{}: {error:#}", cx.name(instance.0)))?);
     thaw::keep_laid(cx, *instance, &typed, unlaid, before);
     Ok(typed)
 }
 
+fn lay_out_ty(cx: &mut Context<'_>, ty: Ty) -> anyhow::Result<()> {
+    if let Kind::Adt(item, _) = *cx.types.kind(ty)
+        && cx.item(item).1.kind == crate::outline::item::ItemKind::Enum
+    {
+        cx.discriminants(item)?;
+    }
+    if matches!(cx.types.kind(ty), Kind::Adt(..) | Kind::Tuple(_) | Kind::Array(..) | Kind::Closure(..)) {
+        cx.layout(ty)?;
+    }
+    Ok(())
+}
+
 /// Computes the layout of each ADT, tuple and array type that lowering `typed` reads, so the names those layouts need are asked for while inference can still retry.
 pub(super) fn lay_out(cx: &mut Context<'_>, typed: &Typed) -> anyhow::Result<()> {
+    if let super::infer::Shape::Closure(body) = &typed.shape
+        && body.parent_laid
+    {
+        for ty in typed.locals[body.parent_locals as usize..].iter().map(|local| local.ty).chain(typed.ret) {
+            if ty != Ty::NONE {
+                lay_out_ty(cx, ty)?;
+            }
+        }
+        return Ok(());
+    }
     let scoped = typed.scoped(&cx.types);
     let tables = scoped.ensure_tables(&cx.types);
     let mut intrinsic_args = Vec::new();
@@ -712,14 +745,7 @@ pub(super) fn lay_out(cx: &mut Context<'_>, typed: &Typed) -> anyhow::Result<()>
         if ty == Ty::NONE || !seen.insert(ty) {
             continue;
         }
-        if let Kind::Adt(item, _) = *cx.types.kind(ty)
-            && cx.item(item).1.kind == crate::outline::item::ItemKind::Enum
-        {
-            cx.discriminants(item)?;
-        }
-        if matches!(cx.types.kind(ty), Kind::Adt(..) | Kind::Tuple(_) | Kind::Array(..) | Kind::Closure(..)) {
-            cx.layout(ty)?;
-        }
+        lay_out_ty(cx, ty)?;
     }
     Ok(())
 }

@@ -207,21 +207,39 @@ pub(super) fn preserved(func: &Function, plan: &Plan<Reg>, block_idx: usize, sta
     crate::emit::preserved(func, (plan, &super::REGS), (block_idx, start, end, usize::MAX), |pos| skip_pos == Some(pos), val)
 }
 
+pub(super) fn shrn_shift(src_ty: Type, dst_ty: Type, imm: i64) -> Option<u32> {
+    let (Type::Vec { lane: sl, count: sc }, Type::Vec { lane: dl, count: dc }) = (src_ty, dst_ty) else { return None };
+    if sc != dc || !sl.is_int() || !dl.is_int() || sl.bits() != dl.bits() * 2 { return None; }
+    let shift = (imm as u32) & (sl.bits() - 1);
+    (1..=dl.bits()).contains(&shift).then_some(shift)
+}
+
 fn fuse_ireduce_ushr(func: &Function, plan: &mut Plan<Reg>, (uses, pos_of): (&[u32], &[Option<(usize, usize, Inst)>]), (b_idx, pos, res): (usize, usize, Value), shr: Value) {
     let src_ty = func.ty(shr);
-    if !matches!(src_ty, Type::I32 | Type::I64) || uses[shr.index()] != 1 || plan.elided[shr.index()] {
+    if uses[shr.index()] != 1 || plan.elided[shr.index()] {
         return;
     }
     let Some((sb, spos, sinst)) = def_entry(pos_of, shr) else { return };
     if sb != b_idx || spos >= pos {
         return;
     }
-    let Op::Binary(Binary::Ushr, val, amt) = func.insts[sinst.index()].op else { return };
-    let Some(shift) = plan.const_of(amt) else { return };
-    let src_bits = src_ty.bits();
-    let shift = (shift as u32) & (src_bits - 1);
-    if shift > 0 && src_bits - shift <= func.ty(res).bits() && preserved(func, plan, b_idx, spos, pos, None, val) {
-        plan.elided[shr.index()] = true;
+    match func.insts[sinst.index()].op {
+        Op::Binary(Binary::Ushr, val, amt) if matches!(src_ty, Type::I32 | Type::I64) => {
+            let Some(shift) = plan.const_of(amt) else { return };
+            let src_bits = src_ty.bits();
+            let shift = (shift as u32) & (src_bits - 1);
+            if shift > 0 && src_bits - shift <= func.ty(res).bits() && preserved(func, plan, b_idx, spos, pos, None, val) {
+                plan.elided[shr.index()] = true;
+            }
+        }
+        Op::Binary(Binary::Ushr | Binary::Sshr, val, amt) if src_ty.is_vector() => {
+            if mem::const_splat(func, plan, pos_of, amt).is_some_and(|(_, imm)| shrn_shift(src_ty, func.ty(res), imm).is_some())
+                && preserved(func, plan, b_idx, spos, pos, None, val)
+            {
+                plan.elided[shr.index()] = true;
+            }
+        }
+        _ => {}
     }
 }
 
@@ -681,6 +699,9 @@ fn fuse_block_shift(
     if matches!(sop, Binary::Ishl | Binary::Ushr | Binary::Sshr) && func.ty(res).is_small_int() {
         bits::try_fuse_bfx(func, plan, info, (b_idx, pos, res), (sop, x, y));
     }
+    if matches!(sop, Binary::Ishl | Binary::Ushr) && matches!(func.ty(res), Type::I32 | Type::I64) && !plan.elided[x.index()] {
+        peel_other_uextend(func, plan, info, (b_idx, pos, res), x);
+    }
 }
 
 fn fuse_block_icmp(
@@ -768,6 +789,6 @@ pub(super) fn fuse(func: &Function, plan: &mut Plan<Reg>, lse: bool) {
     bits::fuse_tst(func, plan, (&uses, &pos_of));
     fuse_fits(func, plan, &uses);
     ccmp::fuse_ccmp(func, plan, (&uses, &pos_of));
-    mem::fuse_relaxed_atomic_addrs(func, plan, (&uses, &pos_of));
+    mem::fuse_atomic_addrs(func, plan, lse, (&uses, &pos_of));
     mem::fuse_store_ireduce(func, plan, &uses);
 }

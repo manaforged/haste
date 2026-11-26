@@ -24,5 +24,5 @@ rustc_abi = { package = "ra-ap-rustc_abi", version = "0.184", default-features =
 rustc_index = { package = "ra-ap-rustc_index", version = "0.184", default-features = false }
 rustc_lexer = { package = "ra-ap-rustc_lexer", version = "0.180", default-features = false }
 
-[target.'cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))'.dependencies]
+[target.'cfg(any(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"), target_os = "macos"))'.dependencies]
 tikv-jemallocator = "=0.7.0"

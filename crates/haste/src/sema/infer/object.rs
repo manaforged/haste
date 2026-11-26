@@ -76,7 +76,7 @@ impl Infer<'_, '_> {
             (Kind::Dyn(..) | Kind::Var(_), _) => Ok(None),
             (_, Kind::Dyn(..)) if self.is_unsized(from)? => Ok(None),
             (_, Kind::Dyn(of, args, members, _)) => {
-                let args = self.cx.types.substs(args).to_vec();
+                let (args, members) = (self.cx.types.substs(args).to_vec(), self.cx.types.items(members).to_vec());
                 self.to_object(from, to, (of, &args, &members))
             }
             _ => Ok(None),
@@ -84,13 +84,14 @@ impl Infer<'_, '_> {
     }
 
     fn object_to_object(&mut self, from: Ty, to: Ty) -> Result<Option<Coercion>> {
-        let (Kind::Dyn(of, args, members, autos), Kind::Dyn(other, wanted, bound, kept)) = (self.cx.types.kind(from).clone(), self.cx.types.kind(to).clone()) else {
+        let (Kind::Dyn(of, args, members, autos), Kind::Dyn(other, wanted, bound, kept)) = (*self.cx.types.kind(from), *self.cx.types.kind(to)) else {
             return Ok(None);
         };
         if of != other {
             return Ok(if wanted.is_empty() { upcast_slot(self.cx, of, other)?.map(Coercion::Upcast) } else { None });
         }
-        if members != bound || autos == kept || !kept.iter().all(|auto| autos.contains(auto)) {
+        let (autos_s, kept_s) = (self.cx.types.items(autos), self.cx.types.items(kept));
+        if members != bound || autos == kept || !kept_s.iter().all(|auto| autos_s.contains(auto)) {
             return Ok(None);
         }
         let (args, wanted) = (self.cx.types.substs(args).to_vec(), self.cx.types.substs(wanted).to_vec());
@@ -168,8 +169,8 @@ impl Infer<'_, '_> {
             self.poly_fallback();
             return Ok(Vtable { ty, object, drop: None, methods: Vec::new(), supers: Vec::new() });
         }
-        let Kind::Dyn(of, args, members, _) = self.cx.types.kind(object).clone() else { bail!("a vtable for a type that is not a trait object") };
-        let args = super::super::ty::object_parts(self.cx.types.substs(args), &members).0.to_vec();
+        let Kind::Dyn(of, args, members, _) = *self.cx.types.kind(object) else { bail!("a vtable for a type that is not a trait object") };
+        let args = super::super::ty::object_parts(self.cx.types.substs(args), self.cx.types.items(members)).0.to_vec();
         let bounds = self.expand_super_bounds(vec![(of, std::iter::once(ty).chain(args.iter().copied()).collect())])?;
         let mut methods = Vec::new();
         for method in self.cx.vtable_methods(of)? {
@@ -181,7 +182,8 @@ impl Infer<'_, '_> {
         }
         let mut supers = Vec::new();
         for of in self.cx.vtable_supers(of)? {
-            let object = self.cx.types.intern(Kind::Dyn(of, Substs::EMPTY, Vec::new(), Vec::new()));
+            let empty = super::super::substs::ItemList::EMPTY;
+            let object = self.cx.types.intern(Kind::Dyn(of, Substs::EMPTY, empty, empty));
             supers.push(self.zonk_vtable(Vtable { ty, object, drop: None, methods: Vec::new(), supers: Vec::new() })?);
         }
         Ok(Vtable { ty, object, drop: None, methods, supers })

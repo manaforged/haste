@@ -19,7 +19,6 @@ const STAMP: &str = "stamp";
 const OUTPUT: &str = "output";
 const FAILED: &str = "failed";
 const OK_MARK: &str = "+";
-const FAILED_MARK: &str = "-";
 
 /// The directory of the store: `$HASTE_HOME`, else `$XDG_CACHE_HOME/haste`, else `$HOME/.cache/haste` (or `%LOCALAPPDATA%\haste` on Windows).
 pub(crate) fn home() -> PathBuf {
@@ -62,19 +61,17 @@ impl Expansion {
         }
         match mark {
             OK_MARK => Some(Ok(output.to_owned())),
-            FAILED_MARK => Some(Err(output.to_owned())),
             _ => None,
         }
     }
 
-    /// Keeps what this call printed, or why it failed, since this program fails the same call the same way.
+    /// Keeps what this call printed on success; failures are never cached so fixing the environment immediately retries.
     pub fn keep(&self, result: &Result<String, String>) -> io::Result<()> {
-        std::fs::create_dir_all(self.path.parent().unwrap_or(&self.path))?;
-        let (mark, text) = match result {
-            Ok(output) => (OK_MARK, output),
-            Err(error) => (FAILED_MARK, error),
+        let Ok(output) = result else {
+            return remove(&self.path);
         };
-        write_new(&self.path, &format!("{mark}{}\n{}{text}", self.inputs.len(), self.inputs))
+        std::fs::create_dir_all(self.path.parent().unwrap_or(&self.path))?;
+        write_new(&self.path, &format!("{OK_MARK}{}\n{}{output}", self.inputs.len(), self.inputs))
     }
 }
 
@@ -107,12 +104,13 @@ pub fn dir(workspace: &Workspace, unit: usize) -> PathBuf {
     let entry = &workspace.graph.units[unit];
     let package = &workspace.packages[entry.package];
     let side = if entry.side == Side::Host { "host" } else { "target" };
+    let profile = if crate::profile() == crate::outline::tree::Profile::Release { "release" } else { "debug" };
     let features: Vec<&str> = entry.features.iter().map(String::as_str).collect();
-    let key = rustc_hash::FxBuildHasher.hash_one((package.manifest.dir.as_path(), side, features.join(",")));
+    let key = rustc_hash::FxBuildHasher.hash_one((package.manifest.dir.as_path(), side, profile, features.join(",")));
     root().join(format!("{}-{}-{key:016x}", package.locked.name, package.locked.version))
 }
 
-/// The kept result of `unit`'s script, its output or why it did not build or run, when it ran with `vars` under this program and no file or variable it watches changed since.
+/// The kept result of `unit`'s script when it succeeded with `vars` under this program and no watched file or variable changed since.
 pub fn kept(workspace: &Workspace, unit: usize, vars: &[(String, String)]) -> Option<Result<Output, String>> {
     let dir = dir(workspace, unit);
     let stamp = std::fs::read_to_string(dir.join(STAMP)).ok()?;
@@ -120,8 +118,8 @@ pub fn kept(workspace: &Workspace, unit: usize, vars: &[(String, String)]) -> Op
     let (inputs, watch) = (lines.next()?, lines.next()?);
     let watched = Watched::read(lines);
     (inputs == inputs_hash(vars) && watch == watched.hash()).then_some(())?;
-    if let Ok(error) = std::fs::read_to_string(dir.join(FAILED)) {
-        return Some(Err(error));
+    if dir.join(FAILED).exists() {
+        return None;
     }
     std::fs::read_to_string(dir.join(OUTPUT)).ok().map(|text| Ok(Output::parse(&text)))
 }
@@ -134,12 +132,12 @@ pub fn keep(workspace: &Workspace, unit: usize, vars: &[(String, String)], text:
     stamp(&dir, vars, &Watched::of(workspace, unit, &Output::parse(text)))
 }
 
-/// Keeps why `unit`'s script did not build or run with `vars`, so later runs report it again until this program, the inputs or the package's files change.
-pub fn keep_failure(workspace: &Workspace, unit: usize, vars: &[(String, String)], error: &str) -> io::Result<()> {
+/// Clears any stale cached build-script stamp after a failed run so the next build retries immediately.
+pub fn clear_failure(workspace: &Workspace, unit: usize) -> io::Result<()> {
     let dir = dir(workspace, unit);
-    std::fs::create_dir_all(&dir)?;
-    write_new(&dir.join(FAILED), error)?;
-    stamp(&dir, vars, &Watched::of(workspace, unit, &Output::default()))
+    remove(&dir.join(FAILED))?;
+    remove(&dir.join(STAMP))?;
+    remove(&dir.join(OUTPUT))
 }
 
 fn stamp(dir: &Path, vars: &[(String, String)], watched: &Watched) -> io::Result<()> {

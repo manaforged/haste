@@ -1,5 +1,6 @@
 use super::asm::{Alu, Cond, FP, Mem, Reg, Size, ZR};
 use super::{A, C, D, Emit, IP, S, T};
+use crate::alloc::Location;
 use crate::ir::{AtomicOrd, AtomicRmwOp, Binary, Convert, Function, IntCC, Lane, Op, ReduceOp, Type, Unary, Value};
 use crate::reloc::{RelocKind, StencilReloc};
 
@@ -97,7 +98,9 @@ impl Emit<'_> {
     fn access(&mut self, op: &Op, result: impl Fn() -> Result<Value, String>) -> Result<(), String> {
         match op {
             Op::Load(addr, offset) => self.load_at(result()?, *addr, *offset),
+            Op::VolatileLoad(addr, offset) => { let from = self.address(*addr, *offset); self.read(result()?, from); }
             Op::Store(value, addr, offset) => self.store_at(*value, *addr, *offset),
+            Op::VolatileStore(value, addr, offset) => { let to = self.address(*addr, *offset); self.write(*value, to); }
             Op::StackAddr(slot, offset) => {
                 let result = result()?;
                 if !self.plan.is_static(result) {
@@ -521,8 +524,26 @@ impl Emit<'_> {
         (addr, 0)
     }
 
+    fn rcpc2_target(&mut self, addr: Value) -> (Reg, i32) {
+        if let Location::Offset(base, disp) = self.plan.location(addr)
+            && (-256..=255).contains(&disp)
+        {
+            return (base, disp);
+        }
+        if let Location::Frame(slot, off) = self.plan.location(addr)
+            && let Some(disp) = self.frame.slots[slot.index()].checked_add(off)
+            && (-256..=255).contains(&disp)
+        {
+            return (FP, disp);
+        }
+        let (base, off) = self.relaxed_atomic_target(addr);
+        if base != addr && (-256..=255).contains(&off) {
+            return (self.bits(base, C), off);
+        }
+        (self.bits(addr, C), 0)
+    }
+
     fn atomic(&mut self, op: &Op, result: impl Fn() -> Result<Value, String>) -> Result<(), String> {
-        self.invalidate_spills();
         let ty = match op {
             Op::AtomicStore(value, _, _) => self.ty(*value),
             _ => self.ty(result()?),
@@ -534,9 +555,18 @@ impl Emit<'_> {
         match op {
             Op::AtomicLoad(addr, ord) => {
                 if ord.has_acquire() {
-                    let at = self.bits(*addr, C);
                     let dst = self.dst(result()?);
-                    self.asm.load_acquire(size, dst, at);
+                    if self.lse && *ord == AtomicOrd::Acquire {
+                        let (base, disp) = self.rcpc2_target(*addr);
+                        if disp != 0 {
+                            self.asm.load_acquire_rcpc_off(size, dst, base, disp);
+                        } else {
+                            self.asm.load_acquire_rcpc(size, dst, base);
+                        }
+                    } else {
+                        let at = self.bits(*addr, C);
+                        self.asm.load_acquire(size, dst, at);
+                    }
                     self.put(result()?, dst);
                 } else {
                     let (base, off) = self.relaxed_atomic_target(*addr);
@@ -545,9 +575,19 @@ impl Emit<'_> {
             }
             Op::AtomicStore(value, addr, ord) => {
                 if ord.has_release() {
-                    let at = self.bits(*addr, C);
-                    let source = self.store_src(*value);
-                    self.asm.store_release(size, at, source);
+                    if self.lse && *ord == AtomicOrd::Release {
+                        let (base, disp) = self.rcpc2_target(*addr);
+                        let source = self.store_src(*value);
+                        if disp != 0 {
+                            self.asm.store_release_off(size, base, disp, source);
+                        } else {
+                            self.asm.store_release(size, base, source);
+                        }
+                    } else {
+                        let at = self.bits(*addr, C);
+                        let source = self.store_src(*value);
+                        self.asm.store_release(size, at, source);
+                    }
                 } else {
                     let (base, off) = self.relaxed_atomic_target(*addr);
                     self.store_at(*value, base, off);
@@ -559,6 +599,7 @@ impl Emit<'_> {
                     self.lse_rmw(*rmw, *ord, size, *addr, *value, res);
                 } else {
                     self.rmw(*rmw, *ord, size, *addr, *value);
+                    self.clobber_regs(&[A, C, D, S, T]);
                     self.put(res, A);
                 }
             }
@@ -568,6 +609,7 @@ impl Emit<'_> {
                     self.lse_cas(*ord, size, *addr, (*expected, *replacement), res);
                 } else {
                     self.cas(*ord, size, *addr, (*expected, *replacement));
+                    self.clobber_regs(&[A, C, D, S, T]);
                     self.put(res, A);
                 }
             }
@@ -582,20 +624,24 @@ impl Emit<'_> {
         let val = match (op, self.plan.const_of(value)) {
             (AtomicRmwOp::Sub, Some(imm)) => {
                 self.asm.mov_imm(IP, imm.wrapping_neg());
+                self.clobber_reg(IP);
                 IP
             }
             (AtomicRmwOp::And, Some(imm)) => {
                 self.asm.mov_imm(IP, !imm);
+                self.clobber_reg(IP);
                 IP
             }
             (AtomicRmwOp::Sub, None) => {
                 let v = self.bits(value, IP);
                 self.asm.alu(Alu::Sub, Size::X, IP, ZR, v);
+                self.clobber_reg(IP);
                 IP
             }
             (AtomicRmwOp::And, None) => {
                 let v = self.bits(value, IP);
                 self.asm.alu(Alu::Orn, Size::X, IP, ZR, v);
+                self.clobber_reg(IP);
                 IP
             }
             (_, Some(0)) => ZR,
@@ -612,7 +658,9 @@ impl Emit<'_> {
             self.dst(result)
         };
         self.asm.lse_rmw(op, ord, size, (at, val, dst));
-        if !dead {
+        if dead {
+            self.clobber_reg(dst);
+        } else {
             self.put(result, dst);
         }
     }
@@ -625,6 +673,7 @@ impl Emit<'_> {
         self.raw(old, expected);
         let rep = if self.plan.const_of(replacement) == Some(0) { ZR } else { self.bits(replacement, IP) };
         self.asm.lse_cas(ord, size, (at, old, rep));
+        self.clobber_reg(old);
         self.put(result, old);
     }
 

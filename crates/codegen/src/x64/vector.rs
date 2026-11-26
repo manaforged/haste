@@ -98,7 +98,7 @@ impl Emit<'_> {
         if self.features.avx {
             let (x, y) = if commute && self.xmm_of(x).is_none() && (self.xmm_of(y).is_some() || (self.ty(x).bytes() == 16 && self.elided_mem(x).is_some() && self.elided_mem(y).is_none())) { (y, x) } else { (x, y) };
             let sx = self.fin(x, X0);
-            let cached_y = self.last_fspill.is_some_and(|(d, _, t)| d == self.frame.values[y.index()] && t == self.ty(y));
+            let cached_y = self.spills.cached_fspill(self.frame.values[y.index()], self.ty(y)).is_some();
             let sy: Rm = if let Some(mem) = (self.ty(y).bytes() == 16).then(|| self.elided_mem(y)).flatten() {
                 mem.into()
             } else if self.ty(y).bytes() == 16 && matches!(self.location(y), Location::Slot) && !cached_y {

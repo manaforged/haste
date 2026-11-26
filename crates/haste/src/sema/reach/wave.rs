@@ -94,7 +94,7 @@ pub(super) fn parallel_drain(cx: &mut Context<'_>, reached: &mut Reached, wave: 
         let forks: Vec<Context<'_>> = (0..workers - 1).map(|_| cx.fork()).collect();
         let shared_ref = &shared;
         cx.in_parallel = true;
-        let joined = std::thread::scope(|scope| {
+        let joined = crate::sync::scope(|scope| {
             let handles: Vec<_> = forks
                 .into_iter()
                 .map(|mut fork| {

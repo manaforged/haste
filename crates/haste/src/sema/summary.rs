@@ -27,6 +27,7 @@ pub enum SummaryKind {
     Poly(Arc<PolySummary>),
     MonomorphicHints(Arc<HashMap<ExprId, ItemRef>>),
     MonomorphicFallback,
+    BorrowError(String),
 }
 
 /// Pre-extracted operand types for deciding whether an overloaded operator simplifies to a builtin.
@@ -116,6 +117,7 @@ pub(super) fn typed_once_poly(cx: &mut Context<'_>, instance: &Instance, unlaid:
     );
     let summary = match built {
         Ok(SummaryKind::Poly(summary)) => summary,
+        Ok(SummaryKind::BorrowError(err)) => return Some(Err(err)),
         Ok(SummaryKind::MonomorphicHints(hints)) => {
             let m_before = cx.quiet_mark();
             let typed = match super::infer::infer_with_hints(cx, instance.0, instance.1, Some(hints)) {
@@ -137,10 +139,14 @@ fn cached_poly_summary(cx: &mut Context<'_>, item: ItemRef) -> Option<Arc<PolySu
     if let Some(kind) = cx.store.lookups.summaries.get_ready(&item) {
         return match kind {
             SummaryKind::Poly(summary) => Some(summary),
-            SummaryKind::MonomorphicHints(_) | SummaryKind::MonomorphicFallback => None,
+            SummaryKind::MonomorphicHints(_) | SummaryKind::MonomorphicFallback | SummaryKind::BorrowError(_) => None,
         };
     }
     frozen::frozen_summary(cx, item)
+}
+
+fn has_summary_body(entry: &crate::outline::item::Item) -> bool {
+    (entry.kind == ItemKind::Fn && entry.body.is_some()) || (entry.kind == ItemKind::Const && entry.name.is_some())
 }
 
 pub(super) fn poly_summary(cx: &mut Context<'_>, item: ItemRef) -> Option<Arc<PolySummary>> {
@@ -148,7 +154,7 @@ pub(super) fn poly_summary(cx: &mut Context<'_>, item: ItemRef) -> Option<Arc<Po
         return Some(summary);
     }
     let (_, entry) = cx.item(item);
-    if entry.kind != ItemKind::Fn || entry.body.is_none() || cx.foreign(item) {
+    if !has_summary_body(entry) || cx.foreign(item) {
         return None;
     }
     let expected = expected_param_count(cx, item)?;
@@ -175,20 +181,38 @@ fn eligible(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> bool {
         return false;
     }
     let (_, entry) = cx.item(item);
-    if entry.kind != ItemKind::Fn || entry.body.is_none() || cx.foreign(item) {
+    if !has_summary_body(entry) || cx.foreign(item) {
         return false;
     }
-    if !matches!(super::infer::compiler_made(cx, item, substs), Ok(None)) {
+    if !matches!(super::infer::virtual_slot(cx, item, substs), Ok(None)) {
         return false;
     }
-    matches!(super::infer::virtual_slot(cx, item, substs), Ok(None))
+    true
 }
 
-fn expected_param_count(cx: &mut Context<'_>, item: ItemRef) -> Option<usize> {
+/// Checks a generic local function body polymorphically when possible, returning any borrow or unsafe error.
+pub fn check_poly_item(cx: &mut Context<'_>, item: ItemRef) -> Result<(), String> {
+    let (_, entry) = cx.item(item);
+    if !has_summary_body(entry) || cx.foreign(item) || cx.outline.is_fixed(item.krate) {
+        return Ok(());
+    }
+    let Some(expected) = expected_param_count(cx, item) else { return Ok(()) };
+    if expected == 0 || expected > u16::MAX as usize {
+        return Ok(());
+    }
+    let summaries = cx.store.lookups.summaries.clone();
+    let built = summaries.run(cx, item, |cx| Ok(load_summary(cx, item, expected as u16)), |_| Ok(SummaryKind::MonomorphicFallback));
+    match built {
+        Ok(SummaryKind::BorrowError(err)) => Err(err),
+        _ => Ok(()),
+    }
+}
+
+pub(super) fn expected_param_count(cx: &mut Context<'_>, item: ItemRef) -> Option<usize> {
     let sig = cx.signature(item).ok()?;
     let own = super::infer::type_params(&sig.generics).count();
     if let Some(block) = cx.owner_impl(item) {
-        let outer = super::infer::type_params(&cx.impl_header(block).ok()?.generics).count();
+        let outer = super::infer::type_params(&cx.impl_header_ref(block).ok()?.generics).count();
         return Some(outer + own);
     }
     if let Some(of) = cx.owner_trait(item) {
@@ -475,9 +499,7 @@ fn instantiate_summary(cx: &mut Context<'_>, instance: Instance, summary: &Arc<P
             return Some(Err(format!("{}: {err:#}", cx.name(instance.0))));
         }
     }
-    if record_instantiated(cx, instance, &concrete_layouts, &typed, unlaid, before) {
-        thaw::note_fresh(cx, instance, &typed);
-    }
+    record_instantiated(cx, instance, &concrete_layouts, &typed, unlaid, before);
     Some(Ok(typed))
 }
 
@@ -702,14 +724,14 @@ fn resolve_call_override(infer: &mut Infer<'_, '_>, expr: ExprId, found: Ty, tup
             Ok(CallOverride { expr, res, autoderefs, overloaded: false, box_free: None })
         }
         Kind::FnPtr(..) => Ok(CallOverride { expr, res: None, autoderefs, overloaded: false, box_free: None }),
-        Kind::Dyn(of, parts, members, _) if infer.is_callable_trait(of) => resolve_dyn_call(infer, (expr, found, ty), (of, parts, &members), autoderefs),
+        Kind::Dyn(of, parts, members, _) if infer.is_callable_trait(of) => resolve_dyn_call(infer, (expr, found, ty), (of, parts, members), autoderefs),
         Kind::Adt(..) => resolve_overloaded_call(infer, expr, found, tuple),
         _ => bail!("unsupported concrete callable {}", infer.show(ty)),
     }
 }
 
-fn resolve_dyn_call(infer: &mut Infer<'_, '_>, (expr, found, ty): (ExprId, Ty, Ty), (of, parts, members): (ItemRef, Substs, &[ItemRef]), autoderefs: Option<u32>) -> Result<CallOverride> {
-    let dyn_tuple = *object_parts(infer.cx.types.substs(parts), members).0.first().ok_or_else(|| anyhow::anyhow!("callable trait object without tuple"))?;
+fn resolve_dyn_call(infer: &mut Infer<'_, '_>, (expr, found, ty): (ExprId, Ty, Ty), (of, parts, members): (ItemRef, Substs, super::substs::ItemList), autoderefs: Option<u32>) -> Result<CallOverride> {
+    let dyn_tuple = *object_parts(infer.cx.types.substs(parts), infer.cx.types.items(members)).0.first().ok_or_else(|| anyhow::anyhow!("callable trait object without tuple"))?;
     let name = super::infer::callable_method_name(infer.cx.lang(of));
     let box_free = matches!(name, "call_once" | "async_call_once")
         .then(|| resolve_box_free(infer, found, autoderefs))

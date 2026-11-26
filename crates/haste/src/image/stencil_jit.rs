@@ -10,7 +10,7 @@ use crate::sema::Context;
 use crate::sema::reach::Reached;
 use crate::sync::lock;
 
-use super::stencil::{DictConfig, FirstJit, FirstJitState, FreshSlots, JitTemplate, TierUpEntry, VerifyRecord};
+use super::stencil::{DictConfig, FirstJit, FirstJitState, FreshSlots, JitTemplate, TierUpEntry, VerifyRecord, aot_relocs_valid};
 use super::workers::{bucket_work, lpt_shards};
 use super::{Image, Pass, stub};
 
@@ -19,6 +19,7 @@ pub(super) struct Ready {
     footprint: Option<FootprintId>,
     code: Option<Arc<Code>>,
     relocs: Option<(Arc<RelocPlan>, RelocVec)>,
+    thawed: bool,
 }
 
 /// A function's encoded stencil, its relocations, and their plan.
@@ -38,18 +39,62 @@ impl Image {
     pub(super) fn compile_batch(&mut self, cx: &mut Context<'_>, reached: &Reached, work: &[usize]) -> Vec<(usize, usize)> {
         let mut work = work.to_vec();
         work.sort_unstable();
-        let shards = lpt_shards(bucket_work(reached, &work), crate::jobs());
-        let forks = shards.iter().map(|_| cx.fork()).collect();
-        let made = self.run_shards(forks, &shards, |mut fork, shard| shard.iter().flat_map(|bucket| self.ready_bucket(&mut fork, reached, bucket)).collect::<Vec<_>>());
-        self.pass.ready = made.into_iter().filter_map(Result::ok).flatten().collect();
+        let buckets = bucket_work(reached, &work);
+        self.pass.ready = if buckets.len() <= 1 || crate::jobs() <= 1 {
+            buckets.iter().flat_map(|bucket| self.ready_bucket(cx, reached, bucket)).collect()
+        } else {
+            let shards = lpt_shards(buckets, crate::jobs());
+            let forks = shards.iter().map(|_| cx.fork()).collect();
+            let made = self.run_shards(forks, &shards, |mut fork, shard| shard.iter().flat_map(|bucket| self.ready_bucket(&mut fork, reached, bucket)).collect::<Vec<_>>());
+            made.into_iter().filter_map(Result::ok).flatten().collect()
+        };
         work.retain(|index| self.pass.ready.contains_key(index));
-        let compiled = work.into_iter().filter_map(|index| self.compile_one(cx, reached, index).ok().map(|code| (index, code))).collect();
+        let compiled = work.into_iter().filter_map(|index| self.compile_one(cx, reached, index).ok().map(|(code, _)| (index, code))).collect();
         self.pass.ready.clear();
         self.take_wanted();
         compiled
     }
 
-    /// What a worker makes ahead for the functions `bucket` of one item: relocations under a plan that a template or an earlier function of the bucket already has, else a lowered and encoded stencil.
+    fn thaw_lazy_stencil(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, fp: FootprintId, wanted0: usize) -> Result<Option<Lowered>> {
+        if !self.backend.is_lazy_jit() {
+            return Ok(None);
+        }
+        let Some((_, key, fp_bits)) = self.frozen_stencil_key(cx, reached, index, fp) else {
+            return Ok(None);
+        };
+        let Some(substrate) = cx.store().substrate().cloned() else {
+            return Ok(None);
+        };
+        let Some(slice) = substrate.stencil(key, fp_bits) else {
+            return Ok(None);
+        };
+        let Ok(code) = slice.to_code().map(Arc::new) else {
+            return Ok(None);
+        };
+        if code.relocs().iter().all(|r| r.symbol_index().is_none()) && code.unwind_drops().is_empty() {
+            return Ok(Some((code, RelocVec::new(), Arc::default())));
+        }
+        let Some(plan) = self.decode_lazy_reloc_plan(cx, reached, slice.plan()).map(Arc::new) else {
+            if self.wanted_len() > wanted0 {
+                bail!("unreached inline callee");
+            }
+            return Ok(None);
+        };
+        if !aot_relocs_valid(&code, plan.reloc_len()) {
+            return Ok(None);
+        }
+        let relocs = match lower::eval_relocs(cx, reached, self, &plan, index) {
+            Ok(r) => r,
+            Err(_) if self.wanted_len() > wanted0 => bail!("unreached inline callee"),
+            Err(_) => return Ok(None),
+        };
+        if self.wanted_len() > wanted0 {
+            bail!("unreached inline callee");
+        }
+        Ok(Some((code, relocs, plan)))
+    }
+
+    /// What a worker makes ahead for the functions `bucket` of one item: relocations under a plan that a template or an earlier function of the bucket already has, else a thawed substrate stencil, else a lowered and encoded stencil.
     fn ready_bucket(&self, cx: &mut Context<'_>, reached: &Reached, bucket: &[usize]) -> Vec<(usize, Ready)> {
         let mut plans: rustc_hash::FxHashMap<FootprintId, Arc<RelocPlan>> = rustc_hash::FxHashMap::default();
         let mut made = Vec::new();
@@ -58,16 +103,29 @@ impl Image {
             let footprint = self.quietly(cx, |cx| lower::eval_footprint(cx, reached, self, index).ok());
             let plan = footprint.and_then(|fp| self.pass.stencils.jit_templates.get(&(item, fp)).map(|template| Arc::clone(&template.reloc_plan)).or_else(|| plans.get(&fp).cloned()));
             let ready = match plan {
-                Some(plan) => Ready { footprint, code: None, relocs: self.quietly(cx, |cx| lower::eval_relocs(cx, reached, self, &plan, index).ok()).map(|relocs| (plan, relocs)) },
-                None => match self.quietly(cx, |cx| lower::lower_stencil(cx, reached, self, index).ok()).and_then(|out| Some((haste_codegen::compile(out.func, &self.compile_target_for(cx, item)).ok()?, out.relocs, out.reloc_plan))) {
-                    Some((code, relocs, plan)) => {
-                        if let Some(fp) = footprint {
-                            plans.insert(fp, Arc::clone(&plan));
+                Some(plan) => Ready { footprint, code: None, relocs: self.quietly(cx, |cx| lower::eval_relocs(cx, reached, self, &plan, index).ok()).map(|relocs| (plan, relocs)), thawed: false },
+                None => {
+                    let wanted_before = self.wanted_len();
+                    let thawed = footprint.and_then(|fp| self.quietly(cx, |cx| self.thaw_lazy_stencil(cx, reached, index, fp, wanted_before).ok().flatten()));
+                    match thawed {
+                        Some((code, relocs, plan)) => {
+                            if let Some(fp) = footprint {
+                                plans.insert(fp, Arc::clone(&plan));
+                            }
+                            Ready { footprint, code: Some(code), relocs: Some((plan, relocs)), thawed: true }
                         }
-                        Ready { footprint, code: Some(Arc::new(code)), relocs: Some((plan, relocs)) }
+                        None if self.wanted_len() > wanted_before => continue,
+                        None => match self.quietly(cx, |cx| lower::lower_stencil(cx, reached, self, index).ok()).and_then(|out| Some((haste_codegen::compile(out.func, &self.compile_target_for(cx, item)).ok()?, out.relocs, out.reloc_plan))) {
+                            Some((code, relocs, plan)) => {
+                                if let Some(fp) = footprint {
+                                    plans.insert(fp, Arc::clone(&plan));
+                                }
+                                Ready { footprint, code: Some(Arc::new(code)), relocs: Some((plan, relocs)), thawed: false }
+                            }
+                            None => continue,
+                        },
                     }
-                    None => continue,
-                },
+                }
             };
             if ready.relocs.is_some() {
                 made.push((index, ready));
@@ -104,39 +162,64 @@ impl Image {
         }
     }
 
-    /// Function `index` lowered and encoded: what a worker made ahead, or a fresh lowering that fails when it noted an unreached function since `wanted0`.
-    fn lowered(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, wanted0: usize, pass: &Pass) -> Result<Lowered> {
-        if let Some(Ready { code: Some(code), relocs: Some((plan, relocs)), .. }) = pass.ready.get(&index) {
-            return Ok((Arc::clone(code), relocs.clone(), Arc::clone(plan)));
+    /// Function `index` lowered and encoded: what a worker made ahead, else a fresh lowering that fails when it noted an unreached function since `wanted0`, plus whether it was thawed from substrate.
+    fn lowered(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, wanted0: usize, pass: &Pass) -> Result<(Lowered, bool)> {
+        if let Some(Ready { code: Some(code), relocs: Some((plan, relocs)), thawed, .. }) = pass.ready.get(&index) {
+            return Ok(((Arc::clone(code), relocs.clone(), Arc::clone(plan)), *thawed));
         }
         let out = lower::lower_stencil(cx, reached, self, index)?;
         if self.wanted_len() > wanted0 {
             bail!("unreached inline callee");
         }
-        Ok((Arc::new(haste_codegen::compile(out.func, &self.compile_target_for(cx, reached.list[index].0.0))?), out.relocs, out.reloc_plan))
+        Ok(((Arc::new(haste_codegen::compile(out.func, &self.compile_target_for(cx, reached.list[index].0.0))?), out.relocs, out.reloc_plan), false))
     }
 
-    pub(super) fn compile_jit_one(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, pass: &mut Pass) -> Result<usize> {
+    fn freeze_lazy(&self, cx: &Context<'_>, reached: &Reached, index: usize, fp: FootprintId, (code, plan): (&Arc<Code>, &RelocPlan), pass: &mut Pass) {
+        if self.backend.is_lazy_jit() && !pass.stencils.cfg.verify && cx.outline.is_fixed(reached.list[index].0.0.krate) {
+            self.freeze_stencil(cx, reached, index, fp, false, code, Some(plan), pass);
+        }
+    }
+
+    pub(super) fn compile_jit_one(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, pass: &mut Pass) -> Result<(usize, bool)> {
         let cfg = pass.stencils.cfg;
         let item = reached.list[index].0.0;
         let wanted0 = self.wanted_len();
         if !cfg.verify
             && cfg.min_fanout > 1
-            && let Some(exec) = self.try_first_jit(cx, reached, index, item, wanted0, pass)?
+            && let Some(hit) = self.try_first_jit(cx, reached, index, item, wanted0, pass)?
         {
-            return Ok(exec);
+            return Ok(hit);
         }
         self.compile_jit_cached(cx, reached, index, item, wanted0, cfg, pass)
     }
 
-    fn try_first_jit(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, item: ItemRef, wanted0: usize, pass: &mut Pass) -> Result<Option<usize>> {
+    fn try_first_jit(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, item: ItemRef, wanted0: usize, pass: &mut Pass) -> Result<Option<(usize, bool)>> {
         match pass.stencils.first_jit.get(&item).cloned() {
             None => {
-                let (code, relocs, reloc_plan) = self.lowered(cx, reached, index, wanted0, pass)?;
+                let fp = if self.backend.is_lazy_jit() && cx.outline.is_fixed(item.krate) {
+                    let fp = self.footprint(cx, reached, index, pass)?;
+                    if self.wanted_len() > wanted0 {
+                        bail!("unreached inline callee");
+                    }
+                    Some(fp)
+                } else {
+                    None
+                };
+                let ((code, relocs, reloc_plan), thawed) = if let Some(fp) = fp
+                    && pass.ready.get(&index).is_none_or(|r| r.code.is_none())
+                    && let Some(hit) = self.thaw_lazy_stencil(cx, reached, index, fp, wanted0)?
+                {
+                    (hit, true)
+                } else {
+                    self.lowered(cx, reached, index, wanted0, pass)?
+                };
+                if !thawed && let Some(fp) = fp {
+                    self.freeze_lazy(cx, reached, index, fp, (&code, &reloc_plan), pass);
+                }
                 let symbols = self.symbols(&relocs);
                 let exec = self.write_jit_code(&mut pass.memory, &code, &symbols)?;
                 pass.stencils.first_jit.insert(item, FirstJitState::First(FirstJit { index, code, symbols, exec, reloc_plan }));
-                Ok(Some(exec))
+                Ok(Some((exec, thawed)))
             }
             Some(FirstJitState::First(first)) => {
                 let fp1 = self.footprint(cx, reached, first.index, pass)?;
@@ -152,23 +235,33 @@ impl Image {
         }
     }
 
-    fn compile_jit_cached(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, item: ItemRef, wanted0: usize, cfg: DictConfig, pass: &mut Pass) -> Result<usize> {
+    fn compile_jit_cached(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, item: ItemRef, wanted0: usize, cfg: DictConfig, pass: &mut Pass) -> Result<(usize, bool)> {
         let footprint = self.footprint(cx, reached, index, pass)?;
         if self.wanted_len() > wanted0 {
             bail!("unreached inline callee");
         }
         let existing_plan = pass.stencils.jit_templates.get(&(item, footprint)).map(|jt| Arc::clone(&jt.reloc_plan));
-        let (symbols, prelowered) = match existing_plan {
+        let (symbols, prelowered, reused) = match existing_plan {
             Some(plan) => {
                 let relocs = self.relocs(cx, reached, &plan, index, pass)?;
                 if self.wanted_len() > wanted0 {
                     bail!("unreached inline callee");
                 }
-                (self.symbols(&relocs), None)
+                (self.symbols(&relocs), None, true)
             }
             None => {
-                let (code, relocs, plan) = self.lowered(cx, reached, index, wanted0, pass)?;
-                (self.symbols(&relocs), Some((code, plan)))
+                let ((code, relocs, plan), thawed) = if !cfg.verify
+                    && pass.ready.get(&index).is_none_or(|r| r.code.is_none())
+                    && let Some(hit) = self.thaw_lazy_stencil(cx, reached, index, footprint, wanted0)?
+                {
+                    (hit, true)
+                } else {
+                    self.lowered(cx, reached, index, wanted0, pass)?
+                };
+                if !thawed {
+                    self.freeze_lazy(cx, reached, index, footprint, (&code, &plan), pass);
+                }
+                (self.symbols(&relocs), Some((code, plan)), thawed)
             }
         };
         let alias_key = (item, footprint, symbols.clone());
@@ -182,12 +275,12 @@ impl Image {
                 };
                 self.verify_single(cx, reached, index, &rec)?;
             }
-            return Ok(addr);
+            return Ok((addr, true));
         }
         let stencil = self.ensure_jit_stencil(cx, reached, index, (item, footprint), prelowered, pass)?;
         let fanout = pass.stencils.jit_templates.get(&(item, footprint)).map_or(1, |jt| jt.fanout);
         if stencil.bytes().len() > cfg.min_bytes && fanout >= cfg.min_fanout {
-            return self.instantiate_jit_dict(cx, reached, index, (item, footprint), symbols, cfg, pass);
+            return Ok((self.instantiate_jit_dict(cx, reached, index, (item, footprint), symbols, cfg, pass)?, reused));
         }
         let exec = self.write_jit_code(&mut pass.memory, &stencil, &symbols)?;
         pass.stencils.aliases.insert(alias_key, (exec, false));
@@ -195,7 +288,7 @@ impl Image {
             let rec = VerifyRecord::Patched { exec, len: stencil.bytes().len(), sites: stencil.sites().to_vec(), unwind_drops: stencil.unwind_drops().to_vec() };
             self.verify_single(cx, reached, index, &rec)?;
         }
-        Ok(exec)
+        Ok((exec, reused))
     }
 
     fn ensure_jit_stencil(&self, cx: &mut Context<'_>, reached: &Reached, index: usize, key: (ItemRef, FootprintId), prelowered: Option<(Arc<Code>, Arc<RelocPlan>)>, pass: &mut Pass) -> Result<Arc<Code>> {
@@ -206,7 +299,7 @@ impl Image {
         let (stencil, reloc_plan) = match prelowered {
             Some(pair) => pair,
             None => {
-                let (code, _, plan) = self.lowered(cx, reached, index, usize::MAX, pass)?;
+                let ((code, _, plan), _) = self.lowered(cx, reached, index, usize::MAX, pass)?;
                 (code, plan)
             }
         };
@@ -331,7 +424,7 @@ impl Image {
         let symbols: Vec<u64> = out.relocs.iter().map(|sym| slots.resolve_symbol(sym)).collect();
         let fresh_code = haste_codegen::compile(out.func, &fresh.0.compile_target_for(cx, reached.list[index].0.0))?;
         let mut expected = vec![0u8; fresh_code.bytes().len()];
-        fresh_code.patch(&symbols, &mut expected);
+        fresh_code.patch(&symbols, &mut expected)?;
         // SAFETY: exec..exec + len is mapped readable executable code in this image.
         let actual = unsafe { std::slice::from_raw_parts(exec as *const u8, len) };
         if actual != expected.as_slice() {
@@ -358,7 +451,7 @@ impl Image {
             }
         } else {
             let mut expected = vec![0u8; fresh_code.bytes().len()];
-            fresh_code.patch(&[], &mut expected);
+            fresh_code.patch(&[], &mut expected)?;
             // SAFETY: body_exec..body_exec + code.bytes().len() is mapped readable executable code in this image.
             let actual_body = unsafe { std::slice::from_raw_parts(body_exec as *const u8, code.bytes().len()) };
             if actual_body != expected.as_slice() {

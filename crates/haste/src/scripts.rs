@@ -18,6 +18,14 @@ use binary::{Binaries, Kept};
 
 const OUT: &str = "out";
 
+/// Whether every sysroot unit that has a build script already has its settled script output.
+pub(crate) fn sysroot_scripts_settled(workspace: &Workspace) -> bool {
+    workspace.graph.units.iter().all(|unit| {
+        let pkg = &workspace.packages[unit.package];
+        !pkg.sysroot || pkg.manifest.build.is_none() || unit.script.is_some()
+    })
+}
+
 /// Gives every unit with a build script its output: the stored one while it is current, else from running the script.
 pub fn settle(workspace: &mut Workspace, targets: &Targets) -> Result<()> {
     crate::with_host_target(|| settle_inner(workspace, targets))
@@ -52,7 +60,7 @@ fn settle_inner(workspace: &mut Workspace, targets: &Targets) -> Result<()> {
         wave.sort_by_key(|&unit| std::cmp::Reverse((dag.build_users[unit].len(), dag.links_users[unit].len())));
         let outcome = run(workspace, targets, &wave, &dag, &mut locks, &mut ran)?;
         drop(locks);
-        finish_wave(workspace, targets, &wave, outcome, &mut dag, &mut ran, &mut failed, &mut kept_queue);
+        finish_wave(workspace, &wave, outcome, &mut dag, &mut ran, &mut failed, &mut kept_queue);
     }
 }
 
@@ -179,7 +187,6 @@ fn drain_kept(
 
 fn finish_wave(
     workspace: &mut Workspace,
-    targets: &Targets,
     wave: &[usize],
     outcome: Outcome,
     dag: &mut ScriptDag,
@@ -205,20 +212,19 @@ fn finish_wave(
     for (unit, failure) in errors {
         let retried = failure.broken.is_some_and(|at| wave_set.contains(&at) && workspace.graph.units[at].script.is_some());
         if !retried {
-            give_up(workspace, targets, unit, &failure, ran, failed);
+            give_up(workspace, unit, &failure, failed);
             dag.finish_unit(workspace, failed, unit, kept_queue);
         }
     }
 }
 
-/// Reports that `unit`'s script did not build or run, keeps that failure for later runs unless something outside stopped the script, and builds its package with the script's cfgs open.
-fn give_up(workspace: &Workspace, targets: &Targets, unit: usize, failure: &Failure, ran: &Ran, failed: &mut HashSet<usize>) {
-    let error = &failure.error;
-    report(workspace, unit, error, failed);
+/// Reports that `unit`'s script did not build or run, clears any stale cache entry so a retry runs fresh, and builds its package with the script's cfgs open.
+fn give_up(workspace: &Workspace, unit: usize, failure: &Failure, failed: &mut HashSet<usize>) {
+    report(workspace, unit, &failure.error, failed);
     if !failure.interrupted
-        && let Err(write) = store::keep_failure(workspace, unit, &vars(workspace, targets, unit, ran), error)
+        && let Err(write) = store::clear_failure(workspace, unit)
     {
-        eprintln!("cannot keep that failure: {write}");
+        eprintln!("cannot clear stale build script state: {write}");
     }
 }
 
@@ -283,10 +289,15 @@ fn run(workspace: &Workspace, targets: &Targets, units: &[usize], dag: &ScriptDa
     let compiled: Vec<(usize, usize)> = scripts.iter().zip(&kept).filter(|(_, kept)| !matches!(kept, Kept::Executable(_))).map(|(script, _)| *script).collect();
     let mains: Vec<Option<crate::names::ItemRef>> = compiled.iter().map(|(_, krate)| outline.main(*krate)).collect();
     let owners = outline.roots.iter().map(|root| root.unit).collect();
-    let (entries, store) = image::entries(&mut compilation, (crate::sema::Cache::default(), &mains))?;
+    let (slot, cache) = if sysroot_scripts_settled(workspace) {
+        crate::build::substrate::cache_with_toolchain_substrate(workspace)
+    } else {
+        (None, crate::sema::Cache::default())
+    };
+    let (entries, store) = image::entries(&mut compilation, (cache, &mains))?;
     let mut demand = Jit::new(store)?;
     demand.set_fast(true);
-    demand.set_ahead(false);
+    demand.set_ahead(true);
     let mut unit_set = HashSet::default();
     for &(unit, _) in &scripts {
         unit_set.insert(unit);
@@ -335,6 +346,9 @@ fn run(workspace: &Workspace, targets: &Targets, units: &[usize], dag: &ScriptDa
         executables: HashSet::default(),
     };
     image::serve(&mut compilation, &crate::macros::load, &mut demand, &mut driver)?;
+    if let Some(slot) = slot {
+        crate::build::substrate::save_jit_substrate(&compilation.outline, demand.store(), demand.image(), slot);
+    }
     let Runs { outcome, reran, .. } = driver;
     let rerun: Vec<(usize, usize)> = scripts.into_iter().filter(|(unit, _)| reran.contains(unit) && outcome.iter().any(|(at, result)| at == unit && result.is_ok())).collect();
     if let Err(error) = binaries.keep_detached(workspace, &mut compilation, &rerun, locks) {

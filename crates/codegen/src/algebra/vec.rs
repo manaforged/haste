@@ -48,7 +48,7 @@ fn movemask_of(cx: &RewriteCx, v: Value) -> Option<(bool, Value)> {
 }
 
 /// Or-s two masks of lane sign bits as one mask of the or of their vectors, which a mask of that or elsewhere then shares.
-pub(super) fn merge_movemasks(cx: &mut RewriteCx, a: Value, b: Value) -> Option<Op> {
+fn merge_movemasks(cx: &mut RewriteCx, a: Value, b: Value) -> Option<Op> {
     let ((wide, x), (other, y)) = (movemask_of(cx, a)?, movemask_of(cx, b)?);
     let ty = cx.func.ty(x);
     if wide != other || ty != cx.func.ty(y) || cx.func.ty(a) != cx.func.ty(b) {
@@ -58,15 +58,98 @@ pub(super) fn merge_movemasks(cx: &mut RewriteCx, a: Value, b: Value) -> Option<
     Some(if wide { Op::TargetOp(TargetOpId::X64Pmovmskb256, TinyArgs::one(both)) } else { Op::Reduce(crate::ir::ReduceOp::Movemask, both) })
 }
 
-/// Moves a bitwise op of two vectors bitcast from one type into that type, so the bitcasts cancel with their neighbours.
-fn sink_bitcast(cx: &mut RewriteCx, res_v: Value, bin: Binary, (a, b): (Value, Value)) -> Option<Op> {
-    let (Some(&Op::Convert(Convert::Bitcast, x)), Some(&Op::Convert(Convert::Bitcast, y))) = (cx.op(a), cx.op(b)) else { return None };
-    let ty = cx.func.ty(x);
-    if ty != cx.func.ty(y) || !ty.lane().is_some_and(Lane::is_int) || ty.bytes() != cx.func.ty(res_v).bytes() {
+fn merge_vec_bitwise_direct(cx: &mut RewriteCx, bin: Binary, a: Value, b: Value) -> Option<Op> {
+    if bin == Binary::Bor && let Some(op) = merge_movemasks(cx, a, b) {
+        return Some(op);
+    }
+    if a == b || !cx.single_use(a) || !cx.single_use(b) {
         return None;
     }
-    let inner = cx.emit(ty, Op::Binary(bin, x, y));
-    Some(Op::Convert(Convert::Bitcast, inner))
+    let (Some(&Op::Extract(va, la)), Some(&Op::Extract(vb, lb))) = (cx.op(a), cx.op(b)) else { return None };
+    let ty = cx.func.ty(va);
+    if la != lb || ty != cx.func.ty(vb) || !ty.lane().is_some_and(Lane::is_int) {
+        return None;
+    }
+    let inner = emit_vec_bitwise(cx, ty, bin, (va, vb), 6);
+    Some(Op::Extract(inner, la))
+}
+
+fn band_common(cx: &RewriteCx, a: Value, b: Value) -> Option<(Value, Value, Value)> {
+    if !cx.single_use(a) || !cx.single_use(b) {
+        return None;
+    }
+    let (Some(&Op::Binary(Binary::Band, a0, a1)), Some(&Op::Binary(Binary::Band, b0, b1))) = (cx.op(a), cx.op(b)) else { return None };
+    let ty = cx.func.ty(a);
+    for (xa, ca) in [(a0, a1), (a1, a0)] {
+        for (xb, cb) in [(b0, b1), (b1, b0)] {
+            if ca == cb || cx.uconst(ca, ty).is_some_and(|ka| cx.uconst(cb, ty) == Some(ka)) {
+                return Some((xa, xb, ca));
+            }
+        }
+    }
+    None
+}
+
+/// Fuses scalar bitwise ops over movemasks or single-use lane extracts (directly or under a shared `Band` mask) into one vector op followed by one extract/movemask.
+pub(super) fn merge_vec_bitwise(cx: &mut RewriteCx, bin: Binary, a: Value, b: Value) -> Option<Op> {
+    if let Some(op) = merge_vec_bitwise_direct(cx, bin, a, b) {
+        return Some(op);
+    }
+    if matches!(bin, Binary::Bor | Binary::Bxor)
+        && let Some((xa, xb, common)) = band_common(cx, a, b)
+        && let Some(inner_op) = merge_vec_bitwise_direct(cx, bin, xa, xb)
+    {
+        let merged = cx.emit(cx.func.ty(a), inner_op);
+        return Some(Op::Binary(Binary::Band, merged, common));
+    }
+    None
+}
+
+fn same_vec_shift(cx: &RewriteCx, ty: Type, sh1: Value, sh2: Value) -> bool {
+    sh1 == sh2
+        || ty.vec_shape().is_some_and(|(lane, count)| {
+            splat_int_imm(cx, sh1, lane, usize::from(count)).is_some_and(|k| splat_int_imm(cx, sh2, lane, usize::from(count)) == Some(k))
+        })
+}
+
+fn sink_vec_bitwise_inner(cx: &mut RewriteCx, res_ty: Type, bin: Binary, (a, b): (Value, Value), depth: u8) -> Option<Op> {
+    if a == b {
+        return None;
+    }
+    if let (Some(&Op::Convert(Convert::Bitcast, x)), Some(&Op::Convert(Convert::Bitcast, y))) = (cx.op(a), cx.op(b)) {
+        let ty = cx.func.ty(x);
+        if ty == cx.func.ty(y) && ty.lane().is_some_and(Lane::is_int) && ty.bytes() == res_ty.bytes() {
+            return Some(Op::Convert(Convert::Bitcast, emit_vec_bitwise(cx, ty, bin, (x, y), depth)));
+        }
+    }
+    if !cx.single_use(a) || !cx.single_use(b) {
+        return None;
+    }
+    match (cx.op(a), cx.op(b)) {
+        (Some(&Op::Convert(Convert::Ireduce, x)), Some(&Op::Convert(Convert::Ireduce, y))) => {
+            let ty = cx.func.ty(x);
+            (ty == cx.func.ty(y) && ty.lane().is_some_and(Lane::is_int)).then(|| Op::Convert(Convert::Ireduce, emit_vec_bitwise(cx, ty, bin, (x, y), depth)))
+        }
+        (Some(&Op::Binary(sop @ (Binary::Ushr | Binary::Ishl | Binary::Sshr), x, sh1)), Some(&Op::Binary(sop2, y, sh2))) if sop == sop2 => {
+            let ty = cx.func.ty(x);
+            (ty == cx.func.ty(y) && ty.lane().is_some_and(Lane::is_int) && same_vec_shift(cx, ty, sh1, sh2))
+                .then(|| Op::Binary(sop, emit_vec_bitwise(cx, ty, bin, (x, y), depth), sh1))
+        }
+        _ => None,
+    }
+}
+
+fn emit_vec_bitwise(cx: &mut RewriteCx, ty: Type, bin: Binary, (a, b): (Value, Value), depth: u8) -> Value {
+    if a == b {
+        return if bin == Binary::Bxor { cx.emit(ty, Op::Const(0)) } else { a };
+    }
+    let op = if depth > 0 { sink_vec_bitwise_inner(cx, ty, bin, (a, b), depth - 1) } else { None }.unwrap_or(Op::Binary(bin, a, b));
+    cx.emit(ty, op)
+}
+
+/// Moves a vector bitwise op inside matching bitcasts, truncations, or identical shifts so common prefixes collapse.
+fn sink_bitcast(cx: &mut RewriteCx, res_v: Value, bin: Binary, (a, b): (Value, Value)) -> Option<Op> {
+    sink_vec_bitwise_inner(cx, cx.func.ty(res_v), bin, (a, b), 6)
 }
 
 fn splat_scalar(cx: &RewriteCx, v: Value, count: usize) -> Option<Value> {

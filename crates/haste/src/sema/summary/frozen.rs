@@ -39,8 +39,18 @@ pub(super) fn closure_free(summary: &PolySummary) -> bool {
     summary.template.closures.is_empty()
 }
 
+fn substs_keyable(outline: &Outline, types: &Types, substs: Substs) -> bool {
+    if substs.is_empty() {
+        return true;
+    }
+    if types.substs(substs).iter().any(|&ty| !types.is_ground(ty)) {
+        return false;
+    }
+    !super::super::reach::filter::substs_has_non_fixed_raw(outline, types, substs)
+}
+
 pub(super) fn instance_keys(outline: &Outline, types: &Types, (item, substs): Instance) -> Option<(u64, u64)> {
-    if !outline.is_fixed(item.krate) {
+    if !outline.is_fixed(item.krate) || !substs_keyable(outline, types, substs) {
         return None;
     }
     let item_key = crate::substrate::sysroot_item_key(outline, item)?;
@@ -48,8 +58,8 @@ pub(super) fn instance_keys(outline: &Outline, types: &Types, (item, substs): In
 }
 
 pub(super) fn instance_bytes<T>(cx: &Context<'_>, instance: Instance, mut decode: impl FnMut(&codec::FileIndex, &[u8]) -> Option<T>) -> Option<T> {
-    let (item_key, substs_key) = instance_keys(cx.outline, &cx.types, instance)?;
     let substrate = cx.store.lookups.substrate.clone()?;
+    let (item_key, substs_key) = instance_keys(cx.outline, &cx.types, instance)?;
     let index = file_index(cx);
     substrate.instance_candidates(item_key, substs_key).find_map(|bytes| decode(index, bytes))
 }
@@ -96,20 +106,20 @@ pub(super) fn encode_fresh_instance(
     (item, substs): Instance,
     typed: &Typed,
 ) -> Option<(bool, u64, u64, Box<[u8]>)> {
-    if !outline.is_fixed(item.krate) {
+    if !outline.is_fixed(item.krate) || !substs_keyable(outline, types, substs) {
         return None;
     }
+    let encode_poly = match &typed.tables {
+        LazyTables::Poly(inst) if !substs.is_empty() && closure_free(&inst.summary) => Some(inst),
+        LazyTables::Eager(tables) if !is_template(summaries, item, tables) => None,
+        _ => return None,
+    };
     let (pure_sysroot, key_fn) = layer_key_fn(outline, types, (item, substs));
     let item_key = key_fn(outline, item)?;
     let substs_key = codec::substs_key(outline, types, substs, key_fn)?;
-    let bytes = match &typed.tables {
-        LazyTables::Poly(inst) if !substs.is_empty() && closure_free(&inst.summary) => {
-            codec::encode_instance(outline, types, substs, inst, &typed.drops, key_fn).ok().flatten()?
-        }
-        LazyTables::Eager(tables) if !is_template(summaries, item, tables) => {
-            codec::encode_typed(outline, types, substs, typed, key_fn).ok().flatten()?
-        }
-        _ => return None,
+    let bytes = match encode_poly {
+        Some(inst) => codec::encode_instance(outline, types, substs, inst, &typed.drops, key_fn).ok().flatten()?,
+        None => codec::encode_typed(outline, types, substs, typed, key_fn).ok().flatten()?,
     };
     Some((pure_sysroot, item_key, substs_key, bytes.into_boxed_slice()))
 }

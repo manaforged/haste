@@ -4,7 +4,7 @@ use rustc_lexer::TokenKind;
 use crate::body::{self as syntax, Body, PathId};
 use crate::names::path::Path as NamePath;
 use crate::names::resolve::macro_path;
-use crate::names::{ItemRef, Primitive, Sym};
+use crate::names::{ItemRef, Primitive};
 
 use super::super::builtin::Builtin;
 use super::super::ty::{Kind, Ty, int_info};
@@ -30,7 +30,7 @@ impl Bits {
 }
 
 impl<'a> Infer<'_, 'a> {
-    pub(super) fn resolve_macro(&mut self, arena: &Body, path: PathId) -> (Vec<Sym>, Option<ItemRef>) {
+    pub(super) fn resolve_macro(&mut self, arena: &Body, path: PathId) -> (super::path::PathSyms, Option<ItemRef>) {
         let (segments, absolute, dollar) = self.segments(arena, path);
         let found = macro_path(&self.cx.paths(self.home.krate), &NamePath { segments: &segments, absolute, dollar }, self.home);
         (segments, found)
@@ -62,8 +62,9 @@ impl<'a> Infer<'_, 'a> {
         let Some(is) = (open + 1..close).find(|&at| src.kind(at) == TokenKind::Ident && src.text(at) == "is") else { bail!("pattern_type! needs `is`") };
         let (inner, base) = syntax::parse_ty(src, open + 1, is)?;
         let base = self.lower_ty(&inner, base)?;
-        let (start, end) = self.valid_range(base, (is + 1, close))?;
-        Ok(self.cx.types.intern(Kind::Pat(base, start, end)))
+        let bounds = self.valid_range(base, (is + 1, close))?;
+        let range = self.cx.types.intern_pat(bounds);
+        Ok(self.cx.types.intern(Kind::Pat(base, range)))
     }
 
     fn valid_range(&mut self, base: Ty, (from, to): (u32, u32)) -> Result<(u128, u128)> {

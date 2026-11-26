@@ -741,6 +741,10 @@ impl Ins<'_> {
     pub fn atomic_store(mut self, value: Value, addr: Value, ord: crate::ir::AtomicOrd) -> Inst {
         self.effect(Op::AtomicStore(value, addr, ord))
     }
+    /// A volatile read of a `ty` at `addr` plus `offset`.
+    pub fn volatile_load(mut self, ty: Type, addr: Value, offset: i32) -> Value { self.value(Op::VolatileLoad(addr, offset), ty) }
+    /// A volatile write of `value` at `addr` plus `offset`.
+    pub fn volatile_store(mut self, value: Value, addr: Value, offset: i32) -> Inst { self.effect(Op::VolatileStore(value, addr, offset)) }
 
     /// Applies `op` with `value` to the `ty` at `addr` with memory ordering `ord` and returns the old contents.
     pub fn atomic_rmw(mut self, ty: Type, op: AtomicRmwOp, ord: crate::ir::AtomicOrd, addr: Value, value: Value) -> Value {

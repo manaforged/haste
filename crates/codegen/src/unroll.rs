@@ -199,21 +199,33 @@ fn unroll_self(
         func.insts[last.index()].op = Op::Jump(exit_blk, exit_args);
         return true;
     }
-    if !self_unroll_fits(func, b, inst_count, back_steps + 1) {
+    let trips = back_steps + 1;
+    let partial = (!self_unroll_fits(func, b, inst_count, trips)).then(|| {
+        let body = inst_count.saturating_sub(1);
+        let ok = inst_count <= 64 && !block_has_float(func, b) && !block_has_vec(func, b) && !block_has_libcall_mem(func, b);
+        ok.then(|| [8_usize, 4, 2].into_iter().find(|&f| trips > f && trips.is_multiple_of(f) && f * body <= MAX_CHAIN_UNROLLED_INSTS)).flatten()
+    });
+    if matches!(partial, Some(None)) {
         return unroll_self_dynamic(func, cfg, (b, cond, back_on_true), (&back_args, exit_blk), global_consts);
     }
+    let steps = partial.flatten().map_or(back_steps, |f| f - 1);
     let body_insts = func.blocks[b].insts[..inst_count - 1].to_vec();
     pop_terminator(func, b);
     let mut cur_back_args = back_args.clone();
     let mut last_map = Vec::new();
-    for _ in 0..back_steps {
+    for _ in 0..steps {
         let mut map: Vec<(Value, Value)> = func.blocks[b].params.iter().copied().zip(cur_back_args.iter().copied()).collect();
         clone_body(func, &body_insts, head, &mut map);
         cur_back_args = back_args.iter().map(|&v| remap_val(&map, v)).collect();
         last_map = map;
     }
     let final_exit_args: Vec<Value> = exit_args.iter().map(|&v| remap_val(&last_map, v)).collect();
-    let jump = func.add(Op::Jump(exit_blk, final_exit_args), None);
+    let term = match (partial.is_some(), back_on_true) {
+        (true, true) => Op::Brif(remap_val(&last_map, cond), head, cur_back_args, exit_blk, final_exit_args),
+        (true, false) => Op::Brif(remap_val(&last_map, cond), exit_blk, final_exit_args, head, cur_back_args),
+        (false, _) => Op::Jump(exit_blk, final_exit_args),
+    };
+    let jump = func.add(term, None);
     func.blocks[b].insts.push(jump);
     remap_other_blocks(func, &[b], &last_map);
     true

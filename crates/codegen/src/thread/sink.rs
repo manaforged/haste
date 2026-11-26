@@ -295,8 +295,49 @@ fn split_cold_loop_exits(func: &mut Function) -> bool {
     split_any
 }
 
-fn loops_subset(loops: &Loops, inner: Block, outer: Block) -> bool {
-    loops.list.iter().all(|each| !each.body[inner.index()] || each.body[outer.index()])
+fn loop_has_calls(func: &Function, loops: &Loops) -> Vec<bool> {
+    loops
+        .list
+        .iter()
+        .map(|each| {
+            each.body.iter().enumerate().any(|(b, &in_l)| {
+                in_l && func.blocks[b].insts.iter().any(|&i| matches!(func.insts[i.index()].op, Op::Call { .. } | Op::TryCall { .. }))
+            })
+        })
+        .collect()
+}
+
+fn vec_const_defs(func: &Function, cfg: &Cfg) -> Vec<bool> {
+    let mut is_scalar_const = vec![false; func.types.len()];
+    let mut is_vec_const = vec![false; func.types.len()];
+    for &b in &cfg.rpo {
+        for &inst in &func.blocks[b.index()].insts {
+            let data = &func.insts[inst.index()];
+            let Some(res) = data.result else { continue };
+            let ty = func.ty(res);
+            if ty.is_vector() {
+                is_vec_const[res.index()] = match &data.op {
+                    Op::Const(_) => true,
+                    Op::Insert(base, scalar, _) => is_vec_const[base.index()] && is_scalar_const[scalar.index()],
+                    Op::Shuffle(a, b, crate::ir::ShuffleMask::Const(_)) => is_vec_const[a.index()] && is_vec_const[b.index()],
+                    Op::Convert(crate::ir::Convert::Bitcast, x) => is_vec_const[x.index()],
+                    _ => false,
+                };
+            } else if matches!(data.op, Op::Const(_)) {
+                is_scalar_const[res.index()] = true;
+            }
+        }
+    }
+    is_vec_const
+}
+
+fn loops_sink_ok(cfg: &Cfg, loop_calls: &[bool], (inner, outer): (Block, Block), (is_vec_const, is_const): (bool, bool)) -> bool {
+    cfg.loops().list.iter().enumerate().all(|(idx, each)| {
+        !each.body[inner.index()]
+            || each.body[outer.index()]
+            || (is_vec_const && loop_calls[idx])
+            || (is_const && loop_calls[idx] && !crate::licm::always_executes_in_loop(cfg, each, inner))
+    })
 }
 
 fn non_trivial_op(op: &Op) -> bool {
@@ -323,15 +364,16 @@ fn diamond_safe(func: &Function, cfg: &Cfg, (block, target): (Block, Block), (op
 }
 
 fn cheap_call_addr(func: &Function, defs: &[Option<Inst>], op: &Op) -> bool {
-    let is_const = |v: Value| defs.get(v.index()).copied().flatten().is_some_and(|i| matches!(func.insts[i.index()].op, Op::Const(_)));
-    match *op {
-        Op::StackAddr(..) => true,
-        Op::Binary(crate::ir::Binary::Iadd | crate::ir::Binary::Isub, a, b) => is_const(a) || is_const(b),
-        _ => false,
-    }
+    crate::licm::cheap_call_addr(op, |v| defs.get(v.index()).copied().flatten().is_some_and(|i| matches!(func.insts[i.index()].op, Op::Const(_))))
 }
 
-fn pick_sink_target(func: &Function, cfg: &Cfg, defs: Option<&[Option<Inst>]>, block: Block, sites: &[(Inst, Block)], (op, moves): (&Op, &[Vec<Inst>])) -> Option<Block> {
+struct SinkInfo<'a> {
+    defs: Option<&'a [Option<Inst>]>,
+    loop_calls: &'a [bool],
+    vec_consts: &'a [bool],
+}
+
+fn pick_sink_target(func: &Function, cfg: &Cfg, info: &SinkInfo<'_>, block: Block, sites: &[(Inst, Block)], (res, op, moves): (Value, &Op, &[Vec<Inst>])) -> Option<Block> {
     let mut lca = sites.first()?.1;
     for &(_, site) in sites {
         if !cfg.reachable[site.index()] {
@@ -341,20 +383,22 @@ fn pick_sink_target(func: &Function, cfg: &Cfg, defs: Option<&[Option<Inst>]>, b
             lca = cfg.idom[lca.index()]?;
         }
     }
+    let is_vec_const = info.vec_consts.get(res.index()).copied().unwrap_or(false);
+    let is_const = !is_vec_const && matches!(op, Op::Const(_));
     let mut target = lca;
     if !(target != block
-        && !loops_subset(cfg.loops(), target, block)
-        && defs.is_some_and(|d| cheap_call_addr(func, d, op))
+        && !loops_sink_ok(cfg, info.loop_calls, (target, block), (false, false))
+        && info.defs.is_some_and(|d| cheap_call_addr(func, d, op))
         && crate::live::has_regular_call(func, target))
     {
-        while target != block && !loops_subset(cfg.loops(), target, block) {
+        while target != block && !loops_sink_ok(cfg, info.loop_calls, (target, block), (is_vec_const, is_const)) {
             target = cfg.idom[target.index()]?;
         }
     }
     if target == block || !cfg.dominates(block, target) {
         return None;
     }
-    diamond_safe(func, cfg, (block, target), (op, &moves[target.index()])).then_some(target)
+    (is_vec_const || diamond_safe(func, cfg, (block, target), (op, &moves[target.index()]))).then_some(target)
 }
 
 fn build_users(func: &Function, spec_def: &[bool]) -> Vec<Vec<(Inst, Block)>> {
@@ -372,16 +416,53 @@ fn build_users(func: &Function, spec_def: &[bool]) -> Vec<Vec<(Inst, Block)>> {
     users
 }
 
+fn topo_visit(func: &Function, moves: &[Inst], defs: &[(u32, usize)], state: &mut [u8], ordered: &mut Vec<Inst>, i: usize) {
+    if state[i] != 0 {
+        return;
+    }
+    state[i] = 1;
+    func.insts[moves[i].index()].op.for_operands(|v| {
+        if let Ok(pos) = defs.binary_search_by_key(&v.0, |&(r, _)| r) {
+            topo_visit(func, moves, defs, state, ordered, defs[pos].1);
+        }
+    });
+    state[i] = 2;
+    ordered.push(moves[i]);
+}
+
+fn topo_sort_moves(func: &Function, moves: &mut Vec<Inst>) {
+    let n = moves.len();
+    if n <= 1 {
+        return;
+    }
+    let mut defs: Vec<(u32, usize)> = moves
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &inst)| func.insts[inst.index()].result.map(|r| (r.0, i)))
+        .collect();
+    if defs.len() <= 1 {
+        return;
+    }
+    defs.sort_unstable_by_key(|&(r, _)| r);
+    let mut ordered = Vec::with_capacity(n);
+    let mut state = vec![0_u8; n];
+    for i in 0..n {
+        topo_visit(func, moves, &defs, &mut state, &mut ordered, i);
+    }
+    *moves = ordered;
+}
+
 fn flush_moves(func: &mut Function, block: Block, moves: &mut Vec<Inst>) {
     if moves.is_empty() {
         return;
     }
-    let mut next: Vec<Inst> = moves.drain(..).rev().collect();
+    topo_sort_moves(func, moves);
+    let mut next: Vec<Inst> = moves.drain(..).collect();
     next.extend_from_slice(&func.blocks[block.index()].insts);
     func.blocks[block.index()].insts = next;
 }
 
-fn sink_block(func: &mut Function, cfg: &Cfg, defs: Option<&[Option<Inst>]>, block: Block, has_child: bool, users: &mut [Vec<(Inst, Block)>], moves: &mut [Vec<Inst>]) -> bool {
+fn sink_block(func: &mut Function, cfg: &Cfg, info: &SinkInfo<'_>, block: Block, has_child: bool, users: &mut [Vec<(Inst, Block)>], moves: &mut [Vec<Inst>]) -> bool {
     flush_moves(func, block, &mut moves[block.index()]);
     if !has_child {
         return false;
@@ -393,6 +474,7 @@ fn sink_block(func: &mut Function, cfg: &Cfg, defs: Option<&[Option<Inst>]>, blo
         return false;
     }
     let mut kept: Vec<bool> = Vec::new();
+    let mut touched: Vec<(usize, usize)> = Vec::new();
     for pos in (0..body_len).rev() {
         let inst = func.blocks[bi].insts[pos];
         let data = &func.insts[inst.index()];
@@ -400,14 +482,18 @@ fn sink_block(func: &mut Function, cfg: &Cfg, defs: Option<&[Option<Inst>]>, blo
         if !data.op.is_speculable() {
             continue;
         }
-        let Some(target) = pick_sink_target(func, cfg, defs, block, &users[res.index()], (&data.op, moves)) else {
+        let Some(target) = pick_sink_target(func, cfg, info, block, &users[res.index()], (res, &data.op, moves)) else {
             continue;
         };
         if kept.is_empty() {
             kept.resize(len, true);
         }
         kept[pos] = false;
-        moves[target.index()].push(inst);
+        let ti = target.index();
+        if !touched.iter().any(|&(t, _)| t == ti) {
+            touched.push((ti, moves[ti].len()));
+        }
+        moves[ti].push(inst);
         data.op.for_operands(|v| {
             for entry in &mut users[v.index()] {
                 if entry.0 == inst {
@@ -415,6 +501,9 @@ fn sink_block(func: &mut Function, cfg: &Cfg, defs: Option<&[Option<Inst>]>, blo
                 }
             }
         });
+    }
+    for (ti, start) in touched {
+        moves[ti][start..].reverse();
     }
     if !kept.is_empty() {
         let mut idx = 0;
@@ -466,12 +555,16 @@ fn sink_dominated(func: &mut Function) -> bool {
     if !any_spec {
         return false;
     }
-    let defs = (!cfg.loops().list.is_empty()).then(|| crate::fold::defs(func));
+    let has_loops = !cfg.loops().list.is_empty();
+    let defs = has_loops.then(|| crate::fold::defs(func));
+    let loop_calls = if has_loops { loop_has_calls(func, cfg.loops()) } else { Vec::new() };
+    let vec_consts = if has_loops && func.types.iter().any(|ty| ty.is_vector()) { vec_const_defs(func, &cfg) } else { Vec::new() };
+    let info = SinkInfo { defs: defs.as_deref(), loop_calls: &loop_calls, vec_consts: &vec_consts };
     let mut users = build_users(func, &spec_def);
     let mut moves = vec![Vec::new(); func.blocks.len()];
     let mut changed = false;
     for &block in &cfg.rpo {
-        changed |= sink_block(func, &cfg, defs.as_deref(), block, has_child[block.index()], &mut users, &mut moves);
+        changed |= sink_block(func, &cfg, &info, block, has_child[block.index()], &mut users, &mut moves);
     }
     changed
 }

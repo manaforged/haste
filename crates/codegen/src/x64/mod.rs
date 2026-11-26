@@ -1,6 +1,7 @@
 mod asm;
 mod atomic;
 mod bits;
+mod call;
 mod features;
 mod float;
 mod frame;
@@ -20,7 +21,7 @@ use asm::{Alu, Asm, Cond, Label, Mem, Reg, Size, Xmm};
 use features::Features;
 pub(crate) use ymm::host_avx2;
 use frame::{Abi, Loc, SAVED, SAVED_RBP, classify};
-use crate::alloc::{CallTarget, Location, Plan, Regs};
+use crate::alloc::{Location, Plan, Regs};
 use crate::emit::{Backend, Tails, emit_brif, emit_call, emit_goto, emit_stubs, emit_try_call, intake_params};
 use crate::frame::{ArgStep, EdgeScratch, Emitter, Ext, Frame, INCOMING, PAGE, Prepared, ShrinkWrap, Step, arg_steps, drive, edge_steps, emit_body, prepare_split, reg_steps, save_offset, shrink_wrap};
 use crate::ir::{ArgumentPurpose, Binary, Block, Function, Inst, Op, SigRef, TargetOpId, Type, Value};
@@ -35,6 +36,7 @@ const REGS: Regs<Reg> = Regs {
     leaf: &[Reg::Rsi, Reg::Rdi, Reg::R9, Reg::R8, Reg::R10, Reg::Rdx, Reg::R11],
     wide_scratch: &wide::WIDE_SCRATCH,
     op_scratch: &[Reg::Rsi, Reg::Rdx, Reg::R11],
+    preserved_clobbers: &[],
     scratch_mask: atomic::scratch_mask,
     dict: Some(Reg::R10),
     float: &float::POOL,
@@ -45,6 +47,7 @@ const REGS: Regs<Reg> = Regs {
     two_address: true,
     park: true,
     fold_sib: true,
+    atomic_addrs: crate::alloc::AtomicAddrMode::Full,
     call_zext: false,
     imm_store,
     high_product: Some(Reg::Rdx),
@@ -79,24 +82,42 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         (_, true) => &REGS,
         (_, false) => &REGS_RBP,
     };
-    let (split, Prepared { order, copied, abi, mut plan, mut frame, mut framed }) = prepare_split(func, regs, target.effort == crate::Effort::Full, |sig| classify(sig, abi_kind))?;
+    let full = target.effort == crate::Effort::Full;
+    let frame_cache = target.direct_calls && target.os == crate::target::Os::Linux;
+    let preserve_tc = frame_cache && abi_kind == CallAbi::SysV;
+    let (split, Prepared { order, copied, abi, mut plan, mut frame, mut framed }) = prepare_split(func, regs, (full, preserve_tc), |sig| classify(sig, abi_kind))?;
     let func = split.as_ref().unwrap_or(func);
     let features = Features::host();
-    let dropped = |plan: &Plan<Reg>| plan.elided.iter().chain(&plan.fused).filter(|&&e| e).count();
-    let dropped_before = dropped(&plan);
-    let (roots, pure_test) = location::fuse(func, &mut plan, &features);
-    if dropped(&plan) != dropped_before {
-        crate::frame::repack_after_elide(func, &plan, &abi, &mut frame, &mut framed, |sig| classify(sig, abi_kind))?;
+    let (roots, pure_test) = if full {
+        let dropped = |plan: &Plan<Reg>| plan.elided.iter().chain(&plan.fused).filter(|&&e| e).count();
+        let dropped_before = dropped(&plan);
+        let fused = location::fuse(func, &mut plan, &features);
+        if dropped(&plan) != dropped_before {
+            crate::frame::repack_after_elide(func, &plan, &abi, &mut frame, &mut framed, |sig| classify(sig, abi_kind))?;
+        }
+        fused
+    } else {
+        (vec![None; func.types.len()], vec![false; func.types.len()])
+    };
+    let tail_calls = if full { crate::frame::find_tail_calls(func, &plan, &abi, true, &|sig| classify(sig, abi_kind)) } else { Vec::new() };
+    if !tail_calls.is_empty() && framed && !crate::frame::needs_frame_without_tails(func, &frame, &abi, &tail_calls) {
+        framed = false;
     }
-    let shrink = shrink_wrap(func, framed, &plan, &frame, &abi.params, &FRAME_REGS);
+    let shrink = full.then(|| shrink_wrap(func, framed, &plan, &frame, &abi.params, &FRAME_REGS, |inst, op| {
+        crate::frame::is_tail(&tail_calls, inst)
+            || (preserve_tc && crate::alloc::is_preserved_call_op(func, op, &plan.through, &plan.locations, &plan.elided))
+    })).flatten();
     let (base, bias) = if framed && !keeps { (Reg::Rsp, frame.size as i32) } else { (Reg::Rbp, 0) };
     let mut asm = Asm::default();
     asm.avx = features.avx;
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
     let defs = crate::fold::defs(func);
-    let overflow_read = wide::overflow_reads(func);
-    let adc_sum = wide::adc_sums(func, &plan, &defs);
-    let flag_carry = wide::flag_carries(func, &plan);
+    let (overflow_read, adc_sum, flag_carry) = if full {
+        (wide::overflow_reads(func), wide::adc_sums(func, &plan, &defs), wide::flag_carries(func, &plan, &defs))
+    } else {
+        let n = func.types.len();
+        (vec![false; n], vec![false; n], vec![false; n])
+    };
     let last_block = order.last().copied();
     let emit = Emit {
         func,
@@ -115,10 +136,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         roots,
         pure_test,
         flags: None,
-        last_spill: crate::spills::SpillCache::new(),
-        last_fspill: None,
-        carry: (None, None),
-        sole_pred: bits::sole_preds(func, &copied),
+        spills: crate::spills::SpillState::new(if full { crate::spills::pred_totals(func, &order, &copied) } else { Vec::new() }),
         next: None,
         last_block,
         at_end: false,
@@ -127,7 +145,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         features,
         copied,
         direct_calls: target.direct_calls,
-        frame_cache: target.direct_calls && target.os == crate::target::Os::Linux,
+        frame_cache,
         cold_calls: Vec::new(),
         shrink,
         in_fast: false,
@@ -137,6 +155,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         flag_carry,
         carry_flags: None,
         tails: Tails::new(),
+        tail_calls,
     };
     drive(emit, &order)
 }
@@ -147,6 +166,8 @@ fn keeps_frame_pointer(func: &Function) -> bool {
         || !func.unwind_drops.is_empty()
         || func.blocks.iter().flat_map(|block| &block.insts).any(|inst| matches!(func.insts[inst.index()].op, Op::TryCall { .. } | Op::FramePointer))
 }
+
+pub(crate) const DICT_STUB_RELOCS: [(u32, crate::reloc::RelocKind); 2] = [(2, crate::reloc::RelocKind::Abs64), (12, crate::reloc::RelocKind::Abs64)];
 
 pub(crate) fn dict_stub(stub_exec: usize, body_exec: usize, dict_addr: usize, tier_up: Option<DictTierUp>) -> Result<Vec<u8>, String> {
     let mut asm = Asm::default();
@@ -192,10 +213,7 @@ pub(super) struct Emit<'a> {
     roots: Vec<Option<location::Root>>,
     pure_test: Vec<bool>,
     flags: Option<(Value, Cond)>,
-    last_spill: crate::spills::SpillCache<Reg>,
-    last_fspill: Option<(i32, Xmm, Type)>,
-    carry: (Option<Block>, Option<crate::spills::SpillCache<Reg>>),
-    sole_pred: Vec<Option<Block>>,
+    spills: crate::spills::SpillState<Reg, Xmm>,
     next: Option<Block>,
     last_block: Option<Block>,
     at_end: bool,
@@ -216,6 +234,7 @@ pub(super) struct Emit<'a> {
     flag_carry: Vec<bool>,
     carry_flags: Option<(bool, [Value; 3])>,
     tails: Tails<'a, Label>,
+    tail_calls: Vec<bool>,
 }
 
 impl<'a> Emitter<'a> for Emit<'a> {
@@ -223,13 +242,17 @@ impl<'a> Emitter<'a> for Emit<'a> {
         self.func
     }
 
-    fn is_elided(&self, value: Value) -> bool { self.plan.elided[value.index()] }
+    fn is_elided(&self, value: Value) -> bool { self.plan.elided[value.index()] || matches!(self.plan.location(value), Location::Offset(..)) }
 
     fn zero_stack_store(&self, inst: Inst) -> Option<(i32, u32)> { crate::frame::stack_zero_store(self.func, &self.frame.slots, inst, |v| self.const_of(v)) }
 
     fn emit_zero_frame(&mut self, offset: i32, bytes: u32) {
         let to = self.frame_mem(offset);
         if bytes == 8 { self.zero_to(to); } else { self.asm.store_imm_sized(Size::of(bytes), to, 0); }
+    }
+
+    fn try_tail_call(&mut self, inst: Inst) -> Result<bool, String> {
+        self.emit_tail_call(inst)
     }
 
     fn prologue(&mut self) {
@@ -253,36 +276,13 @@ impl<'a> Emitter<'a> for Emit<'a> {
         }
     }
 
-    fn intake(&mut self, entry: Block) -> Result<(), String> {
-        intake_params(self, entry)
-    }
-
+    fn intake(&mut self, entry: Block) -> Result<(), String> { intake_params(self, entry) }
     fn set_next(&mut self, next: Option<Block>) { self.next = next; }
-
-    fn bind_block(&mut self, block: Block) {
-        self.invalidate_spills();
-        self.resume_spills(block);
-        self.at_end = self.last_block == Some(block);
-        self.asm.flags_overwritten();
-        self.asm.bind(self.blocks[block.index()]);
-    }
-
-    fn bind_entry(&mut self, block: Block) {
-        self.carry = (Some(block), None);
-        self.at_end = self.last_block == Some(block);
-        self.asm.bind(self.blocks[block.index()]);
-    }
-
+    fn bind_block(&mut self, block: Block) { self.invalidate_spills(); self.resume_spills(block); self.at_end = self.last_block == Some(block); self.asm.flags_overwritten(); self.asm.bind(self.blocks[block.index()]); }
+    fn bind_entry(&mut self, block: Block) { self.at_end = self.last_block == Some(block); self.asm.bind(self.blocks[block.index()]); }
     fn deferred_prologue(&self) -> bool { self.shrink.is_some() }
-
-    fn on_block_bound(&mut self, block: Block) -> Result<(), String> {
-        self.in_fast = self.shrink.as_ref().is_some_and(|s| s.fast[block.index()]);
-        Ok(())
-    }
-
-    fn clear_flags(&mut self) {
-        self.flags = None;
-    }
+    fn on_block_bound(&mut self, block: Block) -> Result<(), String> { self.in_fast = self.shrink.as_ref().is_some_and(|s| s.fast[block.index()]); Ok(()) }
+    fn clear_flags(&mut self) { self.flags = None; }
 
     fn inst(&mut self, inst: Inst) -> Result<(), String> {
         let func = self.func;
@@ -326,13 +326,12 @@ impl<'a> Emitter<'a> for Emit<'a> {
                     return emit_body(self, *block);
                 }
                 emit_goto(self, *block, true);
-                self.carry_spills(self.next == Some(*block));
+                self.record_edge_spill(*block, self.spills.cache);
                 self.invalidate_spills();
                 Ok(())
             }
             Op::Brif(condition, then, then_args, otherwise, else_args) => {
                 let res = emit_brif(self, *condition, (*then, then_args), (*otherwise, else_args));
-                self.carry_spills(then != otherwise && (self.next == Some(*then) || self.next == Some(*otherwise)));
                 self.invalidate_spills();
                 res
             }
@@ -431,7 +430,7 @@ impl Emit<'_> {
         }
     }
 
-    fn epilogue(&mut self) {
+    fn epilogue_body(&mut self) {
         for (index, &reg) in self.frame.saves.iter().enumerate() {
             self.asm.load(Size::Q, reg, self.frame_mem(save_offset(index)));
         }
@@ -439,7 +438,14 @@ impl Emit<'_> {
             self.asm.alu_imm(Alu::Add, Reg::Rsp, self.bias + 8);
         }
         self.asm.flags_overwritten();
-        self.asm.bytes(if self.framed && self.base == Reg::Rbp { &[0xC9, 0xC3] } else { &[0xC3] });
+        if self.framed && self.base == Reg::Rbp {
+            self.asm.bytes(&[0xC9]);
+        }
+    }
+
+    fn epilogue(&mut self) {
+        self.epilogue_body();
+        self.asm.bytes(&[0xC3]);
     }
 
     fn copy_to(&mut self, to: Mem, from: Mem, ty: Type, scratch: Xmm) {
@@ -629,98 +635,6 @@ impl Emit<'_> {
             Loc::Stack(_) | Loc::Struct(..) => {}
         }
     }
-
-    fn copy_struct(&mut self, pointer: Value, offset: u32, size: u32) {
-        self.raw(Reg::Rax, pointer);
-        let mut done = 0;
-        for (width, bytes) in [(Size::Q, 8), (Size::D, 4), (Size::W, 2), (Size::B, 1)] {
-            while size - done >= bytes {
-                self.asm.load(width, Reg::Rcx, Mem::new(Reg::Rax, done as i32));
-                self.asm.store(width, Mem::new(Reg::Rsp, (offset + done) as i32), Reg::Rcx);
-                done += bytes;
-            }
-        }
-        self.clobber_reg(Reg::Rcx);
-    }
-
-    fn arguments(&mut self, sig: SigRef, callee: Value, args: &[Value], is_try: bool) -> Result<Abi, String> {
-        let abi = classify(&self.func.sigs[sig.index()], self.abi_kind)?;
-        for (arg, loc) in args.iter().zip(&abi.params) {
-            match *loc {
-                Loc::Stack(offset) => self.move_to(Mem::new(Reg::Rsp, offset as i32), *arg),
-                Loc::Struct(offset, size) => self.copy_struct(*arg, offset, size),
-                _ => {}
-            }
-        }
-        let direct = self.plan.through[callee.index()];
-        if !is_try
-            && let Some(CallTarget::Symbol(lookup)) = direct
-            && self.func.is_thread_cell(callee)
-            && self.thread_cell_cold(lookup, args)
-        {
-            self.clobber_call_spills();
-            return Ok(abi);
-        }
-        let cell = match direct {
-            Some(CallTarget::Symbol(lookup)) if self.func.is_thread_cell(callee) => args.first().and_then(|&slot| self.thread_cell_hit(slot, lookup)).map(|hit| (lookup, hit)),
-            _ => None,
-        };
-        if cell.is_some() {
-            self.clobber_reg(Reg::Rax);
-        }
-        let held = self.reg_of(callee).filter(|&reg| !matches!(reg, Reg::Rax | Reg::Rcx) && !abi.clobbers(reg));
-        let (mut values, mut locs) = (args.to_vec(), abi.params.clone());
-        if direct.is_none() && held.is_none() {
-            values.push(callee);
-            locs.push(Loc::Int(Reg::R11));
-        }
-        let float_count = self.move_locs(&values, &locs, Some(Reg::Rax));
-        let func = self.func;
-        self.leave_wide(&func.sigs[sig.index()].params);
-        if self.abi_kind == CallAbi::SysV && self.func.sigs[sig.index()].params.iter().any(|param| param.purpose == ArgumentPurpose::Variadic) {
-            self.asm.mov_imm(Reg::Rax, float_count as i64);
-        }
-        self.asm.flags_overwritten();
-        if let Some((lookup, hit)) = cell {
-            let at = self.asm.call_pcrel32();
-            self.relocs.push(StencilReloc::symbol(at, lookup, crate::reloc::RelocKind::PcRel32));
-            self.asm.bind(hit);
-            self.clobber_call_spills();
-            return Ok(abi);
-        }
-        if self.inline_call(direct, args) {
-            self.clobber_call_spills();
-            return Ok(abi);
-        }
-        match direct {
-            Some(CallTarget::Abs(at)) => self.asm.call_absolute(at),
-            Some(CallTarget::Slot(sym)) => {
-                let reloc = self.asm.call_symbol(sym, self.direct_calls);
-                self.relocs.push(reloc);
-            }
-            Some(CallTarget::Runtime(rt)) if self.direct_calls => {
-                let at = self.asm.call_pcrel32();
-                self.relocs.push(StencilReloc::runtime(at, rt, crate::reloc::RelocKind::PcRel32));
-            }
-            Some(CallTarget::Runtime(rt)) => {
-                let at = self.asm.mov_abs64(Reg::R11);
-                self.relocs.push(StencilReloc::runtime(at, rt, crate::reloc::RelocKind::Abs64));
-                self.asm.call(Reg::R11);
-            }
-            Some(CallTarget::Symbol(sym)) if self.direct_calls => {
-                let at = self.asm.call_pcrel32();
-                self.relocs.push(StencilReloc::symbol(at, sym, crate::reloc::RelocKind::PcRel32));
-            }
-            Some(CallTarget::Symbol(sym)) => {
-                let at = self.asm.mov_abs64(Reg::R11);
-                self.relocs.push(StencilReloc::symbol(at, sym, crate::reloc::RelocKind::Abs64));
-                self.asm.call(Reg::R11);
-            }
-            None => self.asm.call(held.unwrap_or(Reg::R11)),
-        }
-        self.clobber_call_spills();
-        Ok(abi)
-    }
 }
 
 impl<'a> Backend<'a, Reg, Label> for Emit<'a> {
@@ -772,8 +686,7 @@ impl<'a> Backend<'a, Reg, Label> for Emit<'a> {
             }
             ParkReg::Float(xmm) => {
                 self.xmm_store(self.ty(value), home, Xmm(xmm));
-                self.invalidate_disp(disp);
-                self.last_fspill = Some((disp, Xmm(xmm), self.ty(value)));
+                self.spills.write_fspill(disp, Xmm(xmm), self.ty(value));
             }
         }
     }
@@ -788,11 +701,18 @@ impl<'a> Backend<'a, Reg, Label> for Emit<'a> {
             ParkReg::Float(xmm) => {
                 self.xmm_load(self.ty(value), Xmm(xmm), home);
                 self.clobber_xmm(Xmm(xmm));
-                self.last_fspill = Some((disp, Xmm(xmm), self.ty(value)));
+                self.spills.fspill = Some((disp, Xmm(xmm), self.ty(value)));
             }
         }
     }
     fn put_exception(&mut self, value: Value) { self.put(value, Reg::Rax); }
     fn push_site(&mut self, site: Site) { self.sites.push(site); }
+    fn spill_cache(&self) -> crate::spills::SpillCache<Reg> { self.spills.cache }
+    fn set_spill_cache(&mut self, cache: crate::spills::SpillCache<Reg>) { self.spills.cache = cache; }
+    fn record_edge_spill(&mut self, target: Block, cache: crate::spills::SpillCache<Reg>) {
+        if !self.in_fast {
+            self.spills.record_edge(self.func.jump_target(target), cache);
+        }
+    }
 }
 

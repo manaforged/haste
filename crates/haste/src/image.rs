@@ -15,7 +15,7 @@ pub mod watch;
 mod workers;
 
 pub use expand::{Job, run_macros};
-pub use lazy::{Driver, Ended, Jit, Program, entries, evaluator, run_on_demand, serve};
+pub use lazy::{Driver, Ended, Jit, Program, entries, evaluator, serve};
 #[cfg(unix)]
 pub(crate) use run::{close_on_exec, fork_child, pipe, wait};
 pub(crate) use run::interrupted;
@@ -92,6 +92,14 @@ impl ImageBackend {
         matches!(self, Self::Check)
     }
 
+    pub(super) fn stencil_tag(&self) -> u64 {
+        match self {
+            Self::Aot(_) => 0xA070_A070_A070_A070,
+            Self::LazyJit { fast } => if *fast || crate::profile() != crate::outline::tree::Profile::Release { 0x1A27_FA57_1A27_FA57 } else { 0x1A27_0000_1A27_0000 },
+            Self::Check | Self::EagerJit { .. } => 0,
+        }
+    }
+
     pub(super) fn aot(&self) -> Option<&Mutex<aot::AotState>> {
         match self {
             Self::Aot(state) => Some(state),
@@ -134,6 +142,7 @@ pub struct Image {
     rodata_map: Mutex<HashMap<(Vec<u8>, Vec<lower::RodataReloc>), lower::RodataId>>,
     static_rodata: Mutex<HashMap<usize, lower::RodataId>>,
     rodata_addrs: Mutex<Vec<u64>>,
+    rodata_entries: Mutex<Vec<(Vec<u8>, Vec<lower::RodataReloc>)>>,
     vtable_map: Mutex<HashMap<Vec<lower::VtableEntry>, lower::VtableId>>,
     vtable_addrs: Mutex<Vec<u64>>,
     vtable_entries: Mutex<Vec<Vec<lower::VtableEntry>>>,
@@ -206,17 +215,19 @@ impl Image {
         Ok(())
     }
 
-    pub(super) fn aot_rodata_entry(&self, id: lower::RodataId) -> Option<(Vec<u8>, Vec<lower::RodataReloc>)> {
-        let aot = self.aot()?;
-        lock(aot).rodata.get(id.0 as usize).cloned()
+    pub(super) fn rodata_entry(&self, id: lower::RodataId) -> Option<(Vec<u8>, Vec<lower::RodataReloc>)> {
+        if let Some(aot) = self.aot() {
+            return lock(aot).rodata.get(id.0 as usize).cloned();
+        }
+        lock(&self.rodata_entries).get(id.0 as usize).cloned()
     }
 
     pub(super) fn encode_aot_reloc_plan(&self, outline: &crate::outline::Outline, types: &crate::sema::ty::Types, reached: &Reached, is_sysroot: bool, plan: &lower::RelocPlan) -> Option<Vec<u8>> {
-        if !self.backend.is_aot() {
+        if !self.backend.is_aot() && !self.backend.is_lazy_jit() {
             return None;
         }
         let key_of = if is_sysroot { crate::substrate::sysroot_only_item_key } else { crate::substrate::sysroot_item_key };
-        crate::substrate::relocs::encode_reloc_plan(outline, types, reached, plan, !is_sysroot, key_of, |id| self.aot_rodata_entry(id), |id| self.vtable_entries(id))
+        crate::substrate::relocs::encode_reloc_plan(outline, types, reached, plan, !is_sysroot, key_of, |id| self.rodata_entry(id), |id| self.vtable_entries(id))
     }
 
     pub(super) fn decode_aot_reloc_plan(&self, outline: &crate::outline::Outline, types: &crate::sema::ty::Types, reached: &Reached, is_sysroot: bool, bytes: &[u8]) -> Option<lower::RelocPlan> {
@@ -225,6 +236,14 @@ impl Image {
         }
         let index = self.file_index.get_or_init(|| crate::sema::summary::codec::FileIndex::build(outline));
         crate::substrate::relocs::decode_reloc_plan(outline, types, reached, self, index, is_sysroot, bytes).ok().flatten()
+    }
+
+    pub(super) fn decode_lazy_reloc_plan(&self, cx: &Context<'_>, reached: &Reached, bytes: &[u8]) -> Option<lower::RelocPlan> {
+        if bytes.is_empty() {
+            return None;
+        }
+        let index = cx.store().file_index(cx.outline);
+        crate::substrate::relocs::decode_reloc_plan(cx.outline, &cx.types, reached, self, index, false, bytes).ok().flatten()
     }
 
     pub(super) fn register_code_fixup(&self, index: usize, at: usize) {
@@ -302,12 +321,12 @@ impl Slots for Image {
     }
 
     fn allow_inline(&self) -> bool {
-        match &self.backend {
-            ImageBackend::Check => false,
-            ImageBackend::EagerJit { fast } => !fast,
-            ImageBackend::LazyJit { fast } => !fast && crate::profile() == crate::outline::tree::Profile::Release,
-            ImageBackend::Aot(_) => true,
-        }
+        crate::profile() == crate::outline::tree::Profile::Release
+            && match &self.backend {
+                ImageBackend::Check => false,
+                ImageBackend::EagerJit { fast } | ImageBackend::LazyJit { fast } => !fast,
+                ImageBackend::Aot(_) => true,
+            }
     }
 
     fn cell(&self, index: usize, size: u32) -> i64 {
@@ -416,6 +435,7 @@ impl Image {
             rodata_map: Mutex::default(),
             static_rodata: Mutex::default(),
             rodata_addrs: Mutex::default(),
+            rodata_entries: Mutex::default(),
             vtable_map: Mutex::default(),
             vtable_addrs: Mutex::default(),
             vtable_entries: Mutex::default(),
@@ -443,7 +463,7 @@ impl Image {
 
     pub(super) fn compile_target_for(&self, cx: &Context<'_>, item: crate::names::ItemRef) -> haste_codegen::Target {
         let base = self.compile_target();
-        if cx.attr_value(item, "cold").is_some() { base.effort(haste_codegen::Effort::Quick) } else { base }
+        if cx.has_attr(item, "cold") { base.effort(haste_codegen::Effort::Quick) } else { base }
     }
 
     /// The encoded machine-code byte length of each reached function, or zero when not compiled.
@@ -558,7 +578,11 @@ impl Image {
         }
     }
 
-    fn compile_one(&mut self, cx: &mut Context<'_>, reached: &Reached, index: usize) -> Result<usize> {
+    pub(super) fn is_fast_lazy(&self) -> bool {
+        matches!(self.backend, ImageBackend::LazyJit { fast: true })
+    }
+
+    fn compile_one(&mut self, cx: &mut Context<'_>, reached: &Reached, index: usize) -> Result<(usize, bool)> {
         self.with_pass(|image, pass| image.compile_jit_one(cx, reached, index, pass))
     }
 }

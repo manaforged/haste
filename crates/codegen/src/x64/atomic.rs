@@ -41,66 +41,29 @@ pub(super) fn scratch_mask(func: &Function, op: &Op) -> u8 {
 }
 
 impl Emit<'_> {
-    pub(super) fn invalidate_spills(&mut self) {
-        self.last_spill.clear();
-        self.last_fspill = None;
-    }
+    pub(super) fn invalidate_spills(&mut self) { self.spills.clear(); }
 
     pub(super) fn clobber_call_spills(&mut self) {
         self.clobber_regs(&[Reg::Rax, Reg::Rcx, Reg::Rdx, Reg::Rsi, Reg::Rdi, Reg::R8, Reg::R9, Reg::R10, Reg::R11]);
-        self.last_fspill = None;
+        self.spills.clear_fspill();
     }
 
-    pub(super) fn clobber_reg(&mut self, reg: Reg) {
-        self.last_spill.clobber(reg);
-    }
+    pub(super) fn clobber_reg(&mut self, reg: Reg) { self.spills.clobber_reg(reg); }
 
-    pub(super) fn clobber_regs(&mut self, regs: &[Reg]) {
-        for &reg in regs {
-            self.clobber_reg(reg);
-        }
-    }
+    pub(super) fn clobber_regs(&mut self, regs: &[Reg]) { regs.iter().for_each(|&reg| self.clobber_reg(reg)); }
 
-    pub(super) fn clobber_xmm(&mut self, xmm: Xmm) {
-        if self.last_fspill.is_some_and(|(_, r, _)| r == xmm) {
-            self.last_fspill = None;
-        }
-    }
+    pub(super) fn clobber_xmm(&mut self, xmm: Xmm) { self.spills.clobber_freg(xmm); }
 
-    pub(super) fn clobber_xmms(&mut self, xmms: &[Xmm]) {
-        for &xmm in xmms {
-            self.clobber_xmm(xmm);
-        }
-    }
+    pub(super) fn clobber_xmms(&mut self, xmms: &[Xmm]) { xmms.iter().for_each(|&xmm| self.clobber_xmm(xmm)); }
 
-    pub(super) fn invalidate_disp(&mut self, disp: i32) {
-        self.last_spill.invalidate(disp);
-        if self.last_fspill.is_some_and(|(d, _, _)| d == disp) {
-            self.last_fspill = None;
-        }
-    }
+    pub(super) fn invalidate_disp(&mut self, disp: i32) { self.spills.invalidate_disp(disp); }
 
-    /// Keeps the reload cache for the block bound next when the current block ends with a branch that moves no edge arguments.
-    pub(super) fn carry_spills(&mut self, plain: bool) {
-        self.carry.1 = (plain && !self.in_fast).then_some(self.last_spill);
-    }
-
-    /// Restores the carried reload cache when `block`'s only predecessor is the block that carried it, and marks `block` as the current block.
-    pub(super) fn resume_spills(&mut self, block: Block) {
-        if let (Some(from), Some(cache)) = self.carry
-            && self.sole_pred.get(block.index()).copied().flatten() == Some(from)
-        {
-            self.last_spill = cache;
-        }
-        self.carry = (Some(block), None);
-    }
+    pub(super) fn resume_spills(&mut self, block: Block) { self.spills.resume(block); }
 
     pub(super) fn record_spill(&mut self, disp: i32, reg: Reg) {
-        if reg == Reg::R11 {
-            return;
+        if reg != Reg::R11 {
+            self.spills.record(disp, reg);
         }
-        self.clobber_reg(reg);
-        self.last_spill.record(disp, reg);
     }
 
     pub(super) fn write_spill(&mut self, disp: i32, reg: Reg) {
@@ -109,7 +72,7 @@ impl Emit<'_> {
     }
 
     pub(super) fn cached_spill_for(&self, disp: i32, preferred: Reg) -> Option<Reg> {
-        self.last_spill.holders(disp).find(|&r| r == preferred).or_else(|| self.last_spill.holders(disp).next())
+        self.spills.cached_for(disp, preferred, None)
     }
 
     pub(super) fn is_fused_cas(&self, v: Value) -> bool {
@@ -180,7 +143,7 @@ impl Emit<'_> {
 
     fn emit_vector_op(&mut self, op: &Op, result: Value) -> Result<(), String> {
         self.clear_flags();
-        self.last_fspill = None;
+        self.spills.clear_fspill();
         match op {
             Op::TargetOp(..) | Op::Extract(..) => self.vector_op(op, result),
             Op::Insert(..) => {
@@ -205,10 +168,12 @@ impl Emit<'_> {
     fn access(&mut self, op: &Op, result: impl Fn() -> Result<Value, String>) -> Result<(), String> {
         match op {
             Op::Load(addr, offset) => self.load(*addr, *offset, result()?),
+            Op::VolatileLoad(addr, offset) => { let from = self.address(*addr, *offset); self.read(result()?, from); }
             Op::Store(value, addr, offset) => {
                 let to = self.address(*addr, *offset);
                 if self.plan.elided[value.index()] && !self.has_elided_mem(*value) { self.emit_mem_rmw(*value, to); } else { self.write(*value, to); }
             }
+            Op::VolatileStore(value, addr, offset) => { let to = self.address(*addr, *offset); self.write(*value, to); }
             Op::StackAddr(slot, offset) => {
                 let result = result()?;
                 if !self.is_static(result) {
@@ -506,6 +471,16 @@ impl Emit<'_> {
     /// Compares `x` with `y` and returns the flags condition under which `cc` holds.
     pub(super) fn cmp_flags(&mut self, cc: IntCC, x: Value, y: Value, live_flags: Option<(Value, Cond)>) -> Cond {
         let is_zero = |v: Value| self.const_of(v).is_some_and(|imm| crate::fold::extend(imm, self.ty(v), false) == 0);
+        let is_one = |v: Value| self.const_of(v).is_some_and(|imm| crate::fold::extend(imm, self.ty(v), false) == 1);
+        let bool_one_var = |a: Value, b: Value| {
+            if is_one(b) && self.plan.clean_bits[a.index()] <= 1 {
+                Some(a)
+            } else if is_one(a) && self.plan.clean_bits[b.index()] <= 1 {
+                Some(b)
+            } else {
+                None
+            }
+        };
         if self.ty(x) == Type::I128 {
             self.invalidate_spills();
             let cond = self.wide_icmp(cc, x, y);
@@ -515,6 +490,17 @@ impl Emit<'_> {
             && live_flags.is_some_and(|(val, fcc)| fcc == Cond::Ne && ((val == x && is_zero(y)) || (val == y && is_zero(x))))
         {
             int::cond(cc)
+        } else if matches!(cc, IntCC::Equal | IntCC::NotEqual)
+            && let Some(bv) = bool_one_var(x, y)
+            && live_flags.is_some_and(|(val, fcc)| fcc == Cond::Ne && val == bv)
+        {
+            if cc == IntCC::Equal { Cond::Ne } else { Cond::E }
+        } else if matches!(cc, IntCC::Equal | IntCC::NotEqual)
+            && let Some(bv) = bool_one_var(x, y)
+            && let Some(reg) = self.reg_of(bv).or_else(|| self.cached_spill(bv))
+        {
+            self.asm.test_sized(Size::of(self.ty(bv).bytes()), reg, reg);
+            if cc == IntCC::Equal { Cond::Ne } else { Cond::E }
         } else if matches!(cc, IntCC::Equal | IntCC::NotEqual)
             && let Some((a, b)) = self.elided_band_cmp(x, y)
         {
@@ -600,7 +586,7 @@ impl Emit<'_> {
         let live_flags = self.flags.take();
         if self.ty(condition).is_vector() {
             self.flags = live_flags;
-            self.last_fspill = None;
+            self.spills.clear_fspill();
             self.vector_select(condition, x, y, result);
             if !self.features.avx {
                 self.clobber_xmms(&[X0, X1]);
@@ -639,7 +625,7 @@ impl Emit<'_> {
             self.fget(dst, x);
             self.asm.bind(done);
             self.clobber_reg(Reg::Rax);
-            self.last_fspill = None;
+            self.spills.clear_fspill();
             self.fput(result, dst);
             return;
         }

@@ -39,14 +39,14 @@ pub use closure::{By, Capture, Closure, ClosureBody, ClosureInfo, by_reference, 
 pub use coerce::Coercion;
 pub use consts::{Anon, Arena};
 pub use drop::{Glue, drop_fn, glue_call, has_drop_impl, needs_drop};
+pub(in crate::sema) use drop::{mark_parent_laid, record_parent_drops};
 pub use looping::{For, Tried};
 pub use method::Adjust;
 pub use name::type_name;
 pub use object::{ALIGN_SLOT, SIZE_SLOT, Vtable, virtual_slot};
 pub use pat::{position, rest_split};
 pub use path::{parse_int, segments};
-pub use scope::{Form, type_params};
-pub use select::header_bound_traits;
+pub use scope::{Form, header_bound_traits, type_params};
 pub use tables::{BodyTables, LazyTables, SiteKey, SyntaxTables, Typed};
 pub(super) use tables::{CallSites, recount_call_sites, shape_calls};
 
@@ -143,6 +143,7 @@ pub struct Infer<'c, 'a> {
     hidden: Vec<(u32, Ty)>,
     const_args: Vec<(String, (u128, (u32, bool)))>,
     selecting: Vec<u64>,
+    assoc_stack: Vec<(ItemRef, Ty, crate::body::PathId)>,
     cycle_hits: u32,
     frames: usize,
     evaluating: Vec<ItemRef>,
@@ -189,6 +190,15 @@ pub(super) fn infer_with_hints(
     if let Some(typed) = compiler_made(cx, item, substs)? {
         return Ok(typed);
     }
+    infer_after_compiler_made(cx, item, substs, method_hints)
+}
+
+pub(super) fn infer_after_compiler_made(
+    cx: &mut Context<'_>,
+    item: ItemRef,
+    substs: Substs,
+    method_hints: Option<std::sync::Arc<HashMap<ExprId, ItemRef>>>,
+) -> Result<Typed> {
     let sig = cx.signature(item)?;
     let slot = object::virtual_slot(cx, item, substs)?;
     let foreign = cx.foreign(item) || slot.is_some();
@@ -223,6 +233,7 @@ pub(super) fn settle(cx: &mut Context<'_>, instance: (ItemRef, Substs), mut type
         closure::register(cx, instance, &typed);
     }
     typed.drops = drop::drop_calls(cx, &typed)?;
+    drop::record_parent_drops(cx, instance, &typed);
     Ok(typed)
 }
 
@@ -275,7 +286,7 @@ impl<'c, 'a> Infer<'c, 'a> {
             metadata, obligations, projections, opaques, operands, casts: Vec::new(), param_origins: Vec::new(),
             receiver_param: None, try_blocks, awaits: Vec::new(), ret_sig: None, out: zonk::take_out(),
             scopes, items, block_uses: Vec::new(), loops, uses, unsure: Vec::new(), diverges: false,
-            hidden: Vec::new(), const_args: Vec::new(), selecting: Vec::new(), cycle_hits: 0, frames: 0,
+            hidden: Vec::new(), const_args: Vec::new(), selecting: Vec::new(), assoc_stack: Vec::new(), cycle_hits: 0, frames: 0,
             evaluating: Vec::new(), proved: rustc_hash::FxHashSet::default(), imports: HashMap::default(),
             local_selections: HashMap::default(), local_projections: HashMap::default(),
             method_hints: None, poly: None,
@@ -550,43 +561,45 @@ impl Infer<'_, '_> {
         if a == b {
             return Ok(());
         }
-        let (kind_a, kind_b) = (self.cx.types.kind(a).clone(), self.cx.types.kind(b).clone());
-        match (&kind_a, &kind_b) {
-            (Kind::Var(_), _) => self.bind(a, b),
-            (_, Kind::Var(_)) => self.bind(b, a),
-            (Kind::IntVar(_) | Kind::FloatVar(_), _) => self.bind(a, b),
-            (_, Kind::IntVar(_) | Kind::FloatVar(_)) => self.bind(b, a),
-            _ => self.unify_shapes(&kind_a, &kind_b).map_err(|()| Clash { a, b, cycle: false }),
-        }
-    }
-
-    fn unify_shapes(&mut self, a: &Kind, b: &Kind) -> Result<(), ()> {
-        let pairs: Vec<(Ty, Ty)> = match (a, b) {
-            (Kind::Tuple(x), Kind::Tuple(y)) => self.zip_substs(*x, *y)?,
-            (Kind::Ref(m, x), Kind::Ref(n, y)) | (Kind::Ptr(m, x), Kind::Ptr(n, y)) if m == n => vec![(*x, *y)],
-            (Kind::Array(x, m), Kind::Array(y, n)) => vec![(*x, *y), (*m, *n)],
-            (Kind::Slice(x), Kind::Slice(y)) => vec![(*x, *y)],
-            (Kind::Pat(x, s, e), Kind::Pat(y, t, f)) if (s, e) == (t, f) => vec![(*x, *y)],
-            (Kind::Adt(i, x), Kind::Adt(j, y)) | (Kind::FnDef(i, x), Kind::FnDef(j, y)) | (Kind::Dyn(i, x, ..), Kind::Dyn(j, y, ..)) if i == j && dyn_members(a) == dyn_members(b) => self.zip_substs(*x, *y)?,
-            (Kind::FnPtr(x, r), Kind::FnPtr(y, s)) => {
-                let mut pairs = self.zip_substs(*x, *y)?;
-                pairs.push((*r, *s));
-                pairs
-            }
-            _ => return Err(()),
+        enum Action { Bind(Ty, Ty), One(Ty, Ty), Two(Ty, Ty, Ty, Ty), Substs(Substs, Substs), FnPtr(Substs, Substs, Ty, Ty) }
+        let action = match (self.cx.types.kind(a), self.cx.types.kind(b)) {
+            (Kind::Var(_), _) => Action::Bind(a, b),
+            (_, Kind::Var(_)) => Action::Bind(b, a),
+            (Kind::IntVar(_) | Kind::FloatVar(_), _) => Action::Bind(a, b),
+            (_, Kind::IntVar(_) | Kind::FloatVar(_)) => Action::Bind(b, a),
+            (Kind::Tuple(x), Kind::Tuple(y)) => Action::Substs(*x, *y),
+            (Kind::Ref(m, x), Kind::Ref(n, y)) | (Kind::Ptr(m, x), Kind::Ptr(n, y)) if m == n => Action::One(*x, *y),
+            (Kind::Array(x, m), Kind::Array(y, n)) => Action::Two(*x, *y, *m, *n),
+            (Kind::Slice(x), Kind::Slice(y)) => Action::One(*x, *y),
+            (Kind::Pat(x, r1), Kind::Pat(y, r2)) if r1 == r2 => Action::One(*x, *y),
+            (ka @ (Kind::Adt(i, x) | Kind::FnDef(i, x) | Kind::Dyn(i, x, ..)), kb @ (Kind::Adt(j, y) | Kind::FnDef(j, y) | Kind::Dyn(j, y, ..)))
+                if std::mem::discriminant(ka) == std::mem::discriminant(kb) && i == j && dyn_members(ka) == dyn_members(kb) => Action::Substs(*x, *y),
+            (Kind::FnPtr(x, r), Kind::FnPtr(y, s)) => Action::FnPtr(*x, *y, *r, *s),
+            _ => return Err(Clash { a, b, cycle: false }),
         };
-        pairs.into_iter().try_for_each(|(x, y)| self.unify_quiet(x, y).map_err(drop))
+        let clash = || Clash { a, b, cycle: false };
+        match action {
+            Action::Bind(var, ty) => self.bind(var, ty),
+            Action::One(x, y) => self.unify_quiet(x, y).map_err(|_| clash()),
+            Action::Two(x0, y0, x1, y1) => self.unify_quiet(x0, y0).and_then(|()| self.unify_quiet(x1, y1)).map_err(|_| clash()),
+            Action::Substs(x, y) => self.unify_substs(x, y).map_err(|()| clash()),
+            Action::FnPtr(x, y, r, s) => self.unify_substs(x, y).map_err(|()| clash()).and_then(|()| self.unify_quiet(r, s).map_err(|_| clash())),
+        }
     }
 
-    fn zip_substs(&self, a: Substs, b: Substs) -> Result<Vec<(Ty, Ty)>, ()> {
+    fn unify_substs(&mut self, a: Substs, b: Substs) -> Result<(), ()> {
         if a == b {
-            return Ok(Vec::new());
+            return Ok(());
         }
-        let (xs, ys) = (self.cx.types.substs(a), self.cx.types.substs(b));
-        if xs.len() != ys.len() {
+        let len = self.cx.types.substs(a).len();
+        if len != self.cx.types.substs(b).len() {
             return Err(());
         }
-        Ok(xs.iter().copied().zip(ys.iter().copied()).collect())
+        for i in 0..len {
+            let (x, y) = (self.cx.types.substs(a)[i], self.cx.types.substs(b)[i]);
+            self.unify_quiet(x, y).map_err(drop)?;
+        }
+        Ok(())
     }
 
     /// Checks that a value of type `found` can be used where `expected` is wanted, through the coercions that keep its bits.
@@ -741,10 +754,10 @@ impl Infer<'_, '_> {
     }
 }
 
-fn dyn_members(kind: &Kind) -> (&[ItemRef], &[ItemRef]) {
-    match kind {
+fn dyn_members(kind: &Kind) -> (super::substs::ItemList, super::substs::ItemList) {
+    match *kind {
         Kind::Dyn(_, _, members, autos) => (members, autos),
-        _ => (&[], &[]),
+        _ => (super::substs::ItemList::EMPTY, super::substs::ItemList::EMPTY),
     }
 }
 

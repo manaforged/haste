@@ -45,7 +45,7 @@ impl Lower<'_, '_> {
             (Atomic(atomic), Some(ty), _) => self.atomic(atomic, ty, substs, args),
             (Unchecked(op), Some(ty), &[x, y]) => self.unchecked(op, (ty, substs.get(1).copied()), x, y).map(Some),
             (ThreeWayCompare, Some(ty), &[x, y]) => self.compare(ty, x, y).map(Some),
-            (RawPointer | Offset(_) | PtrMask | OffsetFrom(_) | Read | Write | WriteBox | MemCopy(_) | WriteBytes | SliceElement, Some(_), _) => self.access_intrinsic(which, substs, args),
+            (RawPointer | Offset(_) | PtrMask | OffsetFrom(_) | Read | Write | VolatileRead | VolatileWrite | WriteBox | MemCopy(_) | WriteBytes | SliceElement, Some(_), _) => self.access_intrinsic(which, substs, args),
             _ => self.value_intrinsic(which, substs, args).map(Some),
         }
     }
@@ -59,12 +59,14 @@ impl Lower<'_, '_> {
             (PtrMask, &[pointer, mask]) => Ok(Some(self.ins().band(pointer, mask))),
             (OffsetFrom(signed), &[to, from]) => self.offset_from(ty, signed, to, from).map(Some),
             (Read, &[from]) => self.read_at(ty, from),
+            (VolatileRead, &[from]) => self.volatile_read(ty, from),
             (Write, &[to, value]) => {
                 let at = Place { base: Base::Addr(to), offset: 0, repr: repr(self.cx, ty)? };
                 self.write(at, value);
                 Ok(None)
             }
-            (Write, &[_]) => Ok(None),
+            (VolatileWrite, &[to, value]) => self.volatile_write(ty, to, value).map(|()| None),
+            (Write | VolatileWrite, &[_]) => Ok(None),
             (WriteBox, &[boxed, ..]) => self.write_box(ty, boxed, args.get(1).copied()).map(Some),
             (MemCopy(_), &[from, to, count]) => self.copy_items(ty, (from, to), count).map(|()| None),
             (WriteBytes, &[to, byte, count]) => self.write_bytes(ty, to, byte, count).map(|()| None),
@@ -233,6 +235,61 @@ impl Lower<'_, '_> {
             count = self.ins().imul(count, inverse);
         }
         Ok(count)
+    }
+
+    fn volatile_chunks(&mut self, ty: Ty) -> Result<Vec<(Type, i32)>> {
+        let layout = self.cx.layout(ty)?;
+        let size = layout.size.bytes() as u32;
+        let max_word = (layout.align.bytes() as u32).clamp(1, 8);
+        let mut chunks = Vec::new();
+        let mut off = 0_u32;
+        while off < size {
+            let rem = size - off;
+            let (ty, step) = if max_word >= 8 && rem >= 8 {
+                (Type::I64, 8)
+            } else if max_word >= 4 && rem >= 4 {
+                (Type::I32, 4)
+            } else if max_word >= 2 && rem >= 2 {
+                (Type::I16, 2)
+            } else {
+                (Type::I8, 1)
+            };
+            chunks.push((ty, off as i32));
+            off += step;
+        }
+        Ok(chunks)
+    }
+
+    fn volatile_read(&mut self, ty: Ty, from: Value) -> Result<Option<Value>> {
+        let whole = repr(self.cx, ty)?;
+        match whole {
+            Repr::Zst => Ok(None),
+            Repr::Scalar(scalar) => Ok(Some(self.ins().volatile_load(scalar, from, 0))),
+            Repr::Mem { .. } => {
+                let Some(slot) = self.slot(whole) else { return Ok(None) };
+                for (word, off) in self.volatile_chunks(ty)? {
+                    let v = self.ins().volatile_load(word, from, off);
+                    self.ins().stack_store(v, slot, off);
+                }
+                Ok(Some(self.address(Place::slot(slot, whole))))
+            }
+        }
+    }
+
+    fn volatile_write(&mut self, ty: Ty, to: Value, value: Value) -> Result<()> {
+        match repr(self.cx, ty)? {
+            Repr::Zst => {}
+            Repr::Scalar(_) => {
+                self.ins().volatile_store(value, to, 0);
+            }
+            Repr::Mem { .. } => {
+                for (word, off) in self.volatile_chunks(ty)? {
+                    let v = self.ins().load(word, value, off);
+                    self.ins().volatile_store(v, to, off);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn read_at(&mut self, ty: Ty, from: Value) -> Result<Option<Value>> {
