@@ -18,7 +18,7 @@ mod workers;
 pub(super) use backend::ImageBackend;
 pub use backend::ImageMode;
 pub use expand::{Job, run_macros};
-pub use lazy::{Driver, Ended, Jit, Program, entries, evaluator, serve};
+pub use lazy::{Driver, Ended, Jit, Program, ReloadError, entries, evaluator, serve};
 pub(crate) use run::interrupted;
 #[cfg(unix)]
 pub(crate) use run::{close_on_exec, fork_child, pipe, wait};

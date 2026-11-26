@@ -15,7 +15,7 @@ use crate::sema::reach::Instance;
 use crate::sema::{Cache, Context, Edited};
 
 use super::super::Image;
-use super::{Driver, Ended, Jit, Reread, entries, serve};
+use super::{Driver, Ended, Jit, ReloadError, Reread, entries, serve};
 
 /// A binary kept between runs: its `main`, and each function it called, compiled on that first call.
 pub struct Program {
@@ -143,7 +143,7 @@ impl Driver for Run<'_, '_> {
         Ok(())
     }
 
-    fn edited(&mut self, compilation: &mut Compilation) -> Result<Vec<(u32, u32)>, String> {
+    fn edited(&mut self, compilation: &mut Compilation) -> Result<Vec<(u32, u32)>, ReloadError> {
         self.reread
             .as_mut()
             .map_or(Ok(Vec::new()), |reread| reread(compilation))

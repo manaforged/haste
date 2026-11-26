@@ -42,7 +42,7 @@ If a workspace has no `Cargo.lock`, `haste` runs `cargo generate-lockfile` autom
 
 ### Incremental daemon
 
-Plain `haste` commands never spawn a background process, though they reuse an already-running daemon for the same workspace unless `HASTE_NO_DAEMON=1` is set. Opt in to a background daemon on Unix with `--daemon` for `8–9 ms` incremental edit checks (120 s idle timeout, configurable via `HASTE_SERVE_IDLE_SECS`), and inspect or stop daemons with `serve status` and `serve stop` (`PATH` is optional):
+Plain `haste` commands never spawn a background process, though they reuse an already-running daemon for the same workspace unless `HASTE_NO_DAEMON=1` is set. Opt in to a background daemon on Unix with `--daemon` for `8–9 ms` incremental edit checks (900 s idle timeout, configurable via `HASTE_SERVE_IDLE_SECS`), and inspect or stop daemons with `serve status` and `serve stop` (`PATH` is optional):
 
 ```bash
 haste build --daemon haste-demo

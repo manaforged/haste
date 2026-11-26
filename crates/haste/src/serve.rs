@@ -333,7 +333,7 @@ mod unix_ipc {
             cmd.arg("-F").arg(sel.features.join(","));
         }
         if std::env::var_os("HASTE_SERVE_IDLE_SECS").is_none() {
-            cmd.env("HASTE_SERVE_IDLE_SECS", "120");
+            cmd.env("HASTE_SERVE_IDLE_SECS", "900");
         }
         cmd.env("HASTE_NO_DAEMON", "1");
         match (request, out) {

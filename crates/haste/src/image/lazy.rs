@@ -23,8 +23,16 @@ use super::{CODE_BYTES, Image, SHARED_BYTES, STATE_BYTES, TABLE_SLOTS, stub};
 /// What answers what a pass of inference asked for, and says what it added.
 pub type Answerer<'f> = &'f dyn Fn(&mut Compilation, Requests) -> Result<Answer>;
 
-/// What reads the watched files again after they change: the `(crate, file)` slots whose function bodies changed, or why the change needs a restart.
-pub type Reread<'r> = &'r mut dyn FnMut(&mut Compilation) -> Result<Vec<(u32, u32)>, String>;
+/// Why a watched edit could not hot-reload in place.
+pub enum ReloadError {
+    /// Syntax, type, or borrow error in the edited file; fixing and saving reloads in place.
+    Compile(String),
+    /// Structural or macro change that requires restarting the process.
+    Restart(String),
+}
+
+/// What reads the watched files again after they change: the `(crate, file)` slots whose function bodies changed, or why the change could not reload.
+pub type Reread<'r> = &'r mut dyn FnMut(&mut Compilation) -> Result<Vec<(u32, u32)>, ReloadError>;
 
 enum Pause {
     Asked(usize, usize),
@@ -44,8 +52,8 @@ pub trait Driver {
     fn start(&mut self, demand: &mut Jit) -> Result<()>;
     /// Takes the end of child `id`.
     fn ended(&mut self, id: usize, ended: Ended) -> Result<()>;
-    /// Reads the watched files again after a change, and gives the `(crate, file)` slots whose function bodies changed, or why the change needs a restart.
-    fn edited(&mut self, _: &mut Compilation) -> Result<Vec<(u32, u32)>, String> {
+    /// Reads the watched files again after a change, and gives the `(crate, file)` slots whose function bodies changed, or why the change could not reload.
+    fn edited(&mut self, _: &mut Compilation) -> Result<Vec<(u32, u32)>, ReloadError> {
         Ok(Vec::new())
     }
 }
@@ -220,14 +228,20 @@ impl Jit {
             Ok(stale) => {
                 let had = self.compiled.len();
                 self.forget(&compilation.outline, Edited::Files(&stale));
+                let patched = had - self.compiled.len();
                 eprintln!(
-                    "hot reload: {} functions in {:.1} ms",
-                    had - self.compiled.len(),
+                    "hot reload: patched {patched} function{} for next call in {:.1} ms",
+                    if patched == 1 { "" } else { "s" },
                     started.elapsed().as_secs_f64() * 1e3
                 );
             }
-            Err(why) => {
-                eprintln!("hot reload: the edit needs a restart, the old code keeps running: {why}")
+            Err(ReloadError::Compile(why)) => {
+                eprintln!(
+                    "hot reload: compile error — old code still serving (fix and save to reload): {why}"
+                );
+            }
+            Err(ReloadError::Restart(why)) => {
+                eprintln!("hot reload: restart required — old code still serving: {why}");
             }
         }
         std::mem::take(&mut self.store)

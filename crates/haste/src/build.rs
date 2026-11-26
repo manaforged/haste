@@ -527,14 +527,17 @@ fn run_watched(
     let mut watched = stamps(workspace, &compilation.outline);
     let files = paths(&watched);
     let mut reread = |compilation: &mut Compilation| {
-        let stale = body_edits(workspace, &mut watched, &mut compilation.outline)?;
+        let stale = body_edits(workspace, &mut watched, &mut compilation.outline)
+            .map_err(crate::image::ReloadError::Restart)?;
         if stale.is_empty() {
             return Ok(stale);
         }
         let syntax_errors = compilation.outline.local_errors(workspace);
         if !syntax_errors.is_empty() {
             eprintln!("{}", syntax_errors.join("\n"));
-            return Err("syntax error in edited file".to_owned());
+            return Err(crate::image::ReloadError::Compile(
+                "syntax error in edited file".to_owned(),
+            ));
         }
         let (_, errors) = batch::check_member_items(
             workspace,
@@ -542,12 +545,14 @@ fn run_watched(
             Cache::default(),
             Some(main.krate as usize),
         )
-        .map_err(|e| format!("{e:#}"))?;
+        .map_err(|e| crate::image::ReloadError::Compile(format!("{e:#}")))?;
         if !errors.is_empty() {
             for err in &errors {
                 eprintln!("{err}");
             }
-            return Err("compile error in edited file".to_owned());
+            return Err(crate::image::ReloadError::Compile(
+                "compile error in edited file".to_owned(),
+            ));
         }
         Ok(stale)
     };
