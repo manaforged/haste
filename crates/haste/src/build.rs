@@ -149,6 +149,15 @@ impl Build {
 
     /// Infers and compiles the `#[test]` or `case_` functions unless that is done.
     pub fn compile_cases(&mut self, workspace: &graph::Workspace) -> Result<()> {
+        self.compile_cases_filtered(workspace, &[])
+    }
+
+    /// Infers and compiles matching `#[test]` or `case_` functions unless that is done.
+    pub fn compile_cases_filtered(
+        &mut self,
+        workspace: &graph::Workspace,
+        filters: &[String],
+    ) -> Result<()> {
         if self.cases.is_none() {
             self.load_members(workspace)?;
             let discovered = test_items(workspace, &self.compilation.outline);
@@ -160,7 +169,8 @@ impl Build {
             };
             #[cfg(not(feature = "diff-harness"))]
             let kind = BatchKind::Tests;
-            let mut batch = Batch::new(workspace, &mut self.compilation, kind, false)?;
+            let mut batch =
+                Batch::new_filtered(workspace, &mut self.compilation, kind, false, filters)?;
             if kind == BatchKind::Tests {
                 let starts: Vec<Option<usize>> = batch.tests.iter().map(|(_, s)| *s).collect();
                 batch.tests = map_tests(&batch.roots, &batch.reached, &starts, discovered);
@@ -450,7 +460,7 @@ pub(crate) fn emit_main(
         workspace,
         compilation,
         (BatchKind::MainAot, Some(main)),
-        true,
+        (true, &[]),
     )?
     .write_aot(compilation, path)
 }

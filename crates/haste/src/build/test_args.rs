@@ -65,14 +65,34 @@ pub(super) fn parse_test_args(args: &[String]) -> TestArgs<'_> {
     parsed
 }
 
+impl TestArgs<'_> {
+    pub(super) fn matches_name(&self, name: &str) -> bool {
+        let matches = |pat: &str| {
+            if self.exact {
+                name == pat
+            } else {
+                name.contains(pat)
+            }
+        };
+        (self.filters.is_empty() || self.filters.iter().any(|f| matches(f)))
+            && !self.skips.iter().any(|s| matches(s))
+    }
+}
+
 pub(super) fn select_test_roots(
     cx: &mut sema::Context<'_>,
     items: &[ItemRef],
+    filters: &[String],
 ) -> (Vec<ItemRef>, Vec<Option<Instance>>, Vec<Instance>) {
+    let args = parse_test_args(filters);
+    let has_filter = !args.filters.is_empty() || !args.skips.is_empty();
     let mut valid = Vec::new();
     let mut starts = Vec::new();
     let mut roots = Vec::new();
     for &item in items {
+        if has_filter && !args.matches_name(&test_label(cx, item)) {
+            continue;
+        }
         let Some(unit) = sema::infer::test_sig(cx, item) else {
             continue;
         };

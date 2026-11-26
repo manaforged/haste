@@ -393,6 +393,16 @@ impl Cache {
         self.lookups.skip_warm_sysroot_bodies = !warm;
     }
 
+    /// Whether warm `.substrate` sysroot lookups eagerly parse bodies for lowering.
+    pub fn warm_sysroot_bodies(&self) -> bool {
+        !self.lookups.skip_warm_sysroot_bodies
+    }
+
+    /// Drops cached final function outcomes while keeping resolved types, lookups, and summaries.
+    pub fn clear_finals(&mut self) {
+        self.finals.clear();
+    }
+
     /// Returns whether any new sysroot `PolySummary` or concrete sysroot instance was built in this session.
     pub fn has_new_sysroot_summaries(&self) -> bool {
         self.lookups

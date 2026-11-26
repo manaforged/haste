@@ -219,19 +219,9 @@ impl Batch {
         let args = parse_test_args(filters);
         let ignored_only = sel.ignored_only || args.ignored_only;
         let include_ignored = sel.include_ignored || args.include_ignored;
-        let matches = |name: &str, pat: &str| {
-            if args.exact {
-                name == pat
-            } else {
-                name.contains(pat)
-            }
-        };
         if args.list {
             for ((_, name), (meta, _)) in self.roots.iter().zip(&self.labels).zip(&self.tests) {
-                if (!args.filters.is_empty() && !args.filters.iter().any(|f| matches(name, f)))
-                    || args.skips.iter().any(|s| matches(name, s))
-                    || (ignored_only && !meta.ignored)
-                {
+                if !args.matches_name(name) || (ignored_only && !meta.ignored) {
                     continue;
                 }
                 println!("{name}: test");
@@ -245,9 +235,7 @@ impl Batch {
             Option<Result<(usize, Option<usize>), usize>>,
         )> = Vec::new();
         for ((&root, name), (meta, start)) in self.roots.iter().zip(&self.labels).zip(&self.tests) {
-            if (!args.filters.is_empty() && !args.filters.iter().any(|f| matches(name, f)))
-                || args.skips.iter().any(|s| matches(name, s))
-            {
+            if !args.matches_name(name) {
                 continue;
             }
             if ignored_only && !meta.ignored {

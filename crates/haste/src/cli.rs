@@ -309,6 +309,12 @@ fn report_cases(
         (Request::Build, None) if stats.is_none() => build
             .compile_binary_oneshot(workspace)
             .and_then(|()| build.check(started.elapsed())),
+        (Request::Test, None) => {
+            let filters = args.get(1..).unwrap_or(&[]);
+            build
+                .compile_cases_filtered(workspace, filters)
+                .and_then(|()| build.report(started, started.elapsed(), filters))
+        }
         _ => crate::serve::finish(&mut build, workspace, (request, out, args), started),
     };
     if let Some((path, graph_span)) = stats {

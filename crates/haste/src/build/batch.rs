@@ -79,9 +79,11 @@ pub(super) struct Batch {
 pub(super) fn check_member_items(
     workspace: &graph::Workspace,
     compilation: &mut Compilation,
-    cache: Cache,
+    mut cache: Cache,
     target: Option<usize>,
 ) -> Result<(Cache, Vec<String>)> {
+    let prev_warm = cache.warm_sysroot_bodies();
+    cache.set_warm_sysroot_bodies(false);
     super::load_members(workspace, compilation)?;
     let items = check_fn_items(workspace, &compilation.outline, target);
     let roots: Vec<Instance> = items
@@ -113,7 +115,11 @@ pub(super) fn check_member_items(
             Ok((cx.release().0, out, seen))
         },
     )?;
-    let (store, poly) = check_poly_resolved(compilation, store, &items)?;
+    let (mut store, poly) = check_poly_resolved(compilation, store, &items)?;
+    if prev_warm {
+        store.clear_finals();
+        store.set_warm_sysroot_bodies(true);
+    }
     for &(item, ref err) in &poly {
         let msg = Batch::format_entry(Some(&compilation.outline), item, None, err);
         if seen.insert(msg.clone()) {
@@ -239,7 +245,7 @@ fn recompile(
 fn finish_batch(
     (kind, main): (BatchKind, Option<ItemRef>),
     (cases, mut reached): (&[ItemRef], Reached),
-    drop_finals: bool,
+    (drop_finals, test_filters): (bool, &[String]),
     substrate: Option<SubstrateSlot>,
     (mut cx, reach_clock): (sema::Context<'_>, sema::census::Clock),
 ) -> Result<Batch> {
@@ -256,7 +262,7 @@ fn finish_batch(
             .filter(|&item| sema::infer::is_case_sig(&mut cx, item))
             .collect(),
         BatchKind::Tests => {
-            let (valid, starts, _) = select_test_roots(&mut cx, cases);
+            let (valid, starts, _) = select_test_roots(&mut cx, cases, test_filters);
             test_starts = starts;
             valid
         }
@@ -347,6 +353,16 @@ impl Batch {
         kind: BatchKind,
         drop_finals: bool,
     ) -> Result<Batch> {
+        Self::new_filtered(workspace, compilation, kind, drop_finals, &[])
+    }
+
+    pub(super) fn new_filtered(
+        workspace: &graph::Workspace,
+        compilation: &mut Compilation,
+        kind: BatchKind,
+        drop_finals: bool,
+        test_filters: &[String],
+    ) -> Result<Batch> {
         let main = (kind == BatchKind::MainAot)
             .then(|| {
                 let sel = crate::selection();
@@ -359,14 +375,19 @@ impl Batch {
                 }
             })
             .transpose()?;
-        Self::rooted(workspace, compilation, (kind, main), drop_finals)
+        Self::rooted(
+            workspace,
+            compilation,
+            (kind, main),
+            (drop_finals, test_filters),
+        )
     }
 
     pub(super) fn rooted(
         workspace: &graph::Workspace,
         compilation: &mut Compilation,
         (kind, main): (BatchKind, Option<ItemRef>),
-        drop_finals: bool,
+        (drop_finals, test_filters): (bool, &[String]),
     ) -> Result<Batch> {
         let mode = kind.mode();
         let reach_clock = sema::census::Clock::now();
@@ -419,7 +440,7 @@ impl Batch {
                     .copied()
                     .filter(|&(item, _)| sema::infer::is_case_sig(cx, item))
                     .collect(),
-                (BatchKind::Tests, _) => select_test_roots(cx, &cases).2,
+                (BatchKind::Tests, _) => select_test_roots(cx, &cases, test_filters).2,
                 (BatchKind::LibCheck | BatchKind::MainCheck, _) => root_insts
                     .iter()
                     .copied()
@@ -431,7 +452,7 @@ impl Batch {
                 finish_batch(
                     (kind, main),
                     (&cases, reached),
-                    drop_finals,
+                    (drop_finals, test_filters),
                     substrate.take(),
                     (cx, reach_clock),
                 )
@@ -576,7 +597,7 @@ impl Batch {
                     .collect();
             }
             BatchKind::Tests => {
-                let (valid, starts, test_roots) = select_test_roots(&mut cx, &cases);
+                let (valid, starts, test_roots) = select_test_roots(&mut cx, &cases, &[]);
                 cases = valid;
                 test_starts = starts;
                 roots = test_roots;
