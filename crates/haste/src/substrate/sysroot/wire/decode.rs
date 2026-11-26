@@ -5,7 +5,7 @@ use anyhow::{Context as _, Result, bail};
 use crate::graph::Workspace;
 use crate::names::{Crate as NamesCrate, Symbols};
 use crate::outline::Outline;
-use crate::outline::source::{Outputs, Source, SourceText, SourceTokens};
+use crate::outline::source::{DiskSource, Outputs, Source, SourceText, SourceTokens};
 use crate::outline::tree::{Crate as OutlineCrate, File, Macro, Textual};
 use crate::sema::summary::codec::Cursor;
 use crate::substrate::Backing;
@@ -13,8 +13,8 @@ use crate::substrate::Backing;
 use super::super::names::read_names_crate;
 use super::super::outline::read_outline_crate;
 use super::super::tokens::{
-    TOKEN_WIRE_LEN, frag_from_tag, read_items, read_marks, read_opt_u32, read_origins, read_path,
-    read_rules, read_str, u32_le,
+    frag_from_tag, read_items, read_marks, read_opt_u32, read_origins, read_path, read_rules,
+    read_str, u32_le,
 };
 use super::super::{CrateIdentity, HEADER_LEN, SYSROOT_MAGIC, SYSROOT_VERSION, match_crates};
 use super::{FIXED_SYM_COUNT, opt_u32_le};
@@ -461,19 +461,32 @@ fn read_file(
     remap: &[u32],
 ) -> Result<File> {
     let path = read_path(cur)?;
-    let text_len = cur.count()?;
-    let text_start = file_off + cur.pos;
-    cur.take(text_len)?;
-    let text_end = file_off + cur.pos;
-    let text = SourceText::mapped_trusted(Arc::clone(backing), text_start, text_end)?;
-    let tok_count = cur.count()?;
-    let tok_bytes = tok_count
-        .checked_mul(TOKEN_WIRE_LEN)
-        .context("token stream overflow")?;
-    let tok_start = file_off + cur.pos;
-    cur.take(tok_bytes)?;
-    let tok_end = file_off + cur.pos;
-    let tokens = SourceTokens::lazy(Arc::clone(backing), tok_start, tok_end, tok_count)?;
+    let (text, tokens) = match cur.u8()? {
+        1 => {
+            let text_len = cur.count()?;
+            let tok_count = cur.count()?;
+            let disk = Arc::new(DiskSource::new(path.clone(), text_len, tok_count));
+            (
+                SourceText::disk(Arc::clone(&disk)),
+                SourceTokens::disk(disk),
+            )
+        }
+        0 => {
+            let text_len = cur.count()?;
+            let text_start = file_off + cur.pos;
+            cur.take(text_len)?;
+            let text_end = file_off + cur.pos;
+            let text = SourceText::mapped_trusted(Arc::clone(backing), text_start, text_end)?;
+            let tok_count = cur.count()?;
+            let tok_bytes = cur.count()?;
+            let tok_start = file_off + cur.pos;
+            cur.take(tok_bytes)?;
+            let tok_end = file_off + cur.pos;
+            let tokens = SourceTokens::compact(Arc::clone(backing), tok_start, tok_end, tok_count)?;
+            (text, tokens)
+        }
+        _ => bail!("invalid sysroot file storage tag"),
+    };
     let marks = read_marks(cur, remap)?;
     let opaque_len = cur.count()?;
     let opaque_bytes = cur.take(opaque_len.checked_mul(9).context("opaque overflow")?)?;

@@ -1,7 +1,9 @@
 mod lex;
 mod storage;
 mod tokens;
+pub(crate) use lex::pair_up as pair_up_tokens;
 use lex::{lex, pair_up};
+pub(crate) use storage::DiskSource;
 pub use storage::{SourceText, SourceTokens};
 pub use tokens::Tokens;
 
