@@ -14,20 +14,20 @@ use std::ptr::NonNull;
 use anyhow::anyhow;
 use anyhow::{Context as _, Result, bail};
 
-const COMPRESSED_MAGIC: [u8; 8] = *b"HSTZ0001";
+const COMPRESSED_MAGIC: [u8; 8] = *b"HSTZ0002";
 const COMPRESSED_HEADER: usize = 16;
 
-/// Atomically writes `chunks` compressed with fast DEFLATE (`HSTZ0001` framing) to `path`.
+/// Atomically writes `chunks` compressed with fast LZ4 (`HSTZ0002` framing) to `path`.
 pub(crate) fn write_compressed(path: &Path, chunks: &[&[u8]]) -> Result<()> {
     let raw_len: usize = chunks.iter().map(|c| c.len()).sum();
     let compressed = if chunks.len() == 1 {
-        miniz_oxide::deflate::compress_to_vec(chunks[0], 1)
+        lz4_flex::block::compress(chunks[0])
     } else {
         let mut combined = Vec::with_capacity(raw_len);
         for chunk in chunks {
             combined.extend_from_slice(chunk);
         }
-        miniz_oxide::deflate::compress_to_vec(&combined, 1)
+        lz4_flex::block::compress(&combined)
     };
     crate::graph::store::write_new_with(path, |writer| {
         writer.write_all(&COMPRESSED_MAGIC)?;
@@ -57,8 +57,8 @@ fn try_open_compressed(file: &mut File, len_u64: u64, min_len: usize) -> Result<
         .context("compressed payload exceeds address space")?;
     let mut payload = Vec::with_capacity(payload_len);
     file.read_to_end(&mut payload)?;
-    let decoded = miniz_oxide::inflate::decompress_to_vec_with_limit(&payload, raw_len)
-        .map_err(|err| anyhow::anyhow!("decompress backing failed: {err:?}"))?;
+    let decoded = lz4_flex::block::decompress(&payload, raw_len)
+        .map_err(|err| anyhow::anyhow!("decompress backing failed: {err}"))?;
     if decoded.len() != raw_len {
         bail!("decompressed backing length mismatch");
     }

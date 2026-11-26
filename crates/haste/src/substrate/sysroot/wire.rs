@@ -260,29 +260,38 @@ fn write_identity(out: &mut Vec<u8>, ident: &CrateIdentity) -> Option<()> {
     Some(())
 }
 
-fn can_reload_from_disk(file: &File) -> bool {
+fn disk_text_tail(file: &File) -> Option<&str> {
     let src = &file.source;
-    !file.expanded
-        && src.base.is_none()
-        && src.marks.is_empty()
-        && src.opaque.is_empty()
-        && matches!(src.origins, crate::outline::source::Origins::Read)
-        && !src.path.starts_with("/haste/")
-        && src.path.is_file()
+    if file.expanded
+        || src.base.is_some()
+        || !matches!(src.origins, crate::outline::source::Origins::Read)
+        || src.path.starts_with("/haste/")
+    {
+        return None;
+    }
+    let meta = std::fs::metadata(&src.path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let disk_len = usize::try_from(meta.len()).ok()?;
+    if src.text.len() < disk_len || !src.text.is_char_boundary(disk_len) {
+        return None;
+    }
+    Some(&src.text[disk_len..])
 }
 
 fn write_file(out: &mut Vec<u8>, file: &Arc<File>, to_local: &[Option<u32>]) -> Option<()> {
     let src = &file.source;
     write_path(out, &src.path)?;
-    if can_reload_from_disk(file) {
+    if let Some(tail) = disk_text_tail(file) {
         out.push(1);
         write_usize(out, src.text.len())?;
-        write_usize(out, src.tokens.len())?;
+        write_str(out, tail)?;
     } else {
         out.push(0);
         write_str(out, &src.text)?;
-        write_compact_tokens(out, &src.tokens)?;
     }
+    write_compact_tokens(out, &src.tokens)?;
     write_marks(out, &src.marks, to_local)?;
     write_usize(out, src.opaque.len())?;
     for &(from, to, frag) in &src.opaque {
