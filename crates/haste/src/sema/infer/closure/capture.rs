@@ -290,6 +290,16 @@ impl<'a> Infer<'_, 'a> {
                 captures.push(cap);
             }
         }
+        if !by_move {
+            for cap in &mut captures {
+                if cap.by == By::Ref && cap.path.is_empty() {
+                    let ty = self.resolve(self.out.locals[cap.local as usize].ty);
+                    if matches!(self.cx.types.kind(ty), Kind::Ref(Mut::Not, _)) {
+                        cap.by = By::Value;
+                    }
+                }
+            }
+        }
         self.truncate_value_paths(&mut captures, &mut known)?;
         Ok((captures, consumes, known))
     }

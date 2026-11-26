@@ -262,6 +262,7 @@ impl Lookups {
         self.type_defs.clear();
         self.trait_calls.clear();
         self.assoc_types.clear();
+        self.auto_traits.clear();
     }
 
     pub(super) fn reconcile(&mut self, outline: &Outline, answer: Option<Answer>) {
@@ -347,6 +348,7 @@ impl Lookups {
         self.trait_calls.clear();
         self.assoc_types.clear();
         self.type_defs.clear();
+        self.auto_traits.clear();
         *guard = loaded;
     }
 }

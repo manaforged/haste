@@ -42,9 +42,11 @@ fn use_entry(
     found: &mut Vec<(Vec<u32>, u32)>,
 ) -> bool {
     let pathlike = |range: std::ops::Range<u32>| {
-        range
-            .clone()
-            .all(|at| is_name(src.kind(at)) || src.kind(at) == TokenKind::Colon)
+        range.clone().all(|at| {
+            is_name(src.kind(at))
+                || src.kind(at) == TokenKind::Colon
+                || (src.kind(at) == TokenKind::Dollar && src.dollar(at).is_some())
+        })
     };
     let joined = |end: u32| {
         prefix
@@ -90,7 +92,10 @@ impl Writer {
             {
                 return self.note_use_group(src, (at + 1, end));
             }
-            if !is_name(src.kind(end)) && src.kind(end) != TokenKind::Colon {
+            if !is_name(src.kind(end))
+                && src.kind(end) != TokenKind::Colon
+                && !(src.kind(end) == TokenKind::Dollar && src.dollar(end).is_some())
+            {
                 return Ok(None);
             }
             end += 1;
@@ -232,6 +237,34 @@ impl Writer {
         Ok(self.resolve_macro(cx, &joined, (0, joined.len() - 1)))
     }
 
+    fn resolve_use_source(
+        &self,
+        cx: &Context<'_>,
+        src: &Source,
+        depth: u8,
+    ) -> Result<Option<ItemRef>> {
+        let last = src.len() - 1;
+        if let Some(found) = self.resolve_macro(cx, src, (0, last)) {
+            return Ok(Some(found));
+        }
+        if depth < 8
+            && last > 0
+            && is_name(src.kind(0))
+            && src.kind(1) == TokenKind::Colon
+            && src.dollar(0).is_none()
+        {
+            let first = plain(src.text(0));
+            if let Some((_, prefix)) = self.uses.iter().rev().find(|(alias, _)| alias == first) {
+                let mut full = Tokens::default();
+                full.copy_range(prefix, 0, prefix.len());
+                (1..=last).for_each(|token| full.copy(src, token));
+                let joined = full.finish(src.path.clone())?;
+                return self.resolve_use_source(cx, &joined, depth + 1);
+            }
+        }
+        Ok(None)
+    }
+
     pub(super) fn find_macro(
         &self,
         cx: &mut Context<'_>,
@@ -245,7 +278,7 @@ impl Writer {
             .rev()
             .find(|(alias, _)| path.0 == path.1 && *alias == name)
         {
-            return Ok(self.resolve_macro(cx, source, (0, source.len() - 1)));
+            return self.resolve_use_source(cx, source, 0);
         }
         let first = plain(run.src.text(path.0));
         if path.0 < path.1
