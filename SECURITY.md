@@ -2,7 +2,13 @@
 
 ## Supported Versions
 
-`haste` is currently experimental (`version = "0.0.0"`, no tagged release yet). Security fixes are applied to the `main` branch.
+`haste` is currently experimental (`version = "0.0.0"`, no tagged release yet). Security fixes are applied to the `main` branch on a best-effort basis.
+
+## Security Model
+
+- Like `cargo`, `haste` executes crate `build.rs` scripts and procedural macros unsandboxed as the invoking user. Only build trusted workspaces.
+- `haste serve` listens on a per-user Unix domain socket (abstract namespace on Linux, temp file on macOS) and verifies the peer UID on every connection.
+- When locked registry or git crates are missing locally, `haste` runs `cargo fetch --locked` automatically unless dependencies are vendored via `cargo vendor` / `.cargo/config.toml`.
 
 ## Reporting a Vulnerability
 

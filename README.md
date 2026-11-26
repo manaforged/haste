@@ -40,7 +40,7 @@ If a workspace has no `Cargo.lock`, `haste` runs `cargo generate-lockfile` autom
 
 ### Incremental daemon
 
-Plain `haste` commands run one-shot and leave no background process. Opt in to the resident workspace daemon on Unix with `--daemon` for `8–9 ms` incremental edit checks, and pass the workspace path to `serve status` and `serve stop`:
+Plain `haste` commands never spawn a background process, though they reuse an already-running daemon for the same workspace unless `HASTE_NO_DAEMON=1` is set. Opt in to a background daemon on Unix with `--daemon` for `8–9 ms` incremental edit checks (120 s idle timeout, configurable via `HASTE_SERVE_IDLE_SECS`), and inspect or stop daemons with `serve status` and `serve stop` (`PATH` is optional):
 
 ```bash
 haste build --daemon haste-demo
@@ -131,7 +131,7 @@ Compute benchmarks subtract each compiler's warmed empty-main startup baseline (
 
 ## Embedding haste as a library
 
-`haste` exposes an embeddable API (`Compiler`, `CompilerBuilder`, `Target`, `Error`, `ErrorKind`, `Diagnostic`, `DiagnosticKind`, `Label`, `Span`) with explicit per-build configuration and no process-global configuration state:
+`haste` exposes an embeddable API (`Compiler`, `CompilerBuilder`, `Target`, `Error`, `ErrorKind`) with explicit per-build configuration and no process-global state. Add it as a git dependency in `Cargo.toml` (`haste = { git = "https://github.com/manaforged/haste" }`, not from crates.io):
 
 ```rust
 use haste::Compiler;
