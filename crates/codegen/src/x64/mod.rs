@@ -111,16 +111,9 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
     let func = split.as_ref().unwrap_or(func);
     let features = Features::for_target(target);
     let (roots, pure_test) = if full {
-        let dropped = |plan: &Plan<Reg>| {
-            plan.elided
-                .iter()
-                .chain(&plan.fused)
-                .filter(|&&e| e)
-                .count()
-        };
-        let dropped_before = dropped(&plan);
+        let dropped_before = plan.dropped_count();
         let fused = location::fuse(func, &mut plan, &features);
-        if dropped(&plan) != dropped_before {
+        if plan.dropped_count() != dropped_before {
             crate::frame::repack_after_elide(func, &plan, &abi, &mut frame, &mut framed, |sig| {
                 classify(sig, abi_kind)
             })?;
@@ -230,7 +223,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
 
 fn keeps_frame_pointer(func: &Function) -> bool {
     func.keep_fp
-        || !func.unwind_drops.is_empty()
+        || func.needs_unwind_frame()
         || func
             .blocks
             .iter()

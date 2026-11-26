@@ -1,5 +1,5 @@
-use super::super::{const_of, def_entry, def_inst, preserved, shift_parts};
-use super::{PosMap, UseInfo, live_root_preserved};
+use super::super::{const_of, def_entry, def_inst, preserved, shift_parts, zero_ext_loc};
+use super::{PosMap, UseInfo};
 use crate::alloc::Plan;
 use crate::arm64::asm::Reg;
 use crate::ir::{Binary, Convert, Function, Inst, Op, Type, Value};
@@ -111,29 +111,26 @@ pub(in crate::arm64) fn extr_parts(
     Some((hi, lo, kr))
 }
 
-fn extr_uext_ok(
+fn extr_leaf_root(
     func: &Function,
     plan: &Plan<Reg>,
     pos_of: PosMap<'_>,
-    (b_idx, pos, other_pos, branch_pos): (usize, usize, usize, usize),
-    (leaf, has_extra, kr): (Value, bool, u32),
-) -> Option<bool> {
+    b_idx: usize,
+    leaf: Value,
+    limit: Option<u32>,
+) -> Option<(Value, Option<usize>)> {
     if !plan.elided[leaf.index()] {
-        return None;
+        return Some((leaf, None));
     }
     let (hb, hpos, hinst) = def_entry(pos_of, leaf)?;
     let Op::Convert(Convert::Uextend, inner) = func.insts[hinst.index()].op else {
         return None;
     };
-    if hb != b_idx || kr > func.ty(inner).bits() {
+    if plan.elided[inner.index()] || hb != b_idx {
         return None;
     }
-    let start = if has_extra { branch_pos } else { hpos };
-    let skip = has_extra.then_some(other_pos);
-    Some(
-        preserved(func, plan, b_idx, start, pos, skip, inner)
-            && (has_extra || preserved(func, plan, b_idx, hpos, branch_pos, None, inner)),
-    )
+    let bits_ok = zero_ext_loc(plan, inner) || limit.is_some_and(|kr| kr <= func.ty(inner).bits());
+    bits_ok.then_some((inner, Some(hpos)))
 }
 
 fn extr_branch_ok(
@@ -143,6 +140,12 @@ fn extr_branch_ok(
     (b_idx, pos, other_pos, branch_pos): (usize, usize, usize, usize),
     (leaf, extra, limit): (Value, Option<Value>, Option<u32>),
 ) -> Option<bool> {
+    let (root, uext_pos) = extr_leaf_root(func, plan, pos_of, b_idx, leaf, limit)?;
+    let uext_ok_before = |bound: usize| {
+        uext_pos.is_none_or(|hpos| {
+            hpos < bound && preserved(func, plan, b_idx, hpos, bound, Some(other_pos), root)
+        })
+    };
     if let Some(ev) = extra
         && !plan.elided[ev.index()]
     {
@@ -150,33 +153,13 @@ fn extr_branch_ok(
         if eb != b_idx || epos >= branch_pos {
             return None;
         }
-        return (live_root_preserved(
-            func,
-            plan,
-            pos_of,
-            (b_idx, epos, branch_pos, Some(other_pos), None),
-            leaf,
-        ) && preserved(func, plan, b_idx, branch_pos, pos, Some(other_pos), leaf))
+        return (uext_ok_before(epos)
+            && preserved(func, plan, b_idx, epos, branch_pos, Some(other_pos), root)
+            && preserved(func, plan, b_idx, branch_pos, pos, Some(other_pos), root))
         .then_some(true);
     }
-    if let Some(kr) = limit
-        && let Some(ok) = extr_uext_ok(
-            func,
-            plan,
-            pos_of,
-            (b_idx, pos, other_pos, branch_pos),
-            (leaf, extra.is_some(), kr),
-        )
-    {
-        return ok.then_some(false);
-    }
-    live_root_preserved(
-        func,
-        plan,
-        pos_of,
-        (b_idx, branch_pos, pos, Some(other_pos), None),
-        leaf,
-    )
+    (uext_ok_before(branch_pos)
+        && preserved(func, plan, b_idx, branch_pos, pos, Some(other_pos), root))
     .then_some(false)
 }
 

@@ -56,12 +56,7 @@ pub(super) fn atomic_addr_base(
     }
     let inst = defs[addr.index()]?;
     let (base, delta) = crate::alloc::iadd_sub_const(&func.insts[inst.index()].op, |v| {
-        plan.const_of(v).or_else(
-            || match defs[v.index()].map(|i| &func.insts[i.index()].op) {
-                Some(&Op::Const(imm)) => Some(imm),
-                _ => None,
-            },
-        )
+        plan.const_or_def(func, |x| defs[x.index()], v)
     })?;
     i32::try_from(delta).ok().map(|disp| (base, disp))
 }
@@ -541,22 +536,11 @@ impl Emit<'_> {
             return;
         };
         let other = if self.plan.elided[a.index()] { b } else { a };
-        let alu = match op {
-            Binary::Iadd => Alu::Add,
-            Binary::Isub => Alu::Sub,
-            Binary::Band => Alu::And,
-            Binary::Bor => Alu::Or,
-            Binary::Bxor => Alu::Xor,
-            _ => return,
+        let Some(alu) = super::int::alu_of(op) else {
+            return;
         };
-        let (ty, size) = (self.ty(value), Size::of(self.ty(value).bytes()));
-        if let Some(imm) = self.const_of(other).and_then(|c| {
-            if ty.bytes() < 8 {
-                Some(c as i32)
-            } else {
-                i32::try_from(c).ok()
-            }
-        }) {
+        let size = Size::of(self.ty(value).bytes());
+        if let Some(imm) = self.imm_sized(other, size) {
             self.asm.alu_imm_sized(size, alu, to, imm);
         } else {
             self.asm.alu_mem_reg(

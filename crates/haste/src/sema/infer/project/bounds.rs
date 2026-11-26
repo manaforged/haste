@@ -2,6 +2,7 @@ use anyhow::{Result, bail};
 
 use crate::body::sig::Predicate;
 use crate::body::{Body, PathId, TyId};
+use crate::diag::DiagnosticKind;
 use crate::names::{ItemRef, ModRef};
 use crate::outline::item::ItemKind;
 use crate::outline::source::Source;
@@ -348,8 +349,22 @@ impl Infer<'_, '_> {
         })
     }
 
+    /// Whether the active inference root belongs to a user crate rather than a fixed sysroot crate.
+    pub(in super::super) fn root_is_user(&self) -> bool {
+        self.root
+            .is_some_and(|root| !self.cx.outline.is_fixed(root.krate))
+    }
+
+    /// Whether trait `of` should be checked as an obligation on call-site and impl bounds.
+    pub(in super::super) fn checks_bound_trait(&self, of: ItemRef) -> bool {
+        !self.compiler_trait(of)
+            || self.is_thread_auto_trait(of)
+            || matches!(self.cx.lang(of), Some("copy" | "clone"))
+    }
+
     /// Holds the call of function `item` at `substs` to the bounds its header puts on any type parameter of its frame, its impl's included: each trait bound whose types are not known yet becomes an obligation, and each associated type a bound binds, as in `I: Iterator<Item = A>`, is tied to the bound type.
     pub(in super::super) fn bind_bounds(&mut self, item: ItemRef, substs: &[Ty]) -> Result<()> {
+        let enforce = self.root_is_user();
         let sig = self.cx.signature(item)?;
         if sig.generics.iter().any(|generic| generic.bounds.len > 0) || !sig.predicates.is_empty() {
             let frame = self.frame(item, substs)?;
@@ -365,27 +380,25 @@ impl Infer<'_, '_> {
                     for bound in
                         named_bounds(&sig.body, src, (&sig.generics, &sig.predicates), name)
                     {
-                        infer.bind_bound(&sig.body, home, (bound, ty))?;
+                        infer.bind_bound(&sig.body, home, (bound, ty), enforce)?;
                     }
                 }
                 for (ty, bound) in infer.typed_predicates(&sig.body, src, &sig.predicates) {
                     if infer
                         .bound_trait_at(&sig.body, bound, home)
-                        .is_some_and(|(of, _)| {
-                            infer.compiler_trait(of) && !infer.is_thread_auto_trait(of)
-                        })
+                        .is_some_and(|(of, _)| !infer.checks_bound_trait(of))
                     {
                         continue;
                     }
-                    infer.bind_bound(&sig.body, home, (bound, ty))?;
+                    infer.bind_bound(&sig.body, home, (bound, ty), enforce)?;
                 }
                 Ok(())
             })?;
         }
-        self.bind_impl_bounds(item, substs)
+        self.bind_impl_bounds(item, substs, enforce)
     }
 
-    fn bind_impl_bounds(&mut self, item: ItemRef, substs: &[Ty]) -> Result<()> {
+    fn bind_impl_bounds(&mut self, item: ItemRef, substs: &[Ty], enforce: bool) -> Result<()> {
         let Some(block) = self.cx.owner_impl(item) else {
             return Ok(());
         };
@@ -393,15 +406,18 @@ impl Infer<'_, '_> {
         let Some(args) = substs.get(..count) else {
             return Ok(());
         };
-        if self.cx.impl_trait(block).is_some()
-            || !args
+        if self.cx.impl_trait(block).is_some() {
+            return Ok(());
+        }
+        if !enforce
+            && !args
                 .iter()
                 .any(|&arg| matches!(self.cx.types.kind(self.resolve(arg)), Kind::Var(_)))
         {
             return Ok(());
         }
         for (of, ty, args, bindings) in self.impl_param_bounds(block, args)? {
-            if self.obligation_open(ty, &args) {
+            if enforce || self.obligation_open(ty, &args) {
                 self.note_obligation_site(of, ty);
                 self.obligations.push((
                     of,
@@ -427,30 +443,42 @@ impl Infer<'_, '_> {
         let params = frame.generics.clone();
         self.with_frame(frame, |infer| {
             let mut found = Vec::new();
+            let mut push_bound = |infer: &mut Self, ty: Ty, bound: u32| -> Result<()> {
+                let Some((of, path)) =
+                    infer.bound_trait_at(arena, bound, home).filter(|&(of, _)| {
+                        infer.checks_bound_trait(of) && !infer.is_callable_trait(of)
+                    })
+                else {
+                    return Ok(());
+                };
+                found.push((
+                    of,
+                    ty,
+                    infer.bound_args(of, arena, path, ty)?,
+                    infer.path_bindings(arena, path)?,
+                ));
+                Ok(())
+            };
             for (name, ty) in params {
                 for bound in named_bounds(arena, src, (&header.generics, &header.predicates), name)
                 {
-                    let Some((of, path)) =
-                        infer.bound_trait_at(arena, bound, home).filter(|&(of, _)| {
-                            (!infer.compiler_trait(of) || infer.is_thread_auto_trait(of))
-                                && !infer.is_callable_trait(of)
-                        })
-                    else {
-                        continue;
-                    };
-                    found.push((
-                        of,
-                        ty,
-                        infer.bound_args(of, arena, path, ty)?,
-                        infer.path_bindings(arena, path)?,
-                    ));
+                    push_bound(infer, ty, bound)?;
                 }
+            }
+            for (ty, bound) in infer.typed_predicates(arena, src, &header.predicates) {
+                push_bound(infer, ty, bound)?;
             }
             Ok(found)
         })
     }
 
-    fn bind_bound(&mut self, arena: &Body, home: ModRef, (bound, ty): (u32, Ty)) -> Result<()> {
+    fn bind_bound(
+        &mut self,
+        arena: &Body,
+        home: ModRef,
+        (bound, ty): (u32, Ty),
+        enforce: bool,
+    ) -> Result<()> {
         let Some((of, path)) = self.bound_trait_at(arena, bound, home) else {
             return Ok(());
         };
@@ -465,9 +493,13 @@ impl Infer<'_, '_> {
         {
             let _ = self.select(of, ty, &args)?;
         }
-        if (!self.compiler_trait(of) && self.obligation_open(ty, &args))
-            || self.is_thread_auto_trait(of)
-        {
+        let push = if enforce {
+            self.checks_bound_trait(of)
+        } else {
+            (!self.compiler_trait(of) && self.obligation_open(ty, &args))
+                || self.is_thread_auto_trait(of)
+        };
+        if push {
             self.note_obligation_site(of, ty);
             self.obligations.push((
                 of,
@@ -475,13 +507,18 @@ impl Infer<'_, '_> {
             ));
         }
         if !self.bindings_hold(arena, path, (of, ty, &args))? {
-            bail!(
-                "{} does not give the associated types that a bound of `{}` binds",
-                self.show(ty),
-                self.cx.name(of)
-            );
+            return Err(self.diag_expr(
+                DiagnosticKind::Trait,
+                None,
+                format!(
+                    "{} does not give the associated types that a bound of `{}` binds",
+                    self.show(ty),
+                    self.cx.name(of)
+                ),
+                "associated type mismatch",
+            ));
         }
-        self.bind_constraints((arena, home), (of, path, &args), ty)
+        self.bind_constraints((arena, home), (of, path, &args), ty, enforce)
     }
 
     fn bind_callable(&mut self, arena: &Body, (of, path): (ItemRef, PathId), ty: Ty) -> Result<()> {
@@ -497,6 +534,7 @@ impl Infer<'_, '_> {
         (arena, home): (&Body, ModRef),
         (of, path, args): (ItemRef, PathId, &[Ty]),
         ty: Ty,
+        enforce: bool,
     ) -> Result<()> {
         for (name, bounds) in path_constraints(arena, path) {
             let name = self.src.text(name).to_string();
@@ -506,7 +544,7 @@ impl Infer<'_, '_> {
             };
             let assoc = self.project(owner, ty, owner_args, &name)?;
             for &bound in arena.list(bounds) {
-                self.bind_bound(arena, home, (bound, assoc))?;
+                self.bind_bound(arena, home, (bound, assoc), enforce)?;
             }
         }
         Ok(())
@@ -519,8 +557,15 @@ impl Infer<'_, '_> {
         (of, ty, args): (ItemRef, Ty, &[Ty]),
         depth: u32,
     ) -> Result<bool> {
-        let key = (of, self.resolve(ty), path);
+        let key = (
+            of,
+            self.resolve(ty),
+            self.substitute_substs(args),
+            path,
+            self.self_ty.map(|t| self.substitute(t)),
+        );
         if self.assoc_stack.len() >= 16 || self.assoc_stack.contains(&key) {
+            self.cycle_hits += 1;
             return Ok(false);
         }
         self.assoc_stack.push(key);

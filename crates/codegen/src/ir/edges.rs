@@ -1,4 +1,4 @@
-use super::{Block, Function, IntCC, Op, Value};
+use super::{Block, FloatCC, Function, IntCC, Op, Value};
 
 impl IntCC {
     /// The comparison that holds exactly when this one does not.
@@ -29,6 +29,54 @@ impl IntCC {
             IntCC::UnsignedGreaterThan => IntCC::UnsignedLessThan,
             IntCC::UnsignedLessThanOrEqual => IntCC::UnsignedGreaterThanOrEqual,
             IntCC::UnsignedGreaterThanOrEqual => IntCC::UnsignedLessThanOrEqual,
+        }
+    }
+
+    /// Whether the comparison reads its operands as unsigned.
+    pub fn is_unsigned(self) -> bool {
+        matches!(
+            self,
+            IntCC::UnsignedLessThan
+                | IntCC::UnsignedGreaterThanOrEqual
+                | IntCC::UnsignedGreaterThan
+                | IntCC::UnsignedLessThanOrEqual
+        )
+    }
+
+    /// Swaps operands if needed so ordering uses `<` or `>=`, returning `(swapped, base_cc)`.
+    pub(crate) fn ordered(self) -> (bool, Self) {
+        match self {
+            IntCC::SignedLessThan | IntCC::SignedGreaterThanOrEqual => (false, self),
+            IntCC::UnsignedLessThan | IntCC::UnsignedGreaterThanOrEqual => (false, self),
+            IntCC::SignedGreaterThan => (true, IntCC::SignedLessThan),
+            IntCC::SignedLessThanOrEqual => (true, IntCC::SignedGreaterThanOrEqual),
+            IntCC::UnsignedGreaterThan => (true, IntCC::UnsignedLessThan),
+            IntCC::UnsignedLessThanOrEqual => (true, IntCC::UnsignedGreaterThanOrEqual),
+            IntCC::Equal | IntCC::NotEqual => (false, self),
+        }
+    }
+
+    /// Converts signed ordering comparisons to their unsigned equivalents.
+    pub fn as_unsigned(self) -> Self {
+        match self {
+            IntCC::SignedLessThan => IntCC::UnsignedLessThan,
+            IntCC::SignedGreaterThanOrEqual => IntCC::UnsignedGreaterThanOrEqual,
+            IntCC::SignedGreaterThan => IntCC::UnsignedGreaterThan,
+            IntCC::SignedLessThanOrEqual => IntCC::UnsignedLessThanOrEqual,
+            other => other,
+        }
+    }
+}
+
+impl FloatCC {
+    /// The comparison with its operands swapped: `a cc b` is `b (cc.swapped()) a`.
+    pub fn swapped(self) -> Self {
+        match self {
+            FloatCC::Equal | FloatCC::NotEqual => self,
+            FloatCC::LessThan => FloatCC::GreaterThan,
+            FloatCC::GreaterThan => FloatCC::LessThan,
+            FloatCC::LessThanOrEqual => FloatCC::GreaterThanOrEqual,
+            FloatCC::GreaterThanOrEqual => FloatCC::LessThanOrEqual,
         }
     }
 }

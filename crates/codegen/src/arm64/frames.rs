@@ -31,20 +31,6 @@ pub(super) enum ColdCall {
     FrameFree(Label, Label, u32),
 }
 
-fn thread_cell_target(
-    func: &Function,
-    plan: &Plan<Reg>,
-    defs: &[Option<Inst>],
-    slot: Value,
-    lookup: u32,
-) -> Option<u32> {
-    match defs[slot.index()].map(|inst| &func.insts[inst.index()].op) {
-        Some(&Op::Symbol(slot_sym)) => Some(slot_sym),
-        _ if plan.const_of(slot) == Some(0) => Some(lookup),
-        _ => None,
-    }
-}
-
 fn tlv_call_sym(
     func: &Function,
     plan: &Plan<Reg>,
@@ -58,7 +44,7 @@ fn tlv_call_sym(
         &plan.through,
         &plan.locations,
         &plan.elided,
-    ) && let Some(sym) = thread_cell_target(func, plan, defs, slot, lookup)
+    ) && let Some(sym) = crate::alloc::thread_cell_target(func, plan, defs, slot, lookup)
     {
         return Some(TlvInitSym::Symbol(sym));
     }
@@ -148,10 +134,11 @@ pub(super) fn plan_tlv_cache(
 
 impl Emit<'_> {
     fn thread_cell_sym(&self, slot: Value, lookup: u32) -> Option<u32> {
-        if !self.tlv_cells {
-            return None;
-        }
-        thread_cell_target(self.func, &self.plan, &self.defs, slot, lookup)
+        self.tlv_cells
+            .then(|| {
+                crate::alloc::thread_cell_target(self.func, &self.plan, &self.defs, slot, lookup)
+            })
+            .flatten()
     }
 
     fn emit_tlv_base(&mut self) -> u32 {
@@ -206,6 +193,16 @@ impl Emit<'_> {
         true
     }
 
+    fn emit_tlv_slot(&mut self, word: u32, build: impl FnOnce(u32, RelocKind) -> StencilReloc) {
+        let (at, kind) = if self.emit_cached_tlv_base() {
+            (self.asm.pos(), RelocKind::ThreadOff32)
+        } else {
+            (self.emit_tlv_base(), RelocKind::Arm64TlvCell)
+        };
+        self.asm.word(word);
+        self.relocs.push(build(at, kind));
+    }
+
     pub(super) fn thread_cell_cold(&mut self, callee: Value, args: &[Value]) -> bool {
         if !self.tlv_cells {
             return false;
@@ -223,20 +220,9 @@ impl Emit<'_> {
             return false;
         };
         let (cold, back) = (self.asm.label(), self.asm.label());
-        if self.emit_cached_tlv_base() {
-            let at = self.asm.pos();
-            self.asm.word(0xF940_0000);
-            self.relocs
-                .push(StencilReloc::symbol(at, target_sym, RelocKind::ThreadOff32));
-        } else {
-            let at = self.emit_tlv_base();
-            self.asm.word(0xF940_0000);
-            self.relocs.push(StencilReloc::symbol(
-                at,
-                target_sym,
-                RelocKind::Arm64TlvCell,
-            ));
-        }
+        self.emit_tlv_slot(0xF940_0000, |at, kind| {
+            StencilReloc::symbol(at, target_sym, kind)
+        });
         self.asm.cbz(false, Size::X, Reg(0), cold);
         self.asm.bind(back);
         self.cold_calls
@@ -258,17 +244,7 @@ impl Emit<'_> {
         let (cold, back) = (self.asm.label(), self.asm.label());
         let off_word = 0x9100_000A | ((bytes & 0xFFF) << 10);
         if rt == RuntimeSymbol::Malloc {
-            if self.emit_cached_tlv_base() {
-                let at = self.asm.pos();
-                self.asm.word(off_word);
-                self.relocs
-                    .push(StencilReloc::runtime(at, rt, RelocKind::ThreadOff32));
-            } else {
-                let at = self.emit_tlv_base();
-                self.asm.word(off_word);
-                self.relocs
-                    .push(StencilReloc::runtime(at, rt, RelocKind::Arm64TlvCell));
-            }
+            self.emit_tlv_slot(off_word, |at, kind| StencilReloc::runtime(at, rt, kind));
             self.asm.ldp_offset(Reg(0), A, C, 0);
             self.asm.cbz(false, Size::X, Reg(0), cold);
             self.asm.load(Size::X, false, Reg(17), Mem::new(Reg(0), 0));
@@ -279,17 +255,7 @@ impl Emit<'_> {
                 .push(ColdCall::FrameAlloc(cold, back, bytes));
         } else {
             self.raw(A, args[0]);
-            if self.emit_cached_tlv_base() {
-                let at = self.asm.pos();
-                self.asm.word(off_word);
-                self.relocs
-                    .push(StencilReloc::runtime(at, rt, RelocKind::ThreadOff32));
-            } else {
-                let at = self.emit_tlv_base();
-                self.asm.word(off_word);
-                self.relocs
-                    .push(StencilReloc::runtime(at, rt, RelocKind::Arm64TlvCell));
-            }
+            self.emit_tlv_slot(off_word, |at, kind| StencilReloc::runtime(at, rt, kind));
             self.asm.ldp_offset(Reg(17), Reg(0), C, 0);
             self.asm.add_imm(
                 true,

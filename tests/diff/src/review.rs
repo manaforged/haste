@@ -239,20 +239,27 @@ fn tls_init_unwind_body(trigger: bool, drops: &mut i64) -> i64 {
     out
 }
 
-pub fn case_rev_thread_local_init_panic_drop(seed: i64) -> i64 {
+fn with_silent_panic_hook<T>(f: impl FnOnce() -> T) -> T {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
-    let (drops, caught) = std::thread::spawn(move || {
-        let mut drops = 0_i64;
-        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            black_box(tls_init_unwind_body(black_box(true), &mut drops));
-        }))
-        .is_err();
-        (drops, i64::from(caught))
-    })
-    .join()
-    .unwrap_or((-1, -1));
+    let out = f();
     std::panic::set_hook(prev);
+    out
+}
+
+pub fn case_rev_thread_local_init_panic_drop(seed: i64) -> i64 {
+    let (drops, caught) = with_silent_panic_hook(|| {
+        std::thread::spawn(move || {
+            let mut drops = 0_i64;
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                black_box(tls_init_unwind_body(black_box(true), &mut drops));
+            }))
+            .is_err();
+            (drops, i64::from(caught))
+        })
+        .join()
+        .unwrap_or((-1, -1))
+    });
     let no_trigger_drops = {
         let mut d = 0_i64;
         black_box(tls_init_unwind_body(black_box(false), &mut d));
@@ -323,17 +330,315 @@ fn cmp_drop_caller(trigger: bool, drops: &mut i64) -> bool {
 }
 
 pub fn case_rev_cmp_drop_unwind(seed: i64) -> i64 {
-    let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
     let mut drops = 0_i64;
-    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        black_box(cmp_drop_caller(black_box(true), &mut drops));
-    }))
-    .is_err();
-    std::panic::set_hook(prev);
+    let caught = with_silent_panic_hook(|| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            black_box(cmp_drop_caller(black_box(true), &mut drops));
+        }))
+        .is_err()
+    });
     let mut ok_drops = 0_i64;
     let eq = cmp_drop_caller(black_box(false), &mut ok_drops);
     drops * 100 + i64::from(caught) * 10 + ok_drops * 1000 + i64::from(eq) + (seed & 3)
+}
+
+#[inline(never)]
+fn shl32_zext_helper(x: u32, y: u32) -> u64 {
+    let a = (x << 4) as u64;
+    let b = (x.wrapping_shl(0)) as u64;
+    let c = ((x << 7) as u64).wrapping_add(y as u64);
+    let d = (x.wrapping_shl(32)) as u64;
+    a ^ b.rotate_left(11) ^ c.rotate_left(23) ^ d.rotate_left(37)
+}
+
+pub fn case_rev_shl32_zext(seed: i64) -> i64 {
+    let x = black_box((seed as u32) | 0xF000_0001);
+    let y = black_box(seed.wrapping_mul(3) as u32);
+    shl32_zext_helper(x, y) as i64
+}
+
+#[inline(never)]
+fn arm64_bfx_uext_mul(p1: isize, p2: i128) -> [isize; 8] {
+    let v0: u16 = 61321u16.wrapping_mul(p2 as u16);
+    let v1: i32 = -2;
+    [
+        p1,
+        p1.wrapping_mul(p1)
+            .wrapping_add((v1 as isize).checked_mul(p1).unwrap_or(2176610907222155318isize)),
+        2isize.wrapping_sub(p1).wrapping_mul(p1.wrapping_shr(v0 as u32)),
+        p1,
+        p1,
+        p1,
+        p1,
+        p1,
+    ]
+}
+
+pub fn case_rev_arm64_bfx_uext_mul(seed: i64) -> i64 {
+    let arr = arm64_bfx_uext_mul(
+        black_box((seed as isize).wrapping_mul(2718559099037094551isize)),
+        black_box((seed as i128).wrapping_mul(4427392249614144833i128)),
+    );
+    (arr[1] ^ arr[2].rotate_left(13)) as i64
+}
+
+#[inline(never)]
+fn widen_u8_to_u128_loop(p0: u8, p1: u32) -> u64 {
+    let arr: [u8; 8] = [
+        p0,
+        p0.wrapping_add(3),
+        (p1 as u8) ^ 0x55,
+        p0.rotate_left(3),
+        p0.wrapping_mul(7),
+        (p1 >> 8) as u8,
+        p0 ^ 0xa5,
+        p0.wrapping_sub(1),
+    ];
+    let mut v1: u8 = arr[(p1 as usize) & 7];
+    for &item in &arr {
+        v1 = v1.wrapping_mul(31).wrapping_add(item);
+    }
+    let mask = 281824386369665800410624849967470095423u128;
+    let v4 = (4294967296u128)
+        .checked_sub(mask & (v1 as u128))
+        .unwrap_or(42u128);
+    (v1 as u64).rotate_left(28) ^ (v4 as u64).rotate_left(49) ^ ((v4 >> 64) as u64)
+}
+
+pub fn case_rev_widen_u8_to_u128(seed: i64) -> i64 {
+    widen_u8_to_u128_loop(black_box(seed as u8), black_box(seed.wrapping_mul(17) as u32)) as i64
+}
+
+#[inline(never)]
+fn arm64_cinc_flag_clobber(p0: u64, p1: i16, p2: i64) -> u64 {
+    let arr: [u128; 3] = [
+        p1 as u128,
+        if (-1isize).saturating_add(p1 as isize) > 5596119597510775268isize {
+            18446744073709551615u128 ^ (p0 as u128)
+        } else {
+            u128::MAX.wrapping_add(p2 as u128)
+        },
+        (p2 as u128).wrapping_mul(31),
+    ];
+    let mut acc = arr[(p0 as usize) % 3];
+    for &item in &arr {
+        acc = acc.wrapping_mul(31).wrapping_add(item);
+    }
+    (acc as u64) ^ ((acc >> 64) as u64).rotate_left(17)
+}
+
+pub fn case_rev_arm64_cinc_flag_clobber(seed: i64) -> i64 {
+    arm64_cinc_flag_clobber(
+        black_box(seed as u64),
+        black_box(seed as i16),
+        black_box(seed.wrapping_mul(131)),
+    ) as i64
+}
+
+#[inline(never)]
+fn step_hash_callee(x: u64) -> u64 {
+    x.wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(19) ^ 0x517c_c1b7_2722_0a95
+}
+
+#[inline(never)]
+fn sink_self_loop_slot_inner(seed: u64, cond: bool) -> u64 {
+    let mut h = 0u64;
+    let mut s = seed;
+    for _ in 0..16 {
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        h = h.rotate_left(5) ^ step_hash_callee(black_box(s));
+    }
+    if cond {
+        h ^= step_hash_callee(black_box(seed ^ 1));
+    }
+    let ptr: *const u64 = &h;
+    // SAFETY: `h` is a live stack local for the duration of this call.
+    let loaded = unsafe { std::ptr::read_volatile(ptr) };
+    loaded ^ h.rotate_left(3)
+}
+
+pub fn case_rev_sink_self_loop_slot(seed: i64) -> i64 {
+    sink_self_loop_slot_inner(black_box(seed as u64), black_box((seed & 1) == 0)) as i64
+}
+
+struct TrackedDrop<'a> {
+    id: i64,
+    panic_on: i64,
+    log: &'a std::sync::atomic::AtomicI64,
+}
+
+impl Drop for TrackedDrop<'_> {
+    fn drop(&mut self) {
+        let prev = self.log.load(std::sync::atomic::Ordering::Relaxed);
+        self.log.store(
+            prev.wrapping_mul(31).wrapping_add(self.id + 7),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        if self.id == self.panic_on {
+            panic!("tracked drop");
+        }
+    }
+}
+
+struct DropPair<'a>(TrackedDrop<'a>, TrackedDrop<'a>);
+
+struct UnsizedDropPair<'a, T: ?Sized>(TrackedDrop<'a>, T);
+
+#[inline(never)]
+fn drop_rest_cases(log: &std::sync::atomic::AtomicI64, panic_on: i64) -> i64 {
+    let mk = |id| TrackedDrop { id, panic_on, log };
+    let r1 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _t = (mk(0), mk(1), mk(2));
+    }))
+    .is_err();
+    let r2 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _p = DropPair(mk(0), mk(3));
+    }))
+    .is_err();
+    let r3 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _a = [mk(0), mk(1), mk(2)];
+    }))
+    .is_err();
+    let r4 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _v = vec![mk(0), mk(1), mk(2)];
+    }))
+    .is_err();
+    let r5 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let a = mk(0);
+        let b = mk(8);
+        let _c = move || a.id + b.id;
+    }))
+    .is_err();
+    let r6 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _u: Box<UnsizedDropPair<'_, [TrackedDrop<'_>]>> =
+            Box::new(UnsizedDropPair(mk(0), [mk(1), mk(2)]));
+    }))
+    .is_err();
+    i64::from(r1)
+        + i64::from(r2) * 2
+        + i64::from(r3) * 4
+        + i64::from(r4) * 8
+        + i64::from(r5) * 16
+        + i64::from(r6) * 32
+}
+
+pub fn case_rev_drop_rest_on_panic(seed: i64) -> i64 {
+    let log = std::sync::atomic::AtomicI64::new(seed & 15);
+    let mask = with_silent_panic_hook(|| {
+        drop_rest_cases(&log, black_box(0))
+            .wrapping_add(drop_rest_cases(&log, black_box(1)).wrapping_mul(64))
+            .wrapping_add(drop_rest_cases(&log, black_box(2)).wrapping_mul(4096))
+    });
+    log.load(std::sync::atomic::Ordering::Relaxed)
+        .wrapping_mul(64)
+        .wrapping_add(mask)
+}
+
+struct CatchInsideDrop<'a>(&'a std::sync::atomic::AtomicI64);
+
+impl Drop for CatchInsideDrop<'_> {
+    fn drop(&mut self) {
+        let inner = std::panic::catch_unwind(|| panic!("inner drop")).is_err();
+        self.0
+            .fetch_add(if inner { 10 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pub fn case_rev_catch_unwind_inside_drop(seed: i64) -> i64 {
+    let acc = std::sync::atomic::AtomicI64::new(seed & 7);
+    let outer = with_silent_panic_hook(|| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = CatchInsideDrop(&acc);
+            panic!("outer");
+        }))
+        .is_err()
+    });
+    acc.load(std::sync::atomic::Ordering::Relaxed) * 2 + i64::from(outer)
+}
+
+#[cfg(unix)]
+unsafe extern "C-unwind" {
+    fn qsort(
+        base: *mut i32,
+        nmemb: usize,
+        size: usize,
+        compar: extern "C-unwind" fn(*const i32, *const i32) -> i32,
+    );
+}
+
+#[cfg(unix)]
+extern "C-unwind" fn qsort_panic_cmp(_: *const i32, _: *const i32) -> i32 {
+    panic!("qsort cmp")
+}
+
+#[cfg(unix)]
+struct QsortDrop<'a>(&'a std::sync::atomic::AtomicI64);
+
+#[cfg(unix)]
+impl Drop for QsortDrop<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_add(100, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(unix)]
+#[inline(never)]
+fn qsort_unwind_sorter(acc: &std::sync::atomic::AtomicI64) {
+    let _guard = QsortDrop(acc);
+    let mut vals = [3i32, 1, 2];
+    // SAFETY: `vals` has 3 valid `i32` elements and `qsort_panic_cmp` has C-unwind ABI.
+    unsafe { qsort(vals.as_mut_ptr(), 3, 4, qsort_panic_cmp) };
+}
+
+#[cfg(unix)]
+#[inline(never)]
+fn qsort_unwind_sorter_indirect(
+    acc: &std::sync::atomic::AtomicI64,
+    sort_fn: unsafe extern "C-unwind" fn(
+        *mut i32,
+        usize,
+        usize,
+        extern "C-unwind" fn(*const i32, *const i32) -> i32,
+    ),
+) {
+    let _guard = QsortDrop(acc);
+    let mut vals = [3i32, 1, 2];
+    // SAFETY: `vals` has 3 valid `i32` elements and `sort_fn` is `qsort` with C-unwind ABI.
+    unsafe { sort_fn(vals.as_mut_ptr(), 3, 4, qsort_panic_cmp) };
+}
+
+pub fn case_rev_cunwind_qsort(seed: i64) -> i64 {
+    #[cfg(unix)]
+    {
+        let acc = std::sync::atomic::AtomicI64::new(seed & 31);
+        let a = black_box(seed.wrapping_add(11));
+        let b = black_box(seed.wrapping_add(23));
+        let c = black_box(seed.wrapping_add(37));
+        let (caught_direct, caught_indirect) = with_silent_panic_hook(|| {
+            let d = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                qsort_unwind_sorter(&acc);
+            }))
+            .is_err();
+            let f: unsafe extern "C-unwind" fn(
+                *mut i32,
+                usize,
+                usize,
+                extern "C-unwind" fn(*const i32, *const i32) -> i32,
+            ) = black_box(qsort);
+            let i = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                qsort_unwind_sorter_indirect(&acc, f);
+            }))
+            .is_err();
+            (d, i)
+        });
+        acc.load(std::sync::atomic::Ordering::Relaxed)
+            .wrapping_add(i64::from(caught_direct) + i64::from(caught_indirect) * 2)
+            .wrapping_add(a ^ b ^ c)
+    }
+    #[cfg(not(unix))]
+    {
+        seed
+    }
 }
 
 pub const CASES: &[(&str, fn(i64) -> i64)] = &[
@@ -345,4 +650,12 @@ pub const CASES: &[(&str, fn(i64) -> i64)] = &[
     ("case_rev_thread_local_init_panic_drop", case_rev_thread_local_init_panic_drop),
     ("case_rev_licm_cold_latch", case_rev_licm_cold_latch),
     ("case_rev_cmp_drop_unwind", case_rev_cmp_drop_unwind),
+    ("case_rev_shl32_zext", case_rev_shl32_zext),
+    ("case_rev_arm64_bfx_uext_mul", case_rev_arm64_bfx_uext_mul),
+    ("case_rev_widen_u8_to_u128", case_rev_widen_u8_to_u128),
+    ("case_rev_arm64_cinc_flag_clobber", case_rev_arm64_cinc_flag_clobber),
+    ("case_rev_sink_self_loop_slot", case_rev_sink_self_loop_slot),
+    ("case_rev_drop_rest_on_panic", case_rev_drop_rest_on_panic),
+    ("case_rev_catch_unwind_inside_drop", case_rev_catch_unwind_inside_drop),
+    ("case_rev_cunwind_qsort", case_rev_cunwind_qsort),
 ];

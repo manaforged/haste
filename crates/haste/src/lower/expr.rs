@@ -213,6 +213,13 @@ impl Lower<'_, '_> {
                 }
             }
             Expr::Ref {
+                expr: inner,
+                mutable: true,
+                raw: false,
+            } if !self.is_place(inner) && self.can_promote_mut_static(inner)? => self
+                .once(self.ty_of(inner), |lower| lower.expr(inner))
+                .map(Some),
+            Expr::Ref {
                 expr: inner, raw, ..
             } => self.reference(inner, raw),
             Expr::TupleField(..) => self.field_value(expr),

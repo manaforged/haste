@@ -206,18 +206,19 @@ pub fn package_vars(workspace: &Workspace, unit: usize) -> Vec<(String, String)>
             manifest.dir.join("Cargo.toml").display().to_string(),
         ),
     ];
+    let meta = &manifest.meta;
     vars.extend(
         [
-            "AUTHORS",
-            "DESCRIPTION",
-            "HOMEPAGE",
-            "REPOSITORY",
-            "LICENSE",
-            "LICENSE_FILE",
-            "README",
-            "RUST_VERSION",
+            ("AUTHORS", &meta.authors),
+            ("DESCRIPTION", &meta.description),
+            ("HOMEPAGE", &meta.homepage),
+            ("REPOSITORY", &meta.repository),
+            ("LICENSE", &meta.license),
+            ("LICENSE_FILE", &meta.license_file),
+            ("README", &meta.readme),
+            ("RUST_VERSION", &meta.rust_version),
         ]
-        .map(|key| (key, String::new())),
+        .map(|(key, val)| (key, val.clone())),
     );
     vars.into_iter()
         .map(|(key, value)| {

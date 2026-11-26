@@ -345,8 +345,23 @@ impl Infer<'_, '_> {
             self.poly_prove(of, self_ty, args);
             return Ok(true);
         }
+        if self.poly_strict_param_obligation(of, self_ty, args) {
+            return Ok(false);
+        }
         self.poly_fallback();
         Ok(true)
+    }
+
+    fn poly_strict_param_obligation(&self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> bool {
+        self.root_is_user()
+            && !self.poly_fell_back()
+            && self.has_params(self_ty)
+            && !self.has_vars(self_ty)
+            && !self.cx.types.has_projs(self_ty)
+            && self.checks_bound_trait(of)
+            && !args
+                .iter()
+                .any(|&a| self.has_vars(a) || self.cx.types.has_projs(self.resolve(a)))
     }
 
     pub(in super::super) fn select_or_assume(
@@ -434,11 +449,7 @@ impl Infer<'_, '_> {
         };
         let arg_ids = self.body.list(args).to_vec();
         if arg_ids.len() != params.len() {
-            bail!(
-                "call takes {} arguments, {} given",
-                params.len(),
-                arg_ids.len()
-            );
+            return Err(self.diag_arity(Some(expr), params.len(), arg_ids.len()));
         }
         for (&arg, &param) in arg_ids.iter().zip(&params) {
             self.call_arg(None, ExprId(arg), (param, None), &mut None)?;

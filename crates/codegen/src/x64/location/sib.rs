@@ -470,7 +470,7 @@ pub(super) fn fuse_mem_rmw(
             };
             if block.insts[lpos + 1..spos]
                 .iter()
-                .any(|&mid| super::fuse::may_barrier_mem(&func.insts[mid.index()].op))
+                .any(|&mid| func.insts[mid.index()].op.is_load_barrier())
             {
                 continue;
             }

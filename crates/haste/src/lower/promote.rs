@@ -30,7 +30,7 @@ impl Lower<'_, '_> {
             .map(Some)
     }
 
-    fn once(
+    pub(super) fn once(
         &mut self,
         ty: Ty,
         fill: impl FnOnce(&mut Self) -> Result<Option<Value>>,

@@ -72,6 +72,13 @@ impl Infer<'_, '_> {
                 continue;
             };
             if !self.has_vars(open) {
+                if matches!(*self.cx.types.kind(self.resolve(found)), Kind::Var(_)) && !final_pass {
+                    self.casts.push((inner, found, target));
+                } else if !self.out.coercions.contains_key(&inner)
+                    && let Some(coercion) = self.coercion(found, target)?
+                {
+                    self.out.coercions.insert(inner, coercion);
+                }
                 continue;
             }
             match *self.cx.types.kind(self.resolve(found)) {

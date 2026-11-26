@@ -67,7 +67,11 @@ pub(super) fn run_with_cycle(
             .push(AbiParam::special(Type::I64, ArgumentPurpose::Dict));
     }
     let mut func = Function::new(sig);
-    func.keep_fp = crate::sema::reach::unwind_enabled(cx, reached);
+    let abort_on_unwind = matches!(typed.shape, Shape::Body)
+        && !cx.fn_abi_may_unwind(*item)
+        && reached.may_unwind(cx, index);
+    func.abort_on_unwind = abort_on_unwind;
+    func.keep_fp = crate::sema::reach::unwind_enabled(cx, reached) || abort_on_unwind;
     let b = FunctionBuilder::new(&mut func);
     let (mut relocs, mut reloc_plan) = (Vec::new(), Vec::new());
     let mut cycle = {

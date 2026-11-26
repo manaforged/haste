@@ -1,4 +1,5 @@
 use anyhow::Result;
+use rustc_hash::FxHashSet as HashSet;
 
 use crate::body::sig::{GenericKind, Signature};
 use crate::body::{Args, Bound, Expr, ExprId, List, Ty as AstTy, TyId};
@@ -78,6 +79,7 @@ pub(in super::super) struct ClosureEffects {
     pub(in super::super) outer_loans: Vec<(u32, BorrowSource)>,
     pub(in super::super) param_loans: Vec<ClosureParamLoan>,
     pub(in super::super) ret_params: Vec<usize>,
+    pub(in super::super) ret_targets: Option<(HashSet<u32>, HashSet<u32>)>,
 }
 
 impl Checker<'_, '_> {
@@ -125,18 +127,7 @@ impl Checker<'_, '_> {
     }
 
     fn callee_param_bounds(&mut self, callee: ExprId) -> Option<ParamBounds> {
-        let cur = self.unwrap_parens(callee);
-        let crate::sema::infer::Res::Local(local) = self.typed.res.get(&cur).copied()? else {
-            return None;
-        };
-        let pos = self.typed.params.iter().position(|&p| p == local)?;
-        let sig = self.cx.signature(self.item).ok()?;
-        let param_idx = if sig.receiver.is_some() {
-            pos.checked_sub(1)?
-        } else {
-            pos
-        };
-        let &(_, param_ty) = sig.params.get(param_idx)?;
+        let (sig, param_ty) = self.local_param_sig_ty(callee)?;
         Some(self.param_bound_reqs(&sig, self.src, param_ty))
     }
 
@@ -367,7 +358,10 @@ impl Checker<'_, '_> {
         let plain = self.expr_plain_local(expr);
         for s in sources {
             if is_temp_target(s.target).is_some() {
-                if in_const && !self.is_non_promotable_temp(expr) {
+                if in_const
+                    && self.temp_target_allowed(s.mutable)
+                    && !self.is_non_promotable_temp(expr)
+                {
                     continue;
                 }
                 return Err(self.does_not_live_long_enough(Some(expr), s.target));
@@ -606,7 +600,7 @@ impl Checker<'_, '_> {
         body_state: &State,
         state: &mut State,
         (moves_capture, mutates_capture, borrows_local): (bool, bool, bool),
-        ret_params: Vec<usize>,
+        (ret_params, ret_targets): (Vec<usize>, Option<(HashSet<u32>, HashSet<u32>)>),
     ) {
         let mut outer_loans = Vec::new();
         let mut param_loans = Vec::new();
@@ -675,6 +669,7 @@ impl Checker<'_, '_> {
                 outer_loans,
                 param_loans,
                 ret_params,
+                ret_targets,
             },
         );
     }

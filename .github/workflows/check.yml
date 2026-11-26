@@ -26,11 +26,12 @@ jobs:
         run: |
           cargo fmt --all --check
           python3 -c 'import pathlib; bad=[(p.read_bytes().count(b"\n"), str(p)) for p in sorted(pathlib.Path("crates").rglob("*.rs")) if p.read_bytes().count(b"\n") > 800]; assert not bad, f"files over 800 lines: {bad}"'
-      - name: Run unit and public API tests
+      - name: Run unit and integration tests
         run: |
           cargo check --locked -p haste
-          cargo test --locked -p haste-codegen -p haste --lib
-          cargo test --locked -p haste --test compiler_api --test soundness
+          cargo test --locked -p haste-codegen
+          cargo test --locked -p haste --lib
+          cargo test --locked -p haste --test compiler_api --test soundness --test regressions
       - name: Build haste
         run: cargo build --locked --release -p haste --features diff-harness
       - name: Run differential and probe suites

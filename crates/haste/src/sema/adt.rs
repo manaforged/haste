@@ -45,9 +45,15 @@ impl<'a> Context<'a> {
         if let Some(found) = self.store.lookups.discriminants.get(&item) {
             return Ok(found);
         }
+        if self.discr_visiting.contains(&item) {
+            anyhow::bail!("cyclic enum discriminant in {}", self.name(item));
+        }
         let before = self.quiet_mark();
         let primitive = self.discriminant_primitive(item);
-        let found: Arc<[i128]> = super::infer::discriminants(self, item, primitive)?.into();
+        self.discr_visiting.push(item);
+        let result = super::infer::discriminants(self, item, primitive);
+        self.discr_visiting.pop();
+        let found: Arc<[i128]> = result?.into();
         if self.quiet_mark() == before {
             self.store
                 .lookups

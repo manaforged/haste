@@ -36,11 +36,7 @@ pub(crate) fn const_val<R: Copy>(
     defs: &[Option<Inst>],
     v: Value,
 ) -> Option<i64> {
-    plan.const_of(v)
-        .or_else(|| match func.insts[defs[v.index()]?.index()].op {
-            Op::Const(imm) => Some(imm),
-            _ => None,
-        })
+    plan.const_or_def(func, |x| defs[x.index()], v)
 }
 
 pub(crate) fn const_halves<R: Copy>(

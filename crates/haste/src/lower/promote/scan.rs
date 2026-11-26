@@ -13,16 +13,30 @@ use super::super::{Lower, Repr, repr};
 use super::literal::Scope;
 
 impl Lower<'_, '_> {
+    /// Whether `&mut inner` can promote into a program-lifetime writable cell: outside loops in a `static mut` initializer (or any ZST static initializer).
+    pub(in super::super) fn can_promote_mut_static(&mut self, inner: ExprId) -> Result<bool> {
+        if !self.loops.is_empty() {
+            return Ok(false);
+        }
+        let item = self.reached.list[self.index].0.0;
+        if self.cx.item(item).1.kind != ItemKind::Static {
+            return Ok(false);
+        }
+        Ok(self.is_mutable_static(item) || self.cx.layout(self.ty_of(inner))?.size.bytes() == 0)
+    }
+
+    /// Whether the function being lowered is a `const` or `static` initializer.
+    pub(in super::super) fn in_const_or_static(&self) -> bool {
+        let item = self.reached.list[self.index].0.0;
+        matches!(
+            self.cx.item(item).1.kind,
+            ItemKind::Const | ItemKind::Static
+        )
+    }
+
     /// Whether `&expr` names a value that lives for the whole program: a literal, a constant, a function, a closure that captures nothing, a constructor, a shared reference to one, an aggregate or constructor call of them, or a field of one; in a constant or static initializer, which the compiler evaluates once, also a call, operator or block of them.
     pub fn promotable(&mut self, expr: ExprId) -> Result<bool> {
-        let item = self.reached.list[self.index].0.0;
-        self.promotable_in(
-            expr,
-            matches!(
-                self.cx.item(item).1.kind,
-                ItemKind::Const | ItemKind::Static
-            ),
-        )
+        self.promotable_in(expr, self.in_const_or_static())
     }
 
     fn promotable_in(&mut self, expr: ExprId, constant: bool) -> Result<bool> {

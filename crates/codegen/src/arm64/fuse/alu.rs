@@ -67,7 +67,9 @@ fn eon_arg_preserved(
             && upos < ipos
             && matches!(
                 func.insts[uinst.index()].op,
-                Op::Convert(Convert::Uextend, inner) if preserved(func, plan, b_idx, upos, pos, Some(ipos), inner)
+                Op::Convert(Convert::Uextend, inner)
+                    if !plan.elided[inner.index()]
+                        && preserved(func, plan, b_idx, upos, pos, Some(ipos), inner)
             )
     })
 }
@@ -138,7 +140,7 @@ pub(super) fn try_fuse_shift_ty(
         (b_idx, spos, pos, Some(spos), res),
         (b, &shift_ok),
     );
-    if !peeled && !preserved(func, plan, b_idx, spos, pos, None, b) {
+    if !peeled && (plan.elided[b.index()] || !preserved(func, plan, b_idx, spos, pos, None, b)) {
         return false;
     }
     plan.elided[shift_val.index()] = true;

@@ -135,16 +135,6 @@ pub(super) fn canonical_icmp(cc: IntCC, x: Operand, y: Operand) -> (IntCC, Opera
     )
 }
 
-fn flip_float_cc(cc: FloatCC) -> FloatCC {
-    match cc {
-        FloatCC::Equal | FloatCC::NotEqual => cc,
-        FloatCC::LessThan => FloatCC::GreaterThan,
-        FloatCC::GreaterThan => FloatCC::LessThan,
-        FloatCC::LessThanOrEqual => FloatCC::GreaterThanOrEqual,
-        FloatCC::GreaterThanOrEqual => FloatCC::LessThanOrEqual,
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum ShuffleKey {
     Const([u8; 16]),
@@ -257,7 +247,7 @@ pub(super) fn key(
             let x_ty = types[find(subst, x).index()];
             let (a, b) = (opnd(x), opnd(y));
             if a > b {
-                Key::Fcmp(flip_float_cc(cc), x_ty, b, a)
+                Key::Fcmp(cc.swapped(), x_ty, b, a)
             } else {
                 Key::Fcmp(cc, x_ty, a, b)
             }

@@ -88,7 +88,21 @@ fn subdirs(dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn registry_dirs() -> Result<Vec<PathBuf>> {
-    subdirs(&cargo_home()?.join("registry/src"))
+    let dir = cargo_home()?.join("registry/src");
+    match std::fs::read_dir(&dir) {
+        Ok(entries) => Ok(entries
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.is_dir())
+            .collect()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(err) => Err(err).with_context(|| format!("reading {}", dir.display())),
+    }
+}
+
+fn registries_with_vendor(top: &Path) -> Result<Vec<PathBuf>> {
+    let mut dirs = registry_dirs()?;
+    dirs.insert(0, top.join("vendor"));
+    Ok(dirs)
 }
 
 fn source_dir(
@@ -233,6 +247,27 @@ fn member_dirs(top: &Path, workspace: Option<&toml::Table>, key: &str) -> Vec<Pa
         .collect()
 }
 
+fn run_cargo(manifest_dir: &Path, args: &[&str]) -> Result<()> {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| std::ffi::OsString::from("cargo"));
+    let out = std::process::Command::new(cargo)
+        .args(args)
+        .args(["--quiet", "--manifest-path"])
+        .arg(manifest_dir.join(MANIFEST_FILE))
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to run `cargo {}` for {}",
+                args.join(" "),
+                manifest_dir.display()
+            )
+        })?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        bail!("`cargo {}` failed: {}", args.join(" "), stderr.trim());
+    }
+    Ok(())
+}
+
 pub(crate) fn workspace_root(root: &Path) -> Result<PathBuf> {
     if let Some(found) = root.ancestors().find(|dir| dir.join(LOCK_FILE).is_file()) {
         return Ok(found.to_owned());
@@ -246,21 +281,7 @@ pub(crate) fn workspace_root(root: &Path) -> Result<PathBuf> {
                 root.display()
             )
         })?;
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| std::ffi::OsString::from("cargo"));
-    let out = std::process::Command::new(cargo)
-        .args(["generate-lockfile", "--quiet", "--manifest-path"])
-        .arg(manifest_dir.join(MANIFEST_FILE))
-        .output()
-        .with_context(|| {
-            format!(
-                "no {LOCK_FILE} at or above {} and failed to run `cargo generate-lockfile`",
-                root.display()
-            )
-        })?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        bail!("`cargo generate-lockfile` failed: {}", stderr.trim());
-    }
+    run_cargo(manifest_dir, &["generate-lockfile"])?;
     root.ancestors()
         .find(|dir| dir.join(LOCK_FILE).is_file())
         .map(Path::to_owned)
@@ -383,7 +404,7 @@ pub(crate) fn load(
         selection.package.as_deref(),
         &features,
         (!selection.no_default_features, selection.all_features),
-        &[],
+        (&[], true),
     )
 }
 
@@ -531,7 +552,7 @@ fn load_filtered(
     package: Option<&str>,
     features: &[&str],
     (default_features, all_features): (bool, bool),
-    omit_root_deps: &[&str],
+    (omit_root_deps, allow_fetch): (&[&str], bool),
 ) -> Result<Workspace> {
     let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_owned());
     let root = canonical.as_path();
@@ -551,8 +572,7 @@ fn load_filtered(
         .filter(|e| !e.is_registry())
         .map(|e| e.name.clone())
         .collect();
-    let mut registries = registry_dirs()?;
-    registries.insert(0, top.join("vendor"));
+    let registries = registries_with_vendor(&top)?;
     let paths = local_paths(root, &top, workspace.as_ref(), &wanted_local)?;
     let (mut packages, mut missing) = load_packages(locked, &registries, &paths)?;
     if !omit_root_deps.is_empty() {
@@ -580,7 +600,7 @@ fn load_filtered(
             None => bail!("{} is not in {LOCK_FILE}", root.display()),
         }
     }
-    let graph = features::resolve(
+    let mut graph = features::resolve(
         &packages,
         targets,
         &members,
@@ -588,6 +608,48 @@ fn load_filtered(
         default_features,
         all_features,
     )?;
+    let is_external = |pkg: &Package| pkg.locked.is_registry() || pkg.locked.git().is_some();
+    if allow_fetch
+        && graph
+            .units
+            .iter()
+            .any(|u| missing[u.package].is_some() && is_external(&packages[u.package]))
+    {
+        eprintln!("haste: fetching missing dependencies with `cargo fetch`...");
+        if let Err(fetch_err) = run_cargo(&top, &["fetch", "--locked"]) {
+            let first = graph
+                .units
+                .iter()
+                .find_map(|u| missing[u.package].as_ref())
+                .map(|e| format!("{e:#}"))
+                .unwrap_or_default();
+            bail!("{first} (automatic `cargo fetch` failed: {fetch_err:#})");
+        }
+        let fresh_regs = registries_with_vendor(&top)?;
+        let retry_idxs: Vec<usize> = missing
+            .iter()
+            .enumerate()
+            .filter(|&(idx, err)| err.is_some() && is_external(&packages[idx]))
+            .map(|(idx, _)| idx)
+            .collect();
+        let retry_entries: Vec<Locked> = retry_idxs
+            .iter()
+            .map(|&idx| packages[idx].locked.clone())
+            .collect();
+        let (reloaded, retry_missing) = load_packages(retry_entries, &fresh_regs, &paths)?;
+        for ((idx, pkg), err) in retry_idxs.into_iter().zip(reloaded).zip(retry_missing) {
+            (packages[idx], missing[idx]) = (pkg, err);
+        }
+        resolve_deps(&mut packages);
+        graph = features::resolve(
+            &packages,
+            targets,
+            &members,
+            features,
+            default_features,
+            all_features,
+        )?;
+    }
     for unit in &graph.units {
         if let Some(err) = missing[unit.package].take() {
             return Err(err);
@@ -682,7 +744,7 @@ pub fn load_sysroot(library: &Path, targets: &Targets) -> Result<Workspace> {
         None,
         features,
         (true, false),
-        &["test"],
+        (&["test"], false),
     )?;
     sysroot
         .packages

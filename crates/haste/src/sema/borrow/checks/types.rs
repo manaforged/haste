@@ -1,19 +1,68 @@
 use rustc_hash::FxHashSet as HashSet;
 
 use crate::body::sig::GenericKind;
-use crate::body::{BlockKind, Expr, ExprId, Stmt, UnOp};
+use crate::body::{BlockKind, Expr, ExprId, Stmt};
 use crate::names::ItemRef;
 use crate::outline::item::ItemKind;
+use crate::sema::Context;
 use crate::sema::impls::ImplRef;
-use crate::sema::infer::{By, Res};
-use crate::sema::ty::{Kind, Ty};
+use crate::sema::infer::{By, Res, Typed};
+use crate::sema::ty::{Kind, Mut, Ty};
 
 use super::super::Checker;
+
+/// Whether `ty` is `Copy` in `item`, resolving closures declared inside `typed` directly and defaulting conservatively to `false`.
+pub(in crate::sema) fn is_copy_ty(
+    cx: &mut Context<'_>,
+    item: ItemRef,
+    typed: &Typed,
+    ty: Ty,
+) -> bool {
+    if ty == Ty::NONE {
+        return true;
+    }
+    match cx.types.kind(ty).clone() {
+        Kind::Ref(Mut::Not, _) => true,
+        Kind::Ref(Mut::Mut, _)
+        | Kind::Slice(_)
+        | Kind::Dyn(..)
+        | Kind::Prim(crate::names::Primitive::Str) => false,
+        Kind::Tuple(items) => cx
+            .types
+            .substs(items)
+            .to_vec()
+            .into_iter()
+            .all(|t| is_copy_ty(cx, item, typed, t)),
+        Kind::Array(inner, _) => is_copy_ty(cx, item, typed, inner),
+        Kind::Closure(parent, _, at) if parent == item => {
+            typed.closures.get(&ExprId(at)).is_some_and(|c| {
+                !c.coroutine
+                    && c.captures.iter().all(|cap| match cap.by {
+                        By::Ref => true,
+                        By::Mut => false,
+                        By::Value => {
+                            let local_ty = typed.locals[cap.local as usize].ty;
+                            let cap_ty = cap.ty(cx, local_ty).unwrap_or(local_ty);
+                            is_copy_ty(cx, item, typed, cap_ty)
+                        }
+                    })
+            })
+        }
+        _ => super::super::super::infer::is_copy(cx, item, ty).unwrap_or(false),
+    }
+}
 
 impl Checker<'_, '_> {
     pub(in super::super) fn ty_holds_borrow(&mut self, ty: Ty) -> bool {
         let mut seen = HashSet::default();
         self.ty_holds_borrow_inner(ty, &mut seen)
+    }
+
+    pub(in super::super) fn ty_is_borrow_free(&mut self, ty: Ty) -> bool {
+        ty != Ty::NONE
+            && !self.cx.types.has_params(ty)
+            && !self.cx.types.has_projs(ty)
+            && !self.ty_holds_borrow(ty)
     }
 
     fn ty_holds_borrow_inner(&mut self, ty: Ty, seen: &mut HashSet<Ty>) -> bool {
@@ -224,14 +273,78 @@ impl Checker<'_, '_> {
         (start..end).any(|t| src.text(t) == "may_dangle")
     }
 
+    pub(in super::super) fn is_static_mut_init(&self) -> bool {
+        self.const_depth == 0
+            && self.closure_depth == 0
+            && self.loop_depth == 0
+            && matches!(self.cx.item(self.item).1.kind, ItemKind::Static)
+            && self.is_static_mut(self.item)
+    }
+
+    pub(in super::super) fn temp_target_allowed(&self, mutable: bool) -> bool {
+        if mutable {
+            self.is_static_mut_init()
+        } else {
+            self.is_const_or_static_item()
+        }
+    }
+
+    pub(in super::super) fn has_overloaded_deref(&self, expr: ExprId) -> bool {
+        if self.typed.derefs.contains_key(&(expr, 0)) {
+            return true;
+        }
+        let count = self
+            .typed
+            .autoderefs
+            .get(&expr)
+            .copied()
+            .unwrap_or(0)
+            .max(self.typed.adjusts.get(&expr).map_or(0, |a| a.derefs));
+        (0..count).any(|step| self.typed.derefs.contains_key(&(expr, step)))
+    }
+
+    pub(in super::super) fn is_non_promotable_borrow_temp(
+        &mut self,
+        expr: ExprId,
+        mutable: bool,
+    ) -> bool {
+        if self.static_root(expr).is_some() {
+            return false;
+        }
+        if self.is_non_promotable_temp(expr) {
+            return true;
+        }
+        mutable && !self.is_static_mut_init() && !self.is_promotable_zst_expr(expr)
+    }
+
+    fn is_promotable_zst_expr(&self, expr: ExprId) -> bool {
+        let ty = self.expr_ty(expr);
+        ty != Ty::NONE
+            && matches!(*self.cx.types.kind(ty), Kind::Array(_, len) if self.cx.types.len(len) == Some(0))
+    }
+
     pub(in super::super) fn is_non_promotable_temp(&self, expr: ExprId) -> bool {
+        if self.has_overloaded_deref(expr) {
+            return true;
+        }
         match *self.body.expr(expr) {
+            Expr::Path(_) => {
+                !self.is_const_or_static_item()
+                    && matches!(self.typed.res.get(&expr), Some(Res::Local(_)))
+            }
             Expr::Paren(inner)
             | Expr::Cast(inner, _)
             | Expr::Field(inner, _)
             | Expr::TupleField(inner, _)
-            | Expr::Unary(UnOp::Deref, inner)
             | Expr::Ref { expr: inner, .. } => self.is_non_promotable_temp(inner),
+            Expr::Unary(_, inner) => {
+                self.typed.operators.contains_key(&expr) || self.is_non_promotable_temp(inner)
+            }
+            Expr::Binary(_, a, b) => {
+                self.typed.operators.contains_key(&expr)
+                    || self.is_non_promotable_temp(a)
+                    || self.is_non_promotable_temp(b)
+            }
             Expr::Call(callee, args) => {
                 let is_ctor = matches!(self.typed.res.get(&callee), Some(Res::Ctor(..)))
                     || matches!(self.typed.res.get(&expr), Some(Res::Ctor(..)));
@@ -252,21 +365,7 @@ impl Checker<'_, '_> {
             Expr::Method { .. } | Expr::Await(_) | Expr::Try(_) => true,
             Expr::Block {
                 kind, stmts, tail, ..
-            } => {
-                !matches!(kind, BlockKind::Const)
-                    && (self
-                        .body
-                        .list(stmts)
-                        .iter()
-                        .any(|&s| match self.body.stmts[s as usize] {
-                            Stmt::Let { init, .. } => {
-                                init.is_some_and(|e| self.is_non_promotable_temp(e))
-                            }
-                            Stmt::Expr(e, _) => self.is_non_promotable_temp(e),
-                            _ => false,
-                        })
-                        || tail.is_some_and(|t| self.is_non_promotable_temp(t)))
-            }
+            } => self.block_is_non_promotable(kind, stmts, tail),
             Expr::Tuple(list) | Expr::Array(list) => self
                 .body
                 .list(list)
@@ -279,18 +378,65 @@ impl Checker<'_, '_> {
                     .any(|&f| self.is_non_promotable_temp(self.body.fields[f as usize].value))
                     || base.is_some_and(|b| self.is_non_promotable_temp(b))
             }
-            Expr::Repeat(a, _) | Expr::Index(a, _) => self.is_non_promotable_temp(a),
+            Expr::Repeat(a, _) => self.is_non_promotable_temp(a),
+            Expr::Index(a, b) => {
+                let a_ty = self.expr_ty(a);
+                let full_range = matches!(
+                    *self.body.expr(self.unwrap_parens(b)),
+                    Expr::Range {
+                        from: None,
+                        to: None,
+                        ..
+                    }
+                ) && a_ty != Ty::NONE
+                    && matches!(self.cx.types.kind(a_ty), Kind::Array(..) | Kind::Slice(..));
+                if full_range {
+                    self.is_non_promotable_temp(a)
+                } else {
+                    !self.is_const_or_static_item()
+                        || self.typed.operators.contains_key(&expr)
+                        || self.is_non_promotable_temp(a)
+                        || self.is_non_promotable_temp(b)
+                }
+            }
             Expr::If(_, t, e) => {
-                self.is_non_promotable_temp(t)
+                !self.is_const_or_static_item()
+                    || self.is_non_promotable_temp(t)
                     || e.is_some_and(|alt| self.is_non_promotable_temp(alt))
             }
-            Expr::Match(_, arms) => self
-                .body
-                .list(arms)
-                .iter()
-                .any(|&a| self.is_non_promotable_temp(self.body.arms[a as usize].body)),
+            Expr::Match(_, arms) => {
+                !self.is_const_or_static_item()
+                    || self
+                        .body
+                        .list(arms)
+                        .iter()
+                        .any(|&a| self.is_non_promotable_temp(self.body.arms[a as usize].body))
+            }
+            Expr::Loop { .. } | Expr::While { .. } | Expr::For { .. } => {
+                !self.is_const_or_static_item()
+            }
             _ => false,
         }
+    }
+
+    fn block_is_non_promotable(
+        &self,
+        kind: BlockKind,
+        stmts: crate::body::List,
+        tail: Option<ExprId>,
+    ) -> bool {
+        if matches!(kind, BlockKind::Const) {
+            return false;
+        }
+        let ids = self.body.list(stmts);
+        if !ids.is_empty() && !self.is_const_or_static_item() {
+            return true;
+        }
+        ids.iter().any(|&s| match self.body.stmts[s as usize] {
+            Stmt::Let { init, .. } => init.is_some_and(|e| self.is_non_promotable_temp(e)),
+            Stmt::Expr(e, _) => self.is_non_promotable_temp(e),
+            _ => false,
+        }) || tail.is_some_and(|t| self.is_non_promotable_temp(t))
     }
 
     fn is_const_fn(&self, item: ItemRef) -> bool {

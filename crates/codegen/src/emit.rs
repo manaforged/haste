@@ -701,3 +701,24 @@ pub(crate) fn zero_cmp_band<R>(
     };
     Some((masked, mpos, x, y))
 }
+
+/// Finds an elided `Band(a, b)` in `x` or `y` whose sibling tests zero via `is_zero`.
+pub(crate) fn elided_band_cmp<R>(
+    func: &Function,
+    plan: &Plan<R>,
+    defs: &[Option<Inst>],
+    (x, y): (Value, Value),
+    is_zero: impl Fn(Value) -> bool,
+) -> Option<(Value, Value)> {
+    let masked = is_zero(y)
+        .then_some(x)
+        .or_else(|| is_zero(x).then_some(y))?;
+    if !plan.elided[masked.index()] {
+        return None;
+    }
+    let inst = defs[masked.index()]?;
+    let Op::Binary(Binary::Band, a, b) = func.insts[inst.index()].op else {
+        return None;
+    };
+    Some((a, b))
+}

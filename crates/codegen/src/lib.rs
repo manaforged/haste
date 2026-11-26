@@ -78,7 +78,7 @@ mod x64;
 pub use asm_text::{Assembly, assemble};
 pub use builder::{FunctionBuilder, Ins, Mark};
 pub use coroutine::Coroutine;
-pub use drop_elide::UnwindDrop;
+pub use drop_elide::{UnwindArg, UnwindDrop};
 pub use error::{Error, ErrorKind};
 pub use ir::{
     AbiParam, ArgumentPurpose, AtomicOrd, AtomicRmwOp, Block, CallConv, FloatCC, Function, Inst,
@@ -103,13 +103,16 @@ pub struct Site {
     pub frame_offset: u32,
 }
 
+/// Bit set in `Code::saved_regs()` when unwinding past this function frame must abort the process.
+pub const UNWIND_ABORT_BIT: u32 = 1 << 31;
+
 /// One frame-relative owned value dropped during panic unwinding when its 1-byte active flag is non-zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CodeUnwindDrop {
     pub local_off: i32,
     pub flag_off: i32,
     pub drop_sym: u32,
-    pub indirect: bool,
+    pub arg: UnwindArg,
 }
 
 /// Machine code for one function, its exception call sites, its stencil relocations, and its small loops.

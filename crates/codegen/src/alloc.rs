@@ -6,12 +6,14 @@ mod hints;
 pub(crate) mod hoist;
 mod preserved;
 mod setup;
+pub(crate) mod verify;
 pub(crate) mod walk;
 
 pub(crate) use addr::{atomic_elidable_addrs, iadd_sub_const};
 pub(crate) use hints::{rcpc2_atomic_site, rcpc2_delta_fits};
 pub(crate) use preserved::{
-    cold_cached_frame, cold_thread_cell, is_preserved_call_op, used_preserved_leaf_regs,
+    cold_cached_frame, cold_thread_cell, is_preserved_call_op, thread_cell_target,
+    used_preserved_leaf_regs,
 };
 pub(crate) use setup::BASE_WEIGHT;
 
@@ -288,13 +290,13 @@ fn spill_cost<R>(
     })
 }
 
-pub(crate) fn plan<R: Copy + PartialEq>(
+pub(crate) fn plan<R: Copy + PartialEq + std::fmt::Debug>(
     func: &Function,
     regs: &Regs<R>,
     (order, copied, weighed, preserve_tc): (&[Block], &[bool], bool, bool),
     params: &[Loc<R>],
     classify: &impl Fn(&Signature) -> Result<Abi<R>, String>,
-) -> Plan<R> {
+) -> Result<Plan<R>, String> {
     let count = func.types.len();
     let mut locations = vec![Location::Slot; count];
     fold::consts(func, regs.absolute_calls, &mut locations);
@@ -509,7 +511,7 @@ pub(crate) fn plan<R: Copy + PartialEq>(
     } else {
         hoist::Hoist::empty()
     };
-    Plan {
+    let plan = Plan {
         locations,
         fused,
         used,
@@ -526,7 +528,11 @@ pub(crate) fn plan<R: Copy + PartialEq>(
         clean_bits,
         spill_cost,
         hoist,
+    };
+    if crate::verify::verify_passes_enabled() {
+        verify::verify_plan(func, &live, &plan, regs, (order, copied, &copies))?;
     }
+    Ok(plan)
 }
 
 impl<R: Copy> Plan<R> {
@@ -568,6 +574,29 @@ impl<R: Copy> Plan<R> {
         } else {
             None
         }
+    }
+
+    /// Returns the immediate value of `value` from its allocated location or defining `Const`.
+    pub(crate) fn const_or_def(
+        &self,
+        func: &Function,
+        def: impl FnOnce(Value) -> Option<Inst>,
+        value: Value,
+    ) -> Option<i64> {
+        self.const_of(value)
+            .or_else(|| match func.insts[def(value)?.index()].op {
+                Op::Const(imm) => Some(imm),
+                _ => None,
+            })
+    }
+
+    /// Number of values eliminated from register allocation by elision or fusion.
+    pub(crate) fn dropped_count(&self) -> usize {
+        self.elided
+            .iter()
+            .chain(&self.fused)
+            .filter(|&&e| e)
+            .count()
     }
 }
 

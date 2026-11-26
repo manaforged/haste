@@ -57,6 +57,7 @@ use anyhow::{Result, bail};
 
 use crate::body::sig::Signature;
 use crate::body::{Body, ExprId, PatId};
+use crate::diag::{Diagnostic, DiagnosticKind, Span};
 use crate::names::{ItemRef, ModRef, Primitive};
 use crate::outline::source::Source;
 
@@ -103,6 +104,11 @@ pub enum Shape {
 }
 
 pub(super) type Name<'a> = (&'a str, u32);
+type LocalObligations = Box<[(ItemRef, Vec<Ty>)]>;
+type LocalSelectionKey = (ItemRef, Ty, Substs, Option<u32>, bool);
+type LocalSelectionValue = (Option<(super::impls::ImplRef, Substs)>, LocalObligations);
+type LocalProjectionKey = (ItemRef, Ty, Substs, crate::names::Sym, Substs, Option<u32>);
+type LocalProjectionValue = (Option<Ty>, LocalObligations);
 
 /// The inference of one body.
 pub struct Infer<'c, 'a> {
@@ -122,6 +128,13 @@ pub struct Infer<'c, 'a> {
     var_trail: Vec<(u32, Option<Ty>)>,
     diverge_trail: Vec<(u32, u32)>,
     trail_depth: u32,
+    trail_bases: Vec<usize>,
+    var_epoch: u64,
+    capture_epoch: u64,
+    pre_var_epoch: u64,
+    local_cache_epoch: u64,
+    local_closed_cache_epoch: u64,
+    local_cache_var_limit: usize,
     metadata: Vec<(Ty, Ty)>,
     obligations: Vec<(ItemRef, Vec<Ty>)>,
     projections: Vec<project::Projection>,
@@ -144,7 +157,7 @@ pub struct Infer<'c, 'a> {
     hidden: Vec<(u32, Ty)>,
     const_args: Vec<(String, (u128, (u32, bool)))>,
     selecting: Vec<u64>,
-    assoc_stack: Vec<(ItemRef, Ty, crate::body::PathId)>,
+    assoc_stack: Vec<(ItemRef, Ty, Substs, crate::body::PathId, Option<Ty>)>,
     cycle_hits: u32,
     frames: usize,
     evaluating: Vec<ItemRef>,
@@ -153,15 +166,20 @@ pub struct Infer<'c, 'a> {
         (ItemRef, Option<crate::names::Sym>, Option<u32>, Vec<u32>),
         Vec<crate::names::PerNs>,
     >,
-    local_selections: HashMap<(ItemRef, Ty, Substs), Option<(super::impls::ImplRef, Substs)>>,
-    local_projections: HashMap<(ItemRef, Ty, Substs, crate::names::Sym, Substs), Option<Ty>>,
+    local_selections: HashMap<LocalSelectionKey, LocalSelectionValue>,
+    local_closed_selections: HashMap<LocalSelectionKey, LocalSelectionValue>,
+    local_projections: HashMap<LocalProjectionKey, LocalProjectionValue>,
+    local_closed_projections: HashMap<LocalProjectionKey, LocalProjectionValue>,
     method_hints: Option<std::sync::Arc<HashMap<ExprId, ItemRef>>>,
     pub(super) poly: Option<Box<poly::PolyState>>,
+    body_src: &'a Source,
     current_expr: Option<ExprId>,
+    current_pat: Option<PatId>,
     obligation_sites: HashMap<(ItemRef, Ty), ExprId>,
     captures_settled: bool,
     auto_stack: Vec<(ItemRef, Ty)>,
     matches: Vec<(ExprId, Ty, crate::body::List)>,
+    active_discr: Option<(ItemRef, Vec<Option<i128>>, Vec<bool>)>,
 }
 
 impl Drop for Infer<'_, '_> {
@@ -213,14 +231,20 @@ pub(super) fn infer_after_compiler_made(
     let home = cx.module_of(item)?;
     let root = Some(item.body_owner());
     let args = cx.types.substs(substs).to_vec();
-    let mut infer = Infer::start(cx, (&body, &sig, src), home);
-    (infer.root, infer.instance, infer.method_hints) = (root, Some((item, substs)), method_hints);
-    let mut frame = infer.frame(item, &args)?;
-    (frame.src, frame.root) = (src, root);
-    infer.swap_frame(frame);
-    infer.out.exprs.resize(body.exprs.len(), Ty::NONE);
-    infer.run(foreign)?;
-    let mut typed = infer.finish()?;
+    let mut typed = {
+        let mut infer = Box::new(Infer::start(cx, (&body, &sig, src), home));
+        (infer.root, infer.instance, infer.method_hints) =
+            (root, Some((item, substs)), method_hints);
+        let mut frame = infer.frame(item, &args)?;
+        (frame.src, frame.root) = (src, root);
+        infer.swap_frame(frame);
+        infer.out.exprs.resize(body.exprs.len(), Ty::NONE);
+        infer.run(foreign)?;
+        if !foreign {
+            infer.check_const_body_overflow(item)?;
+        }
+        (*infer).finish()?
+    };
     if foreign {
         super::global_asm::bind(cx, item, &mut typed);
     }
@@ -341,6 +365,13 @@ impl<'c, 'a> Infer<'c, 'a> {
             var_trail: Vec::new(),
             diverge_trail: Vec::new(),
             trail_depth: 0,
+            trail_bases: Vec::new(),
+            var_epoch: 0,
+            capture_epoch: 0,
+            pre_var_epoch: 0,
+            local_cache_epoch: 0,
+            local_closed_cache_epoch: 0,
+            local_cache_var_limit: 0,
             metadata,
             obligations,
             projections,
@@ -370,14 +401,19 @@ impl<'c, 'a> Infer<'c, 'a> {
             proved: rustc_hash::FxHashSet::default(),
             imports: HashMap::default(),
             local_selections: HashMap::default(),
+            local_closed_selections: HashMap::default(),
             local_projections: HashMap::default(),
+            local_closed_projections: HashMap::default(),
             method_hints: None,
             poly: None,
+            body_src: src,
             current_expr: None,
+            current_pat: None,
             obligation_sites: HashMap::default(),
             captures_settled: false,
             auto_stack: Vec::new(),
             matches: Vec::new(),
+            active_discr: None,
         }
     }
 
@@ -390,12 +426,12 @@ impl<'c, 'a> Infer<'c, 'a> {
     }
 
     fn diag_span(
-        kind: crate::diag::DiagnosticKind,
-        span: Option<crate::diag::Span>,
+        kind: DiagnosticKind,
+        span: Option<Span>,
         msg: impl Into<String>,
         label: impl Into<String>,
     ) -> anyhow::Error {
-        let mut diag = crate::diag::Diagnostic::new(kind, msg).with_span(span);
+        let mut diag = Diagnostic::new(kind, msg).with_span(span);
         let label = label.into();
         if !label.is_empty() {
             diag = diag.with_primary_label(label);
@@ -405,29 +441,83 @@ impl<'c, 'a> Infer<'c, 'a> {
 
     pub(super) fn diag_expr(
         &self,
-        kind: crate::diag::DiagnosticKind,
+        kind: DiagnosticKind,
         expr: Option<ExprId>,
         msg: impl Into<String>,
         label: impl Into<String>,
     ) -> anyhow::Error {
         let span = expr
             .or(self.current_expr)
-            .and_then(|id| crate::diag::Span::from_expr(self.src, self.body, id));
+            .and_then(|id| Span::from_expr(self.body_src, self.body, id));
         Self::diag_span(kind, span, msg, label)
     }
 
     pub(super) fn diag_tok(
         &self,
-        kind: crate::diag::DiagnosticKind,
+        kind: DiagnosticKind,
         tok: u32,
+        msg: impl Into<String>,
+        label: impl Into<String>,
+    ) -> anyhow::Error {
+        Self::diag_span(kind, Span::from_token(self.body_src, tok), msg, label)
+    }
+
+    pub(super) fn diag_pat(
+        &self,
+        kind: DiagnosticKind,
+        pat: PatId,
         msg: impl Into<String>,
         label: impl Into<String>,
     ) -> anyhow::Error {
         Self::diag_span(
             kind,
-            crate::diag::Span::from_token(self.src, tok),
+            Span::from_pat(self.body_src, self.body, pat),
             msg,
             label,
+        )
+    }
+
+    pub(super) fn diag_arity(
+        &self,
+        expr: Option<ExprId>,
+        want: usize,
+        got: usize,
+    ) -> anyhow::Error {
+        self.diag_expr(
+            DiagnosticKind::Type,
+            expr,
+            format!("call takes {want} arguments, {got} given"),
+            "unexpected number of arguments",
+        )
+    }
+
+    pub(super) fn diag_deref_limit(&self, expr: ExprId, found: Ty) -> anyhow::Error {
+        self.diag_expr(
+            DiagnosticKind::Type,
+            Some(expr),
+            format!(
+                "reached the recursion limit while dereferencing {}",
+                self.show(found)
+            ),
+            "dereference recursion limit exceeded",
+        )
+    }
+
+    pub(super) fn diag_not_callable(&self, expr: ExprId, found: Ty) -> anyhow::Error {
+        self.diag_expr(
+            DiagnosticKind::Type,
+            Some(expr),
+            format!("calling `{}` is not supported", self.show(found)),
+            "call expression requires function",
+        )
+    }
+
+    pub(super) fn diag_unknown_field(&self, tok: u32, item: ItemRef, name: &str) -> anyhow::Error {
+        self.diag_tok(
+            DiagnosticKind::Name,
+            tok,
+            format!("no field `{name}` on `{}`", self.cx.name(item)),
+            "unknown field",
         )
     }
 }

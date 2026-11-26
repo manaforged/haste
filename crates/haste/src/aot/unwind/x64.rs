@@ -340,8 +340,10 @@ pub(in crate::aot) fn emit_x64_start_panic(
         0x49, 0x89, 0x47, 0x10, 0x49, 0x89, 0x57, 0x18, 0x49, 0x89, 0x1F,
     ]);
     emit_x64_walk_call(c, addrs, false, out);
+    out.bytes(&[0x48, 0x85, 0xC0]);
+    let aborted = x64_fwd32(&[0x0F, 0x84], out);
     c.bytes_call(&[0x49, 0x8D, 0x4F, 0x30, 0xBA, 1, 0, 0, 0], "longjmp", out)?;
-    [no_state, no_frame]
+    [no_state, no_frame, aborted]
         .into_iter()
         .for_each(|l| x64_patch32(l, out));
     c.call("abort", out)?;

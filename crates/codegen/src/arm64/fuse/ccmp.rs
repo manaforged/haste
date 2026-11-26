@@ -1,6 +1,6 @@
 use super::super::asm::Reg;
 use super::flag::{icmp_consumer, preserves_flags, try_cmp_preserved};
-use super::{def_entry, local_single};
+use super::{def_entry, def_inst, elided_or_deferred, local_single};
 use crate::alloc::{Location, Plan};
 use crate::ir::{Binary, Function, Inst, IntCC, Op, Value};
 
@@ -150,14 +150,16 @@ fn local_child(
         .flatten()
 }
 
-fn branch_or_trap_only(func: &Function, plan: &Plan<Reg>, tail: &[Inst], res: Value) -> bool {
+fn branch_or_trap_only(
+    func: &Function,
+    plan: &Plan<Reg>,
+    def: &dyn Fn(Value) -> Option<Inst>,
+    tail: &[Inst],
+    res: Value,
+) -> bool {
     for &ni in tail {
         let nd = &func.insts[ni.index()];
-        if !matches!(nd.op, Op::Call { .. })
-            && nd
-                .result
-                .is_some_and(|r| plan.elided[r.index()] || plan.deferred[r.index()])
-        {
+        if elided_or_deferred(plan, nd) {
             continue;
         }
         if matches!(&nd.op, Op::Brif(c, _, ta, _, ea) if *c == res && !ta.contains(&res) && !ea.contains(&res))
@@ -165,7 +167,7 @@ fn branch_or_trap_only(func: &Function, plan: &Plan<Reg>, tail: &[Inst], res: Va
         {
             return true;
         }
-        if !preserves_flags(func, plan, &nd.op, nd.result, false) {
+        if !preserves_flags(func, plan, def, &nd.op, nd.result, false) {
             return false;
         }
     }
@@ -175,7 +177,7 @@ fn branch_or_trap_only(func: &Function, plan: &Plan<Reg>, tail: &[Inst], res: Va
 fn try_fuse_root(
     func: &Function,
     plan: &mut Plan<Reg>,
-    info @ (uses, _): (&[u32], &[Option<(usize, usize, Inst)>]),
+    info @ (uses, pos_of): (&[u32], &[Option<(usize, usize, Inst)>]),
     (b_idx, pos, res): (usize, usize, Value),
     (op, x, y): (Binary, Value, Value),
 ) {
@@ -186,11 +188,12 @@ fn try_fuse_root(
         return;
     }
     let tail = &func.blocks[b_idx].insts[pos + 1..];
+    let def = |v| def_inst(pos_of, v);
     let already_elided = plan.elided[res.index()];
     if already_elided
         && (op != Binary::Band
             || uses[res.index()] != 1
-            || !branch_or_trap_only(func, plan, tail, res))
+            || !branch_or_trap_only(func, plan, &def, tail, res))
     {
         return;
     }
@@ -217,7 +220,7 @@ fn try_fuse_root(
         return;
     };
     let fuse_flags =
-        already_elided || (uses[res.index()] == 1 && icmp_consumer(func, plan, tail, res));
+        already_elided || (uses[res.index()] == 1 && icmp_consumer(func, plan, &def, tail, res));
     for v in chain {
         plan.elided[v.index()] = true;
     }

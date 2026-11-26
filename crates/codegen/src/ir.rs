@@ -316,6 +316,10 @@ pub struct Function {
     pub(crate) value_flags: Vec<u8>,
     /// Whether this function must keep a standard frame pointer chain for unwind stack walking.
     pub keep_fp: bool,
+    /// Whether unwinding past this function frame must abort (nounwind ABI boundary).
+    pub abort_on_unwind: bool,
+    /// Whether this function must save all callee-saved registers in its prologue for foreign unwind frames.
+    pub save_all_regs: bool,
     pub(crate) unwind_drops: Vec<crate::UnwindDrop>,
     pub(crate) no_unwind_syms: Vec<u32>,
     pub(crate) elide_drops: bool,
@@ -341,6 +345,8 @@ impl Function {
             rodata_bytes: Vec::new(),
             value_flags: Vec::new(),
             keep_fp: false,
+            abort_on_unwind: false,
+            save_all_regs: false,
             unwind_drops: Vec::new(),
             no_unwind_syms: Vec::new(),
             elide_drops: false,
@@ -348,6 +354,10 @@ impl Function {
             cfg_rev: 0,
             cfg_cache: CfgCache::default(),
         }
+    }
+
+    pub(crate) fn needs_unwind_frame(&self) -> bool {
+        self.abort_on_unwind || self.save_all_regs || !self.unwind_drops.is_empty()
     }
 
     pub(crate) fn bump_cfg(&mut self) {

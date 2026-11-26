@@ -3,10 +3,16 @@
 use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use haste_codegen::{CodeUnwindDrop, Site};
+use haste_codegen::{CodeUnwindDrop, Site, UNWIND_ABORT_BIT, UnwindArg};
 
-const DROP_ACTIVE: u8 = 1;
-const DROP_LINKED: u8 = 2;
+pub(crate) const DROP_ACTIVE: u8 = 1;
+pub(crate) const DROP_LINKED: u8 = 2;
+pub(crate) const DROP_WIDE: u8 = 4;
+pub(crate) const DROP_NODE_BYTES: u32 = 40;
+pub(crate) const DROP_NODE_PREV_OFF: i32 = 8;
+pub(crate) const DROP_NODE_NEXT_OFF: i32 = 16;
+pub(crate) const DROP_NODE_FN_OFF: i32 = 24;
+pub(crate) const DROP_NODE_ARG_OFF: i32 = 32;
 
 #[repr(C, align(16))]
 struct JmpBuf([u64; 64]);
@@ -26,7 +32,7 @@ struct JitUnwindDrop {
     local_off: i32,
     flag_off: i32,
     drop_slot: usize,
-    indirect: usize,
+    arg: usize,
 }
 
 #[repr(C)]
@@ -96,7 +102,7 @@ pub(crate) fn register_shared_drops(
                 local_off: d.local_off,
                 flag_off: d.flag_off,
                 drop_slot: slot,
-                indirect: usize::from(d.indirect),
+                arg: usize::from(d.arg.as_u8()),
             })
         })
         .collect();
@@ -203,12 +209,12 @@ pub struct DropNode {
     addr: *mut u8,
 }
 
-const _: () = assert!(std::mem::size_of::<DropNode>() == 40);
+const _: () = assert!(std::mem::size_of::<DropNode>() == DROP_NODE_BYTES as usize);
 const _: () = assert!(std::mem::offset_of!(DropNode, state) == 0);
-const _: () = assert!(std::mem::offset_of!(DropNode, prev) == 8);
-const _: () = assert!(std::mem::offset_of!(DropNode, next) == 16);
-const _: () = assert!(std::mem::offset_of!(DropNode, drop_fn) == 24);
-const _: () = assert!(std::mem::offset_of!(DropNode, addr) == 32);
+const _: () = assert!(std::mem::offset_of!(DropNode, prev) == DROP_NODE_PREV_OFF as usize);
+const _: () = assert!(std::mem::offset_of!(DropNode, next) == DROP_NODE_NEXT_OFF as usize);
+const _: () = assert!(std::mem::offset_of!(DropNode, drop_fn) == DROP_NODE_FN_OFF as usize);
+const _: () = assert!(std::mem::offset_of!(DropNode, addr) == DROP_NODE_ARG_OFF as usize);
 
 /// Two-word fat pointer matching Rust's `*mut (dyn Any + Send + 'static)` ABI on x86-64 and arm64.
 #[repr(C)]
@@ -221,6 +227,16 @@ pub struct FatPtr {
 thread_local! {
     static CURRENT_FRAME: Cell<*mut UnwindFrame> = const { Cell::new(std::ptr::null_mut()) };
     static CURRENT_DROPS: Cell<*mut DropNode> = const { Cell::new(std::ptr::null_mut()) };
+    static CLEANUP_FP: Cell<usize> = const { Cell::new(0) };
+}
+
+#[inline(never)]
+unsafe fn invoke_cleanup_drop(drop_fn: extern "C" fn(*mut u8, usize), arg0: *mut u8, arg1: usize) {
+    let marker = 0usize;
+    let boundary = std::hint::black_box(&raw const marker as usize);
+    let prev = CLEANUP_FP.replace(boundary);
+    drop_fn(arg0, arg1);
+    CLEANUP_FP.set(prev);
 }
 
 #[cfg(unix)]
@@ -311,10 +327,20 @@ unsafe fn drain_drops_until(mark: *mut DropNode, limit_addr: usize) {
         // SAFETY: every node above `mark` lives on an active unwound stack frame above `catch_unwind`.
         unsafe {
             unlink_drop(node);
-            let active = ((*node).state & DROP_ACTIVE) != 0;
+            let state = (*node).state;
+            let active = (state & DROP_ACTIVE) != 0;
             (*node).state &= !DROP_ACTIVE;
             if active {
-                ((*node).drop_fn)((*node).addr);
+                let (arg0, arg1) = if (state & DROP_WIDE) != 0 {
+                    let wide = (*node).addr as *const usize;
+                    ((*wide) as *mut u8, *wide.add(1))
+                } else {
+                    ((*node).addr, 0)
+                };
+                // SAFETY: 1-arg C ABI `fn(*mut u8)` ignores the unused second argument register.
+                let drop_fn: extern "C" fn(*mut u8, usize) =
+                    std::mem::transmute::<extern "C" fn(*mut u8), _>((*node).drop_fn);
+                invoke_cleanup_drop(drop_fn, arg0, arg1);
             }
         }
     }
@@ -337,20 +363,27 @@ unsafe fn run_jit_frame_drops(fp: usize, call_pc: usize, regs: Option<&mut Saved
             }
             *flag_ptr = 0;
             let slot_ptr = fp.wrapping_add_signed(d.local_off as isize);
-            let arg = if d.indirect != 0 {
-                *(slot_ptr as *const *mut u8)
-            } else {
-                slot_ptr as *mut u8
+            let (arg0, arg1) = match UnwindArg::from_u8(d.arg as u8) {
+                Some(UnwindArg::Indirect) => (*(slot_ptr as *const *mut u8), 0),
+                Some(UnwindArg::Wide) => (
+                    *(slot_ptr as *const *mut u8),
+                    *((slot_ptr + 8) as *const usize),
+                ),
+                _ => (slot_ptr as *mut u8, 0),
             };
             let drop_addr = *(d.drop_slot as *const usize);
             if drop_addr != 0 {
-                let drop_fn: extern "C" fn(*mut u8) = std::mem::transmute::<usize, _>(drop_addr);
-                drop_fn(arg);
+                let drop_fn: extern "C" fn(*mut u8, usize) =
+                    std::mem::transmute::<usize, _>(drop_addr);
+                invoke_cleanup_drop(drop_fn, arg0, arg1);
             }
         }
     }
+    if (saved_regs & UNWIND_ABORT_BIT) != 0 {
+        std::process::abort();
+    }
     if let Some(regs) = regs {
-        let mut mask = saved_regs;
+        let mut mask = saved_regs & !UNWIND_ABORT_BIT;
         let mut bit = 0usize;
         let mut k = 0usize;
         while mask != 0 && bit < regs.len() {
@@ -374,7 +407,11 @@ unsafe fn unwind_jit_frames(
     (stop_fp, mark): (usize, *mut DropNode),
     mut regs: Option<&mut SavedRegs>,
 ) -> Option<(usize, usize, usize)> {
+    let cleanup_fp = CLEANUP_FP.get();
     while fp != 0 && (stop_fp == 0 || fp < stop_fp) {
+        if cleanup_fp != 0 && fp >= cleanup_fp {
+            std::process::abort();
+        }
         // SAFETY: `fp` and `mark` bound active stack frames between the panic site and the catcher.
         unsafe {
             if ret_pc > 0
@@ -396,6 +433,9 @@ unsafe fn unwind_jit_frames(
             fp = prev_fp;
             ret_pc = prev_ret;
         }
+    }
+    if cleanup_fp != 0 && (stop_fp == 0 || stop_fp >= cleanup_fp) {
+        std::process::abort();
     }
     if stop_fp != 0 {
         // SAFETY: drains any remaining linked drop guards above `mark`.

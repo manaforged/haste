@@ -183,7 +183,7 @@ impl<'a> Infer<'_, 'a> {
         let (key, local_key) = if super::super::project::has_assoc_bounds(arena, path) {
             (None, None)
         } else {
-            self.selection_keys(of, ty, args)
+            self.selection_keys(of, ty, args, true)
         };
         if let Some(found) = self.cached_selection(key.as_ref(), local_key.as_ref()) {
             return Ok(found.is_some());

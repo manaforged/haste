@@ -19,13 +19,7 @@ impl Emit<'_> {
             return Err(format!("{cc:?} of 256-bit vector {lane:?}"));
         }
         let dst = self.xmm_of(result).unwrap_or(X2);
-        let unsigned = matches!(
-            cc,
-            IntCC::UnsignedLessThan
-                | IntCC::UnsignedLessThanOrEqual
-                | IntCC::UnsignedGreaterThan
-                | IntCC::UnsignedGreaterThanOrEqual
-        );
+        let unsigned = cc.is_unsigned();
         if lane == Lane::I64 && !self.features.sse41 {
             self.scalarize_int_icmp(cc, lane, count, x, y, dst);
         } else if self.features.avx && !unsigned {
@@ -49,13 +43,7 @@ impl Emit<'_> {
         b: Xmm,
         dst: Xmm,
     ) {
-        let unsigned = matches!(
-            cc,
-            IntCC::UnsignedLessThan
-                | IntCC::UnsignedLessThanOrEqual
-                | IntCC::UnsignedGreaterThan
-                | IntCC::UnsignedGreaterThanOrEqual
-        );
+        let unsigned = cc.is_unsigned();
         if unsigned {
             let sign = match lane {
                 Lane::I8 => 0x80_i64,

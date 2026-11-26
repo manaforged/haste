@@ -147,7 +147,7 @@ fn try_local_sinks(
 ) {
     let nslots = func.slots.len();
     let li = u.local.index();
-    if u.indirect
+    if u.arg.is_indirect()
         || u.local == u.flag
         || li >= nslots
         || ctx.tables.local_uses[li] != 1

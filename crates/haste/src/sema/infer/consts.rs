@@ -101,11 +101,134 @@ impl<'a> Infer<'_, 'a> {
             Ok((value & mask(int.0), int))
         });
         match (folded, width) {
+            (Err(error), _) if evaluate::is_const_arithmetic_error(&error) => Err(error),
             (Err(error), Some(int)) if !substs.iter().any(|&ty| self.has_vars(ty)) => {
                 let interned = self.cx.types.intern_substs(substs);
                 self.run_instance(&(item, interned), int, error)
             }
             (found, _) => found,
+        }
+    }
+
+    pub(super) fn check_const_body_overflow(&mut self, item: ItemRef) -> Result<()> {
+        if !matches!(
+            self.cx.item(item).1.kind,
+            ItemKind::Const | ItemKind::Static
+        ) {
+            return Ok(());
+        }
+        let Some(root) = self.body.root else {
+            return Ok(());
+        };
+        let body = self.body;
+        self.check_const_expr_overflow(body, root)
+    }
+
+    fn check_const_expr_overflow(&mut self, arena: &Body, expr: ExprId) -> Result<()> {
+        let want = self
+            .out
+            .exprs
+            .get(expr.0 as usize)
+            .copied()
+            .filter(|&ty| ty != Ty::NONE)
+            .and_then(|ty| self.int_of(self.resolve(ty)));
+        if let Some(int) = want {
+            match self.const_typed(arena, expr, int) {
+                Ok(_) => return Ok(()),
+                Err(err) if evaluate::is_const_arithmetic_error(&err) => {
+                    return Err(self.diag_expr(
+                        crate::diag::DiagnosticKind::Type,
+                        Some(expr),
+                        err.to_string(),
+                        "evaluation of constant value failed",
+                    ));
+                }
+                Err(_) => {}
+            }
+        }
+        match *arena.expr(expr) {
+            Expr::Paren(inner) | Expr::Unary(_, inner) | Expr::Cast(inner, _) => {
+                self.check_const_expr_overflow(arena, inner)
+            }
+            Expr::Ref { expr: inner, .. } => self.check_const_expr_overflow(arena, inner),
+            Expr::Binary(_, lhs, rhs) => {
+                self.check_const_expr_overflow(arena, lhs)?;
+                self.check_const_expr_overflow(arena, rhs)
+            }
+            Expr::Tuple(list) | Expr::Array(list) => {
+                for &id in arena.list(list) {
+                    self.check_const_expr_overflow(arena, ExprId(id))?;
+                }
+                Ok(())
+            }
+            Expr::Repeat(val, _) => self.check_const_expr_overflow(arena, val),
+            Expr::Struct { fields, base, .. } => {
+                for &id in arena.list(fields) {
+                    self.check_const_expr_overflow(arena, arena.fields[id as usize].value)?;
+                }
+                if let Some(base) = base {
+                    self.check_const_expr_overflow(arena, base)?;
+                }
+                Ok(())
+            }
+            Expr::Call(callee, args) => {
+                self.check_const_expr_overflow(arena, callee)?;
+                for &id in arena.list(args) {
+                    self.check_const_expr_overflow(arena, ExprId(id))?;
+                }
+                Ok(())
+            }
+            Expr::Method {
+                receiver, params, ..
+            } => {
+                self.check_const_expr_overflow(arena, receiver)?;
+                for &id in arena.list(params) {
+                    self.check_const_expr_overflow(arena, ExprId(id))?;
+                }
+                Ok(())
+            }
+            Expr::Block { stmts, tail, .. } => {
+                for &id in arena.list(stmts) {
+                    match arena.stmts[id as usize] {
+                        crate::body::Stmt::Let {
+                            init, otherwise, ..
+                        } => {
+                            if let Some(e) = init {
+                                self.check_const_expr_overflow(arena, e)?;
+                            }
+                            if let Some(e) = otherwise {
+                                self.check_const_expr_overflow(arena, e)?;
+                            }
+                        }
+                        crate::body::Stmt::Expr(e, _) => {
+                            self.check_const_expr_overflow(arena, e)?
+                        }
+                        crate::body::Stmt::Item(..)
+                        | crate::body::Stmt::Macro { .. }
+                        | crate::body::Stmt::Empty => {}
+                    }
+                }
+                if let Some(tail) = tail {
+                    self.check_const_expr_overflow(arena, tail)?;
+                }
+                Ok(())
+            }
+            Expr::If(cond, then, otherwise) => {
+                self.check_const_expr_overflow(arena, cond)?;
+                self.check_const_expr_overflow(arena, then)?;
+                if let Some(alt) = otherwise {
+                    self.check_const_expr_overflow(arena, alt)?;
+                }
+                Ok(())
+            }
+            Expr::Match(scrut, arms) => {
+                self.check_const_expr_overflow(arena, scrut)?;
+                for &id in arena.list(arms) {
+                    self.check_const_expr_overflow(arena, arena.arms[id as usize].body)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
         }
     }
 
@@ -302,7 +425,8 @@ impl<'a> Infer<'_, 'a> {
 
     fn variant_value(&mut self, item: ItemRef, index: u32) -> Result<(u128, Int)> {
         let at = self.cx.variant_position(item, index)?;
-        if !self.cx.adt_def(item)?.variants[at].fields.is_empty() {
+        let def = self.cx.adt_def(item)?;
+        if !def.variants[at].fields.is_empty() {
             bail!(
                 "a constant variant of {} that has fields",
                 self.cx.name(item)
@@ -311,8 +435,91 @@ impl<'a> Infer<'_, 'a> {
         let Some(int) = int_info(self.cx.discriminant_primitive(item)) else {
             bail!("an enum tag that is not an integer");
         };
-        let value = self.cx.discriminants(item)?[at];
+        let value = if self
+            .active_discr
+            .as_ref()
+            .is_some_and(|(active, ..)| *active == item)
+        {
+            self.eval_discr_at(item, &def, int, at)?
+        } else {
+            self.cx.discriminants(item)?[at]
+        };
         Ok((value as u128 & mask(int.0), int))
+    }
+
+    fn eval_discr_at(
+        &mut self,
+        item: ItemRef,
+        def: &crate::body::adt::AdtDef,
+        int: Int,
+        at: usize,
+    ) -> Result<i128> {
+        let mut anchor = at;
+        while anchor > 0 && def.variants[anchor].discriminant.is_none() {
+            if self
+                .active_discr
+                .as_ref()
+                .is_some_and(|(_, cached, _)| cached[anchor].is_some())
+            {
+                break;
+            }
+            anchor -= 1;
+        }
+        let base = if let Some(value) = self
+            .active_discr
+            .as_ref()
+            .and_then(|(_, cached, _)| cached[anchor])
+        {
+            value
+        } else if let Some(expr) = def.variants[anchor].discriminant {
+            if let Some((_, _, visiting)) = self.active_discr.as_mut() {
+                if visiting[anchor] {
+                    bail!("cyclic enum discriminant in {}", self.cx.name(item));
+                }
+                visiting[anchor] = true;
+            }
+            let computed = self.const_typed(&def.body, expr, int).map(|(value, _)| {
+                if int.1 {
+                    signed(value & mask(int.0), int.0)
+                } else {
+                    (value & mask(int.0)) as i128
+                }
+            });
+            if let Some((_, cached, visiting)) = self.active_discr.as_mut() {
+                visiting[anchor] = false;
+                if let Ok(value) = computed {
+                    cached[anchor] = Some(value);
+                }
+            }
+            computed?
+        } else {
+            if let Some((_, cached, _)) = self.active_discr.as_mut() {
+                cached[anchor] = Some(0);
+            }
+            0
+        };
+        let max_val: i128 = if int.1 {
+            if int.0 >= 128 {
+                i128::MAX
+            } else {
+                (1_i128 << (int.0 - 1)) - 1
+            }
+        } else if int.0 >= 127 {
+            i128::MAX
+        } else {
+            (1_i128 << int.0) - 1
+        };
+        let mut value = base;
+        for step in (anchor + 1)..=at {
+            if value >= max_val {
+                bail!("enum discriminant overflow in {}", self.cx.name(item));
+            }
+            value += 1;
+            if let Some((_, cached, _)) = self.active_discr.as_mut() {
+                cached[step] = Some(value);
+            }
+        }
+        Ok(value)
     }
 
     pub(super) fn discriminants(
@@ -324,20 +531,21 @@ impl<'a> Infer<'_, 'a> {
         let Some(int) = int_info(primitive) else {
             bail!("an enum tag that is not an integer");
         };
-        let mut next = 0_i128;
-        let mut values = Vec::with_capacity(def.variants.len());
-        for variant in &def.variants {
-            if let Some(expr) = variant.discriminant {
-                let (value, _) = self.const_typed(&def.body, expr, int)?;
-                next = if int.1 {
-                    signed(value & mask(int.0), int.0)
-                } else {
-                    (value & mask(int.0)) as i128
-                };
+        let count = def.variants.len();
+        let saved = self
+            .active_discr
+            .replace((item, vec![None; count], vec![false; count]));
+        let mut values = Vec::with_capacity(count);
+        for at in 0..count {
+            match self.eval_discr_at(item, &def, int, at) {
+                Ok(value) => values.push(value),
+                Err(err) => {
+                    self.active_discr = saved;
+                    return Err(err);
+                }
             }
-            values.push(next);
-            next = next.wrapping_add(1);
         }
+        self.active_discr = saved;
         Ok(values)
     }
 
@@ -346,6 +554,7 @@ impl<'a> Infer<'_, 'a> {
             return Ok(param);
         }
         let (value, (bits, _)) = match self.const_defaulted(arena, expr, USIZE) {
+            Err(error) if evaluate::is_const_arithmetic_error(&error) => return Err(error),
             Err(error) => self.run_anon(arena, expr, error)?,
             found => found?,
         };

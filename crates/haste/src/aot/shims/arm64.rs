@@ -45,7 +45,9 @@ pub(in crate::aot) fn emit_arm64_unwind_state(
     }
     emit_arm64_tls_get(c, addrs.thread_key + 16, out)?;
     let hit = arm64_fwd(0xB500_0000, out);
-    c.words_call(&[0xD280_0020, 0xD280_0201], "calloc", out)?;
+    const _: () = assert!(tls::UNWIND_STATE_BYTES <= 0xFFFF);
+    let mov_x1_size = 0xD280_0001_u32 | ((tls::UNWIND_STATE_BYTES as u32) << 5);
+    c.words_call(&[0xD280_0020, mov_x1_size], "calloc", out)?;
     let fail = arm64_fwd(0xB400_0000, out);
     c.words_call(
         &[

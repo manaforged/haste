@@ -20,6 +20,7 @@ struct UseCounts {
 pub(super) struct SlotEscapes {
     pub(super) unescaped: Vec<bool>,
     pub(super) addr_unescaped: Vec<bool>,
+    pub(super) unwind_target: Vec<bool>,
     pub(super) call_readonly: Vec<bool>,
     pub(super) return_only: Vec<bool>,
     pub(super) noalias: Vec<bool>,
@@ -46,6 +47,7 @@ impl SlotEscapes {
         Self {
             unescaped: vec![true; func.slots.len()],
             addr_unescaped: vec![true; func.slots.len()],
+            unwind_target: vec![false; func.slots.len()],
             call_readonly: vec![true; func.slots.len()],
             return_only: vec![true; func.slots.len()],
             noalias: vec![false; func.signature.params.len()],
@@ -84,6 +86,9 @@ fn finish_slot_escape(
                 esc.unescaped[s.index()] = false;
             }
             let uw = counts.unwind_stores.get(v).copied().unwrap_or(0);
+            if uw > 0 {
+                esc.unwind_target[s.index()] = true;
+            }
             if spilled || counts.safe[v] + uw != counts.total[v] {
                 esc.addr_unescaped[s.index()] = false;
             }
@@ -412,11 +417,11 @@ pub(super) fn classify_uses(
         return esc;
     }
     let n = func.types.len();
-    let has_indirect_unwind = func.unwind_drops.iter().any(|u| u.indirect);
+    let has_indirect_unwind = func.unwind_drops.iter().any(|u| u.arg.is_indirect());
     let mut unwind_write_only = if has_indirect_unwind {
         let mut v = vec![false; func.slots.len()];
         for u in &func.unwind_drops {
-            if u.indirect {
+            if u.arg.is_indirect() {
                 v[u.local.index()] = true;
             }
         }

@@ -67,6 +67,13 @@ fn load_with_sysroot(
     let mut outline = crate::outline::new(workspace, targets, scripts);
     let cached = crate::substrate::sysroot::try_load(workspace, targets, &mut outline);
     let was_miss = cached.is_none();
+    let show_sysroot = was_miss
+        && crate::substrate::enabled()
+        && crate::scripts::sysroot_scripts_settled(workspace);
+    let sysroot_started = show_sysroot.then(std::time::Instant::now);
+    if show_sysroot {
+        eprintln!("haste: indexing standard library (one-time)...");
+    }
     if !eager_all {
         if was_miss {
             crate::substrate::preload_fixed_files(workspace, &targets.target.triple, &outline);
@@ -126,6 +133,12 @@ fn load_with_sysroot(
     }
     if was_miss && crate::scripts::sysroot_scripts_settled(workspace) {
         crate::substrate::sysroot::save(workspace, targets, &compilation);
+        if let Some(started) = sysroot_started {
+            eprintln!(
+                "haste: standard library cached in {:.1}s",
+                started.elapsed().as_secs_f64()
+            );
+        }
     }
     let errors = compilation.outline.local_errors(workspace);
     if !errors.is_empty() {
@@ -773,23 +786,12 @@ fn macro_graph_stamp(outline: &Outline, roots: &[usize]) -> u64 {
         krate.hash(&mut hasher);
         outline.deps[krate].hash(&mut hasher);
         let holder = &outline.crates[krate];
-        let extent = holder.extent();
-        (
-            extent.files,
-            extent.impls,
-            extent.impl_bodies,
-            extent.consumed,
-            extent.partial,
-            holder.expansions,
-        )
-            .hash(&mut hasher);
+        let e = holder.extent();
+        let meta = (e.files, e.impls, e.impl_bodies, e.consumed, e.partial);
+        (meta, holder.expansions).hash(&mut hasher);
         for file in &holder.files {
-            (
-                std::sync::Arc::as_ptr(file) as usize,
-                file.items.items.len(),
-                file.source.text.len(),
-            )
-                .hash(&mut hasher);
+            let ptr = std::sync::Arc::as_ptr(file) as usize;
+            (ptr, file.items.items.len(), file.source.text.len()).hash(&mut hasher);
         }
     }
     hasher.finish()

@@ -133,7 +133,7 @@ impl Checker<'_, '_> {
         depth
     }
 
-    pub(super) fn ty_max_ref_depth(&self, ty: Ty) -> u32 {
+    pub(in super::super) fn ty_max_ref_depth(&self, ty: Ty) -> u32 {
         if ty == Ty::NONE {
             return 0;
         }

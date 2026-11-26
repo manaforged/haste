@@ -8,6 +8,19 @@ use super::lock;
 
 type Job = Box<dyn FnOnce() -> bool + Send + 'static>;
 
+const WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+fn spawn_worker<F, T>(f: F)
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    std::thread::Builder::new()
+        .stack_size(WORKER_STACK_SIZE)
+        .spawn(f)
+        .expect("failed to spawn worker thread");
+}
+
 #[derive(Default)]
 struct Queue {
     jobs: VecDeque<Job>,
@@ -34,14 +47,14 @@ impl Pool {
     /// Queues `job`, waking an idle worker, or starting one when every worker is busy, so each job starts at once as a spawned thread would; a forked child, which has none of the workers, gives each job a thread of its own.
     fn submit(&'static self, job: Job) {
         if std::process::id() != self.pid {
-            std::thread::spawn(job);
+            spawn_worker(job);
             return;
         }
         let mut queue = lock(&self.queue);
         queue.jobs.push_back(job);
         if queue.jobs.len() > queue.waiting {
             drop(queue);
-            std::thread::spawn(move || self.work());
+            spawn_worker(move || self.work());
         } else {
             drop(queue);
             self.ready.notify_one();

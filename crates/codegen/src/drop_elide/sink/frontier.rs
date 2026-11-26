@@ -251,6 +251,9 @@ fn prune_sink_region(
     ),
     in_r: &mut [bool],
 ) -> Option<Vec<Block>> {
+    if live_in[b.index()] && func.successors(b).any(|s| s == b) {
+        return None;
+    }
     let always_in = always_ready.map(|(ai, _)| ai);
     let always_out = always_ready.map(|(_, ao)| ao);
     let n = func.blocks.len();
@@ -272,9 +275,10 @@ fn prune_sink_region(
                     && !(always_out.is_some_and(|ao| ao[p.index()]) && cfg.dominates(b, p))
             });
             let bad_succ = func.successors(blk).any(|s| {
-                !in_r[s.index()]
-                    && live_in[s.index()]
-                    && !target_ok(cfg, depths, always_in, call_in_loop, b, in_r, s)
+                (s == b && live_in[s.index()])
+                    || (!in_r[s.index()]
+                        && live_in[s.index()]
+                        && !target_ok(cfg, depths, always_in, call_in_loop, b, in_r, s))
             });
             if bad_pred || bad_succ {
                 in_r[bi] = false;

@@ -162,10 +162,13 @@ impl Lower<'_, '_> {
     /// The place of `expr`, holding its value in a new frame slot when it is not a place already.
     pub fn place_or_temp(&mut self, expr: ExprId) -> Result<Option<Place>> {
         let coerced = self.typed.coercions.get(&expr);
-        if coerced.is_none()
-            && let Some(place) = self.place_of(expr)?
-        {
-            return Ok(Some(place));
+        if coerced.is_none() {
+            if let Some(place) = self.place_of(expr)? {
+                return Ok(Some(place));
+            }
+            if self.is_uncaptured_local(expr) && self.repr_of(expr)? == Repr::Zst {
+                return Ok(None);
+            }
         }
         self.temp(expr)
     }

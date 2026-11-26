@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use haste_codegen::{StackSlot, Type, UnwindDrop, Value};
+use haste_codegen::{StackSlot, Type, UnwindArg, UnwindDrop, Value};
 
 use crate::body::ExprId;
 use crate::host::HostSymbol;
@@ -148,7 +148,7 @@ impl Lower<'_, '_> {
         Ok(())
     }
 
-    pub(super) fn body_may_unwind(&mut self) -> Result<bool> {
+    pub(in crate::lower) fn body_may_unwind(&mut self) -> Result<bool> {
         Ok(self.open && self.reached.may_unwind(self.cx, self.index))
     }
 
@@ -167,6 +167,16 @@ impl Lower<'_, '_> {
         self.mode == LowerMode::Dict
     }
 
+    fn copy_wide_to_slot(&mut self, place: Option<Place>, ty: Ty) -> Result<StackSlot> {
+        let addr = self.address_or_dangling(place, ty)?;
+        let wide_slot = self.b.create_stack_slot(16, 3);
+        let data = self.ins().load(Type::I64, addr, 0);
+        let meta = self.ins().load(Type::I64, addr, 8);
+        self.ins().stack_store(data, wide_slot, 0);
+        self.ins().stack_store(meta, wide_slot, 8);
+        Ok(wide_slot)
+    }
+
     pub(super) fn push_unwind_origin(
         &mut self,
         origin: TyOrigin,
@@ -179,24 +189,32 @@ impl Lower<'_, '_> {
         };
         let substs = self.cx.types.intern_substs(&[ty]);
         let glue_index = self.reached_index(glue, substs)?;
+        let is_wide = self.cx.is_unsized(ty)?;
         if !self.uses_drop_list() {
             let drop_sym = self.push_reloc(
                 SymbolSource::Slot(glue_index),
                 RelocStep::SiteSlot(SiteOrigin::DropGlue(origin)),
             );
-            let (local, local_off, indirect) = match place {
+            let (local, local_off, arg) = match place {
                 Some(Place {
                     base: Base::Slot(slot),
                     offset,
                     repr,
-                }) if !matches!(repr, Repr::Zst) && self.b.func.slot_align_shift(slot) <= 4 => {
-                    (slot, offset, false)
-                }
+                }) if !matches!(repr, Repr::Zst) && self.b.func.slot_align_shift(slot) <= 4 => (
+                    slot,
+                    offset,
+                    if is_wide {
+                        UnwindArg::Wide
+                    } else {
+                        UnwindArg::Direct
+                    },
+                ),
+                _ if is_wide => (self.copy_wide_to_slot(place, ty)?, 0, UnwindArg::Wide),
                 _ => {
                     let addr = self.address_or_dangling(place, ty)?;
                     let ptr_slot = self.b.create_stack_slot(8, 3);
                     self.ins().stack_store(addr, ptr_slot, 0);
-                    (ptr_slot, 0, true)
+                    (ptr_slot, 0, UnwindArg::Indirect)
                 }
             };
             let flag = self.flag(init);
@@ -205,17 +223,42 @@ impl Lower<'_, '_> {
                 local_off,
                 flag,
                 drop_sym,
-                indirect,
+                arg,
             });
             return Ok(flag);
         }
         let drop_fn = self.code_of(glue_index, SiteOrigin::DropGlue(origin));
-        let addr = self.address_or_dangling(place, ty)?;
-        let slot = self.b.create_stack_slot(40, 3);
+        let addr = if is_wide {
+            match place {
+                Some(Place {
+                    base: Base::Slot(slot),
+                    offset,
+                    ..
+                }) => self.ins().stack_addr(Type::I64, slot, offset),
+                _ => {
+                    let wide_slot = self.copy_wide_to_slot(place, ty)?;
+                    self.ins().stack_addr(Type::I64, wide_slot, 0)
+                }
+            }
+        } else {
+            self.address_or_dangling(place, ty)?
+        };
+        let slot = self
+            .b
+            .create_stack_slot(crate::host::unwind::DROP_NODE_BYTES, 3);
         self.flags.push(slot);
-        self.set(slot, init);
-        self.ins().stack_store(drop_fn, slot, 24);
-        self.ins().stack_store(addr, slot, 32);
+        let init_bits = u8::from(init)
+            | if is_wide {
+                crate::host::unwind::DROP_WIDE
+            } else {
+                0
+            };
+        let state_val = self.ins().iconst(Type::I8, i64::from(init_bits));
+        self.ins().stack_store(state_val, slot, 0);
+        self.ins()
+            .stack_store(drop_fn, slot, crate::host::unwind::DROP_NODE_FN_OFF);
+        self.ins()
+            .stack_store(addr, slot, crate::host::unwind::DROP_NODE_ARG_OFF);
         let node = self.ins().stack_addr(Type::I64, slot, 0);
         self.call_host(HostSymbol::DropPush, &[node], None);
         Ok(slot)

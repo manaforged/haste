@@ -27,7 +27,7 @@ pub(super) struct Vars {
 impl<'a> Infer<'_, 'a> {
     /// The one impl of trait `of` at trait arguments `args` for `self_ty`, or none when no impl or several apply.
     pub fn select(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> Result<Option<Picked>> {
-        let (key, local_key) = self.selection_keys(of, self_ty, args);
+        let (key, local_key) = self.selection_keys(of, self_ty, args, false);
         if let Some(found) = self.cached_selection(key.as_ref(), local_key.as_ref()) {
             return Ok(
                 found.map(|(block, impl_args)| (block, self.cx.types.substs(impl_args).to_vec()))
@@ -88,10 +88,11 @@ impl<'a> Infer<'_, 'a> {
         depth: u32,
     ) -> Result<Vec<(Picked, Vars)>> {
         let self_ty = self.resolve(self_ty);
-        if depth as usize + self.selecting.len() > crate::RECURSION_LIMIT
-            || (matches!(self.cx.types.kind(self_ty), Kind::Var(_))
-                && !self.is_pending_opaque(self_ty))
-        {
+        if depth as usize + self.selecting.len() > crate::RECURSION_LIMIT {
+            self.cycle_hits += 1;
+            return Ok(Vec::new());
+        }
+        if matches!(self.cx.types.kind(self_ty), Kind::Var(_)) && !self.is_pending_opaque(self_ty) {
             return Ok(Vec::new());
         }
         let mut found = self.impl_candidates(of, self_ty, args, depth)?;

@@ -103,13 +103,28 @@ impl Checker<'_, '_> {
             {
                 self.place_borrow_sources(expr, true, state, None)
             }
+            Expr::TupleField(base, index)
+                if !self.has_overloaded_deref(expr)
+                    && !(allow_mut_ref_reborrow && self.is_mut_ref_ty(ty)) =>
+            {
+                self.tuple_field_sources(base, index, state)
+                    .unwrap_or_else(|| self.copy_projected_borrow_sources(expr, base, state))
+            }
             Expr::Field(base, _)
             | Expr::TupleField(base, _)
             | Expr::Index(base, _)
             | Expr::Unary(UnOp::Deref, base) => {
                 self.copy_projected_borrow_sources(expr, base, state)
             }
-            Expr::Path(_) => self.path_borrow_sources(expr, state, allow_mut_ref_reborrow),
+            Expr::Path(_) => {
+                if let Some(local) = self.expr_plain_local(expr)
+                    && state.moved.get(local as usize).copied().unwrap_or(false)
+                    && let Some(cached) = self.temp_sources.get(&expr)
+                {
+                    return cached.clone();
+                }
+                self.path_borrow_sources(expr, state, allow_mut_ref_reborrow)
+            }
             Expr::Tuple(list) | Expr::Array(list) => {
                 let items: Vec<u32> = self.body.list(list).to_vec();
                 let mut out = Vec::new();
@@ -135,9 +150,7 @@ impl Checker<'_, '_> {
                     let mut sources =
                         self.expr_borrow_sources_inner(field.value, state, true, field_extend);
                     if is_shared {
-                        for s in &mut sources {
-                            s.mutable = false;
-                        }
+                        sources = clamp_mut(sources, false);
                     }
                     out.extend(sources);
                 }
@@ -332,19 +345,10 @@ impl Checker<'_, '_> {
     }
 
     fn struct_shared_ref_fields(&mut self, expr: ExprId) -> HashSet<String> {
-        let (adt_item, variant) = match self.typed.res.get(&expr).copied() {
-            Some(Res::Ctor(item, v, _)) => (item, v as usize),
-            _ => match *self.cx.types.kind(self.expr_ty(expr)) {
-                Kind::Adt(item, _) => (item, 0),
-                _ => return HashSet::default(),
-            },
-        };
-        let Ok(def) = self.cx.adt_def(adt_item) else {
+        let Some((adt_item, variant, _, def)) = self.struct_adt_variant(expr) else {
             return HashSet::default();
         };
-        let Some(var) = def.variants.get(variant) else {
-            return HashSet::default();
-        };
+        let var = &def.variants[variant];
         let adt_src = &self.cx.file(adt_item).source;
         var.fields
             .iter()
@@ -542,27 +546,36 @@ impl Checker<'_, '_> {
             Expr::Paren(inner) | Expr::Cast(inner, _) => {
                 self.non_place_borrow_sources(inner, mutable, state, extend_depth)
             }
-            Expr::Field(base, _) | Expr::TupleField(base, _) => {
-                if self.is_ref_ty(self.expr_ty(base)) {
-                    clamp_mut(
-                        self.expr_borrow_sources_inner(base, state, true, None),
-                        mutable,
-                    )
+            Expr::Field(base, _) | Expr::TupleField(base, _) | Expr::Index(base, _)
+                if !self.has_overloaded_deref(expr) && self.is_ref_ty(self.expr_ty(base)) =>
+            {
+                clamp_mut(
+                    self.expr_borrow_sources_inner(base, state, true, None),
+                    mutable,
+                )
+            }
+            Expr::TupleField(base, index) if !self.has_overloaded_deref(expr) => {
+                if let Some(srcs) = self.tuple_field_sources(base, index, state) {
+                    clamp_mut(srcs, mutable)
                 } else {
                     self.non_place_borrow_sources(base, mutable, state, extend_depth)
                 }
             }
-            Expr::Index(base, _) => {
-                if self.is_ref_ty(self.expr_ty(base)) {
-                    clamp_mut(
-                        self.expr_borrow_sources_inner(base, state, true, None),
-                        mutable,
-                    )
-                } else {
-                    self.non_place_borrow_sources(base, mutable, state, extend_depth)
-                }
+            Expr::Field(base, _) if !self.has_overloaded_deref(expr) => {
+                self.non_place_borrow_sources(base, mutable, state, extend_depth)
             }
-            Expr::Unary(UnOp::Deref, inner) => {
+            Expr::Index(base, _) if !self.has_overloaded_deref(expr) => {
+                let mut out = self.non_place_borrow_sources(base, mutable, state, extend_depth);
+                if !self.base_goes_through_ref(base)
+                    && out.is_empty()
+                    && self.is_non_promotable_borrow_temp(expr, mutable)
+                {
+                    let depth = extend_depth.unwrap_or(self.temp_scope_depth);
+                    out.push(BorrowSource::temp(depth, mutable, false));
+                }
+                out
+            }
+            Expr::Unary(UnOp::Deref, inner) if !self.typed.derefs.contains_key(&(expr, 0)) => {
                 let inner_ty = self.expr_ty(inner);
                 if inner_ty != Ty::NONE && matches!(self.cx.types.kind(inner_ty), Kind::Ptr(..)) {
                     Vec::new()
@@ -576,20 +589,32 @@ impl Checker<'_, '_> {
                 }
             }
             _ => {
-                if self.is_ref_ty(self.expr_ty(expr)) {
+                if !mutable && self.is_ref_ty(self.expr_ty(expr)) {
                     return clamp_mut(
                         self.expr_borrow_sources_inner(expr, state, true, extend_depth),
                         mutable,
                     );
                 }
                 let mut out = Vec::new();
-                if self.is_non_promotable_temp(expr) {
+                if self.is_non_promotable_borrow_temp(expr, mutable) {
                     let depth = extend_depth.unwrap_or(self.temp_scope_depth);
                     out.push(BorrowSource::temp(depth, mutable, false));
                 }
-                if self.ty_holds_borrow(self.expr_ty(expr)) {
+                let deref_base = match *self.body.expr(expr) {
+                    Expr::Field(b, _)
+                    | Expr::TupleField(b, _)
+                    | Expr::Index(b, _)
+                    | Expr::Unary(UnOp::Deref, b) => Some(b),
+                    _ => None,
+                };
+                if self.ty_holds_borrow(self.expr_ty(expr)) || deref_base.is_some() {
+                    let src_expr = if self.ty_holds_borrow(self.expr_ty(expr)) {
+                        expr
+                    } else {
+                        deref_base.unwrap_or(expr)
+                    };
                     for s in clamp_mut(
-                        self.expr_borrow_sources_inner(expr, state, true, extend_depth),
+                        self.expr_borrow_sources_inner(src_expr, state, true, extend_depth),
                         mutable,
                     ) {
                         if !out.contains(&s) {
@@ -741,10 +766,12 @@ pub(super) fn unwrap_container_loans(
     dedup_sources(out)
 }
 
-fn clamp_mut(mut out: Vec<BorrowSource>, mutable: bool) -> Vec<BorrowSource> {
+pub(super) fn clamp_mut(mut out: Vec<BorrowSource>, mutable: bool) -> Vec<BorrowSource> {
     if !mutable {
         for s in &mut out {
-            s.mutable = false;
+            if super::checks::is_temp_target(s.target).is_none() {
+                s.mutable = false;
+            }
         }
     }
     out

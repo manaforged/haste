@@ -1,22 +1,14 @@
 use super::super::asm::{Alu, Cond, Reg, Size, ZR};
 use super::super::{A, Emit, IP, T};
-use super::{add_imm_parts, cond, swap_cond};
+use super::{add_imm_parts, cond};
 use crate::frame::Ext;
 use crate::ir::{Binary, Convert, IntCC, Op, Type, Value};
 
 impl Emit<'_> {
     pub(in crate::arm64) fn elided_band_cmp(&self, x: Value, y: Value) -> Option<(Value, Value)> {
-        let masked = (self.const_imm(y) == Some(0))
-            .then_some(x)
-            .or_else(|| (self.const_imm(x) == Some(0)).then_some(y))?;
-        if !self.plan.elided[masked.index()] {
-            return None;
-        }
-        let Op::Binary(Binary::Band, a, b) = self.func.insts[self.defs[masked.index()]?.index()].op
-        else {
-            return None;
-        };
-        Some((a, b))
+        crate::emit::elided_band_cmp(self.func, &self.plan, &self.defs, (x, y), |v| {
+            self.const_imm(v) == Some(0)
+        })
     }
 
     pub(in crate::arm64) fn cmp_arg(
@@ -58,13 +50,14 @@ impl Emit<'_> {
             self.last_cmp = None;
             return true;
         }
-        let reg = if self.is_zext_sub_cmp(lhs, cc, raw) {
+        let zext_sub = !signed && self.is_zext_sub_cmp(lhs, cc, raw);
+        let reg = if zext_sub {
             self.bits(lhs, A)
         } else {
             self.cmp_arg(lhs, A, bytes, signed)
         };
         self.asm.add_imm(sub, true, size, ZR, reg, imm);
-        self.last_cmp = Some((size, lhs, rhs, signed));
+        self.last_cmp = (!zext_sub).then_some((size, lhs, rhs, signed));
         true
     }
 
@@ -102,7 +95,7 @@ impl Emit<'_> {
             return Some(cond(cc));
         }
         if self.cmp_imm((y, x), (bytes, size, cc)) {
-            return Some(swap_cond(cond(cc)));
+            return Some(cond(cc.swapped()));
         }
         if let Some(c) = self.cmp_high_bits(cc, (x, y), size) {
             return Some(c);
@@ -117,7 +110,7 @@ impl Emit<'_> {
             self.asm
                 .alu_extended(Alu::Subs, size, ext_op, shift, ZR, lhs, rhs);
             self.last_cmp = Some((size, y, x, signed));
-            return Some(swap_cond(cond(cc)));
+            return Some(cond(cc.swapped()));
         }
         None
     }
@@ -162,7 +155,7 @@ impl Emit<'_> {
         let (lhs, rhs) = self.bits_pair(self.peel_uextend(y), b);
         self.emit_shifted(Alu::Subs, size, ZR, lhs, (rhs, shift, imm));
         self.last_cmp = Some((size, y, x, signed));
-        Some(swap_cond(cond(cc)))
+        Some(cond(cc.swapped()))
     }
 
     pub(in crate::arm64) fn compare(&mut self, cc: IntCC, x: Value, y: Value) -> Cond {
@@ -180,7 +173,7 @@ impl Emit<'_> {
             return cond(cc);
         }
         if self.last_cmp == Some((size, y, x, signed)) {
-            return swap_cond(cond(cc));
+            return cond(cc.swapped());
         }
         if let Some(c) = self
             .cmp_sload(cc, x, y)
@@ -348,7 +341,7 @@ impl Emit<'_> {
                     self.shift_by(Binary::Ushr, (val, amt), self.ty(x).bits() as u8, dst);
                 } else if self.plan.zero_ext[result.index()]
                     && self.ty(result).bits() < 32
-                    && !self.is_zext_within(x, self.ty(result).bits(), 4)
+                    && u32::from(self.plan.clean_bits[x.index()]) > self.ty(result).bits()
                 {
                     let src = self.bits(x, A);
                     self.asm.extend(false, self.ty(result).bytes(), dst, src);

@@ -5,7 +5,7 @@ use haste_codegen::{Arch, Os};
 
 use super::shims::{
     KERNEL32_DLL, UCRTBASE_DLL, arm64_adrp, emit_arm64_adrp_add, emit_shims, emit_stub, plan_shims,
-    windows_deps,
+    windows_crt_dll, windows_deps,
 };
 use super::{
     Buf, Executable, PatchCtx, Plan, SectionAddrs, Symbol, patch_code, plan_veneers, resolve_sym,
@@ -46,7 +46,7 @@ fn normalize_pe_dll(raw: &str) -> Cow<'static, str> {
     }
 }
 
-fn collect_pe_imports<'a>(plan: &Plan<'a>) -> Vec<PeImport<'a>> {
+fn collect_pe_imports<'a>(arch: Arch, plan: &Plan<'a>) -> Vec<PeImport<'a>> {
     let mut imports: Vec<PeImport<'a>> = Vec::new();
     let mut push_fixed = |name: &'a str, dll: &'static str| {
         if !imports.iter().any(|imp| imp.name == name) {
@@ -58,7 +58,7 @@ fn collect_pe_imports<'a>(plan: &Plan<'a>) -> Vec<PeImport<'a>> {
     };
     push_fixed("ExitProcess", KERNEL32_DLL);
     for &shim in &plan.shims {
-        for (dep, dll) in windows_deps(shim) {
+        for (dep, dll) in windows_deps(arch, shim) {
             push_fixed(dep, dll);
         }
     }
@@ -70,7 +70,10 @@ fn collect_pe_imports<'a>(plan: &Plan<'a>) -> Vec<PeImport<'a>> {
         if imports.iter().any(|existing| existing.name == imp.name) {
             continue;
         }
-        let dll = link_lib.map_or(Cow::Borrowed(UCRTBASE_DLL), normalize_pe_dll);
+        let dll = link_lib.map_or_else(
+            || Cow::Borrowed(windows_crt_dll(imp.name)),
+            normalize_pe_dll,
+        );
         imports.push(PeImport {
             name: imp.name,
             dll,
@@ -239,7 +242,7 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     };
 
     let plan = Plan::collect(exe, &["ExitProcess"])?;
-    let pe_imports = collect_pe_imports(&plan);
+    let pe_imports = collect_pe_imports(arch, &plan);
     let pe_import_idx = |name: &str| pe_imports.iter().position(|imp| imp.name == name);
     let stubs_in_text = 0usize;
     let start_in_text = (stubs_in_text + pe_imports.len() * stub_size).next_multiple_of(16);
@@ -440,7 +443,7 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
         arch,
         Os::Windows,
         &plan,
-        text_base_va,
+        text_base_va - text_raw_off as u64,
         0,
         addrs,
         &stub_va,

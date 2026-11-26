@@ -106,7 +106,7 @@ pub(in crate::aot) fn emit_arm64_catch_unwind(
             0x9100_C3E0,
             0xAA1F_03E1,
         ]);
-        c.call("_setjmp", out)?;
+        c.call("_setjmpex", out)?;
         let caught = arm64_fwd(0x3500_0000, out);
         let ok_zero = arm64_jcc(
             &[0xAA16_03E0, 0xD63F_0280, 0xF940_03E8, 0xF900_0268],
@@ -257,8 +257,9 @@ pub(in crate::aot) fn emit_arm64_start_panic(
         0xF900_02F3,
     ]);
     emit_arm64_walk_call(c, addrs, false, out);
+    let aborted = arm64_fwd(0xB400_0000, out);
     c.words_call(&[0x9100_C2E0, 0x5280_0021], "longjmp", out)?;
-    arm64_here(&[no_state, no_frame], out);
+    arm64_here(&[no_state, no_frame, aborted], out);
     c.call("abort", out)?;
     out.u32(0xD420_0020);
     Ok(())

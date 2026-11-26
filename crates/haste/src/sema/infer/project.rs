@@ -9,8 +9,9 @@ use crate::outline::item::ItemKind;
 use super::super::impls::ImplRef;
 use super::super::substs::Substs;
 use super::super::ty::{Kind, Ty};
-use super::Infer;
 use super::scope::type_params;
+use super::unify::{CacheState, replay_obligations};
+use super::{Infer, LocalProjectionKey};
 
 /// An associated type whose `Self` is not known yet: trait, `Self`, trait arguments, name, and the variable that stands for it.
 pub(super) type Projection = (ItemRef, Ty, Vec<Ty>, String, Ty);
@@ -141,36 +142,30 @@ impl Infer<'_, '_> {
         Ok(result)
     }
 
-    fn projection_key(
-        &mut self,
-        of: ItemRef,
-        ty: Ty,
-        args: &[Ty],
-        (name, own): (&str, &[Ty]),
-        ok: fn(&Self, Ty) -> bool,
-    ) -> Option<ProjectionKey> {
-        if !ok(self, ty) {
-            return None;
-        }
-        let args = self.substs_if(args, ok)?;
-        let own = self.substs_if(own, ok)?;
-        let sym = self.cx.names.symbols.intern(name);
-        Some((of, self.substitute(ty), args, sym, own))
-    }
-
     fn projection_keys(
         &mut self,
         of: ItemRef,
         ty: Ty,
         args: &[Ty],
-        own: (&str, &[Ty]),
-    ) -> (Option<ProjectionKey>, Option<ProjectionKey>) {
-        if let Some(key) = self.projection_key(of, ty, args, own, Self::closed) {
-            return (Some(key), None);
+        (name, own): (&str, &[Ty]),
+    ) -> (Option<ProjectionKey>, Option<(LocalProjectionKey, usize)>) {
+        self.sync_local_cache();
+        if self.closed(ty)
+            && let Some(args) = self.closed_substs(args)
+            && let Some(own) = self.closed_substs(own)
+        {
+            let sym = self.cx.names.symbols.intern(name);
+            return (Some((of, self.substitute(ty), args, sym, own)), None);
         }
+        let Some((sub_ty, sub_args, sub_own, krate, var_limit)) =
+            self.local_key_parts(ty, args, own)
+        else {
+            return (None, None);
+        };
+        let sym = self.cx.names.symbols.intern(name);
         (
             None,
-            self.projection_key(of, ty, args, own, Self::locally_closed),
+            Some(((of, sub_ty, sub_args, sym, sub_own, krate), var_limit)),
         )
     }
 
@@ -191,30 +186,85 @@ impl Infer<'_, '_> {
         if let Some(found) = key
             .as_ref()
             .and_then(|k| self.cx.store.lookups.projections.get(k))
-            .or_else(|| {
-                local_key
-                    .as_ref()
-                    .and_then(|k| self.local_projections.get(k).copied())
-            })
         {
             return Ok(found);
         }
-        let state = self.cache_state();
-        let res = self.picked_alias_uncached(of, ty, args, (name, own))?;
-        if self.cache_state() == state {
-            if let Some(key) = key
-                && res.is_none_or(|t| self.closed(t))
-            {
-                let cached = res.map(|t| self.substitute(t));
-                self.cx.store.lookups.projections.insert(key, cached);
-            } else if let Some(key) = local_key
-                && res.is_none_or(|t| self.locally_closed(t))
-            {
-                let cached = res.map(|t| self.substitute(t));
-                self.local_projections.insert(key, cached);
-            }
+        if let Some((ref k, key_limit)) = local_key
+            && let Some(found) = self.cached_local_projection(k, key_limit)
+        {
+            return Ok(found);
         }
+        let prev_bases = self.trail_bases.len();
+        self.trail_bases.push(self.vars.len());
+        let state = self.cache_state();
+        let res = self.picked_alias_uncached(of, ty, args, (name, own));
+        self.trail_bases.truncate(prev_bases);
+        let res = res?;
+        self.store_projection(key, local_key, res, state);
         Ok(res)
+    }
+
+    fn cached_local_projection(
+        &mut self,
+        k: &LocalProjectionKey,
+        key_limit: usize,
+    ) -> Option<Option<Ty>> {
+        if key_limit == 0
+            && self.local_closed_cache_epoch == self.capture_epoch
+            && let Some((found, obs)) = self.local_closed_projections.get(k)
+        {
+            let found = *found;
+            replay_obligations(&mut self.obligations, obs);
+            return Some(found);
+        }
+        if self.local_cache_epoch == self.var_epoch
+            && let Some((found, obs)) = self.local_projections.get(k)
+        {
+            let found = *found;
+            replay_obligations(&mut self.obligations, obs);
+            return Some(found);
+        }
+        None
+    }
+
+    fn store_projection(
+        &mut self,
+        key: Option<ProjectionKey>,
+        local_key: Option<(LocalProjectionKey, usize)>,
+        res: Option<Ty>,
+        state: CacheState,
+    ) {
+        let (global_ok, local_ok) = self.cache_check(state);
+        if global_ok && let Some(k) = key {
+            if res.is_none_or(|t| self.closed(t)) {
+                let cached = res.map(|t| self.substitute(t));
+                self.cx.store.lookups.projections.insert(k, cached);
+            }
+            return;
+        }
+        if !local_ok {
+            return;
+        }
+        let Some((k, key_limit)) = local_key else {
+            return;
+        };
+        let single;
+        let val_tys: &[Ty] = match res {
+            Some(t) => {
+                single = [t];
+                &single
+            }
+            None => &[],
+        };
+        let Some((obs, var_limit)) = self.prepare_local_store(key_limit, val_tys, state) else {
+            return;
+        };
+        let cached = res.map(|t| self.substitute(t));
+        if var_limit == 0 {
+            self.local_closed_projections.insert(k, (cached, obs));
+        } else {
+            self.local_projections.insert(k, (cached, obs));
+        }
     }
 
     fn picked_alias_uncached(
@@ -399,13 +449,18 @@ pub(super) fn path_constraints(arena: &Body, path: PathId) -> Vec<(u32, crate::b
 }
 
 pub(super) fn has_assoc_bounds(arena: &Body, path: PathId) -> bool {
-    let Some(list) = angle_args(arena, path) else {
+    let Some(&last) = arena.list(arena.path(path).segments).last() else {
         return false;
     };
-    arena.list(list).iter().any(|&at| {
-        matches!(
-            arena.args[at as usize],
-            crate::body::GenericArg::Binding { .. } | crate::body::GenericArg::Constraint { .. }
-        )
-    })
+    match arena.segments[last as usize].args {
+        Some(crate::body::Args::Paren { .. }) => true,
+        Some(crate::body::Args::Angle(list)) => arena.list(list).iter().any(|&at| {
+            matches!(
+                arena.args[at as usize],
+                crate::body::GenericArg::Binding { .. }
+                    | crate::body::GenericArg::Constraint { .. }
+            )
+        }),
+        Some(crate::body::Args::ReturnType) | None => false,
+    }
 }

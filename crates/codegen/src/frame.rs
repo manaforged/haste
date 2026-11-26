@@ -5,7 +5,9 @@ mod tail;
 use emit::mark_line;
 pub(crate) use emit::{emit_body, stack_zero_store};
 pub(crate) use shrink::{ShrinkWrap, shrink_wrap};
-pub(crate) use steps::{ArgStep, EdgeScratch, Step, arg_steps, edge_steps, reg_steps, same_home};
+pub(crate) use steps::{
+    ArgStep, EdgeScratch, Step, arg_steps, edge_steps, loc_targets, reg_steps, same_home,
+};
 pub(crate) use tail::{find_tail_calls, is_tail, needs_frame_without_tails};
 
 use crate::alloc::{Location, Plan, Regs};
@@ -143,7 +145,7 @@ pub(crate) fn ordered_saves<R: Copy + PartialEq>(used: &[R], all: &[R]) -> (Vec<
 
 fn needs_frame<R>(func: &Function, frame: &Frame<R>, stack_params: bool, bracketed: bool) -> bool {
     stack_params
-        || !func.unwind_drops.is_empty()
+        || func.needs_unwind_frame()
         || frame.size > 0
         || !frame.saves.is_empty()
         || !frame.float_saves.is_empty()
@@ -239,7 +241,7 @@ pub(crate) fn resolve_unwind_drops<R>(
             local_off: frame.slots[u.local.index()] + u.local_off,
             flag_off: frame.slots[u.flag.index()],
             drop_sym: u.drop_sym,
-            indirect: u.indirect,
+            arg: u.arg,
         })
         .collect()
 }
@@ -499,7 +501,7 @@ pub(crate) fn repack_after_elide<R: Copy + PartialEq>(
 }
 
 /// Prepares `func`; when a loop reads a value that spilled, splits it at that loop's header, keeps the splits whose parameter then gets a register, and returns the split copy with its preparation when it leaves less weighted spill traffic than the unsplit one.
-pub(crate) fn prepare_split<R: Copy + PartialEq>(
+pub(crate) fn prepare_split<R: Copy + PartialEq + std::fmt::Debug>(
     func: &Function,
     regs: &Regs<R>,
     (weighed, preserve_tc): (bool, bool),
@@ -554,7 +556,7 @@ pub(crate) fn prepare_split<R: Copy + PartialEq>(
     })
 }
 
-pub(crate) fn prepare<R: Copy + PartialEq>(
+pub(crate) fn prepare<R: Copy + PartialEq + std::fmt::Debug>(
     func: &Function,
     regs: &Regs<R>,
     (weighed, preserve_tc): (bool, bool),
@@ -577,10 +579,30 @@ pub(crate) fn prepare<R: Copy + PartialEq>(
         (&order, &copied, weighed, preserve_tc),
         &abi.params,
         &classify,
+    )?;
+    let (saves, gp_mask) = ordered_saves(
+        if func.save_all_regs {
+            regs.saved
+        } else {
+            &plan.used
+        },
+        regs.saved,
     );
-    let (saves, gp_mask) = ordered_saves(&plan.used, regs.saved);
-    let (float_saves, fp_mask) = ordered_saves(&plan.used_floats, regs.saved_float);
-    let saved_mask = gp_mask | (fp_mask << regs.saved.len());
+    let (float_saves, fp_mask) = ordered_saves(
+        if func.save_all_regs {
+            regs.saved_float
+        } else {
+            &plan.used_floats
+        },
+        regs.saved_float,
+    );
+    let saved_mask = gp_mask
+        | (fp_mask << regs.saved.len())
+        | if func.abort_on_unwind {
+            crate::UNWIND_ABORT_BIT
+        } else {
+            0
+        };
     let (frame, framed) = build_frame(
         func,
         (saves, float_saves, saved_mask),

@@ -13,6 +13,26 @@ use super::ty::mask;
 /// The width and signedness of an integer type.
 pub(super) type Int = (u32, bool);
 
+/// A compile-time constant arithmetic failure (overflow, division by zero, or invalid logarithm).
+#[derive(Debug)]
+pub(super) struct ConstArithmeticError(pub(super) String);
+
+impl std::fmt::Display for ConstArithmeticError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ConstArithmeticError {}
+
+pub(super) fn is_const_arithmetic_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<ConstArithmeticError>().is_some()
+}
+
+pub(super) fn const_arithmetic_error(msg: impl Into<String>) -> anyhow::Error {
+    ConstArithmeticError(msg.into()).into()
+}
+
 /// A method that constant expressions call: a pure method of the integer types, or the length of a string, byte string or array.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ConstMethod {
@@ -136,6 +156,12 @@ fn ilog(value: u128, base: u128) -> u128 {
     log
 }
 
+const SHIFT_OVERFLOW: &str = "attempt to shift with overflow in a constant";
+
+pub(super) fn is_signed_min(value: u128, bits: u32) -> bool {
+    bits > 0 && (value & mask(bits)) == (1_u128 << (bits - 1))
+}
+
 pub(super) fn int_method(
     method: ConstMethod,
     x: u128,
@@ -147,9 +173,29 @@ pub(super) fn int_method(
         (ConstMethod::Ilog | ConstMethod::Ilog2 | ConstMethod::Ilog10, _) => {
             int_log(method, x, arg, int).map(|log| (log, (32, false)))
         }
-        (ConstMethod::Pow, Some(exp)) => Ok((x.wrapping_pow(exp as u32) & mask(int.0), int)),
+        (ConstMethod::Pow, Some(exp)) => checked_pow(x, exp, int).map(|val| (val, int)),
         (ConstMethod::Pow, None) => bail!("`pow` in a constant has no exponent"),
         _ => Ok((int_bits(method, x & mask(int.0), int.0), (32, false))),
+    }
+}
+
+fn checked_pow(x: u128, exp: u128, (bits, is_signed): Int) -> Result<u128> {
+    let overflow = || const_arithmetic_error("attempt to multiply with overflow in a constant");
+    let exp = u32::try_from(exp).map_err(|_| overflow())?;
+    if is_signed {
+        let sx = signed(x, bits);
+        let val = sx.checked_pow(exp).ok_or_else(overflow)?;
+        let masked = (val as u128) & mask(bits);
+        if signed(masked, bits) != val {
+            return Err(overflow());
+        }
+        Ok(masked)
+    } else {
+        let val = (x & mask(bits)).checked_pow(exp).ok_or_else(overflow)?;
+        if bits < 128 && val > mask(bits) {
+            return Err(overflow());
+        }
+        Ok(val & mask(bits))
     }
 }
 
@@ -160,14 +206,20 @@ fn int_log(
     (bits, is_signed): Int,
 ) -> Result<u128> {
     if x == 0 || (is_signed && signed(x, bits) < 0) {
-        bail!("the logarithm of a value that is not positive in a constant");
+        return Err(const_arithmetic_error(
+            "the logarithm of a value that is not positive in a constant",
+        ));
     }
     Ok(match (method, base) {
         (ConstMethod::Ilog2, _) => u128::from(127 - x.leading_zeros()),
         (ConstMethod::Ilog, Some(base)) if !(is_signed && signed(base, bits) < 2) && base >= 2 => {
             ilog(x, base)
         }
-        (ConstMethod::Ilog, _) => bail!("a logarithm of base below 2 in a constant"),
+        (ConstMethod::Ilog, _) => {
+            return Err(const_arithmetic_error(
+                "a logarithm of base below 2 in a constant",
+            ));
+        }
         _ => ilog(x, 10),
     })
 }
@@ -196,38 +248,72 @@ pub(super) fn convert(value: u128, from: Int, to: Int) -> u128 {
 }
 
 pub(super) fn fold(op: BinOp, x: u128, y: u128, (bits, is_signed): Int) -> Result<u128> {
-    if matches!(op, BinOp::Div | BinOp::Rem) && y == 0 {
-        bail!("a division by zero in a constant");
-    }
-    Ok(match op {
-        BinOp::Div | BinOp::Rem | BinOp::Shr if is_signed => {
-            fold_signed(op, signed(x, bits), y, bits)
+    if matches!(op, BinOp::Div | BinOp::Rem) {
+        if (y & mask(bits)) == 0 {
+            return Err(const_arithmetic_error(
+                "attempt to divide by zero in a constant",
+            ));
         }
-        BinOp::Div | BinOp::Rem | BinOp::Shr => fold_unsigned(op, x, y),
-        BinOp::Add => x.wrapping_add(y),
-        BinOp::Sub => x.wrapping_sub(y),
-        BinOp::Mul => x.wrapping_mul(y),
-        BinOp::Shl => x.checked_shl(y as u32).unwrap_or(0),
-        BinOp::BitAnd => x & y,
-        BinOp::BitOr => x | y,
-        BinOp::BitXor => x ^ y,
+        if is_signed && is_signed_min(x, bits) && signed(y, bits) == -1 {
+            let msg = if op == BinOp::Div {
+                "attempt to divide with overflow in a constant"
+            } else {
+                "attempt to calculate the remainder with overflow in a constant"
+            };
+            return Err(const_arithmetic_error(msg));
+        }
+        return Ok(if is_signed {
+            fold_signed(op, signed(x, bits), y, bits)
+        } else {
+            fold_unsigned(op, x & mask(bits), y & mask(bits))
+        });
+    }
+    if matches!(op, BinOp::Shl | BinOp::Shr) {
+        if y >= u128::from(bits) {
+            return Err(const_arithmetic_error(SHIFT_OVERFLOW));
+        }
+        let ov = if op == BinOp::Shl {
+            OverflowOp::Shl
+        } else {
+            OverflowOp::Shr
+        };
+        let (val, over) = overflowing_op(ov, x, y, (bits, is_signed));
+        if over {
+            return Err(const_arithmetic_error(SHIFT_OVERFLOW));
+        }
+        return Ok(val);
+    }
+    match op {
+        BinOp::Add | BinOp::Sub | BinOp::Mul => {
+            let ov = match op {
+                BinOp::Add => OverflowOp::Add,
+                BinOp::Sub => OverflowOp::Sub,
+                _ => OverflowOp::Mul,
+            };
+            let (val, over) = overflowing_op(ov, x, y, (bits, is_signed));
+            if over {
+                return Err(const_arithmetic_error("arithmetic overflow in a constant"));
+            }
+            Ok(val)
+        }
+        BinOp::BitAnd => Ok(x & y),
+        BinOp::BitOr => Ok(x | y),
+        BinOp::BitXor => Ok(x ^ y),
         other => bail!("the operator {other:?} in a constant is not evaluated yet"),
-    })
+    }
 }
 
 fn fold_signed(op: BinOp, x: i128, y: u128, bits: u32) -> u128 {
     match op {
         BinOp::Div => x.wrapping_div(signed(y, bits)) as u128,
-        BinOp::Rem => x.wrapping_rem(signed(y, bits)) as u128,
-        _ => (x >> (y as u32).min(127)) as u128,
+        _ => x.wrapping_rem(signed(y, bits)) as u128,
     }
 }
 
 fn fold_unsigned(op: BinOp, x: u128, y: u128) -> u128 {
     match op {
         BinOp::Div => x / y,
-        BinOp::Rem => x % y,
-        _ => x.checked_shr(y as u32).unwrap_or(0),
+        _ => x % y,
     }
 }
 

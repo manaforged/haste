@@ -18,8 +18,9 @@ use crate::outline::source::Source;
 
 use super::Context;
 use super::infer::Typed;
-use super::ty::{Kind, Mut, Ty};
+use super::ty::{Kind, Ty};
 
+use calls::ActiveClosure;
 use places::{PlaceStep, steps_conflict};
 use propagate::{BorrowSource, TupleSources};
 
@@ -140,12 +141,10 @@ struct BreakFrame {
     is_block: bool,
     depth: u32,
     states: Vec<State>,
+    continues: Vec<State>,
     sources: Vec<BorrowSource>,
-}
-
-struct ActiveClosure {
-    params: Vec<u32>,
-    ret_params: Vec<usize>,
+    break_live: HashSet<u32>,
+    continue_live: Option<HashSet<u32>>,
 }
 
 struct Checker<'c, 'a> {
@@ -162,11 +161,13 @@ struct Checker<'c, 'a> {
     no_move_captures: Vec<(u32, Vec<PlaceStep>)>,
     returns_borrow: bool,
     returns_only_static: bool,
-    param_lts: calls::ParamLifetimes<'c>,
+    ret_named_lts: Vec<&'c str>,
+    param_lts: calls::ParamLifetimes,
     return_min_depth: u32,
     closure_depth: u32,
     const_depth: u32,
     unsafe_depth: u32,
+    loop_depth: u32,
     closure_by_val_caps: Vec<u32>,
     active_closures: Vec<ActiveClosure>,
     stmt_depth: u32,
@@ -183,41 +184,7 @@ struct Checker<'c, 'a> {
     current_pat: Option<PatId>,
 }
 
-/// Whether `ty` is `Copy` in `item`, resolving closures declared inside `typed` directly and defaulting conservatively to `false`.
-pub(super) fn is_copy_ty(cx: &mut Context<'_>, item: ItemRef, typed: &Typed, ty: Ty) -> bool {
-    if ty == Ty::NONE {
-        return true;
-    }
-    match cx.types.kind(ty).clone() {
-        Kind::Ref(Mut::Not, _) => true,
-        Kind::Ref(Mut::Mut, _)
-        | Kind::Slice(_)
-        | Kind::Dyn(..)
-        | Kind::Prim(crate::names::Primitive::Str) => false,
-        Kind::Tuple(items) => cx
-            .types
-            .substs(items)
-            .to_vec()
-            .into_iter()
-            .all(|t| is_copy_ty(cx, item, typed, t)),
-        Kind::Array(inner, _) => is_copy_ty(cx, item, typed, inner),
-        Kind::Closure(parent, _, at) if parent == item => {
-            typed.closures.get(&ExprId(at)).is_some_and(|c| {
-                !c.coroutine
-                    && c.captures.iter().all(|cap| match cap.by {
-                        super::infer::By::Ref => true,
-                        super::infer::By::Mut => false,
-                        super::infer::By::Value => {
-                            let local_ty = typed.locals[cap.local as usize].ty;
-                            let cap_ty = cap.ty(cx, local_ty).unwrap_or(local_ty);
-                            is_copy_ty(cx, item, typed, cap_ty)
-                        }
-                    })
-            })
-        }
-        _ => super::infer::is_copy(cx, item, ty).unwrap_or(false),
-    }
-}
+pub(super) use checks::is_copy_ty;
 
 /// Checks ownership, mutability, borrow aliasing, and dangling local reference escapes on `body`.
 pub(super) fn check(
@@ -296,12 +263,18 @@ pub(super) fn check(
             }
         }
     }
-    let returns_only_static = !sig.is_async
-        && sig.ret.is_some_and(|ret_ast| {
-            let mut ret_lts = calls::Lifetimes::default();
-            calls::collect_ty_lifetimes(&sig.body, src, ret_ast, &mut ret_lts);
-            calls::sig_returns_only_static(sig, src, ret_ast, &ret_lts)
-        });
+    let (returns_only_static, ret_named_lts) = if !sig.is_async
+        && let Some(ret_ast) = sig.ret
+    {
+        let mut ret_lts = calls::Lifetimes::default();
+        calls::collect_ty_lifetimes(&sig.body, src, ret_ast, &mut ret_lts);
+        (
+            calls::sig_returns_only_static(sig, src, ret_ast, &ret_lts),
+            calls::sig_return_named_lifetimes(sig, src, ret_ast, &ret_lts),
+        )
+    } else {
+        (false, Vec::new())
+    };
     let param_lts = calls::compute_param_lifetimes(cx, item, sig, src, typed, n);
     let mut checker = Checker {
         cx,
@@ -317,11 +290,13 @@ pub(super) fn check(
         no_move_captures: Vec::new(),
         returns_borrow: false,
         returns_only_static,
+        ret_named_lts,
         param_lts,
         return_min_depth: 1,
         closure_depth: 0,
         const_depth: 0,
         unsafe_depth: u32::from(sig.is_unsafe),
+        loop_depth: 0,
         closure_by_val_caps: Vec::new(),
         active_closures: Vec::new(),
         stmt_depth: 1,
@@ -360,7 +335,7 @@ pub(super) fn check(
             .params
             .get(param_offset + idx)
             .map(|&pl| vec![checker.param_fallback_source(pl)]);
-        checker.check_param_pat(pat, fallback.as_deref().unwrap_or(&[]), &mut state)?;
+        checker.bind_pat_param(pat, fallback.as_deref().unwrap_or(&[]), &mut state)?;
     }
     let empty_live = HashSet::default();
     let root_place_ctx = checker.is_mut_ref_ty(checker.expr_ty(root))
@@ -484,6 +459,24 @@ impl Checker<'_, '_> {
         id
     }
 
+    pub(super) fn release_temp_states(states: &mut [State], id: u32) {
+        for s in states {
+            s.loans.retain(|l| l.holder != Some(id));
+        }
+    }
+
+    pub(super) fn release_temp_in_breaks(&mut self, id: u32) {
+        for frame in &mut self.breaks {
+            Self::release_temp_states(&mut frame.states, id);
+            Self::release_temp_states(&mut frame.continues, id);
+        }
+    }
+
+    pub(super) fn release_temp_holder(&mut self, state: &mut State, id: u32) {
+        state.loans.retain(|l| l.holder != Some(id));
+        self.release_temp_in_breaks(id);
+    }
+
     pub(super) fn is_const_or_static_item(&self) -> bool {
         self.const_depth > 0
             || (self.closure_depth == 0
@@ -542,7 +535,7 @@ impl Checker<'_, '_> {
 
     fn is_escaping_return(&self, src: &BorrowSource) -> bool {
         if checks::is_temp_target(src.target).is_some() {
-            return !self.is_const_or_static_item();
+            return !self.temp_target_allowed(src.mutable);
         }
         if self.closure_depth > 0
             && !src.through_ref
@@ -566,9 +559,15 @@ impl Checker<'_, '_> {
             >= self.return_min_depth
     }
 
-    pub(super) fn escapes_depth(&self, target: u32, through_ref: bool, depth: u32) -> bool {
+    pub(super) fn escapes_depth(
+        &self,
+        target: u32,
+        through_ref: bool,
+        mutable: bool,
+        depth: u32,
+    ) -> bool {
         if let Some(t_depth) = checks::is_temp_target(target) {
-            if self.is_const_or_static_item() {
+            if self.temp_target_allowed(mutable) {
                 return false;
             }
             let effective = if t_depth >= STMT_TEMP_OFFSET {
@@ -629,15 +628,6 @@ impl Checker<'_, '_> {
         Ok(())
     }
 
-    fn check_param_pat(
-        &mut self,
-        pat: PatId,
-        fallback: &[BorrowSource],
-        state: &mut State,
-    ) -> Result<()> {
-        self.bind_pat_param(pat, fallback, state)
-    }
-
     fn check_return_escape(&mut self, expr: ExprId, state: &State) -> Result<()> {
         let had_cached = if let Some(cached) = self.temp_sources.get(&expr).cloned() {
             let site = self.return_diag_site(expr);
@@ -671,7 +661,8 @@ impl Checker<'_, '_> {
             }
             _ => {
                 let sources = self.expr_borrow_sources(expr, state);
-                self.check_return_sources(expr, &sources)
+                self.check_return_sources(expr, &sources)?;
+                self.check_return_tuple_named_lt(expr, state)
             }
         }
     }
@@ -696,10 +687,18 @@ impl Checker<'_, '_> {
                 {
                     active.ret_params.push(idx);
                 }
+                if src.origin_only {
+                    active.ret_orig.insert(src.target);
+                } else {
+                    active.ret_real.insert(src.target);
+                }
             }
         }
         for src in sources {
             if self.is_escaping_return(src) {
+                if checks::is_temp_target(src.target).is_some() {
+                    return Err(self.does_not_live_long_enough(Some(expr), src.target));
+                }
                 return Err(self.borrow_err(
                     Some(expr),
                     format!(
@@ -720,6 +719,7 @@ impl Checker<'_, '_> {
                     ),
                 ));
             }
+            self.check_return_named_lt(expr, src)?;
         }
         Ok(())
     }
@@ -734,7 +734,7 @@ impl Checker<'_, '_> {
             let Some(holder) = l.holder else { continue };
             if !is_temp_holder(Some(holder))
                 && outer_live.contains(&holder)
-                && self.escapes_depth(l.target, l.through_ref, block_depth)
+                && self.escapes_depth(l.target, l.through_ref, l.mutable, block_depth)
             {
                 return Err(self.does_not_live_long_enough(l.site, l.target));
             }
@@ -744,18 +744,13 @@ impl Checker<'_, '_> {
 }
 
 fn join_moved(dst: &mut State, other: &State) {
-    for (d, &o) in dst.init.iter_mut().zip(&other.init) {
-        *d &= o;
-    }
-    for (d, &o) in dst.maybe_init.iter_mut().zip(&other.maybe_init) {
-        *d |= o;
-    }
-    for (d, &o) in dst.moved.iter_mut().zip(&other.moved) {
-        *d |= o;
-    }
-    for (d, &o) in dst.moved_at.iter_mut().zip(&other.moved_at) {
-        if d.is_none() {
-            *d = o;
+    let n = dst.init.len().min(other.init.len());
+    for i in 0..n {
+        dst.init[i] &= other.init[i];
+        dst.maybe_init[i] |= other.maybe_init[i];
+        dst.moved[i] |= other.moved[i];
+        if dst.moved_at[i].is_none() {
+            dst.moved_at[i] = other.moved_at[i];
         }
     }
     for pm in &other.partial_moves {

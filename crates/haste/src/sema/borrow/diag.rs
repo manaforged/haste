@@ -164,6 +164,16 @@ impl Checker<'_, '_> {
         steps: &[PlaceStep],
         state: &State,
     ) -> Result<()> {
+        self.check_can_move_except(local, steps, state, None)
+    }
+
+    pub(super) fn check_can_move_except(
+        &self,
+        local: u32,
+        steps: &[PlaceStep],
+        state: &State,
+        except_holder: Option<u32>,
+    ) -> Result<()> {
         self.check_not_moved(local, steps, state)?;
         if self
             .no_move_captures
@@ -178,11 +188,10 @@ impl Checker<'_, '_> {
                 ),
             ));
         }
-        if let Some(loan) = state
-            .loans
-            .iter()
-            .find(|l| loan_conflicts_borrow(l, local, steps))
-        {
+        if let Some(loan) = state.loans.iter().find(|l| {
+            except_holder.is_none_or(|h| l.holder != Some(h))
+                && loan_conflicts_borrow(l, local, steps)
+        }) {
             return Err(self.borrow_err_labeled(
                 None,
                 format!(

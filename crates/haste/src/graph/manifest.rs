@@ -34,12 +34,26 @@ pub struct Dep {
     pub platform: Option<String>,
 }
 
+/// Package metadata strings exported as `CARGO_PKG_*` environment variables.
+#[derive(Clone, Debug, Default)]
+pub struct PackageMeta {
+    pub authors: String,
+    pub description: String,
+    pub homepage: String,
+    pub repository: String,
+    pub license: String,
+    pub license_file: String,
+    pub readme: String,
+    pub rust_version: String,
+}
+
 /// The parts of a `Cargo.toml` that the graph needs.
 #[derive(Clone, Debug, Default)]
 pub struct Manifest {
     pub dir: PathBuf,
     pub name: String,
     pub edition: String,
+    pub meta: PackageMeta,
     pub links: Option<String>,
     pub build: Option<PathBuf>,
     pub lib: Option<PathBuf>,
@@ -88,6 +102,10 @@ fn strings(value: Option<&Value>) -> Vec<String> {
         .collect()
 }
 
+fn is_workspace_inherited(table: &Table) -> bool {
+    table.get("workspace").and_then(Value::as_bool) == Some(true)
+}
+
 fn merged(spec: &Value, workspace: Option<&Table>, key: &str) -> Table {
     let mut table = match spec {
         Value::String(req) => {
@@ -96,7 +114,7 @@ fn merged(spec: &Value, workspace: Option<&Table>, key: &str) -> Table {
         Value::Table(table) => table.clone(),
         _ => Table::new(),
     };
-    if table.get("workspace").and_then(Value::as_bool) == Some(true)
+    if is_workspace_inherited(&table)
         && let Some(base) = workspace.and_then(|ws| ws.get(key))
     {
         let extra = strings(table.get("features"));
@@ -303,17 +321,54 @@ pub fn workspace_of(dir: &Path) -> Result<Option<Table>> {
     Ok(Some(workspace))
 }
 
-fn edition_of(package: &Table, workspace: Option<&Table>) -> String {
-    let inherited = || {
+fn inherited_value<'a>(
+    package: &'a Table,
+    workspace: Option<&'a Table>,
+    key: &str,
+) -> Option<&'a Value> {
+    let val = package.get(key)?;
+    if val.as_table().is_some_and(is_workspace_inherited) {
         workspace
             .and_then(|ws| ws.get("package"))
             .and_then(Value::as_table)
-            .and_then(|package| text(package, "edition"))
-    };
-    text(package, "edition")
-        .or_else(inherited)
-        .unwrap_or("2015")
+            .and_then(|wp| wp.get(key))
+    } else {
+        Some(val)
+    }
+}
+
+fn inherited_text_or(
+    package: &Table,
+    workspace: Option<&Table>,
+    key: &str,
+    default: &str,
+) -> String {
+    inherited_value(package, workspace, key)
+        .and_then(Value::as_str)
+        .unwrap_or(default)
         .to_owned()
+}
+
+fn inherited_text(package: &Table, workspace: Option<&Table>, key: &str) -> String {
+    inherited_text_or(package, workspace, key, "")
+}
+
+fn edition_of(package: &Table, workspace: Option<&Table>) -> String {
+    inherited_text_or(package, workspace, "edition", "2015")
+}
+
+fn package_meta(package: &Table, workspace: Option<&Table>) -> PackageMeta {
+    let authors = strings(inherited_value(package, workspace, "authors")).join(":");
+    PackageMeta {
+        authors,
+        description: inherited_text(package, workspace, "description"),
+        homepage: inherited_text(package, workspace, "homepage"),
+        repository: inherited_text(package, workspace, "repository"),
+        license: inherited_text(package, workspace, "license"),
+        license_file: inherited_text(package, workspace, "license-file"),
+        readme: inherited_text(package, workspace, "readme"),
+        rust_version: inherited_text(package, workspace, "rust-version"),
+    }
 }
 
 fn manifest_of(dir: &Path, root: &Table, workspace: Option<&Table>) -> Result<Manifest> {
@@ -336,6 +391,7 @@ fn manifest_of(dir: &Path, root: &Table, workspace: Option<&Table>) -> Result<Ma
     Ok(Manifest {
         dir: dir.to_owned(),
         edition: edition_of(package, workspace),
+        meta: package_meta(package, workspace),
         links: text(package, "links").map(str::to_owned),
         build: build_script(dir, package),
         lib,

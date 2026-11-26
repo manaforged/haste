@@ -3,11 +3,22 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/cargo.sh
 
-suite="${1:-${HASTE_BENCH_SUITE:-all}}"
-case "$suite" in
-    all|compute|build|self) ;;
-    *) echo "usage: $0 [all|compute|build|self]" >&2; exit 2 ;;
-esac
+suite="${HASTE_BENCH_SUITE:-all}"
+bench_long="${HASTE_BENCH_LONG:-0}"
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        all|compute|build|self) suite="$1"; shift ;;
+        --long) bench_long=1; shift ;;
+        -h|--help)
+            echo "usage: $0 [all|compute|build|self] [--long]"
+            exit 0
+            ;;
+        *)
+            echo "usage: $0 [all|compute|build|self] [--long]" >&2
+            exit 2
+            ;;
+    esac
+done
 
 build_haste </dev/null >/dev/null 2>&1 || { echo "haste does not build"; exit 2; }
 haste_bin="${HASTE_BIN:-${CARGO_TARGET_DIR:-target}/release/haste}"
@@ -30,6 +41,23 @@ if [ "$suite" = "all" ] || [ "$suite" = "build" ]; then
 fi
 
 if [ "$suite" = "all" ] || [ "$suite" = "compute" ]; then
+    mkdir -p "$tmp/empty/src"
+    cat > "$tmp/empty/Cargo.toml" <<'EOF'
+[package]
+name = "empty"
+version = "0.1.0"
+edition = "2021"
+EOF
+    cat > "$tmp/empty/Cargo.lock" <<'EOF'
+version = 4
+
+[[package]]
+name = "empty"
+version = "0.1.0"
+EOF
+    cat > "$tmp/empty/src/main.rs" <<'EOF'
+fn main() {}
+EOF
     mkdir -p "$tmp/compute/src"
     cat > "$tmp/compute/Cargo.toml" <<'EOF'
 [package]
@@ -84,39 +112,47 @@ fn sha256_compress(state: &mut [u32; 8], block: &[u8; 64]) {
     state[6] = state[6].wrapping_add(g); state[7] = state[7].wrapping_add(h);
 }
 
-fn bench_sha256() -> u64 {
+fn bench_sha256(mult: usize) -> u64 {
     let mut state = [0x6a09e667u32, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
     let mut block = [0u8; 64];
     for i in 0..64 { block[i] = (i as u8).wrapping_mul(37).wrapping_add(13); }
-    for round in 0..250_000u32 {
+    for round in 0..(2_000_000usize * mult) {
         block[0] = round as u8;
         block[1] = (round >> 8) as u8;
+        block[2] = (round >> 16) as u8;
+        block[3] = (round >> 24) as u8;
         sha256_compress(&mut state, &block);
     }
     u64::from(state[0]) << 32 | u64::from(state[7])
 }
 
-fn bench_sieve() -> u64 {
+fn bench_sieve(mult: usize) -> u64 {
     const N: usize = 4_000_000;
     let mut is_prime = vec![1u8; N + 1];
-    is_prime[0] = 0;
-    is_prime[1] = 0;
-    let mut p = 2;
-    while p * p <= N {
-        if is_prime[p] != 0 {
-            let mut m = p * p;
-            while m <= N {
-                is_prime[m] = 0;
-                m += p;
+    let mut total = 0u64;
+    for round in 0..(20 * mult) {
+        let n = std::hint::black_box(N - (round % 1000) * 1021);
+        is_prime[..=n].fill(1);
+        is_prime[0] = 0;
+        is_prime[1] = 0;
+        let mut p = 2;
+        while p * p <= n {
+            if is_prime[p] != 0 {
+                let mut m = p * p;
+                while m <= n {
+                    is_prime[m] = 0;
+                    m += p;
+                }
             }
+            p += 1;
         }
-        p += 1;
+        let mut sum = 0u64;
+        for (i, &flag) in is_prime[..=n].iter().enumerate() {
+            if flag != 0 { sum = sum.wrapping_add(i as u64); }
+        }
+        total = total.wrapping_add(sum);
     }
-    let mut sum = 0u64;
-    for (i, &flag) in is_prime.iter().enumerate() {
-        if flag != 0 { sum = sum.wrapping_add(i as u64); }
-    }
-    sum
+    total
 }
 
 fn quicksort(a: &mut [u64]) {
@@ -147,29 +183,34 @@ fn quicksort(a: &mut [u64]) {
     quicksort(&mut a[j + 1..]);
 }
 
-fn bench_sort() -> u64 {
+fn bench_sort(mult: usize) -> u64 {
     let mut data = Vec::with_capacity(500_000);
     let mut s = 0x9e37_79b9_7f4a_7c15u64;
-    for _ in 0..500_000 {
-        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
-        data.push(s);
-    }
-    quicksort(&mut data);
     let mut acc = 0u64;
-    for i in (0..data.len()).step_by(97) {
-        if let Ok(pos) = data.binary_search(&data[i]) {
-            acc = acc.wrapping_add(pos as u64 ^ data[pos]);
+    for _ in 0..(8 * mult) {
+        data.clear();
+        for _ in 0..500_000 {
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            data.push(s);
+        }
+        quicksort(&mut data);
+        for i in (0..data.len()).step_by(97) {
+            if let Ok(pos) = data.binary_search(&data[i]) {
+                acc = acc.wrapping_add(pos as u64 ^ data[pos]);
+            }
         }
     }
     acc
 }
 
-fn bench_scan() -> u64 {
+fn bench_scan(mult: usize) -> u64 {
     let sample = br#"{"id":12345,"name":"alpha_beta","tags":["rust","compiler","jit","aot"],"active":true,"score":987654}"#;
     let mut buf = Vec::with_capacity(sample.len() * 2000);
     for _ in 0..2000 { buf.extend_from_slice(sample); }
     let mut total = 0u64;
-    for _ in 0..40 {
+    for round in 0..(1200 * mult) {
+        buf[6 + (round % 5)] = b'0' + ((round % 9) as u8) + 1;
+        let _ = std::hint::black_box(buf.as_ptr());
         let mut i = 0;
         while i < buf.len() {
             match buf[i] {
@@ -206,7 +247,7 @@ where
     iter.fold(0.0f64, |acc, (idx, v)| acc + f(idx, v))
 }
 
-fn bench_fp_iter() -> u64 {
+fn bench_fp_iter(mult: usize) -> u64 {
     const N: usize = 65_536;
     let mut xs = Vec::with_capacity(N);
     let mut ys = Vec::with_capacity(N);
@@ -216,7 +257,7 @@ fn bench_fp_iter() -> u64 {
         ys.push(1.0 / (1.0 + t * t));
     }
     let mut total = 0.0f64;
-    for round in 0..64usize {
+    for round in 0..(4096usize * mult) {
         let scale = 1.0 + (round as f64) * 0.015625;
         let zipped = xs
             .iter()
@@ -229,28 +270,34 @@ fn bench_fp_iter() -> u64 {
             val * w
         });
         total += part;
-        let slot = round * 13 % N;
+        let slot = (round * 13) % N;
         xs[slot] = xs[slot] * 0.999_938_964_843_75 + 0.000_244_140_625;
     }
     total.to_bits()
 }
 
 fn main() {
-    let arg = std::env::args().nth(1).unwrap_or_else(|| "all".to_owned());
+    let mut args = std::env::args().skip(1);
+    let arg = args.next().unwrap_or_else(|| "all".to_owned());
+    let mult: usize = args
+        .next()
+        .and_then(|s| s.parse().ok())
+        .filter(|&m| m >= 1)
+        .unwrap_or(1);
     let out = match arg.as_str() {
-        "sha256" => bench_sha256(),
-        "sieve" => bench_sieve(),
-        "sort" => bench_sort(),
-        "scan" => bench_scan(),
-        "fp_iter" => bench_fp_iter(),
-        _ => bench_sha256() ^ bench_sieve() ^ bench_sort() ^ bench_scan() ^ bench_fp_iter(),
+        "sha256" => bench_sha256(mult),
+        "sieve" => bench_sieve(mult),
+        "sort" => bench_sort(mult),
+        "scan" => bench_scan(mult),
+        "fp_iter" => bench_fp_iter(mult),
+        _ => bench_sha256(mult) ^ bench_sieve(mult) ^ bench_sort(mult) ^ bench_scan(mult) ^ bench_fp_iter(mult),
     };
     println!("{out}");
 }
 EOF
 fi
 
-python3 - "$tmp" "$haste_bin" "$suite" "$cache_dir" "$cargo_tmp" <<'PYEOF'
+python3 - "$tmp" "$haste_bin" "$suite" "$cache_dir" "$cargo_tmp" "$bench_long" <<'PYEOF'
 import os
 import re
 import signal
@@ -260,6 +307,8 @@ import time
 from pathlib import Path
 
 tmp, haste_bin, suite, cache_dir, cargo_tmp = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+bench_long = sys.argv[6] == "1"
+mult = 4 if bench_long else 1
 run_cold = os.environ.get("HASTE_BENCH_COLD", "1") != "0"
 rounds = max(1, int(os.environ.get("HASTE_BENCH_ROUNDS", "5")))
 warm_haste_env = dict(os.environ)
@@ -289,6 +338,10 @@ def run_timed(cmd, env=None):
 def median_ms(n, cmd, env=None):
     return median_of(run_timed(cmd, env=env) for _ in range(n))
 
+def median_ms_warmed(n, cmd, env=None):
+    run_timed(cmd, env=env)
+    return median_ms(n, cmd, env=env)
+
 def median_ms_checked(n, cmd, env=None):
     warm = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=True)
     out = warm.stdout.strip()
@@ -309,6 +362,9 @@ def fmt_ms(ms):
     if ms >= 100.0:
         return f"{round(ms)} ms"
     return f"{ms:.1f} ms"
+
+def fmt_net_raw(net_ms, raw_ms):
+    return f"{fmt_ms(net_ms)} (raw {fmt_ms(raw_ms)})"
 
 def print_build_table(title, rows, has_prev):
     if has_prev:
@@ -466,12 +522,20 @@ if suite in ("all", "self"):
     sections += 1
 
 if suite in ("all", "compute"):
+    empty_dir = os.path.join(tmp, "empty")
+    empty_haste = os.path.join(tmp, "empty_haste")
+    empty_rustc = os.path.join(tmp, "empty_rustc")
+    empty_rustc_matched = os.path.join(tmp, "empty_rustc_matched")
+    empty_main = os.path.join(empty_dir, "src", "main.rs")
     compute_dir = os.path.join(tmp, "compute")
     compute_haste = os.path.join(tmp, "compute_haste")
     compute_rustc = os.path.join(tmp, "compute_rustc")
     compute_rustc_matched = os.path.join(tmp, "compute_rustc_matched")
     src_main = os.path.join(compute_dir, "src", "main.rs")
     procs = [
+        subprocess.Popen([haste_bin, "--release", "build", "-o", empty_haste, empty_dir], env=warm_haste_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL),
+        subprocess.Popen(["rustc", "-C", "opt-level=3", "--edition=2021", empty_main, "-o", empty_rustc], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL),
+        subprocess.Popen(["rustc", "-C", "opt-level=3", "-C", "target-cpu=native", "-C", "panic=abort", "--edition=2021", empty_main, "-o", empty_rustc_matched], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL),
         subprocess.Popen([haste_bin, "--release", "build", "-o", compute_haste, compute_dir], env=warm_haste_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL),
         subprocess.Popen(["rustc", "-C", "opt-level=3", "--edition=2021", src_main, "-o", compute_rustc], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL),
         subprocess.Popen(["rustc", "-C", "opt-level=3", "-C", "target-cpu=native", "-C", "panic=abort", "--edition=2021", src_main, "-o", compute_rustc_matched], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL),
@@ -479,20 +543,37 @@ if suite in ("all", "compute"):
     if any(p.wait() != 0 for p in procs):
         sys.exit(1)
 
+    baseline_rounds = max(rounds, 7)
+    h_base = median_ms_warmed(baseline_rounds, [empty_haste])
+    c_base = median_ms_warmed(baseline_rounds, [empty_rustc])
+    m_base = median_ms_warmed(baseline_rounds, [empty_rustc_matched])
+
     if sections:
         print()
-    print(f"### AOT Codegen Runtime (`haste --release` vs `rustc`, median of {rounds}, warmed)")
+    scale_label = f"long ({mult}x)" if bench_long else "default"
+    print(f"### AOT Codegen Runtime (`haste --release` vs `rustc`, median of {rounds}, warmed, scale={scale_label})")
     print()
-    print("| Workload | haste --release | rustc -O3 | vs -O3 | rustc -O3 native+abort | vs matched | Output |")
+    print(
+        f"Empty-main startup baseline (median of {baseline_rounds}, warmed): "
+        f"`haste --release` = {fmt_ms(h_base)} | `rustc -O3` = {fmt_ms(c_base)} | `rustc -O3 native+abort` = {fmt_ms(m_base)}"
+    )
+    print()
+    print("| Workload | haste --release (net / raw) | rustc -O3 (net / raw) | vs -O3 | rustc -O3 native+abort (net / raw) | vs matched | Output |")
     print("| --- | ---: | ---: | ---: | ---: | ---: | --- |")
     for work in ("sha256", "sieve", "sort", "scan", "fp_iter"):
-        h_ms, h_out = median_ms_checked(rounds, [compute_haste, work])
-        c_ms, c_out = median_ms_checked(rounds, [compute_rustc, work])
-        m_ms, m_out = median_ms_checked(rounds, [compute_rustc_matched, work])
+        h_raw, h_out = median_ms_checked(rounds, [compute_haste, work, str(mult)])
+        c_raw, c_out = median_ms_checked(rounds, [compute_rustc, work, str(mult)])
+        m_raw, m_out = median_ms_checked(rounds, [compute_rustc_matched, work, str(mult)])
         if h_out != c_out or h_out != m_out:
             print(f"MISMATCH on {work}: haste={h_out} rustc={c_out} matched={m_out}", file=sys.stderr)
             sys.exit(1)
-        r_default = f"{h_ms / max(c_ms, 1e-6):.2f}x"
-        r_matched = f"{h_ms / max(m_ms, 1e-6):.2f}x"
-        print(f"| `{work}` | {fmt_ms(h_ms)} | {fmt_ms(c_ms)} | {r_default} | {fmt_ms(m_ms)} | {r_matched} | exact match (`{h_out}`) |")
+        h_net = max(0.0, h_raw - h_base)
+        c_net = max(0.0, c_raw - c_base)
+        m_net = max(0.0, m_raw - m_base)
+        r_default = f"{h_net / max(c_net, 1e-3):.2f}x"
+        r_matched = f"{h_net / max(m_net, 1e-3):.2f}x"
+        print(
+            f"| `{work}` | {fmt_net_raw(h_net, h_raw)} | {fmt_net_raw(c_net, c_raw)} | {r_default} | "
+            f"{fmt_net_raw(m_net, m_raw)} | {r_matched} | exact match (`{h_out}`) |"
+        )
 PYEOF

@@ -7,6 +7,8 @@ use std::mem::ManuallyDrop;
 #[cfg(unix)]
 use std::os::fd::FromRawFd;
 use std::sync::Mutex;
+#[cfg(unix)]
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
 pub(super) const STUB_BYTES: usize = 64;
@@ -17,6 +19,7 @@ static STUBS_FROM: AtomicUsize = AtomicUsize::new(0);
 static STUBS_TO: AtomicUsize = AtomicUsize::new(0);
 static ASK: AtomicI32 = AtomicI32::new(-1);
 static ANSWER: AtomicI32 = AtomicI32::new(-1);
+static SHARED_LOCK: AtomicUsize = AtomicUsize::new(0);
 static TALK: Mutex<()> = Mutex::new(());
 
 /// The text section and global label of the shared stub entry, in the object format's syntax: Mach-O symbols take a leading underscore.
@@ -161,13 +164,72 @@ pub(super) fn code(index: usize, slot: usize) -> Vec<u8> {
     bytes
 }
 
-/// Records, before the program forks, where the call table and the stubs are and which pipe ends reach the compiler.
-pub(super) fn connect(table: usize, stubs: std::ops::Range<usize>, (ask, answer): (i32, i32)) {
+/// Records, before the program forks, where the call table and the stubs are, the shared pipe lock, and which pipe ends reach the compiler.
+pub(super) fn connect(
+    table: usize,
+    stubs: std::ops::Range<usize>,
+    (ask, answer): (i32, i32),
+    shared_lock: usize,
+) {
     TABLE.store(table, Ordering::Release);
     STUBS_FROM.store(stubs.start, Ordering::Release);
     STUBS_TO.store(stubs.end, Ordering::Release);
     ASK.store(ask, Ordering::Release);
     ANSWER.store(answer, Ordering::Release);
+    SHARED_LOCK.store(shared_lock, Ordering::Release);
+}
+
+#[cfg(unix)]
+struct SharedPipeGuard(Option<&'static AtomicU32>);
+
+#[cfg(unix)]
+impl SharedPipeGuard {
+    fn acquire() -> Self {
+        let addr = SHARED_LOCK.load(Ordering::Acquire);
+        if addr == 0 {
+            return Self(None);
+        }
+        // SAFETY: `addr` points to a zero-initialized `AtomicU32` in the image's MAP_SHARED arena that lives for the child's lifetime.
+        let lock = unsafe { &*(addr as *const AtomicU32) };
+        // SAFETY: `getpid` has no preconditions.
+        let raw_pid = unsafe { libc::getpid() };
+        let pid = if raw_pid > 0 { raw_pid as u32 } else { 1 };
+        let mut spins = 0u32;
+        loop {
+            match lock.compare_exchange_weak(0, pid, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Self(Some(lock)),
+                Err(owner) => {
+                    spins = spins.wrapping_add(1);
+                    if spins & 0xFF == 0
+                        && owner != 0
+                        && owner != pid
+                        // SAFETY: `owner` is a positive PID; signal 0 probes liveness without delivering a signal.
+                        && unsafe { libc::kill(owner as libc::pid_t, 0) } != 0
+                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                        && lock
+                            .compare_exchange(owner, pid, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok()
+                    {
+                        return Self(Some(lock));
+                    }
+                    if spins < 64 {
+                        std::thread::yield_now();
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_micros(50));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SharedPipeGuard {
+    fn drop(&mut self) {
+        if let Some(lock) = self.0 {
+            lock.store(0, Ordering::Release);
+        }
+    }
 }
 
 /// The code that slot `index` holds when it is no longer a stub.
@@ -191,9 +253,15 @@ fn ask(index: usize) -> std::io::Result<usize> {
         )
     };
     ask.write_all(&(index as u64).to_le_bytes())?;
-    let mut code = [0; 8];
-    answer.read_exact(&mut code)?;
-    Ok(u64::from_le_bytes(code) as usize)
+    let mut frame = [0u8; 16];
+    loop {
+        answer.read_exact(&mut frame)?;
+        let reply_index = u64::from_le_bytes(frame[..8].try_into().unwrap_or([0; 8])) as usize;
+        let code = u64::from_le_bytes(frame[8..].try_into().unwrap_or([0; 8])) as usize;
+        if reply_index == index {
+            return Ok(code);
+        }
+    }
 }
 
 #[cfg(not(unix))]
@@ -207,6 +275,8 @@ extern "C" fn resolve(index: usize) -> usize {
         return code;
     }
     let _talk = crate::sync::lock(&TALK);
+    #[cfg(unix)]
+    let _shared = SharedPipeGuard::acquire();
     if !tier_up && let Some(code) = compiled(index) {
         return code;
     }

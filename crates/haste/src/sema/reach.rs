@@ -20,7 +20,7 @@ pub(super) use collect::run_scoped;
 pub use collect::{reach_again, reach_anew, reach_wave};
 pub(crate) use items::typed_once;
 pub(super) use items::{infer_entry, is_inferring, lay_out};
-pub(crate) use unwind::host_symbol_may_unwind;
+pub(crate) use unwind::{foreign_dynamic_may_unwind, host_symbol_may_unwind};
 pub use wave::infer_quiet;
 
 use filter::ReachFilter;
@@ -387,7 +387,9 @@ pub(super) fn push_tail_calls(typed: &Typed, push: &mut impl FnMut(Instance)) {
 pub(crate) const PANIC_BOUNDS_CHECK: &str = "panic_bounds_check";
 
 pub(crate) fn unwind_enabled(cx: &Context<'_>, reached: &Reached) -> bool {
-    crate::profile() != crate::outline::tree::Profile::Release || reached.has_catch_unwind(cx)
+    crate::profile() != crate::outline::tree::Profile::Release
+        || reached.is_incremental()
+        || reached.has_catch_unwind(cx)
 }
 
 /// Infers declared function `index` when it has no body yet, and returns whether it did.

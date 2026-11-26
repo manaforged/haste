@@ -5,21 +5,10 @@ use crate::x64::asm::{Alu, Cond, Group3, Reg, Size};
 
 impl Emit<'_> {
     pub(in crate::x64) fn elided_band_cmp(&self, x: Value, y: Value) -> Option<(Value, Value)> {
-        let is_zero = |v: Value| {
+        crate::emit::elided_band_cmp(self.func, &self.plan, &self.defs, (x, y), |v| {
             self.const_of(v)
                 .is_some_and(|imm| crate::fold::extend(imm, self.ty(v), false) == 0)
-        };
-        let masked = is_zero(y)
-            .then_some(x)
-            .or_else(|| is_zero(x).then_some(y))?;
-        if !self.plan.elided[masked.index()] {
-            return None;
-        }
-        let inst = self.defs[masked.index()]?;
-        let Op::Binary(Binary::Band, a, b) = self.func.insts[inst.index()].op else {
-            return None;
-        };
-        Some((a, b))
+        })
     }
 
     pub(in crate::x64) fn emit_cmp_pair(

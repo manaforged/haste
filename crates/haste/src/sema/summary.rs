@@ -34,7 +34,7 @@ pub enum SummaryKind {
     Poly(Arc<PolySummary>),
     MonomorphicHints(Arc<HashMap<ExprId, ItemRef>>),
     MonomorphicFallback,
-    BorrowError(String),
+    Error(String),
 }
 
 /// Pre-extracted operand types for deciding whether an overloaded operator simplifies to a builtin.
@@ -130,7 +130,7 @@ pub(super) fn typed_once_poly(
     );
     let summary = match built {
         Ok(SummaryKind::Poly(summary)) => summary,
-        Ok(SummaryKind::BorrowError(err)) => return Some(Err(err)),
+        Ok(SummaryKind::Error(err)) => return Some(Err(err)),
         Ok(SummaryKind::MonomorphicHints(hints)) => {
             let m_before = cx.quiet_mark();
             let typed =
@@ -157,7 +157,7 @@ fn cached_poly_summary(cx: &mut Context<'_>, item: ItemRef) -> Option<Arc<PolySu
             SummaryKind::Poly(summary) => Some(summary),
             SummaryKind::MonomorphicHints(_)
             | SummaryKind::MonomorphicFallback
-            | SummaryKind::BorrowError(_) => None,
+            | SummaryKind::Error(_) => None,
         };
     }
     frozen::frozen_summary(cx, item)
@@ -234,7 +234,7 @@ pub fn check_poly_item(cx: &mut Context<'_>, item: ItemRef) -> Result<(), String
         |_| Ok(SummaryKind::MonomorphicFallback),
     );
     match built {
-        Ok(SummaryKind::BorrowError(err)) => Err(err),
+        Ok(SummaryKind::Error(err)) => Err(err),
         _ => Ok(()),
     }
 }

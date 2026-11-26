@@ -125,6 +125,9 @@ impl<'l, 'a> Lower<'l, 'a> {
                     return None;
                 }
                 self.write_const_bytes(scope, (item, elem), at, out, depth, in_generic)?;
+                if stride == 0 {
+                    return Some(());
+                }
                 for index in 1..count {
                     out.copy_within(at..at + stride, at + index * stride);
                 }

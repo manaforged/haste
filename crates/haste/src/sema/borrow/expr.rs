@@ -5,11 +5,18 @@ use crate::body::{BinOp, BlockKind, Expr, ExprId, List, PatId, UnOp, jumps_to};
 use crate::outline::item::ItemKind;
 
 use super::super::infer::Res;
-use super::super::ty::{Kind, Ty};
+use super::super::ty::{Kind, Mut, Ty};
 use super::places::PlaceStep;
 use super::{Checker, State, merge_branch, prune_dead_loans, prune_moved_loans};
 
 impl Checker<'_, '_> {
+    fn finish_expr_divergence(&self, expr: ExprId, state: &mut State) {
+        let expr_ty = self.expr_ty(expr);
+        if expr_ty != Ty::NONE && matches!(*self.cx.types.kind(expr_ty), Kind::Never) {
+            state.diverged = true;
+        }
+    }
+
     pub(super) fn check_expr(
         &mut self,
         expr: ExprId,
@@ -27,10 +34,7 @@ impl Checker<'_, '_> {
         let res = self.check_expr_kind(expr, state, place_ctx, outer_live, value_used, depth);
         self.current_expr = prev_expr;
         res?;
-        let expr_ty = self.expr_ty(expr);
-        if expr_ty != Ty::NONE && matches!(*self.cx.types.kind(expr_ty), Kind::Never) {
-            state.diverged = true;
-        }
+        self.finish_expr_divergence(expr, state);
         Ok(())
     }
 
@@ -157,7 +161,14 @@ impl Checker<'_, '_> {
             }
             Expr::Return(val) => self.check_return_expr(val, state, outer_live, depth),
             Expr::Break(label, val) => self.check_break_expr(label, val, state, outer_live, depth),
-            Expr::Continue(_) => {
+            Expr::Continue(label) => {
+                if let Some(idx) = self
+                    .breaks
+                    .iter()
+                    .rposition(|f| !f.is_block && jumps_to(self.src, (f.label, false), label))
+                {
+                    self.breaks[idx].continues.push(state.clone());
+                }
                 state.diverged = true;
                 Ok(())
             }
@@ -532,6 +543,69 @@ impl Checker<'_, '_> {
         self.check_expr(inner, state, reborrow_mut, outer_live, true, depth)
     }
 
+    pub(super) fn check_tuple_with_expected_tys(
+        &mut self,
+        expr: ExprId,
+        list: List,
+        elem_tys: &[Ty],
+        state: &mut State,
+        outer_live: &HashSet<u32>,
+        depth: u32,
+    ) -> Result<()> {
+        let prev_expr = self.current_expr;
+        self.current_expr = Some(expr);
+        let ids: Vec<u32> = self.body.list(list).to_vec();
+        let res = if ids.len() == elem_tys.len() {
+            let refs: Vec<Option<Mut>> = elem_tys.iter().map(|&t| self.ptr_or_ref_mut(t)).collect();
+            self.check_arg_list_expected_tys(&ids, &refs, elem_tys, state, outer_live, depth)
+        } else {
+            self.check_list_expr(list, state, outer_live, depth)
+        };
+        self.current_expr = prev_expr;
+        res?;
+        self.finish_expr_divergence(expr, state);
+        Ok(())
+    }
+
+    pub(super) fn check_let_init(
+        &mut self,
+        pat: PatId,
+        ann_ty: Option<crate::body::TyId>,
+        init: ExprId,
+        (place_ctx, value_used): (bool, bool),
+        state: &mut State,
+        outer_live: &HashSet<u32>,
+        depth: u32,
+    ) -> Result<()> {
+        let has_ty = ann_ty.is_some_and(|t| !matches!(*self.body.ty(t), crate::body::Ty::Infer));
+        if let Some(at) = ann_ty
+            && has_ty
+            && let Expr::Tuple(list) = *self.body.expr(self.unwrap_parens(init))
+            && let Some(elem_tys) = self
+                .typed
+                .pats
+                .get(&pat)
+                .copied()
+                .filter(|&t| t != Ty::NONE)
+                .or_else(|| Some(self.expr_ty(init)))
+                .map(|t| self.mask_infer_tuple_ty(at, t))
+                .and_then(|t| self.peeled_tuple_elems(t))
+        {
+            return self
+                .check_tuple_with_expected_tys(init, list, &elem_tys, state, outer_live, depth);
+        }
+        let reborrow_mut = (has_ty || self.typed.coercions.contains_key(&init))
+            && self.is_mut_ref_ty(self.expr_ty(init));
+        self.check_expr(
+            init,
+            state,
+            place_ctx || reborrow_mut,
+            outer_live,
+            value_used,
+            depth,
+        )
+    }
+
     fn check_list_expr(
         &mut self,
         list: List,
@@ -540,7 +614,20 @@ impl Checker<'_, '_> {
         depth: u32,
     ) -> Result<()> {
         let ids: Vec<u32> = self.body.list(list).to_vec();
-        self.check_arg_list(&ids, None, None, false, state, outer_live, depth)
+        let arg_tys = self.current_expr.and_then(|e| {
+            let need = ids
+                .iter()
+                .any(|&id| self.typed.coercions.contains_key(&ExprId(id)));
+            if !need {
+                return None;
+            }
+            match *self.cx.types.kind(self.expr_ty(e)) {
+                Kind::Tuple(elems) => Some(self.cx.types.substs(elems).to_vec()),
+                Kind::Array(elem, _) => Some(vec![elem; ids.len()]),
+                _ => None,
+            }
+        });
+        self.check_arg_list_with_refs(&ids, None, arg_tys.as_deref(), state, outer_live, depth)
     }
 
     fn check_struct_expr(
@@ -552,13 +639,20 @@ impl Checker<'_, '_> {
         outer_live: &HashSet<u32>,
         depth: u32,
     ) -> Result<()> {
-        let val_ids: Vec<u32> = self
-            .body
-            .list(fields)
+        let field_ids: Vec<u32> = self.body.list(fields).to_vec();
+        let val_ids: Vec<u32> = field_ids
             .iter()
             .map(|&f| self.body.fields[f as usize].value.0)
             .collect();
-        self.check_arg_list(&val_ids, None, None, false, state, outer_live, depth)?;
+        let (field_refs, field_tys) = self.struct_field_ref_muts(expr, &field_ids);
+        self.check_arg_list_expected_tys(
+            &val_ids,
+            &field_refs,
+            &field_tys,
+            state,
+            outer_live,
+            depth,
+        )?;
         self.check_static_struct_fields(expr, &val_ids, state)?;
         if let Some(b) = base {
             self.check_fru_base(expr, fields, b, state, outer_live, depth)?;
@@ -572,16 +666,10 @@ impl Checker<'_, '_> {
         val_ids: &[u32],
         state: &State,
     ) -> Result<()> {
-        let (adt_item, variant) = match self.typed.res.get(&expr).copied() {
-            Some(Res::Ctor(item, v, _)) => (item, v as usize),
-            _ => return Ok(()),
-        };
-        let Ok(def) = self.cx.adt_def(adt_item) else {
+        let Some((adt_item, variant, _, def)) = self.struct_adt_variant(expr) else {
             return Ok(());
         };
-        let Some(var) = def.variants.get(variant) else {
-            return Ok(());
-        };
+        let var = &def.variants[variant];
         let adt_src = &self.cx.file(adt_item).source;
         let static_indices: Vec<u32> = var
             .fields
@@ -671,7 +759,10 @@ impl Checker<'_, '_> {
             if let Some(v) = val {
                 let srcs = self.expr_borrow_sources(v, state);
                 for src in &srcs {
-                    if self.escapes_depth(src.target, src.through_ref, target_depth) {
+                    if self.escapes_depth(src.target, src.through_ref, src.mutable, target_depth)
+                        || (super::checks::is_temp_target(src.target).is_some()
+                            && !self.temp_target_allowed(src.mutable))
+                    {
                         return Err(self.does_not_live_long_enough(Some(v), src.target));
                     }
                 }

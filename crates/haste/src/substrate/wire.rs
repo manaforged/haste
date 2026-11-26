@@ -87,7 +87,10 @@ impl<'a> StencilSlice<'a> {
                 local_off: read_u32(drops, at) as i32,
                 flag_off: read_u32(drops, at + 4) as i32,
                 drop_sym: read_u32(drops, at + 8),
-                indirect: read_u32(drops, at + 12) != 0,
+                arg: u8::try_from(read_u32(drops, at + 12))
+                    .ok()
+                    .and_then(haste_codegen::UnwindArg::from_u8)
+                    .ok_or_else(|| anyhow::anyhow!("corrupt substrate: invalid unwind arg kind"))?,
             })
         })
     }
@@ -176,7 +179,7 @@ pub(super) fn encode_unwind_drops(drops: &[CodeUnwindDrop], out: &mut Vec<u8>) {
         out.extend_from_slice(&(d.local_off as u32).to_le_bytes());
         out.extend_from_slice(&(d.flag_off as u32).to_le_bytes());
         out.extend_from_slice(&d.drop_sym.to_le_bytes());
-        out.extend_from_slice(&u32::from(d.indirect).to_le_bytes());
+        out.extend_from_slice(&u32::from(d.arg.as_u8()).to_le_bytes());
     }
 }
 

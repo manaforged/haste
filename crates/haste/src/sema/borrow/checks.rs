@@ -5,18 +5,20 @@ mod types;
 use anyhow::Result;
 use rustc_hash::FxHashSet as HashSet;
 
-use crate::body::{Expr, ExprId, List, UnOp};
+use crate::body::{Expr, ExprId, List, Pat, PatId, UnOp};
 use crate::outline::item::ItemKind;
 use crate::sema::infer::Res;
 use crate::sema::ty::{Kind, Ty};
 
+use super::bind::push_source_loans;
 use super::places::{FieldKey, Place, PlaceStep, push_step};
 use super::propagate::BorrowSource;
-use super::{Checker, PartialMove, State, loan_conflicts_borrow};
+use super::{Checker, PartialMove, State, is_temp_holder, loan_conflicts_borrow, merge_states};
 
 pub(super) const TEMP_TARGET_BASE: u32 = u32::MAX - 262_144;
 
 pub(super) use closure::ClosureEffects;
+pub(in crate::sema) use types::is_copy_ty;
 
 pub(super) fn is_temp_target(target: u32) -> Option<u32> {
     (target >= TEMP_TARGET_BASE && target < super::ITER_HOLDER_BASE)
@@ -284,7 +286,7 @@ impl Checker<'_, '_> {
         Ok(())
     }
 
-    fn struct_adt(
+    pub(super) fn struct_adt(
         &self,
         expr: ExprId,
     ) -> Option<(crate::names::ItemRef, usize, super::super::substs::Substs)> {
@@ -394,4 +396,122 @@ impl Checker<'_, '_> {
         }
         Ok(())
     }
+
+    pub(super) fn check_const_block_locals(
+        &self,
+        stmts: List,
+        tail: Option<ExprId>,
+        block_depth: u32,
+    ) -> Result<()> {
+        let ids_check: Vec<u32> = self.body.list(stmts).to_vec();
+        let (c_before, _, c_tail) = self.block_liveness(&ids_check, tail, &HashSet::default());
+        let live_in = c_before.first().unwrap_or(&c_tail);
+        if let Some(&bad) = live_in.iter().find(|&&loc| {
+            self.scope_depth
+                .get(loc as usize)
+                .is_some_and(|&d| d < block_depth)
+        }) {
+            return Err(self.const_err(
+                None,
+                format!(
+                    "attempt to use a non-constant value `{}` in a constant",
+                    self.local_name(bad)
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn hold_drop_temp(&mut self, expr: ExprId, state: &mut State) -> Option<u32> {
+        let ty = self.expr_ty(expr);
+        if !self.ty_holds_borrow(ty) || !self.ty_has_borrow_drop(ty) {
+            return None;
+        }
+        let sources = self.expr_borrow_sources(expr, state);
+        if sources.is_empty() {
+            return None;
+        }
+        let id = self.next_temp_holder();
+        push_source_loans(&mut state.loans, Some(id), &sources, Some(expr));
+        Some(id)
+    }
+
+    pub(super) fn pat_inspects_scrut(&self, pat: PatId) -> bool {
+        !matches!(*self.body.pat(pat), Pat::Wild | Pat::Bind { sub: None, .. })
+    }
+
+    pub(super) fn base_goes_through_ref(&self, mut expr: ExprId) -> bool {
+        loop {
+            if self.is_ref_ty(self.expr_ty(expr)) {
+                return true;
+            }
+            match *self.body.expr(expr) {
+                Expr::Paren(inner)
+                | Expr::Cast(inner, _)
+                | Expr::Field(inner, _)
+                | Expr::TupleField(inner, _)
+                | Expr::Index(inner, _)
+                | Expr::Unary(UnOp::Deref, inner) => expr = inner,
+                _ => return false,
+            }
+        }
+    }
+
+    pub(super) fn peeled_tuple_elems(&self, mut ty: Ty) -> Option<Vec<Ty>> {
+        if ty == Ty::NONE {
+            return None;
+        }
+        while let Kind::Pat(inner, ..) = *self.cx.types.kind(ty) {
+            ty = inner;
+        }
+        match *self.cx.types.kind(ty) {
+            Kind::Tuple(elems) => Some(self.cx.types.substs(elems).to_vec()),
+            _ => None,
+        }
+    }
+
+    pub(super) fn mask_infer_tuple_ty(&mut self, mut ast_ty: crate::body::TyId, ty: Ty) -> Ty {
+        while let crate::body::Ty::Paren(inner) = *self.body.ty(ast_ty) {
+            ast_ty = inner;
+        }
+        match *self.body.ty(ast_ty) {
+            crate::body::Ty::Infer => Ty::NONE,
+            crate::body::Ty::Tuple(list) if ty != Ty::NONE => {
+                let Kind::Tuple(elems) = *self.cx.types.kind(ty) else {
+                    return ty;
+                };
+                let ast_elems: Vec<u32> = self.body.list(list).to_vec();
+                let ty_elems: Vec<Ty> = self.cx.types.substs(elems).to_vec();
+                if ast_elems.len() != ty_elems.len() {
+                    return ty;
+                }
+                let masked: Vec<Ty> = ast_elems
+                    .into_iter()
+                    .zip(ty_elems)
+                    .map(|(a, t)| self.mask_infer_tuple_ty(crate::body::TyId(a), t))
+                    .collect();
+                let substs = self.cx.types.intern_substs(&masked);
+                self.cx.types.intern(Kind::Tuple(substs))
+            }
+            _ => ty,
+        }
+    }
+}
+
+pub(super) fn retain_non_loop_state(state: &mut State, loop_locals: &HashSet<u32>) {
+    let keep = |h| is_temp_holder(Some(h)) || !loop_locals.contains(&h);
+    state.loans.retain(|l| l.holder.is_none_or(keep));
+    state
+        .tuple_elem_sources
+        .retain(|k, _| !loop_locals.contains(k));
+}
+
+pub(super) fn merge_break_states(mut merged: Option<State>, states: Vec<State>) -> Option<State> {
+    for bs in states {
+        match &mut merged {
+            Some(acc) => merge_states(acc, &bs),
+            None => merged = Some(bs),
+        }
+    }
+    merged
 }

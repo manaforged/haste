@@ -1,7 +1,7 @@
 use super::super::Site;
 use super::super::patterns::product_halves;
 use super::super::sib::{idx_source, store_load_ok};
-use super::{FuseCtx, may_barrier_mem, preserved};
+use super::{FuseCtx, preserved};
 use crate::alloc::Plan;
 use crate::ir::{
     Binary, BlockData, Convert, Function, Inst, InstData, Lane, Op, ShuffleMask, TargetOpId, Type,
@@ -18,7 +18,7 @@ pub(super) fn load_fuses(ctx: &FuseCtx<'_>, lpos: usize, eff_pos: usize, skip: &
     if eff_pos <= lpos
         || insts[lpos + 1..eff_pos]
             .iter()
-            .any(|&mid| may_barrier_mem(&ctx.func.insts[mid.index()].op))
+            .any(|&mid| ctx.func.insts[mid.index()].op.is_load_barrier())
     {
         return false;
     }

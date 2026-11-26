@@ -1,6 +1,7 @@
 use anyhow::{Result, bail};
 
 use crate::body::{Body, Expr, List, Lit, Pat, PatId, PathId};
+use crate::diag::DiagnosticKind;
 use crate::names::plain;
 use crate::outline::item::ItemKind;
 
@@ -51,6 +52,13 @@ impl Infer<'_, '_> {
     }
 
     fn pat(&mut self, pat: PatId, ty: Ty, mode: Mode) -> Result<()> {
+        let prev = self.current_pat.replace(pat);
+        let res = self.pat_inner(pat, ty, mode);
+        self.current_pat = prev;
+        res
+    }
+
+    fn pat_inner(&mut self, pat: PatId, ty: Ty, mode: Mode) -> Result<()> {
         let (ty, mode) = self.peel(pat, ty, mode);
         self.out.pats.insert(pat, ty);
         match *self.body.pat(pat) {
@@ -67,8 +75,8 @@ impl Infer<'_, '_> {
                 .into_iter()
                 .chain(to)
                 .try_for_each(|end| self.value_pat(end, ty)),
-            Pat::Tuple(list) => self.tuple_pat(list, ty, mode),
-            Pat::Slice(list) => self.slice_pat(list, ty, mode),
+            Pat::Tuple(list) => self.tuple_pat(pat, list, ty, mode),
+            Pat::Slice(list) => self.slice_pat(pat, list, ty, mode),
             Pat::Ref {
                 mutable,
                 pat: inner,
@@ -77,7 +85,12 @@ impl Infer<'_, '_> {
             Pat::TupleStruct(path, list) => self.variant_pat(pat, path, ty, (list, mode)),
             Pat::Struct { path, fields, .. } => self.struct_pat(pat, path, ty, (fields, mode)),
             Pat::Or(list) => self.or_pat(pat, list, ty, mode),
-            ref other => bail!("unsupported pattern {other:?}"),
+            ref other => Err(self.diag_pat(
+                DiagnosticKind::Type,
+                pat,
+                format!("unsupported pattern {other:?}"),
+                "unsupported pattern",
+            )),
         }
     }
 
@@ -173,7 +186,7 @@ impl Infer<'_, '_> {
         (self.resolve(ty), mode)
     }
 
-    fn tuple_pat(&mut self, list: List, ty: Ty, mode: Mode) -> Result<()> {
+    fn tuple_pat(&mut self, pat: PatId, list: List, ty: Ty, mode: Mode) -> Result<()> {
         let (pats, rest) = rest_split(self.body, list)?;
         let items = match (self.cx.types.kind(ty).clone(), rest) {
             (Kind::Tuple(items), _) => self.cx.types.substs(items).to_vec(),
@@ -183,15 +196,22 @@ impl Infer<'_, '_> {
                 self.unify(ty, tuple)?;
                 items
             }
-            _ => bail!("the type of a tuple pattern with `..` must be known here"),
+            _ => {
+                return Err(self.diag_pat(
+                    DiagnosticKind::Type,
+                    pat,
+                    "the type of a tuple pattern with `..` must be known here",
+                    "type must be known here",
+                ));
+            }
         };
-        self.positional(&pats, rest, &items, mode)
+        self.positional(pat, &pats, rest, &items, mode)
     }
 
-    fn slice_pat(&mut self, list: List, ty: Ty, mode: Mode) -> Result<()> {
+    fn slice_pat(&mut self, pat: PatId, list: List, ty: Ty, mode: Mode) -> Result<()> {
         let (pats, rest) = rest_split(self.body, list)?;
         let given = pats.len() - usize::from(rest.is_some());
-        let element = self.slice_element(ty, given, rest.is_some())?;
+        let element = self.slice_element(pat, ty, given, rest.is_some())?;
         for (at, &pat) in pats.iter().enumerate() {
             let item = if Some(at) == rest {
                 self.rest_ty(ty, element, given)
@@ -213,11 +233,18 @@ impl Infer<'_, '_> {
         }
     }
 
-    fn slice_element(&mut self, ty: Ty, given: usize, rest: bool) -> Result<Ty> {
+    fn slice_element(&mut self, pat: PatId, ty: Ty, given: usize, rest: bool) -> Result<Ty> {
         let (element, len) = match *self.cx.types.kind(ty) {
             Kind::Slice(element) => return Ok(element),
             Kind::Array(element, len) => (element, len),
-            _ => bail!("slice pattern on {}", self.show(ty)),
+            _ => {
+                return Err(self.diag_pat(
+                    DiagnosticKind::Type,
+                    pat,
+                    format!("slice pattern on {}", self.show(ty)),
+                    "expected an array or slice",
+                ));
+            }
         };
         let resolved_len = self.resolve(len);
         if matches!(
@@ -227,20 +254,30 @@ impl Infer<'_, '_> {
             self.poly_fallback();
         }
         match self.cx.types.len(resolved_len) {
-            Some(len) if given as u64 > len || (!rest && given as u64 != len) => {
-                bail!("pattern has {given} elements, the array has {len}")
-            }
+            Some(len) if given as u64 > len || (!rest && given as u64 != len) => Err(self
+                .diag_pat(
+                    DiagnosticKind::Type,
+                    pat,
+                    format!("pattern has {given} elements, the array has {len}"),
+                    "pattern length mismatch",
+                )),
             Some(_) => Ok(element),
             None if !rest => {
                 let known = self.cx.types.intern(Kind::Value(given as u128));
                 self.unify(len, known).map(|()| element)
             }
-            None => bail!("a slice pattern with `..` on an array of unknown length"),
+            None => Err(self.diag_pat(
+                DiagnosticKind::Type,
+                pat,
+                "a slice pattern with `..` on an array of unknown length",
+                "array length must be known here",
+            )),
         }
     }
 
     fn positional(
         &mut self,
+        pat: PatId,
         pats: &[PatId],
         rest: Option<usize>,
         items: &[Ty],
@@ -248,7 +285,12 @@ impl Infer<'_, '_> {
     ) -> Result<()> {
         let given = pats.len() - usize::from(rest.is_some());
         if given > items.len() || (rest.is_none() && given != items.len()) {
-            bail!("pattern has {given} fields, the type has {}", items.len());
+            return Err(self.diag_pat(
+                DiagnosticKind::Type,
+                pat,
+                format!("pattern has {given} fields, the type has {}", items.len()),
+                "pattern field count mismatch",
+            ));
         }
         for (at, &pat) in pats.iter().enumerate() {
             let Some(index) = position(at, pats.len(), rest, items.len()) else {
@@ -262,7 +304,12 @@ impl Infer<'_, '_> {
     fn path_pat(&mut self, pat: PatId, path: PathId, (ty, mode): (Ty, Mode)) -> Result<()> {
         let (found, res) = self.value_path(path)?;
         if !matches!(res, Res::Ctor(..)) && !self.is_const(&res) {
-            bail!("pattern path is not a unit constructor or a constant");
+            return Err(self.diag_pat(
+                DiagnosticKind::Type,
+                pat,
+                "pattern path is not a unit constructor or a constant",
+                "not a unit constructor or constant",
+            ));
         }
         self.named_value(pat, (found, res), ty, mode)
     }
@@ -297,7 +344,12 @@ impl Infer<'_, '_> {
     ) -> Result<()> {
         let body = self.body;
         let Some((item, variant, args)) = self.ctor(body, path, true)? else {
-            bail!("pattern path is not a tuple constructor")
+            return Err(self.diag_pat(
+                DiagnosticKind::Type,
+                pat,
+                "pattern path is not a tuple constructor",
+                "not a tuple constructor",
+            ));
         };
         let adt = self.cx.types.intern(Kind::Adt(item, args));
         self.unify(ty, adt)?;
@@ -314,7 +366,7 @@ impl Infer<'_, '_> {
                 self.check_field_visible(item, index as u32, None, pat_tok, &index.to_string())?;
             }
         }
-        self.positional(&pats, rest, &fields, mode)
+        self.positional(pat, &pats, rest, &fields, mode)
     }
 
     fn struct_pat(
@@ -326,7 +378,12 @@ impl Infer<'_, '_> {
     ) -> Result<()> {
         let body = self.body;
         let Some((item, variant, args)) = self.ctor(body, path, false)? else {
-            bail!("struct pattern of something that is not a struct")
+            return Err(self.diag_pat(
+                DiagnosticKind::Type,
+                pat,
+                "struct pattern of something that is not a struct",
+                "not a struct",
+            ));
         };
         let adt = self.cx.types.intern(Kind::Adt(item, args));
         self.unify(ty, adt)?;
@@ -337,7 +394,7 @@ impl Infer<'_, '_> {
             let field = body.field_pats[at as usize];
             let name = plain(self.src.text(field.name));
             let Some(index) = self.field_index(item, variant, name)? else {
-                bail!("no field `{name}` on {}", self.cx.name(item))
+                return Err(self.diag_unknown_field(field.name, item, name));
             };
             self.check_field_visible(item, index, None, Some(field.name), name)?;
             self.out.field_pats.insert(field.pat, index);
@@ -354,7 +411,7 @@ impl Infer<'_, '_> {
             let bound = self.scopes.split_off(depth);
             match &first {
                 None => first = Some(bound),
-                Some(names) => self.merge_alt(names, bound)?,
+                Some(names) => self.merge_alt(pat, names, bound)?,
             }
         }
         let names = first.unwrap_or_default();
@@ -367,15 +424,26 @@ impl Infer<'_, '_> {
 
     fn merge_alt(
         &mut self,
+        pat: PatId,
         names: &[(super::Name, u32)],
         bound: Vec<(super::Name, u32)>,
     ) -> Result<()> {
         if names.len() != bound.len() {
-            bail!("the alternatives of an or-pattern bind different names");
+            return Err(self.diag_pat(
+                DiagnosticKind::Name,
+                pat,
+                "the alternatives of an or-pattern bind different names",
+                "mismatched bindings across or-pattern",
+            ));
         }
         for (name, local) in bound {
             let Some(&(_, kept)) = names.iter().find(|(other, _)| *other == name) else {
-                bail!("`{}` is not bound in every alternative", name.0)
+                return Err(self.diag_pat(
+                    DiagnosticKind::Name,
+                    pat,
+                    format!("`{}` is not bound in every alternative", name.0),
+                    "binding missing from another alternative",
+                ));
             };
             self.unify(
                 self.out.locals[local as usize].ty,

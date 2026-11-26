@@ -578,4 +578,24 @@ fn main() {
 }
 "#,
     );
+    check_fails(
+        "let_tuple_infer_elem_moves_mut_ref",
+        "fn main() { let mut x = 1; let r = &mut x; let (_a, _b): (_, i32) = (r, 0); *r += 1; }",
+    );
+    check_passes(
+        "struct_field_tuple_reborrows_mut_refs",
+        "struct Pair<'a> { f: (&'a mut i32, &'a mut i32) }\nfn main() { let (mut a, mut b) = (1, 2); let (r1, r2) = (&mut a, &mut b); let _p = Pair { f: (r1, r2) }; *r1 += 1; *r2 += 1; }",
+    );
+    check_fails(
+        "overloaded_deref_temp_field_preserves_container_borrow",
+        "use std::ops::Deref;\nstruct Inner { x: i32 }\nstruct Wrap<'a>(&'a mut Inner);\nimpl<'a> Deref for Wrap<'a> { type Target = Inner; fn deref(&self) -> &Inner { &*self.0 } }\nfn take_two(_: &i32, _: &mut Inner) {}\nfn main() { let mut inner = Inner { x: 1 }; take_two(&Wrap(&mut inner).x, &mut inner); }",
+    );
+    check_passes(
+        "recursive_assoc_bounds_distinguish_trait_args",
+        "struct S; struct Zero; struct Succ<T>(T);\ntrait Tr<A> { type Item; }\nimpl<A> Tr<A> for S { type Item = S; }\ntrait Step<N> {}\nimpl Step<Zero> for S {}\nimpl<N> Step<Succ<N>> for S where S: Tr<N, Item: Step<N>> {}\nfn check<T: Step<Succ<Succ<Zero>>>>() {}\nfn main() { check::<S>(); }",
+    );
+    check_fails(
+        "swapped_result_alias_try_does_not_peel_wrong_tuple_elem",
+        "mod m { pub type Result<E, T> = std::result::Result<T, E>; }\nfn split<'a, 'b>(a: &'a str, b: &'b str) -> m::Result<(&'a str, &'a str), (&'b str, &'a str)> { Ok((b, a)) }\nfn bad<'a, 'b>(a: &'a str, b: &'b str) -> std::result::Result<&'a str, (&'a str, &'a str)> { let (x, _y) = split(a, b)?; Ok(x) }\nfn main() { let _ = bad(\"a\", \"b\"); }",
+    );
 }

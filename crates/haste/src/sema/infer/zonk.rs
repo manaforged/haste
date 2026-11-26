@@ -172,10 +172,18 @@ impl Infer<'_, '_> {
 
     pub(super) fn finish_poly(
         mut self,
-    ) -> Result<(Typed, Option<Box<super::poly::PolyState>>, bool)> {
-        self.settle_all()?;
+    ) -> std::result::Result<
+        (Typed, Option<Box<super::poly::PolyState>>, bool),
+        (anyhow::Error, bool),
+    > {
+        if let Err(err) = self.settle_all() {
+            return Err((err, self.poly_fell_back()));
+        }
         let clean = self.shared_here(None) && self.backlog() == 0 && !self.has_unbound_out_vars();
-        let typed = self.pack_typed()?;
+        let typed = match self.pack_typed() {
+            Ok(typed) => typed,
+            Err(err) => return Err((err, self.poly_fell_back())),
+        };
         let mut poly = self.poly.take();
         if let Some(state) = &mut poly {
             super::poly::zonk_poly_state(&mut self, state);

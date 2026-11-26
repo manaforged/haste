@@ -135,15 +135,117 @@ with_timeout() {
     perl -e 'alarm shift; exec @ARGV or die "exec failed: $!\n"' "$secs" "$@"
 }
 
-should_skip_common() {
-    local file=$1
-    if grep -Eq '#!\[feature\(|//@ (aux-build:|compile-flags:|edition:2015|only-|ignore-|revisions:)' "$file"; then
-        return 0
+discover_suite() {
+    local suite=$1 search_root=$2 limit=$3 suite_tmp=$4
+    find "$search_root" -type f -name '*.rs' ! -path '*/auxiliary/*' | sort | perl -e '
+        use strict;
+        use warnings;
+        my ($suite, $limit, $cand_path, $counts_path) = @ARGV;
+        open my $cand_fh, ">", $cand_path or die "open $cand_path: $!";
+        my ($total, $s_feat, $s_aux, $s_flags, $s_rev, $s_only, $s_other, $s_limit, $cands) = (0) x 9;
+        while (my $file = <STDIN>) {
+            chomp $file;
+            next unless length $file;
+            $total++;
+            open my $fh, "<", $file or do {
+                $s_other++;
+                next;
+            };
+            my ($has_feat, $has_aux, $has_flags, $has_rev, $has_only, $has_ed15, $has_extern) = (0) x 7;
+            my ($has_err_anno, $has_fail_dir, $has_run_or_main) = (0) x 3;
+            my ($lineno, $prev_target) = (0, undef);
+            my (@expected_lines, %seen_line);
+            while (my $line = <$fh>) {
+                $lineno++;
+                $has_feat = 1 if $line =~ /#!\[feature\(/;
+                $has_aux = 1 if $line =~ m{//\@\s*(?:aux-build|aux-crate|aux-bin):};
+                $has_flags = 1 if $line =~ m{//\@\s*compile-flags:};
+                $has_rev = 1 if $line =~ m{//\@\s*revisions:};
+                $has_only = 1 if $line =~ m{//\@\s*(?:only-|ignore-)};
+                $has_ed15 = 1 if $line =~ m{//\@\s*edition:2015\b};
+                if ($line =~ /^\s*(?:pub\s+)?extern\s+crate\s+/ && $line !~ /extern\s+crate\s+(?:std|core|alloc)\s*;/) {
+                    $has_extern = 1;
+                }
+                $has_err_anno = 1 if $line =~ m{//~(?:\[[^\]]*\])?(?:\^+|[vV]+|\||\?)?\s*ERROR\b};
+                $has_fail_dir = 1 if $line =~ m{//\@\s*(?:check-fail|build-fail|run-fail|compile-fail)\b};
+                if ($line =~ m{//\@\s*run-pass\b} || $line =~ /(?:^|[^A-Za-z0-9_])fn\s+main\s*\(/) {
+                    $has_run_or_main = 1;
+                }
+                if ($suite eq "borrowck") {
+                    if ($line =~ m{//~(?:\[[^\]]*\])?\?}) {
+                        $prev_target = undef;
+                    } elsif ($line =~ m{//~(?:\[[^\]]*\])?(\^+|[vV]+|\|)?\s*(ERROR|NOTE|HELP|WARN(?:ING)?)\b}) {
+                        my ($marker, $kind) = (defined($1) ? $1 : "", $2);
+                        my $target;
+                        if ($marker eq "|") {
+                            $target = defined($prev_target) ? $prev_target : $lineno;
+                        } elsif ($marker =~ /^\^+$/) {
+                            $target = $lineno - length($marker);
+                            $target = 1 if $target < 1;
+                        } elsif ($marker =~ /^[vV]+$/) {
+                            $target = $lineno + length($marker);
+                        } else {
+                            $target = $lineno;
+                        }
+                        $prev_target = $target;
+                        if ($kind eq "ERROR" && !$seen_line{$target}++) {
+                            push @expected_lines, $target;
+                        }
+                    }
+                }
+            }
+            close $fh;
+            if ($has_feat) { $s_feat++; next; }
+            if ($has_aux) { $s_aux++; next; }
+            if ($has_flags) { $s_flags++; next; }
+            if ($has_rev) { $s_rev++; next; }
+            if ($has_only) { $s_only++; next; }
+            if ($has_ed15 || $has_extern) { $s_other++; next; }
+            if ($suite eq "borrowck") {
+                if (!$has_err_anno) { $s_other++; next; }
+            } else {
+                if ($has_err_anno || $has_fail_dir || !$has_run_or_main) { $s_other++; next; }
+            }
+            if ($limit > 0 && $cands >= $limit) {
+                $s_limit++;
+                next;
+            }
+            $cands++;
+            print $cand_fh $file, "\t", join(",", @expected_lines), "\n";
+        }
+        close $cand_fh;
+        open my $cnt_fh, ">", $counts_path or die "open $counts_path: $!";
+        print $cnt_fh join("\t", $total, $s_feat, $s_aux, $s_flags, $s_rev, $s_only, $s_other, $s_limit, $cands), "\n";
+        close $cnt_fh;
+    ' "$suite" "$limit" "$suite_tmp/candidates.tsv" "$suite_tmp/counts.tsv"
+}
+
+borrowck_line_matches() {
+    local expected_csv=$1 combined_file=$2
+    if [ -z "$expected_csv" ]; then
+        return 1
     fi
-    if grep -E '^[[:space:]]*(pub[[:space:]]+)?extern[[:space:]]+crate[[:space:]]+' "$file" | grep -Evq 'extern[[:space:]]+crate[[:space:]]+(std|core|alloc)[[:space:]]*;'; then
-        return 0
-    fi
-    return 1
+    perl -e '
+        use strict;
+        use warnings;
+        my ($expected_csv, $combined_path) = @ARGV;
+        my %want = map { $_ => 1 } grep { length } split /,/, $expected_csv;
+        open my $fh, "<", $combined_path or exit 1;
+        my $in_borrow = 0;
+        while (my $line = <$fh>) {
+            if ($line =~ /^error\[borrow\]:/) {
+                $in_borrow = 1;
+            } elsif ($line =~ /^(?:error|warning|note)(?:\[[^\]]*\])?:/) {
+                $in_borrow = 0;
+            } elsif ($in_borrow && $line =~ m{^\s*-->\s+(.+):(\d+):(\d+)\s*$}) {
+                my ($path, $lineno) = ($1, $2);
+                if ($path =~ m{(?:^|[\\/])src[\\/](?:main|lib)\.rs$} && $want{$lineno}) {
+                    exit 0;
+                }
+            }
+        }
+        exit 1;
+    ' "$expected_csv" "$combined_file"
 }
 
 write_crate() {
@@ -200,8 +302,8 @@ stdout_matches() {
 }
 
 run_borrowck_one() {
-    local file=$1 work=$2 res_file=$3
-    local rel crate_type="lib" r_status=0 h_status=0
+    local file=$1 work=$2 res_file=$3 expected_lines=${4:-}
+    local rel crate_type="lib" r_status=0 h_status=0 line_ok=0
     rel=$(rel_path "$file")
     mkdir -p "$work/rustc_out"
 
@@ -223,7 +325,10 @@ run_borrowck_one() {
         printf 'CRASH\t%s\texit %s\n' "$rel" "$h_status" >"$res_file"
     elif [ "$h_status" -ne 0 ]; then
         if grep -q 'error\[borrow\]:' "$work/haste.combined"; then
-            printf 'PASS\t%s\n' "$rel" >"$res_file"
+            if borrowck_line_matches "$expected_lines" "$work/haste.combined"; then
+                line_ok=1
+            fi
+            printf 'PASS\t%s\t%d\n' "$rel" "$line_ok" >"$res_file"
         else
             local reason
             reason=$(grep -Em1 '^(error|Error)' "$work/haste.combined" || true)
@@ -318,45 +423,34 @@ run_pass_one() {
     printf 'PASS\t%s\n' "$rel" >"$res_file"
 }
 
+pct() {
+    awk -v p="$1" -v t="$2" 'BEGIN { if (t > 0) printf "%.1f%%", (p * 100.0) / t; else printf "0.0%" }'
+}
+
 run_suite() {
     local suite=$1
     local search_root="$tests_dir"
     local candidates=()
-    local static_skipped=0
-    local file
+    local cand_lines=()
+    local file expected_lines
 
     if [ "$suite" = "borrowck" ] && [ -d "$tests_dir/borrowck" ]; then
         search_root="$tests_dir/borrowck"
     fi
 
-    while IFS= read -r file; do
-        if should_skip_common "$file"; then
-            static_skipped=$((static_skipped + 1))
-            continue
-        fi
-        if [ "$suite" = "borrowck" ]; then
-            if ! grep -Eq '//~[^[:space:]]*[[:space:]]+ERROR' "$file"; then
-                static_skipped=$((static_skipped + 1))
-                continue
-            fi
-        else
-            if grep -Eq '//~[^[:space:]]*[[:space:]]+ERROR|//@ (check-fail|build-fail|run-fail|compile-fail)' "$file"; then
-                static_skipped=$((static_skipped + 1))
-                continue
-            fi
-            if ! grep -Eq '//@ run-pass|(^|[^[:alnum:]_])fn[[:space:]]+main[[:space:]]*\(' "$file"; then
-                static_skipped=$((static_skipped + 1))
-                continue
-            fi
-        fi
-        candidates+=("$file")
-        if [ "$limit" -gt 0 ] && [ "${#candidates[@]}" -ge "$limit" ]; then
-            break
-        fi
-    done < <(find "$search_root" -type f -name '*.rs' ! -path '*/auxiliary/*' | sort)
-
     local suite_tmp="$tmp/$suite"
     mkdir -p "$suite_tmp/work" "$suite_tmp/res"
+
+    discover_suite "$suite" "$search_root" "$limit" "$suite_tmp"
+
+    local discovered_total=0 s_feat=0 s_aux=0 s_flags=0 s_rev=0 s_only=0 s_other=0 s_limit=0 cand_count=0
+    IFS=$'\t' read -r discovered_total s_feat s_aux s_flags s_rev s_only s_other s_limit cand_count <"$suite_tmp/counts.tsv"
+
+    while IFS=$'\t' read -r file expected_lines; do
+        [ -n "$file" ] || continue
+        candidates+=("$file")
+        cand_lines+=("${expected_lines:-}")
+    done <"$suite_tmp/candidates.tsv"
 
     local total="${#candidates[@]}"
     local worker_jobs="$jobs"
@@ -370,7 +464,7 @@ run_suite() {
                 for ((i = 0; i < total; i++)); do
                     mkdir "$suite_tmp/claim.$i" 2>/dev/null || continue
                     if [ "$suite" = "borrowck" ]; then
-                        run_borrowck_one "${candidates[$i]}" "$suite_tmp/work/$i" "$suite_tmp/res/$i.res"
+                        run_borrowck_one "${candidates[$i]}" "$suite_tmp/work/$i" "$suite_tmp/res/$i.res" "${cand_lines[$i]:-}"
                     else
                         run_pass_one "${candidates[$i]}" "$suite_tmp/work/$i" "$suite_tmp/res/$i.res"
                     fi
@@ -380,42 +474,75 @@ run_suite() {
         wait
     fi
 
-    local tested=0 skipped="$static_skipped" passed=0 other_err=0 failed=0 crashed=0
+    local ran=0 passed=0 line_matched=0 located_ran=0 other_err=0 failed=0 crashed=0
     local kind name reason
     for ((i = 0; i < total; i++)); do
         IFS=$'\t' read -r kind name reason <"$suite_tmp/res/$i.res"
         case "$kind" in
             SKIP)
-                skipped=$((skipped + 1))
+                s_other=$((s_other + 1))
                 ;;
             PASS)
-                tested=$((tested + 1))
+                ran=$((ran + 1))
                 passed=$((passed + 1))
+                if [ -n "${cand_lines[$i]:-}" ]; then
+                    located_ran=$((located_ran + 1))
+                fi
+                if [ "${reason:-0}" = "1" ]; then
+                    line_matched=$((line_matched + 1))
+                fi
                 ;;
             OTHER)
-                tested=$((tested + 1))
+                ran=$((ran + 1))
                 other_err=$((other_err + 1))
+                if [ -n "${cand_lines[$i]:-}" ]; then
+                    located_ran=$((located_ran + 1))
+                fi
                 printf '%s\t%s\tother-err: %s\n' "$suite" "$name" "$reason" >>"$tmp/failures.tsv"
                 ;;
             FAIL)
-                tested=$((tested + 1))
+                ran=$((ran + 1))
                 failed=$((failed + 1))
+                if [ -n "${cand_lines[$i]:-}" ]; then
+                    located_ran=$((located_ran + 1))
+                fi
                 printf '%s\t%s\t%s\n' "$suite" "$name" "$reason" >>"$tmp/failures.tsv"
                 ;;
             CRASH)
-                tested=$((tested + 1))
+                ran=$((ran + 1))
                 crashed=$((crashed + 1))
+                if [ -n "${cand_lines[$i]:-}" ]; then
+                    located_ran=$((located_ran + 1))
+                fi
                 printf '%s\t%s\t%s (crash)\n' "$suite" "$name" "$reason" >>"$tmp/failures.tsv"
                 ;;
         esac
     done
 
+    local suite_skipped=$((s_feat + s_aux + s_flags + s_rev + s_only + s_other + s_limit))
     local rate
-    rate=$(awk -v p="$passed" -v t="$tested" 'BEGIN { if (t > 0) printf "%.1f%%", (p * 100.0) / t; else printf "0.0%" }')
-    printf '| %s | %d | %d | %d | %d | %d | %d | %s |\n' "$suite" "$tested" "$skipped" "$passed" "$other_err" "$failed" "$crashed" "$rate" >>"$tmp/summary.rows"
+    rate=$(pct "$passed" "$ran")
+    printf '| %s | %d | %d | %d | %d | %d | %d | %d | %s |\n' \
+        "$suite" "$discovered_total" "$suite_skipped" "$ran" "$passed" "$other_err" "$failed" "$crashed" "$rate" >>"$tmp/summary.rows"
 
-    total_tested=$((total_tested + tested))
-    total_skipped=$((total_skipped + skipped))
+    local skip_detail="feature=$s_feat aux-build=$s_aux compile-flags=$s_flags revisions=$s_rev only/ignore=$s_only other=$s_other"
+    if [ "$s_limit" -gt 0 ]; then
+        skip_detail="$skip_detail limit=$s_limit"
+    fi
+    if [ "$suite" = "borrowck" ]; then
+        printf -- '- `%s`: total=%d skipped=%d (%s) ran=%d passed=%d other-err=%d failed=%d crashed=%d\n' \
+            "$suite" "$discovered_total" "$suite_skipped" "$skip_detail" "$ran" "$passed" "$other_err" "$failed" "$crashed" >>"$tmp/breakdown.lines"
+        borrow_ran=$ran
+        borrow_diag_match=$passed
+        borrow_line_match=$line_matched
+        borrow_located=$located_ran
+    else
+        printf -- '- `%s`: total=%d skipped=%d (%s) ran=%d passed=%d failed=%d crashed=%d\n' \
+            "$suite" "$discovered_total" "$suite_skipped" "$skip_detail" "$ran" "$passed" "$failed" "$crashed" >>"$tmp/breakdown.lines"
+    fi
+
+    last_discovered_total="$discovered_total"
+    total_ran=$((total_ran + ran))
     total_passed=$((total_passed + passed))
     total_other=$((total_other + other_err))
     total_failed=$((total_failed + failed))
@@ -424,12 +551,17 @@ run_suite() {
 
 : >"$tmp/failures.tsv"
 : >"$tmp/summary.rows"
-total_tested=0
-total_skipped=0
+: >"$tmp/breakdown.lines"
+last_discovered_total=0
+total_ran=0
 total_passed=0
 total_other=0
 total_failed=0
 total_crashed=0
+borrow_ran=0
+borrow_diag_match=0
+borrow_line_match=0
+borrow_located=0
 
 case "$mode" in
     borrowck)
@@ -444,12 +576,38 @@ case "$mode" in
         ;;
 esac
 
-printf '| Suite | Tested | Skipped | Passed | OtherErr | Failed | Crashed | Pass Rate |\n'
-printf '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n'
+printf '| Suite | Total | Skipped | Ran | Passed | OtherErr | Failed | Crashed | Pass Rate |\n'
+printf '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n'
 cat "$tmp/summary.rows"
 if [ "$mode" = "all" ]; then
-    total_rate=$(awk -v p="$total_passed" -v t="$total_tested" 'BEGIN { if (t > 0) printf "%.1f%%", (p * 100.0) / t; else printf "0.0%" }')
-    printf '| **total** | **%d** | **%d** | **%d** | **%d** | **%d** | **%d** | **%s** |\n' "$total_tested" "$total_skipped" "$total_passed" "$total_other" "$total_failed" "$total_crashed" "$total_rate"
+    unique_total="$last_discovered_total"
+    unique_skipped=$((unique_total - total_ran))
+    total_rate=$(pct "$total_passed" "$total_ran")
+    printf '| **total** | **%d** | **%d** | **%d** | **%d** | **%d** | **%d** | **%d** | **%s** |\n' \
+        "$unique_total" "$unique_skipped" "$total_ran" "$total_passed" "$total_other" "$total_failed" "$total_crashed" "$total_rate"
+fi
+
+printf '\n### Suite Breakdown\n\n'
+cat "$tmp/breakdown.lines"
+
+if [ "$mode" = "borrowck" ] || [ "$mode" = "all" ]; then
+    diag_rate=$(pct "$borrow_diag_match" "$borrow_ran")
+    line_rate=$(pct "$borrow_line_match" "$borrow_located")
+    borrow_unlocated=$((borrow_ran - borrow_located))
+    if [ "$borrow_unlocated" -gt 0 ]; then
+        printf '\nBorrowck accuracy: diag-match=%d/%d (%s) line-match=%d/%d (%s) unlocated=%d\n' \
+            "$borrow_diag_match" "$borrow_ran" "$diag_rate" \
+            "$borrow_line_match" "$borrow_located" "$line_rate" \
+            "$borrow_unlocated"
+    else
+        printf '\nBorrowck accuracy: diag-match=%d/%d (%s) line-match=%d/%d (%s)\n' \
+            "$borrow_diag_match" "$borrow_ran" "$diag_rate" \
+            "$borrow_line_match" "$borrow_located" "$line_rate"
+    fi
+fi
+
+if [ -n "${HASTE_UI_TSV:-}" ] && [ -f "$tmp/failures.tsv" ]; then
+    cp "$tmp/failures.tsv" "$HASTE_UI_TSV"
 fi
 
 if [ -s "$tmp/failures.tsv" ]; then

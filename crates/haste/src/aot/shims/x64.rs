@@ -55,12 +55,14 @@ pub(in crate::aot) fn emit_x64_unwind_state(
     }
     emit_x64_tls_get(c, addrs.thread_key + 16, out)?;
     let hit = x64_jcc(&[0x48, 0x85, 0xC0], 0x75, out);
+    const _: () = assert!(tls::UNWIND_STATE_BYTES <= 0xFF);
+    let size = tls::UNWIND_STATE_BYTES as u8;
     let calloc_args = if c.win {
-        &[0xB9, 1, 0, 0, 0, 0xBA, 0x10, 0, 0, 0][..]
+        [0xB9, 1, 0, 0, 0, 0xBA, size, 0, 0, 0]
     } else {
-        &[0xBF, 1, 0, 0, 0, 0xBE, 0x10, 0, 0, 0]
+        [0xBF, 1, 0, 0, 0, 0xBE, size, 0, 0, 0]
     };
-    c.bytes_call(calloc_args, "calloc", out)?;
+    c.bytes_call(&calloc_args, "calloc", out)?;
     let fail = x64_jcc(&[0x48, 0x85, 0xC0], 0x74, out);
     let set_args = if c.win {
         &[0x48, 0x89, 0xC3, 0x41, 0x8B, 0x4D, 0x08, 0x48, 0x89, 0xDA][..]

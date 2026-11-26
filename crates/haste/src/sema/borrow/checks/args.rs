@@ -24,6 +24,7 @@ impl Checker<'_, '_> {
         expr: ExprId,
         receiver: ExprId,
         param_ids: &[u32],
+        pre_arg_sources: &[Vec<BorrowSource>],
         recv_mut: bool,
         sig: Option<&Signature>,
         state: &mut State,
@@ -97,6 +98,8 @@ impl Checker<'_, '_> {
                 filtered
             } else if is_fresh_ref {
                 self.copied_arg_borrow_sources(expr, arg, state)
+            } else if let Some(pre) = pre_arg_sources.get(idx) {
+                pre.clone()
             } else {
                 self.expr_borrow_sources(arg, state)
             };
@@ -471,8 +474,9 @@ impl Checker<'_, '_> {
         &mut self,
         expr: ExprId,
         arg_ids: &[u32],
+        arg_sources: &[Vec<BorrowSource>],
         sig: Option<&Signature>,
-        fn_item: Option<ItemRef>,
+        fn_item: Option<crate::names::ItemRef>,
         has_self_arg: bool,
         state: &mut State,
     ) -> Result<()> {
@@ -491,6 +495,7 @@ impl Checker<'_, '_> {
                 expr,
                 recv_expr,
                 &arg_ids[1..],
+                arg_sources.get(1..).unwrap_or(&[]),
                 recv_mut,
                 Some(sig),
                 state,
@@ -500,6 +505,11 @@ impl Checker<'_, '_> {
             arg_ids.get(1..).unwrap_or(&[])
         } else {
             arg_ids
+        };
+        let param_arg_sources = if has_self_arg {
+            arg_sources.get(1..).unwrap_or(&[])
+        } else {
+            arg_sources
         };
         if param_args.len() < 2 || sig.params.len() < 2 {
             return Ok(());
@@ -564,7 +574,13 @@ impl Checker<'_, '_> {
                         }
                         _ => ExprId(src_id),
                     };
-                    let sources = self.expr_borrow_sources(src_expr, state);
+                    let sources = if src_expr == ExprId(src_id)
+                        && let Some(pre) = param_arg_sources.get(src_idx)
+                    {
+                        pre.clone()
+                    } else {
+                        self.expr_borrow_sources(src_expr, state)
+                    };
                     self.propagate_assign_sources(&p, &sources, state)?;
                 }
             }

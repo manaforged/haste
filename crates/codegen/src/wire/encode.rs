@@ -135,12 +135,14 @@ impl Writer {
             w.raw(bytes);
         });
         self.byte(u8::from(func.keep_fp));
+        self.byte(u8::from(func.abort_on_unwind));
+        self.byte(u8::from(func.save_all_regs));
         self.slice(&func.unwind_drops, |w, u| {
             w.u32(u.local.0);
             w.i64(i64::from(u.local_off));
             w.u32(u.flag.0);
             w.u32(u.drop_sym);
-            w.byte(u8::from(u.indirect));
+            w.byte(u.arg.as_u8());
         });
         self.u32(func.frame_private);
         self.u32(func.cfg_rev);

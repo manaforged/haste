@@ -39,7 +39,7 @@ use haste_codegen::Code;
 use consumers::{CONSUMER_REC_LEN, Consumer};
 
 const MAGIC: [u8; 8] = *b"HSTSUB01";
-const VERSION: u32 = 29;
+const VERSION: u32 = 30;
 const HEADER_LEN: usize = 72;
 const SUMMARY_REC_LEN: usize = 16;
 const STENCIL_REC_LEN: usize = 80;

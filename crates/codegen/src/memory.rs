@@ -146,6 +146,11 @@ impl Memory {
         Ok(exec)
     }
 
+    /// Prevents future writes from mapping new chunks that already-forked children could not see.
+    pub fn seal(&mut self) {
+        self.sealed = true;
+    }
+
     /// Maps a chunk of `size` bytes now, so that processes forked after this call write into the same pages.
     pub fn reserve(&mut self, size: usize) -> Result<(), Error> {
         self.chunks
@@ -276,6 +281,11 @@ impl Arena {
         }
         self.remap(self.bump.size.max(len.next_multiple_of(page())))?;
         self.alloc(len)
+    }
+
+    /// Prevents future allocations from remapping a new region invisible to already-forked children.
+    pub fn seal(&mut self) {
+        self.split = true;
     }
 
     /// Gives this forked process part `part` of `parts` of the free space.

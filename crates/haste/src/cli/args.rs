@@ -5,6 +5,8 @@ use anyhow::{Context, Result};
 use crate::outline;
 use crate::serve::Request;
 
+use super::help::{HelpTopic, help_text, version_string};
+
 const TOP_COMMANDS: [(Command, &str); 3] = [
     (Command::Serve(ServeAction::Run), "serve"),
     (Command::Prep, "prep"),
@@ -83,49 +85,72 @@ fn next_str(args: &mut impl Iterator<Item = std::ffi::OsString>) -> Result<Strin
 
 fn parse(
     args: &mut std::iter::Peekable<impl Iterator<Item = std::ffi::OsString>>,
-) -> Result<Command> {
+) -> Result<std::result::Result<Command, Meta>> {
     let word = next_str(args)?;
     if word == "serve" {
+        if let Some(meta) = args
+            .peek()
+            .and_then(|raw| raw.to_str())
+            .and_then(Meta::from_flag)
+        {
+            args.next();
+            return Ok(Err(meta.with_command(Command::Serve(ServeAction::Run))));
+        }
         return Ok(match args.peek().and_then(|raw| raw.to_str()) {
             Some("status") => {
                 args.next();
-                Command::Serve(ServeAction::Status)
+                Ok(Command::Serve(ServeAction::Status))
             }
             Some("stop") => {
                 args.next();
-                Command::Serve(ServeAction::Stop { all: false })
+                Ok(Command::Serve(ServeAction::Stop { all: false }))
             }
-            _ => Command::Serve(ServeAction::Run),
+            _ => Ok(Command::Serve(ServeAction::Run)),
         });
     }
     if let Some((cmd, _)) = TOP_COMMANDS.into_iter().find(|(_, name)| *name == word) {
-        return Ok(cmd);
+        return Ok(Ok(cmd));
     }
     if word == "debug" {
+        if let Some(meta) = args
+            .peek()
+            .and_then(|raw| raw.to_str())
+            .and_then(Meta::from_flag)
+        {
+            args.next();
+            return Ok(Err(meta.with_command(Command::Debug(Query::Graph))));
+        }
         let name = next_str(args)?;
         return QUERIES
             .into_iter()
             .find(|(_, query)| *query == name)
-            .map(|(query, _)| Command::Debug(query))
+            .map(|(query, _)| Ok(Command::Debug(query)))
             .with_context(usage);
     }
     Request::parse_mode(&word)
-        .map(Command::Request)
+        .map(|req| Ok(Command::Request(req)))
         .with_context(usage)
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Meta {
     Version,
-    Help,
+    Help(Option<HelpTopic>),
 }
 
 impl Meta {
     pub(super) fn from_flag(flag: &str) -> Option<Self> {
         match flag {
             "-V" | "--version" => Some(Self::Version),
-            "-h" | "--help" => Some(Self::Help),
+            "-h" | "--help" => Some(Self::Help(None)),
             _ => None,
+        }
+    }
+
+    fn with_command(self, cmd: Command) -> Self {
+        match self {
+            Self::Help(None) => Self::Help(Some(HelpTopic::from_command(cmd))),
+            other => other,
         }
     }
 }
@@ -275,9 +300,12 @@ fn parse_args_raw(
     if let Some(meta) = consume_options(&mut args, &mut opts)? {
         return Ok(Err(meta));
     }
-    let command = parse(&mut args)?;
+    let command = match parse(&mut args)? {
+        Ok(cmd) => cmd,
+        Err(meta) => return Ok(Err(meta)),
+    };
     if let Some(meta) = consume_options(&mut args, &mut opts)? {
-        return Ok(Err(meta));
+        return Ok(Err(meta.with_command(command)));
     }
     if matches!(command, Command::Clean) {
         if args.peek().is_some() {
@@ -312,7 +340,7 @@ fn parse_args_raw(
     if !matches!(command, Command::Debug(_))
         && let Some(meta) = consume_options(&mut args, &mut opts)?
     {
-        return Ok(Err(meta));
+        return Ok(Err(meta.with_command(command)));
     }
     let command = match command {
         Command::Serve(ServeAction::Stop { .. }) => Command::Serve(ServeAction::Stop {
@@ -396,8 +424,8 @@ pub(super) fn parse_invocation() -> Result<std::result::Result<ParsedInvocation,
 
 pub(super) fn print_meta(meta: Meta) {
     match meta {
-        Meta::Version => println!("haste {}", env!("CARGO_PKG_VERSION")),
-        Meta::Help => println!("{}", usage()),
+        Meta::Version => println!("{}", version_string()),
+        Meta::Help(topic) => println!("{}", help_text(topic)),
     }
 }
 
@@ -490,5 +518,39 @@ mod tests {
         assert_eq!(path, PathBuf::from("examples/hello"));
 
         assert!(parse_strs(&["build", "--all", "examples/hello"]).is_err());
+    }
+
+    #[test]
+    fn subcommand_help_routes_to_topic_and_version_formats_sha() {
+        assert_eq!(
+            parse_strs(&["--help"]).unwrap().err(),
+            Some(Meta::Help(None))
+        );
+        assert_eq!(
+            parse_strs(&["build", "--help"]).unwrap().err(),
+            Some(Meta::Help(Some(HelpTopic::Build)))
+        );
+        assert_eq!(
+            parse_strs(&["run", "-h"]).unwrap().err(),
+            Some(Meta::Help(Some(HelpTopic::Run)))
+        );
+        assert_eq!(
+            parse_strs(&["test", "--help"]).unwrap().err(),
+            Some(Meta::Help(Some(HelpTopic::Test)))
+        );
+        assert_eq!(
+            parse_strs(&["serve", "--help"]).unwrap().err(),
+            Some(Meta::Help(Some(HelpTopic::Serve)))
+        );
+        assert_eq!(
+            parse_strs(&["debug", "--help"]).unwrap().err(),
+            Some(Meta::Help(Some(HelpTopic::Debug)))
+        );
+        assert_ne!(help_text(Some(HelpTopic::Build)), help_text(None));
+        assert_ne!(
+            help_text(Some(HelpTopic::Run)),
+            help_text(Some(HelpTopic::Test))
+        );
+        assert!(version_string().starts_with("haste "));
     }
 }

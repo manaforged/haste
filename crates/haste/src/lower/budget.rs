@@ -248,7 +248,7 @@ fn inlinable_item(
     let ((item, substs), Ok(typed)) = &reached.list[index] else {
         return None;
     };
-    if cx.foreign(*item) {
+    if cx.foreign(*item) || (!cx.fn_abi_may_unwind(*item) && reached.may_unwind(cx, index)) {
         return None;
     }
     let hint = hint(cx, *item);

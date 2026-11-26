@@ -1,12 +1,31 @@
 use rustc_hash::FxHashSet as HashSet;
 
-use crate::body::{BlockKind, Expr, ExprId, Pat, PatId, Stmt};
+use crate::body::{BinOp, BlockKind, Expr, ExprId, List, Pat, PatId, Stmt, jumps_to};
 use crate::sema::infer::Res;
 use crate::sema::ty::Ty;
 
 use super::Checker;
 
+#[derive(Clone, Copy)]
+pub(super) struct LiveTarget<'a> {
+    pub(super) label: Option<u32>,
+    pub(super) is_block: bool,
+    pub(super) break_live: &'a HashSet<u32>,
+    pub(super) continue_live: Option<&'a HashSet<u32>>,
+}
+
 impl Checker<'_, '_> {
+    pub(super) fn active_live_targets(&self) -> Vec<LiveTarget<'_>> {
+        self.breaks
+            .iter()
+            .map(|f| LiveTarget {
+                label: f.label,
+                is_block: f.is_block,
+                break_live: &f.break_live,
+                continue_live: f.continue_live.as_ref(),
+            })
+            .collect()
+    }
     pub(super) fn collect_pat_locals(&self, pat: PatId, out: &mut HashSet<u32>) {
         match *self.body.pat(pat) {
             Pat::Bind { sub, .. } => {
@@ -54,9 +73,10 @@ impl Checker<'_, '_> {
         tail: Option<ExprId>,
         outer_live: &HashSet<u32>,
     ) -> (Vec<HashSet<u32>>, Vec<HashSet<u32>>, HashSet<u32>) {
+        let targets = self.active_live_targets();
         let mut live = outer_live.clone();
         if let Some(t) = tail {
-            self.collect_live_expr(t, &mut live);
+            self.collect_live_expr_with(t, &mut live, &targets);
         }
         for &id in ids {
             if let Stmt::Let {
@@ -78,13 +98,36 @@ impl Checker<'_, '_> {
         let mut before_stmt = vec![HashSet::default(); ids.len()];
         for pos in (0..ids.len()).rev() {
             after_stmt[pos] = live.clone();
-            self.collect_live_stmt(self.body.stmts[ids[pos] as usize], &mut live);
+            self.collect_live_stmt_with(self.body.stmts[ids[pos] as usize], &mut live, &targets);
             before_stmt[pos] = live.clone();
         }
         (before_stmt, after_stmt, tail_live)
     }
 
-    pub(super) fn collect_live_stmt(&self, stmt: Stmt, live: &mut HashSet<u32>) {
+    pub(super) fn collect_match_arms_live(
+        &self,
+        arm_ids: &[u32],
+        outer_live: &HashSet<u32>,
+        live: &mut HashSet<u32>,
+    ) {
+        let targets = self.active_live_targets();
+        for &arm_id in arm_ids {
+            let arm = self.body.arms[arm_id as usize];
+            let mut arm_live = outer_live.clone();
+            self.collect_live_expr_with(arm.body, &mut arm_live, &targets);
+            if let Some(g) = arm.guard {
+                self.collect_live_expr_with(g, &mut arm_live, &targets);
+            }
+            live.extend(arm_live);
+        }
+    }
+
+    fn collect_live_stmt_with(
+        &self,
+        stmt: Stmt,
+        live: &mut HashSet<u32>,
+        targets: &[LiveTarget<'_>],
+    ) {
         match stmt {
             Stmt::Let {
                 pat,
@@ -98,18 +141,28 @@ impl Checker<'_, '_> {
                     live.remove(&local);
                 }
                 if let Some(e) = otherwise {
-                    self.collect_live_expr(e, live);
+                    self.collect_live_expr_with(e, live, targets);
                 }
                 if let Some(e) = init {
-                    self.collect_live_expr(e, live);
+                    self.collect_live_expr_with(e, live, targets);
                 }
             }
-            Stmt::Expr(e, _) => self.collect_live_expr(e, live),
+            Stmt::Expr(e, _) => self.collect_live_expr_with(e, live, targets),
             Stmt::Item(..) | Stmt::Macro { .. } | Stmt::Empty => {}
         }
     }
 
     pub(super) fn collect_live_expr(&self, expr: ExprId, live: &mut HashSet<u32>) {
+        let targets = self.active_live_targets();
+        self.collect_live_expr_with(expr, live, &targets);
+    }
+
+    fn collect_live_expr_with(
+        &self,
+        expr: ExprId,
+        live: &mut HashSet<u32>,
+        targets: &[LiveTarget<'_>],
+    ) {
         match *self.body.expr(expr) {
             Expr::Path(_) => {
                 if let Some(Res::Local(local)) = self.typed.res.get(&expr) {
@@ -124,163 +177,305 @@ impl Checker<'_, '_> {
             | Expr::Try(e)
             | Expr::Await(e)
             | Expr::Paren(e)
-            | Expr::Become(e) => self.collect_live_expr(e, live),
+            | Expr::Become(e) => self.collect_live_expr_with(e, live, targets),
             Expr::Assign(lhs, rhs) => {
                 if let Some(local) = self.expr_plain_local(lhs) {
                     if !self.drop_locals.contains(&local) {
                         live.remove(&local);
                     }
-                    self.collect_live_expr(rhs, live);
+                    self.collect_live_expr_with(rhs, live, targets);
                 } else {
-                    self.collect_live_expr(rhs, live);
-                    self.collect_live_expr(lhs, live);
+                    self.collect_live_expr_with(rhs, live, targets);
+                    self.collect_live_expr_with(lhs, live, targets);
                 }
             }
-            Expr::Binary(_, a, b)
-            | Expr::AssignOp(_, a, b)
-            | Expr::Index(a, b)
-            | Expr::Repeat(a, b) => {
-                self.collect_live_expr(b, live);
-                self.collect_live_expr(a, live);
+            Expr::Binary(op, a, b) => {
+                if matches!(op, BinOp::And | BinOp::Or) {
+                    let mut b_live = live.clone();
+                    self.collect_live_expr_with(b, &mut b_live, targets);
+                    live.extend(b_live);
+                } else {
+                    self.collect_live_expr_with(b, live, targets);
+                }
+                self.collect_live_expr_with(a, live, targets);
+            }
+            Expr::AssignOp(_, a, b) | Expr::Index(a, b) | Expr::Repeat(a, b) => {
+                self.collect_live_expr_with(b, live, targets);
+                self.collect_live_expr_with(a, live, targets);
             }
             Expr::Call(callee, args) => {
                 for &a in self.body.list(args).iter().rev() {
-                    self.collect_live_expr(ExprId(a), live);
+                    self.collect_live_expr_with(ExprId(a), live, targets);
                 }
-                self.collect_live_expr(callee, live);
+                self.collect_live_expr_with(callee, live, targets);
             }
             Expr::Method {
                 receiver, params, ..
             } => {
                 for &a in self.body.list(params).iter().rev() {
-                    self.collect_live_expr(ExprId(a), live);
+                    self.collect_live_expr_with(ExprId(a), live, targets);
                 }
-                self.collect_live_expr(receiver, live);
+                self.collect_live_expr_with(receiver, live, targets);
             }
-            Expr::Block { stmts, tail, .. } => {
-                if let Some(t) = tail {
-                    self.collect_live_expr(t, live);
-                }
-                for &s in self.body.list(stmts).iter().rev() {
-                    self.collect_live_stmt(self.body.stmts[s as usize], live);
-                }
-            }
-            Expr::If(c, t, e) => {
-                let mut then_live = HashSet::default();
-                self.collect_live_expr(t, &mut then_live);
-                live.extend(then_live);
-                if let Some(alt) = e {
-                    let mut else_live = HashSet::default();
-                    self.collect_live_expr(alt, &mut else_live);
-                    live.extend(else_live);
-                }
-                self.collect_live_expr(c, live);
-            }
+            Expr::Block {
+                stmts, tail, label, ..
+            } => self.collect_live_block(label, stmts, tail, live, targets),
+            Expr::If(c, t, e) => self.collect_live_if(c, t, e, live, targets),
             Expr::Let(pat, init) => {
                 let mut bound = HashSet::default();
                 self.collect_pat_locals(pat, &mut bound);
                 for local in bound {
                     live.remove(&local);
                 }
-                self.collect_live_expr(init, live);
+                self.collect_live_expr_with(init, live, targets);
             }
-            Expr::While { cond, body, .. } => {
-                let mut loop_live = HashSet::default();
-                self.collect_live_expr(body, &mut loop_live);
-                self.collect_live_expr(cond, &mut loop_live);
-                live.extend(loop_live);
-            }
-            Expr::Loop { body, .. } => {
-                let mut loop_live = HashSet::default();
-                self.collect_live_expr(body, &mut loop_live);
-                live.extend(loop_live);
+            Expr::While {
+                cond, body, label, ..
+            } => *live = self.compute_loop_live(label, Some(cond), None, body, live, targets),
+            Expr::Loop { body, label, .. } => {
+                *live = self.compute_loop_live(label, None, None, body, live, targets)
             }
             Expr::Closure { params, body, .. } => {
-                let mut body_live = HashSet::default();
-                self.collect_live_expr(body, &mut body_live);
-                if let Some(closure) = self.typed.closures.get(&expr) {
-                    for &local in &closure.params {
-                        body_live.remove(&local);
-                    }
-                }
-                for &p in self.body.list(params) {
-                    let param = self.body.params[p as usize];
-                    let mut bound = HashSet::default();
-                    self.collect_pat_locals(param.pat, &mut bound);
-                    for local in bound {
-                        body_live.remove(&local);
-                    }
-                }
-                live.extend(body_live);
+                self.collect_live_closure(expr, params, body, live);
             }
             Expr::For {
-                pat, iter, body, ..
+                pat,
+                iter,
+                body,
+                label,
+                ..
             } => {
-                let mut loop_live = HashSet::default();
-                self.collect_live_expr(body, &mut loop_live);
-                let mut bound = HashSet::default();
-                self.collect_pat_locals(pat, &mut bound);
-                for local in bound {
-                    loop_live.remove(&local);
-                }
-                live.extend(loop_live);
-                self.collect_live_expr(iter, live);
+                *live = self.compute_loop_live(label, None, Some(pat), body, live, targets);
+                self.collect_live_expr_with(iter, live, targets);
             }
-            Expr::Match(scrut, arms) => {
-                let mut arms_live = HashSet::default();
-                for &a in self.body.list(arms) {
-                    let arm = self.body.arms[a as usize];
-                    let mut arm_live = HashSet::default();
-                    self.collect_live_expr(arm.body, &mut arm_live);
-                    if let Some(g) = arm.guard {
-                        self.collect_live_expr(g, &mut arm_live);
-                    }
-                    let mut bound = HashSet::default();
-                    self.collect_pat_locals(arm.pat, &mut bound);
-                    for local in bound {
-                        arm_live.remove(&local);
-                    }
-                    arms_live.extend(arm_live);
-                }
-                live.extend(arms_live);
-                self.collect_live_expr(scrut, live);
-            }
-            Expr::Tuple(list) | Expr::Array(list) => {
-                for &a in self.body.list(list).iter().rev() {
-                    self.collect_live_expr(ExprId(a), live);
-                }
-            }
+            Expr::Match(scrut, arms) => self.collect_live_match(scrut, arms, live, targets),
+            Expr::Tuple(list) | Expr::Array(list) => self.collect_live_list(list, live, targets),
             Expr::Struct { fields, base, .. } => {
-                if let Some(b) = base {
-                    self.collect_live_expr(b, live);
-                }
-                for &f in self.body.list(fields).iter().rev() {
-                    self.collect_live_expr(self.body.fields[f as usize].value, live);
-                }
+                self.collect_live_struct(fields, base, live, targets);
             }
             Expr::Range { from, to, .. } => {
                 if let Some(t) = to {
-                    self.collect_live_expr(t, live);
+                    self.collect_live_expr_with(t, live, targets);
                 }
                 if let Some(f) = from {
-                    self.collect_live_expr(f, live);
+                    self.collect_live_expr_with(f, live, targets);
                 }
             }
-            Expr::Return(e) | Expr::Break(_, e) => {
+            Expr::Return(e) => {
                 live.clear();
                 if let Some(e) = e {
-                    self.collect_live_expr(e, live);
+                    self.collect_live_expr_with(e, live, targets);
                 }
             }
-            Expr::Continue(_) => {
-                live.clear();
+            Expr::Break(label, e) => {
+                if let Some(target) = targets
+                    .iter()
+                    .rev()
+                    .find(|t| jumps_to(self.src, (t.label, t.is_block), label))
+                {
+                    *live = target.break_live.clone();
+                }
+                if let Some(e) = e {
+                    self.collect_live_expr_with(e, live, targets);
+                }
+            }
+            Expr::Continue(label) => {
+                if let Some(cont) = targets
+                    .iter()
+                    .rev()
+                    .find(|t| !t.is_block && jumps_to(self.src, (t.label, false), label))
+                    .and_then(|t| t.continue_live)
+                {
+                    *live = cont.clone();
+                }
             }
             Expr::Yield(e) => {
                 if let Some(e) = e {
-                    self.collect_live_expr(e, live);
+                    self.collect_live_expr_with(e, live, targets);
                 }
             }
             _ => {}
+        }
+    }
+
+    fn collect_live_closure(
+        &self,
+        expr: ExprId,
+        params: List,
+        body: ExprId,
+        live: &mut HashSet<u32>,
+    ) {
+        let mut body_live = HashSet::default();
+        self.collect_live_expr_with(body, &mut body_live, &[]);
+        if let Some(closure) = self.typed.closures.get(&expr) {
+            for &local in &closure.params {
+                body_live.remove(&local);
+            }
+        }
+        for &p in self.body.list(params) {
+            let param = self.body.params[p as usize];
+            let mut bound = HashSet::default();
+            self.collect_pat_locals(param.pat, &mut bound);
+            for local in bound {
+                body_live.remove(&local);
+            }
+        }
+        live.extend(body_live);
+    }
+
+    fn collect_live_list(&self, list: List, live: &mut HashSet<u32>, targets: &[LiveTarget<'_>]) {
+        for &a in self.body.list(list).iter().rev() {
+            self.collect_live_expr_with(ExprId(a), live, targets);
+        }
+    }
+
+    fn collect_live_struct(
+        &self,
+        fields: List,
+        base: Option<ExprId>,
+        live: &mut HashSet<u32>,
+        targets: &[LiveTarget<'_>],
+    ) {
+        if let Some(b) = base {
+            self.collect_live_expr_with(b, live, targets);
+        }
+        for &f in self.body.list(fields).iter().rev() {
+            self.collect_live_expr_with(self.body.fields[f as usize].value, live, targets);
+        }
+    }
+
+    fn collect_live_block(
+        &self,
+        label: Option<u32>,
+        stmts: List,
+        tail: Option<ExprId>,
+        live: &mut HashSet<u32>,
+        targets: &[LiveTarget<'_>],
+    ) {
+        let after_block = label.map(|_| live.clone());
+        let mut block_targets;
+        let cur = if let Some(ref break_live) = after_block {
+            block_targets = targets.to_vec();
+            block_targets.push(LiveTarget {
+                label,
+                is_block: true,
+                break_live,
+                continue_live: None,
+            });
+            &block_targets
+        } else {
+            targets
+        };
+        if let Some(t) = tail {
+            self.collect_live_expr_with(t, live, cur);
+        }
+        for &s in self.body.list(stmts).iter().rev() {
+            self.collect_live_stmt_with(self.body.stmts[s as usize], live, cur);
+        }
+    }
+
+    fn collect_live_if(
+        &self,
+        c: ExprId,
+        t: ExprId,
+        e: Option<ExprId>,
+        live: &mut HashSet<u32>,
+        targets: &[LiveTarget<'_>],
+    ) {
+        let mut then_live = live.clone();
+        self.collect_live_expr_with(t, &mut then_live, targets);
+        if let Some(alt) = e {
+            let mut else_live = live.clone();
+            self.collect_live_expr_with(alt, &mut else_live, targets);
+            *live = then_live;
+            live.extend(else_live);
+        } else {
+            live.extend(then_live);
+        }
+        self.collect_live_expr_with(c, live, targets);
+    }
+
+    fn collect_live_match(
+        &self,
+        scrut: ExprId,
+        arms: List,
+        live: &mut HashSet<u32>,
+        targets: &[LiveTarget<'_>],
+    ) {
+        let arm_ids = self.body.list(arms);
+        if !arm_ids.is_empty() {
+            let mut arms_live = HashSet::default();
+            for &a in arm_ids {
+                let arm = self.body.arms[a as usize];
+                let mut arm_live = live.clone();
+                self.collect_live_expr_with(arm.body, &mut arm_live, targets);
+                if let Some(g) = arm.guard {
+                    self.collect_live_expr_with(g, &mut arm_live, targets);
+                }
+                let mut bound = HashSet::default();
+                self.collect_pat_locals(arm.pat, &mut bound);
+                for local in bound {
+                    arm_live.remove(&local);
+                }
+                arms_live.extend(arm_live);
+            }
+            *live = arms_live;
+        }
+        self.collect_live_expr_with(scrut, live, targets);
+    }
+
+    pub(super) fn compute_loop_live(
+        &self,
+        label: Option<u32>,
+        cond: Option<ExprId>,
+        pat: Option<PatId>,
+        body: ExprId,
+        after_live: &HashSet<u32>,
+        targets: &[LiveTarget<'_>],
+    ) -> HashSet<u32> {
+        let mut loop_locals = HashSet::default();
+        if let Some(c) = cond {
+            self.collect_declared_locals_expr(c, &mut loop_locals);
+        }
+        if let Some(p) = pat {
+            self.collect_pat_locals(p, &mut loop_locals);
+        }
+        self.collect_declared_locals_expr(body, &mut loop_locals);
+        let mut head_live = HashSet::default();
+        loop {
+            let mut body_live = head_live.clone();
+            let mut next_targets = targets.to_vec();
+            next_targets.push(LiveTarget {
+                label,
+                is_block: false,
+                break_live: after_live,
+                continue_live: Some(&head_live),
+            });
+            self.collect_live_expr_with(body, &mut body_live, &next_targets);
+            if let Some(p) = pat {
+                let mut bound = HashSet::default();
+                self.collect_pat_locals(p, &mut bound);
+                for l in bound {
+                    body_live.remove(&l);
+                }
+            }
+            let mut next_head = if cond.is_some() || pat.is_some() {
+                let mut h = after_live.clone();
+                h.extend(body_live);
+                h
+            } else {
+                body_live
+            };
+            if let Some(c) = cond {
+                self.collect_live_expr_with(c, &mut next_head, &next_targets);
+            }
+            for l in &loop_locals {
+                next_head.remove(l);
+            }
+            if next_head == head_live {
+                return head_live;
+            }
+            head_live = next_head;
         }
     }
 
@@ -303,33 +498,61 @@ impl Checker<'_, '_> {
             Expr::Binary(_, a, b)
             | Expr::Assign(a, b)
             | Expr::AssignOp(_, a, b)
-            | Expr::Index(a, b) => {
+            | Expr::Index(a, b)
+            | Expr::Repeat(a, b)
+            | Expr::While {
+                cond: a, body: b, ..
+            } => {
                 self.collect_declared_locals_expr(a, out);
                 self.collect_declared_locals_expr(b, out);
             }
-            Expr::Block { stmts, tail, .. } => {
-                for &s in self.body.list(stmts) {
-                    if let Stmt::Let {
-                        pat,
-                        init,
-                        otherwise,
-                        ..
-                    } = self.body.stmts[s as usize]
-                    {
-                        self.collect_pat_locals(pat, out);
-                        if let Some(e) = init {
-                            self.collect_declared_locals_expr(e, out);
-                        }
-                        if let Some(e) = otherwise {
-                            self.collect_declared_locals_expr(e, out);
-                        }
-                    } else if let Stmt::Expr(e, _) = self.body.stmts[s as usize] {
-                        self.collect_declared_locals_expr(e, out);
-                    }
+            Expr::Loop { body, .. } => self.collect_declared_locals_expr(body, out),
+            Expr::For {
+                pat, iter, body, ..
+            } => {
+                self.collect_pat_locals(pat, out);
+                self.collect_declared_locals_expr(iter, out);
+                self.collect_declared_locals_expr(body, out);
+            }
+            Expr::Call(callee, list)
+            | Expr::Method {
+                receiver: callee,
+                params: list,
+                ..
+            } => {
+                self.collect_declared_locals_expr(callee, out);
+                for &id in self.body.list(list) {
+                    self.collect_declared_locals_expr(ExprId(id), out);
                 }
-                if let Some(t) = tail {
+            }
+            Expr::Tuple(list) | Expr::Array(list) => {
+                for &id in self.body.list(list) {
+                    self.collect_declared_locals_expr(ExprId(id), out);
+                }
+            }
+            Expr::Struct { fields, base, .. } => {
+                for &id in self.body.list(fields) {
+                    self.collect_declared_locals_expr(self.body.fields[id as usize].value, out);
+                }
+                if let Some(b) = base {
+                    self.collect_declared_locals_expr(b, out);
+                }
+            }
+            Expr::Range { from, to, .. } => {
+                if let Some(f) = from {
+                    self.collect_declared_locals_expr(f, out);
+                }
+                if let Some(t) = to {
                     self.collect_declared_locals_expr(t, out);
                 }
+            }
+            Expr::Return(e) | Expr::Break(_, e) | Expr::Yield(e) => {
+                if let Some(e) = e {
+                    self.collect_declared_locals_expr(e, out);
+                }
+            }
+            Expr::Block { stmts, tail, .. } => {
+                self.collect_declared_locals_block(stmts, tail, out);
             }
             Expr::If(c, t, e) => {
                 self.collect_declared_locals_expr(c, out);
@@ -350,6 +573,37 @@ impl Checker<'_, '_> {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn collect_declared_locals_block(
+        &self,
+        stmts: crate::body::List,
+        tail: Option<ExprId>,
+        out: &mut HashSet<u32>,
+    ) {
+        for &s in self.body.list(stmts) {
+            match self.body.stmts[s as usize] {
+                Stmt::Let {
+                    pat,
+                    init,
+                    otherwise,
+                    ..
+                } => {
+                    self.collect_pat_locals(pat, out);
+                    if let Some(e) = init {
+                        self.collect_declared_locals_expr(e, out);
+                    }
+                    if let Some(e) = otherwise {
+                        self.collect_declared_locals_expr(e, out);
+                    }
+                }
+                Stmt::Expr(e, _) => self.collect_declared_locals_expr(e, out),
+                _ => {}
+            }
+        }
+        if let Some(t) = tail {
+            self.collect_declared_locals_expr(t, out);
         }
     }
 

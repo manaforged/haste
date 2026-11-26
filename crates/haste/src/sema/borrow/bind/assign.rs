@@ -64,7 +64,7 @@ impl Checker<'_, '_> {
         let idx_temp = self.lock_index_base(lhs, state)?;
         let sub_res = self.check_place_subexprs(lhs, state, outer_live, depth);
         if let Some(tid) = idx_temp {
-            state.loans.retain(|l| l.holder != Some(tid));
+            self.release_temp_holder(state, tid);
         }
         sub_res?;
         if p.through_ref || p.through_deref {

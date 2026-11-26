@@ -1,6 +1,7 @@
 use anyhow::{Result, bail};
 
 use crate::body::{BinOp, ExprId};
+use crate::diag::DiagnosticKind;
 
 use super::super::ty::{Kind, Ty};
 use super::expr::operator_trait;
@@ -96,7 +97,12 @@ impl Infer<'_, '_> {
     fn assign_impl(&mut self, expr: ExprId, op: BinOp, (place, value): (Ty, Ty)) -> Result<()> {
         let (lang, name) = assign_trait(op)?;
         let Some((_, method)) = self.operator_impl((&lang, &name), place, &[value])? else {
-            bail!("unsupported compound assignment on {}", self.show(place))
+            return Err(self.diag_expr(
+                DiagnosticKind::Type,
+                Some(expr),
+                format!("unsupported compound assignment on {}", self.show(place)),
+                "cannot apply compound assignment",
+            ));
         };
         self.out
             .operators

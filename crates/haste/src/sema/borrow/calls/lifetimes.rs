@@ -38,28 +38,7 @@ pub(in super::super) fn collect_ty_lifetimes<'s>(
                 }
             }
             for &seg_id in segs {
-                match body.segments[seg_id as usize].args {
-                    Some(Args::Angle(list)) => {
-                        for &arg_id in body.list(list) {
-                            match body.args[arg_id as usize] {
-                                GenericArg::Lifetime(lt) => push_lt(src.text(lt), out),
-                                GenericArg::Ty(t) | GenericArg::Binding { ty: t, .. } => {
-                                    collect_ty_lifetimes(body, src, t, out);
-                                }
-                                GenericArg::Constraint { .. } | GenericArg::Const(_) => {}
-                            }
-                        }
-                    }
-                    Some(Args::Paren { inputs, output }) => {
-                        for &t in body.list(inputs) {
-                            collect_ty_lifetimes(body, src, TyId(t), out);
-                        }
-                        if let Some(o) = output {
-                            collect_ty_lifetimes(body, src, o, out);
-                        }
-                    }
-                    Some(Args::ReturnType) | None => {}
-                }
+                collect_segment_args_lifetimes(body, src, body.segments[seg_id as usize].args, out);
             }
         }
         AstTy::Tuple(list) => {
@@ -73,17 +52,12 @@ pub(in super::super) fn collect_ty_lifetimes<'s>(
                     Bound::Lifetime(lt) => push_lt(src.text(lt), out),
                     Bound::Trait { path, .. } => {
                         for &seg_id in body.list(body.path(path).segments) {
-                            if let Some(Args::Angle(args)) = body.segments[seg_id as usize].args {
-                                for &arg_id in body.list(args) {
-                                    match body.args[arg_id as usize] {
-                                        GenericArg::Lifetime(lt) => push_lt(src.text(lt), out),
-                                        GenericArg::Ty(t) | GenericArg::Binding { ty: t, .. } => {
-                                            collect_ty_lifetimes(body, src, t, out);
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
+                            collect_segment_args_lifetimes(
+                                body,
+                                src,
+                                body.segments[seg_id as usize].args,
+                                out,
+                            );
                         }
                     }
                     Bound::Use(_) => {}
@@ -121,10 +95,51 @@ pub(in super::super) fn collect_ty_lifetimes<'s>(
     }
 }
 
+fn collect_segment_args_lifetimes<'s>(
+    body: &Body,
+    src: &'s Source,
+    args: Option<Args>,
+    out: &mut Lifetimes<'s>,
+) {
+    match args {
+        Some(Args::Angle(list)) => {
+            for &arg_id in body.list(list) {
+                match body.args[arg_id as usize] {
+                    GenericArg::Lifetime(lt) => push_lt(src.text(lt), out),
+                    GenericArg::Ty(t) | GenericArg::Binding { ty: t, .. } => {
+                        collect_ty_lifetimes(body, src, t, out);
+                    }
+                    GenericArg::Constraint { .. } | GenericArg::Const(_) => {}
+                }
+            }
+        }
+        Some(Args::Paren { inputs, output }) => {
+            for &t in body.list(inputs) {
+                collect_ty_lifetimes(body, src, TyId(t), out);
+            }
+            if let Some(o) = output {
+                collect_ty_lifetimes(body, src, o, out);
+            }
+        }
+        Some(Args::ReturnType) | None => {}
+    }
+}
+
+pub(super) const LT_STATIC: &str = "'static";
+pub(super) const LT_ELIDED: &str = "'_";
+
+pub(super) fn is_named_lt(name: &str) -> bool {
+    name != LT_ELIDED && name != LT_STATIC
+}
+
+pub(super) fn owned_lts(lts: Vec<&str>) -> Vec<String> {
+    lts.into_iter().map(str::to_owned).collect()
+}
+
 fn push_lt<'s>(text: &'s str, out: &mut Lifetimes<'s>) {
-    if text == "'_" {
+    if text == LT_ELIDED {
         out.has_elided = true;
-    } else if text == "'static" {
+    } else if text == LT_STATIC {
         out.saw_static = true;
     } else if !out.named.contains(&text) {
         out.named.push(text);
@@ -159,34 +174,51 @@ pub(in super::super) fn receiver_has_any_named(src: &Source, item: &Item, named:
     false
 }
 
-pub(in super::super) fn impl_has_lifetime(
+fn impl_self_lifetimes(
     cx: &mut crate::sema::Context<'_>,
     item: crate::names::ItemRef,
-) -> bool {
-    cx.owner_impl(item).is_some_and(|block| {
-        cx.impl_header(block).is_ok_and(|hdr| {
-            if hdr
-                .generics
-                .iter()
-                .any(|g| g.kind == crate::body::sig::GenericKind::Lifetime)
-            {
-                return true;
-            }
-            let impl_src = &cx.impl_file(block).source;
-            let mut lts = Lifetimes::default();
-            collect_ty_lifetimes(&hdr.body, impl_src, hdr.self_ty, &mut lts);
-            lts.has_elided || !lts.named.is_empty()
-        })
-    })
+) -> (bool, bool, Vec<String>) {
+    let Some(block) = cx.owner_impl(item) else {
+        return (false, false, Vec::new());
+    };
+    let Ok(hdr) = cx.impl_header(block) else {
+        return (false, false, Vec::new());
+    };
+    let has_lt_generic = hdr
+        .generics
+        .iter()
+        .any(|g| g.kind == crate::body::sig::GenericKind::Lifetime);
+    let impl_src = &cx.impl_file(block).source;
+    let mut lts = Lifetimes::default();
+    collect_ty_lifetimes(&hdr.body, impl_src, hdr.self_ty, &mut lts);
+    let has_lt = has_lt_generic || lts.has_elided || !lts.named.is_empty();
+    let has_elided = has_lt && lts.named.is_empty();
+    (has_lt, has_elided, owned_lts(lts.named))
 }
 
-pub(in super::super) struct ParamLifetimes<'s> {
+pub(in super::super) struct ParamLifetimes {
     pub(in super::super) is_static: Vec<bool>,
     pub(in super::super) inner_is_static: Vec<bool>,
-    pub(in super::super) named_lts: Vec<Vec<&'s str>>,
+    pub(in super::super) named_lts: Vec<Vec<String>>,
     pub(in super::super) has_elided_lt: Vec<bool>,
-    pub(in super::super) inner_named_lts: Vec<Vec<&'s str>>,
+    pub(in super::super) inner_named_lts: Vec<Vec<String>>,
     pub(in super::super) inner_has_elided_lt: Vec<bool>,
+}
+
+impl ParamLifetimes {
+    pub(super) fn slot(&self, slot: usize, peel: bool) -> (bool, Option<&[String]>) {
+        if peel {
+            (
+                self.inner_has_elided_lt.get(slot).copied().unwrap_or(true),
+                self.inner_named_lts.get(slot).map(Vec::as_slice),
+            )
+        } else {
+            (
+                self.has_elided_lt.get(slot).copied().unwrap_or(true),
+                self.named_lts.get(slot).map(Vec::as_slice),
+            )
+        }
+    }
 }
 
 pub(in super::super) fn is_prim_name(name: &str) -> bool {
@@ -197,29 +229,41 @@ pub(in super::super) fn is_owned_container(name: &str) -> bool {
     matches!(name, "Option" | "Result" | "Vec" | "Box")
 }
 
+pub(in super::super) fn pred_matches_name_in(
+    body: &Body,
+    src: &Source,
+    pred: &crate::body::sig::Predicate,
+    name: &str,
+) -> bool {
+    pred.ty.is_some_and(|pt| match *body.ty(pt) {
+        AstTy::Path(path) => {
+            let p = body.path(path);
+            let segs = body.list(p.segments);
+            p.qself.is_none()
+                && segs.len() == 1
+                && src.text(body.segments[segs[0] as usize].name) == name
+        }
+        _ => false,
+    })
+}
+
 pub(in super::super) fn pred_matches_name(
     sig: &crate::body::sig::Signature,
     src: &Source,
     pred: &crate::body::sig::Predicate,
     name: &str,
 ) -> bool {
-    pred.ty.is_some_and(|pt| match *sig.body.ty(pt) {
-        AstTy::Path(path) => {
-            let segs = sig.body.list(sig.body.path(path).segments);
-            segs.len() == 1 && src.text(sig.body.segments[segs[0] as usize].name) == name
-        }
-        _ => false,
-    })
+    pred_matches_name_in(&sig.body, src, pred, name)
 }
 
-pub(in super::super) fn compute_param_lifetimes<'s>(
+pub(in super::super) fn compute_param_lifetimes(
     cx: &mut crate::sema::Context<'_>,
     item: crate::names::ItemRef,
     sig: &crate::body::sig::Signature,
-    src: &'s Source,
+    src: &Source,
     typed: &crate::sema::infer::Typed,
     n: usize,
-) -> ParamLifetimes<'s> {
+) -> ParamLifetimes {
     let mut info = ParamLifetimes {
         is_static: vec![true; n],
         inner_is_static: vec![false; n],
@@ -228,7 +272,12 @@ pub(in super::super) fn compute_param_lifetimes<'s>(
         inner_named_lts: vec![Vec::new(); n],
         inner_has_elided_lt: vec![false; n],
     };
-    let impl_has_lt = impl_has_lifetime(cx, item);
+    for &p in &typed.params {
+        if let Some(slot) = info.is_static.get_mut(p as usize) {
+            *slot = false;
+        }
+    }
+    let (impl_has_lt, impl_has_elided, impl_named) = impl_self_lifetimes(cx, item);
     let mut cursor = 0usize;
     if let Some((kind, _)) = sig.receiver {
         if let Some(&local) = typed.params.get(cursor)
@@ -242,24 +291,26 @@ pub(in super::super) fn compute_param_lifetimes<'s>(
                         let lt_static = lifetime_is_static(sig, src, name);
                         info.is_static[slot] = lt_static;
                         info.inner_is_static[slot] = !impl_has_lt || lt_static;
-                        if name == "'_" {
+                        if name == LT_ELIDED {
                             info.has_elided_lt[slot] = true;
-                        } else if name != "'static" {
-                            info.named_lts[slot].push(name);
+                        } else if is_named_lt(name) {
+                            info.named_lts[slot].push(name.to_owned());
                         }
                     } else {
                         info.is_static[slot] = false;
                         info.has_elided_lt[slot] = true;
                         info.inner_is_static[slot] = !impl_has_lt;
                     }
-                    info.inner_has_elided_lt[slot] = impl_has_lt && !info.inner_is_static[slot];
+                    info.inner_named_lts[slot] = impl_named.clone();
+                    info.inner_has_elided_lt[slot] = !info.inner_is_static[slot] && impl_has_elided;
                 }
                 crate::body::sig::SelfKind::Typed(ty) => {
                     record_param_ty(sig, src, ty, impl_has_lt, slot, &mut info);
                 }
                 crate::body::sig::SelfKind::Value => {
                     info.is_static[slot] = !impl_has_lt;
-                    info.has_elided_lt[slot] = impl_has_lt;
+                    info.named_lts[slot] = impl_named.clone();
+                    info.has_elided_lt[slot] = impl_has_elided;
                 }
             }
         }
@@ -287,26 +338,37 @@ fn has_elided_or_unbounded_lt(
         || has_unbounded_type_param(sig, src, lts)
 }
 
-fn record_param_ty<'s>(
+fn record_param_ty(
     sig: &crate::body::sig::Signature,
-    src: &'s Source,
+    src: &Source,
     ty: TyId,
     impl_has_lt: bool,
     slot: usize,
-    info: &mut ParamLifetimes<'s>,
+    info: &mut ParamLifetimes,
 ) {
     let mut lts = Lifetimes::default();
     collect_ty_lifetimes(&sig.body, src, ty, &mut lts);
     info.is_static[slot] = param_ty_is_static(sig, src, &lts, impl_has_lt);
     info.has_elided_lt[slot] = has_elided_or_unbounded_lt(sig, src, &lts, impl_has_lt);
-    info.named_lts[slot] = lts.named;
-    if let AstTy::Ref { ty: inner, .. } = *sig.body.ty(ty) {
+    info.named_lts[slot] = owned_lts(lts.named);
+    if let AstTy::Ref {
+        lifetime,
+        ty: inner,
+        ..
+    } = *sig.body.ty(ty)
+    {
+        if let Some(lt) = lifetime
+            && is_named_lt(src.text(lt))
+        {
+            info.has_elided_lt[slot] = false;
+            info.named_lts[slot] = vec![src.text(lt).to_owned()];
+        }
         info.inner_is_static[slot] = ast_ty_is_provably_static(sig, src, inner);
         let mut inner_lts = Lifetimes::default();
         collect_ty_lifetimes(&sig.body, src, inner, &mut inner_lts);
         info.inner_has_elided_lt[slot] =
             has_elided_or_unbounded_lt(sig, src, &inner_lts, impl_has_lt);
-        info.inner_named_lts[slot] = inner_lts.named;
+        info.inner_named_lts[slot] = owned_lts(inner_lts.named);
     }
 }
 
@@ -328,13 +390,52 @@ fn lifetime_is_static(sig: &crate::body::sig::Signature, src: &Source, name: &st
     lifetime_outlives(sig, src, name, "'static")
 }
 
-pub(in super::super) fn lifetime_outlives(
-    sig: &crate::body::sig::Signature,
-    src: &Source,
-    a: &str,
+pub(super) fn push_outlives_in_header<'s>(
+    body: &Body,
+    src: &'s Source,
+    generics: &[crate::body::sig::Generic],
+    predicates: &[crate::body::sig::Predicate],
+    cur: &str,
+    visited: &mut Vec<&'s str>,
+    target: &str,
+) -> bool {
+    let bound_lists = generics
+        .iter()
+        .filter(|g| g.kind == crate::body::sig::GenericKind::Lifetime && src.text(g.name) == cur)
+        .map(|g| g.bounds)
+        .chain(
+            predicates
+                .iter()
+                .filter(|p| p.lifetime.is_some_and(|lt| src.text(lt) == cur))
+                .map(|p| p.bounds),
+        );
+    for bounds in bound_lists {
+        for &bound_id in body.list(bounds) {
+            if let Bound::Lifetime(lt) = body.bounds[bound_id as usize] {
+                let next = src.text(lt);
+                if next == target || next == LT_STATIC {
+                    return true;
+                }
+                if !visited.contains(&next) {
+                    visited.push(next);
+                }
+            }
+        }
+    }
+    false
+}
+
+pub(super) fn lifetime_outlives_in_headers<'s>(
+    headers: &[(
+        &Body,
+        &'s Source,
+        &[crate::body::sig::Generic],
+        &[crate::body::sig::Predicate],
+    )],
+    a: &'s str,
     b: &str,
 ) -> bool {
-    if a == b || a == "'static" {
+    if a == b || a == LT_STATIC {
         return true;
     }
     let mut visited = vec![a];
@@ -342,34 +443,22 @@ pub(in super::super) fn lifetime_outlives(
     while cursor < visited.len() {
         let cur = visited[cursor];
         cursor += 1;
-        let bound_lists = sig
-            .generics
-            .iter()
-            .filter(|g| {
-                g.kind == crate::body::sig::GenericKind::Lifetime && src.text(g.name) == cur
-            })
-            .map(|g| g.bounds)
-            .chain(
-                sig.predicates
-                    .iter()
-                    .filter(|p| p.lifetime.is_some_and(|lt| src.text(lt) == cur))
-                    .map(|p| p.bounds),
-            );
-        for bounds in bound_lists {
-            for &bound_id in sig.body.list(bounds) {
-                if let Bound::Lifetime(lt) = sig.body.bounds[bound_id as usize] {
-                    let next = src.text(lt);
-                    if next == b || next == "'static" {
-                        return true;
-                    }
-                    if !visited.contains(&next) {
-                        visited.push(next);
-                    }
-                }
+        for &(body, src, generics, predicates) in headers {
+            if push_outlives_in_header(body, src, generics, predicates, cur, &mut visited, b) {
+                return true;
             }
         }
     }
     false
+}
+
+pub(in super::super) fn lifetime_outlives(
+    sig: &crate::body::sig::Signature,
+    src: &Source,
+    a: &str,
+    b: &str,
+) -> bool {
+    lifetime_outlives_in_headers(&[(&sig.body, src, &sig.generics, &sig.predicates)], a, b)
 }
 
 fn has_unbounded_type_param(
@@ -541,6 +630,18 @@ pub(in super::super) fn sig_returns_only_static(
     !ast_ty_has_type_param(&sig.body, src, ret_ast, &type_params)
 }
 
+pub(in super::super) fn sig_return_named_lifetimes<'s>(
+    sig: &crate::body::sig::Signature,
+    _src: &'s Source,
+    _ret_ast: TyId,
+    lts: &Lifetimes<'s>,
+) -> Vec<&'s str> {
+    if sig.is_async || lts.has_elided || lts.named.is_empty() {
+        return Vec::new();
+    }
+    lts.named.clone()
+}
+
 fn ast_ty_has_type_param(body: &Body, src: &Source, ty_id: TyId, type_params: &[&str]) -> bool {
     match *body.ty(ty_id) {
         AstTy::Ref { ty, .. }
@@ -651,58 +752,4 @@ pub(in super::super) fn callable_param_inputs(
         }
     });
     inputs_out
-}
-
-impl super::super::Checker<'_, '_> {
-    pub(in super::super) fn param_satisfies_caller_lt(
-        &mut self,
-        local: u32,
-        req_lts: &[&str],
-        peel_outer_ref: bool,
-    ) -> bool {
-        if !self.is_non_static_param(local) {
-            return true;
-        }
-        let slot = local as usize;
-        if peel_outer_ref && self.param_inner_is_static(local) {
-            return true;
-        }
-        let has_elided = if peel_outer_ref {
-            self.param_lts
-                .inner_has_elided_lt
-                .get(slot)
-                .copied()
-                .unwrap_or(true)
-        } else {
-            self.param_lts
-                .has_elided_lt
-                .get(slot)
-                .copied()
-                .unwrap_or(true)
-        };
-        if has_elided {
-            return false;
-        }
-        let declared = if peel_outer_ref {
-            self.param_lts.inner_named_lts.get(slot)
-        } else {
-            self.param_lts.named_lts.get(slot)
-        };
-        let Some(declared) = declared else {
-            return false;
-        };
-        if declared.is_empty() {
-            return false;
-        }
-        let Ok(sig) = self.cx.signature(self.item) else {
-            return false;
-        };
-        let invariant = peel_outer_ref && self.is_mut_ref_ty(self.local_ty(local));
-        declared.iter().all(|&p_lt| {
-            req_lts.iter().all(|&req| {
-                lifetime_outlives(&sig, self.src, p_lt, req)
-                    && (!invariant || lifetime_outlives(&sig, self.src, req, p_lt))
-            })
-        })
-    }
 }

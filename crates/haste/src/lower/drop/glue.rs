@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use haste_codegen::{StackSlot, Type, Value};
+use haste_codegen::{IntCC, StackSlot, Type, Value};
 
 use crate::names::{ItemRef, Primitive};
 use crate::sema::infer::{Fields, Res, Shape, needs_drop};
@@ -238,6 +238,33 @@ impl Lower<'_, '_> {
         })
     }
 
+    pub(in crate::lower) fn drop_guarded_list(
+        &mut self,
+        origin: &TyOrigin,
+        variant: u32,
+        fields: &[(u32, Ty, Place)],
+    ) -> Result<()> {
+        if fields.is_empty() {
+            return Ok(());
+        }
+        let want_unwind = fields.len() > 1 && self.wants_field_unwind()?;
+        let mut slots = Vec::new();
+        if want_unwind {
+            self.push_variant_unwind(origin, variant, &fields[1..], &mut slots)?;
+        }
+        for (idx, &(field, field_ty, part)) in fields.iter().enumerate() {
+            if !self.open {
+                return Ok(());
+            }
+            if want_unwind && idx > 0 {
+                let slot = slots[fields.len() - 1 - idx];
+                self.disarm_unwind(slot, true);
+            }
+            self.glue(field_ty, Some(part), origin.clone().step(variant, field))?;
+        }
+        Ok(())
+    }
+
     pub(in crate::lower) fn drop_fields(
         &mut self,
         ty: Ty,
@@ -252,16 +279,23 @@ impl Lower<'_, '_> {
             },
             _ => return Ok(()),
         };
-        self.each_field(
-            (ty, Some(place)),
-            &variants,
-            &mut |lower, (variant, field), field_ty, part| {
-                lower.glue(field_ty, part, origin.clone().step(variant, field))
-            },
-        )
+        let per_variant = self.droppable_variants(ty, place, &variants)?;
+        if per_variant.is_empty() {
+            return Ok(());
+        }
+        let enumerated = variants.len() > 1;
+        for (variant, fields) in per_variant {
+            let mut run = |lower: &mut Self| lower.drop_guarded_list(&origin, variant, &fields);
+            if enumerated {
+                self.when_variant(Some(place), ty, variant, &mut run)?;
+            } else {
+                run(self)?;
+            }
+        }
+        Ok(())
     }
 
-    fn drop_elements(
+    pub(super) fn drop_elements(
         &mut self,
         inner: Ty,
         data: Value,
@@ -273,8 +307,33 @@ impl Lower<'_, '_> {
         }
         let size = self.cx.layout(inner)?.size.bytes() as i64;
         let element = repr(self.cx, inner)?;
+        let want_unwind = self.wants_field_unwind()?;
+        let guard = if want_unwind {
+            let slice_ty = self.cx.types.intern(Kind::Slice(inner));
+            let rem_slot = self.b.create_stack_slot(16, 3);
+            let slice_origin = origin.clone().step(super::super::reloc::SLICE_WRAP_STEP, 0);
+            let rem_flag = self.push_unwind_origin(
+                slice_origin,
+                slice_ty,
+                Some(Place::slot(rem_slot, WIDE)),
+                false,
+            )?;
+            Some((rem_slot, rem_flag))
+        } else {
+            None
+        };
         let mut failed = None;
         self.each(count, |lower, index| {
+            if let Some((rem_slot, rem_flag)) = guard {
+                let next = lower.ins().iadd_imm(index, 1);
+                let rem_len = lower.ins().isub(count, next);
+                let next_off = lower.ins().imul_imm(next, size);
+                let next_ptr = lower.ins().iadd(data, next_off);
+                lower.ins().stack_store(next_ptr, rem_slot, 0);
+                lower.ins().stack_store(rem_len, rem_slot, 8);
+                let has_rem = lower.ins().icmp_imm(IntCC::NotEqual, rem_len, 0);
+                lower.set_dynamic_active(rem_flag, true, has_rem);
+            }
             let offset = lower.ins().imul_imm(index, size);
             let at = lower.ins().iadd(data, offset);
             if let Err(error) = lower.glue(
@@ -289,6 +348,11 @@ impl Lower<'_, '_> {
                 failed = Some(error);
             }
         });
+        if let Some((_, rem_flag)) = guard
+            && self.open
+        {
+            self.disarm_unwind(rem_flag, true);
+        }
         failed.map_or(Ok(()), Err)
     }
 }

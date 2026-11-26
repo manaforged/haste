@@ -8,7 +8,7 @@ use crate::emit::{
 };
 use crate::frame::{
     ArgStep, EdgeScratch, Emitter, Ext, Frame, INCOMING, PAGE, ShrinkWrap, Step, arg_steps,
-    edge_steps, emit_body, reg_steps, save_offset,
+    edge_steps, emit_body, loc_targets, reg_steps, save_offset,
 };
 use crate::ir::{
     ArgumentPurpose, Binary, Block, Function, Inst, Op, SigRef, TargetOpId, Type, Value,
@@ -481,42 +481,19 @@ impl Emit<'_> {
         locs: &[Loc],
         scratch: Option<Reg>,
     ) -> usize {
-        let float_targets: Vec<(Value, u8)> = values
-            .iter()
-            .zip(locs)
-            .filter_map(|(&val, &loc)| {
-                if let Loc::Float(xmm) = loc {
-                    Some((val, xmm))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let (float_targets, int_targets, pair_targets) = loc_targets(values, locs);
         for step in arg_steps(&float_targets, |v| self.plan.float_of(v)) {
             self.float_step(step);
             if let ArgStep::Move(_, dst) | ArgStep::Restore(dst) = step {
                 self.clobber_xmm(Xmm(dst));
             }
         }
-        let int_targets: Vec<(Value, Reg)> = values
-            .iter()
-            .zip(locs)
-            .filter_map(|(&val, &loc)| {
-                if let Loc::Int(reg) = loc {
-                    Some((val, reg))
-                } else {
-                    None
-                }
-            })
-            .collect();
         for step in arg_steps(&int_targets, |v| self.reg_of(v)) {
             self.int_step(step, scratch);
         }
-        for (&val, &loc) in values.iter().zip(locs) {
-            if let Loc::Pair(low, high) = loc {
-                self.raw(low, val);
-                self.high(high, val);
-            }
+        for (val, low, high) in pair_targets {
+            self.raw(low, val);
+            self.high(high, val);
         }
         float_targets.len()
     }

@@ -18,8 +18,18 @@ use super::test_args::parse_test_args;
 #[cfg(feature = "diff-harness")]
 include!("../../../../tests/case_inputs.rs");
 
+pub(super) fn print_formatted_diagnostics(diagnostics: &[String]) {
+    for diag in diagnostics {
+        if crate::diag::is_rendered(diag) {
+            eprintln!("{diag}\n");
+        } else {
+            eprintln!("error: {diag}");
+        }
+    }
+}
+
 impl Batch {
-    fn format_entry(
+    pub(super) fn format_entry(
         outline: Option<&outline::Outline>,
         item: ItemRef,
         name: Option<&str>,
@@ -100,18 +110,18 @@ impl Batch {
         for &(item, ref error) in &self.poly_failures {
             record(item, error);
         }
+        for msg in &self.member_errors {
+            failed_items += 1;
+            if seen.insert(msg.clone()) {
+                out.push(msg.clone());
+            }
+        }
         (out, failed_items)
     }
 
     pub(super) fn print_diagnostics(&self, outline: &outline::Outline) -> usize {
         let (diagnostics, failed_items) = self.collect_diagnostics(outline);
-        for diag in &diagnostics {
-            if crate::diag::is_rendered(diag) {
-                eprintln!("{diag}\n");
-            } else {
-                eprintln!("error: {diag}");
-            }
-        }
+        print_formatted_diagnostics(&diagnostics);
         failed_items
     }
 
@@ -201,6 +211,10 @@ impl Batch {
         started: Instant,
         filters: &[String],
     ) -> Result<i32> {
+        if !self.member_errors.is_empty() {
+            print_formatted_diagnostics(&self.member_errors);
+            return Ok(101);
+        }
         let sel = crate::selection();
         let args = parse_test_args(filters);
         let ignored_only = sel.ignored_only || args.ignored_only;

@@ -16,16 +16,6 @@ pub(super) const BRANCHES: [FloatCC; 6] = [
     FloatCC::GreaterThanOrEqual,
 ];
 
-fn swap_float_cc(cc: FloatCC) -> FloatCC {
-    match cc {
-        FloatCC::LessThan => FloatCC::GreaterThan,
-        FloatCC::LessThanOrEqual => FloatCC::GreaterThanOrEqual,
-        FloatCC::GreaterThan => FloatCC::LessThan,
-        FloatCC::GreaterThanOrEqual => FloatCC::LessThanOrEqual,
-        other => other,
-    }
-}
-
 fn fmov_imm8(double: bool, bits: u64) -> Option<u8> {
     let (frac_drop, exp_bits, sign_shift) = if double { (48, 8, 63) } else { (19, 5, 31) };
     let u = if double { bits } else { bits & 0xFFFF_FFFF };
@@ -225,7 +215,7 @@ impl Emit<'_> {
         let (eff_cc, zero_arg) = if self.is_float_zero(y, ty) {
             (cc, Some(x))
         } else if self.is_float_zero(x, ty) {
-            (swap_float_cc(cc), Some(y))
+            (cc.swapped(), Some(y))
         } else {
             (cc, None)
         };

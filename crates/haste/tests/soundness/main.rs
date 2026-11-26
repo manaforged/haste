@@ -1,6 +1,7 @@
 #[path = "../common/mod.rs"]
 mod common;
 mod edge_cases;
+mod frontend;
 mod lifetimes;
 mod self_host;
 

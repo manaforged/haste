@@ -2,7 +2,7 @@ use super::Emit;
 use super::asm::{Alu, Asm, Cond, Label, Mem, Reg, Size};
 use crate::CallAbi;
 use crate::alloc::CallTarget;
-use crate::ir::{ArgumentPurpose, Op, Value};
+use crate::ir::{ArgumentPurpose, Value};
 use crate::reloc::{FRAME_CACHE_DEPTH, FRAME_CACHE_LIMIT, RelocKind, RuntimeSymbol, StencilReloc};
 
 pub(super) enum ColdCall {
@@ -40,18 +40,7 @@ impl Emit<'_> {
         }
     }
 
-    /// Takes a cached frame of `bytes` for runtime `rt` from the thread's frame cache inline, calling the runtime only on a miss; false when the cache does not apply.
-    pub(super) fn cached_frame(&mut self, rt: RuntimeSymbol, bytes: Option<i64>) -> bool {
-        let Some(bytes) =
-            bytes.filter(|&b| self.frame_cache && (0..i64::from(FRAME_CACHE_LIMIT)).contains(&b))
-        else {
-            return false;
-        };
-        if !matches!(rt, RuntimeSymbol::Malloc | RuntimeSymbol::Free) {
-            return false;
-        }
-        let head = bytes as i32;
-        let (cold, back) = (self.asm.label(), self.asm.label());
+    fn emit_cached_frame_fast(&mut self, rt: RuntimeSymbol, head: i32, free_ptr: Reg, cold: Label) {
         if rt == RuntimeSymbol::Malloc {
             self.thread_reloc(rt, |asm| asm.fs_quad(0x8B, Reg::Rax as u8, head, None));
             self.asm.test(Reg::Rax, Reg::Rax);
@@ -65,10 +54,39 @@ impl Emit<'_> {
             });
             self.asm.jcc(Cond::Ae, cold);
             self.thread_reloc(rt, |asm| asm.fs_quad(0x8B, Reg::Rcx as u8, head, None));
-            self.asm.store(Size::Q, Mem::new(Reg::Rdi, 0), Reg::Rcx);
-            self.thread_reloc(rt, |asm| asm.fs_quad(0x89, Reg::Rdi as u8, head, None));
+            self.asm.store(Size::Q, Mem::new(free_ptr, 0), Reg::Rcx);
+            self.thread_reloc(rt, |asm| asm.fs_quad(0x89, free_ptr as u8, head, None));
             self.thread_reloc(rt, |asm| asm.fs_quad(0xFF, 0, head + 8, None));
         }
+    }
+
+    fn preserved_leaf_regs(&self, cache: &mut Option<Vec<Reg>>) -> Vec<Reg> {
+        cache
+            .get_or_insert_with(|| {
+                let has_dict = self
+                    .func
+                    .signature
+                    .params
+                    .iter()
+                    .any(|p| p.purpose == ArgumentPurpose::Dict);
+                crate::alloc::used_preserved_leaf_regs(&super::REGS, &self.plan.locations, has_dict)
+            })
+            .clone()
+    }
+
+    /// Takes a cached frame of `bytes` for runtime `rt` from the thread's frame cache inline, calling the runtime only on a miss; false when the cache does not apply.
+    pub(super) fn cached_frame(&mut self, rt: RuntimeSymbol, bytes: Option<i64>) -> bool {
+        let Some(bytes) =
+            bytes.filter(|&b| self.frame_cache && (0..i64::from(FRAME_CACHE_LIMIT)).contains(&b))
+        else {
+            return false;
+        };
+        if !matches!(rt, RuntimeSymbol::Malloc | RuntimeSymbol::Free) {
+            return false;
+        }
+        let head = bytes as i32;
+        let (cold, back) = (self.asm.label(), self.asm.label());
+        self.emit_cached_frame_fast(rt, head, Reg::Rdi, cold);
         self.asm.bind(back);
         self.cold_calls.push(ColdCall::Frame(
             cold,
@@ -79,14 +97,11 @@ impl Emit<'_> {
     }
 
     fn thread_cell_sym(&self, slot: Value, lookup: u32) -> Option<u32> {
-        if !self.frame_cache {
-            return None;
-        }
-        match self.defs[slot.index()].map(|inst| &self.func.insts[inst.index()].op) {
-            Some(&Op::Symbol(slot_sym)) => Some(slot_sym),
-            _ if self.const_of(slot) == Some(0) => Some(lookup),
-            _ => None,
-        }
+        self.frame_cache
+            .then(|| {
+                crate::alloc::thread_cell_target(self.func, &self.plan, &self.defs, slot, lookup)
+            })
+            .flatten()
     }
 
     /// Reads the calling thread's cell of thread slot `slot` from the static TLS slot table into rax and jumps to the returned label when the cell is made, so only a miss runs the call that follows; `None` when the table does not apply.
@@ -156,24 +171,10 @@ impl Emit<'_> {
         let head = bytes as i32;
         let (cold, back) = (self.asm.label(), self.asm.label());
         self.asm.flags_overwritten();
-        if rt == RuntimeSymbol::Malloc {
-            self.thread_reloc(rt, |asm| asm.fs_quad(0x8B, Reg::Rax as u8, head, None));
-            self.asm.test(Reg::Rax, Reg::Rax);
-            self.asm.jcc(Cond::E, cold);
-            self.asm.load(Size::Q, Reg::Rcx, Mem::new(Reg::Rax, 0));
-            self.thread_reloc(rt, |asm| asm.fs_quad(0x89, Reg::Rcx as u8, head, None));
-            self.thread_reloc(rt, |asm| asm.fs_quad(0xFF, 1, head + 8, None));
-        } else {
+        if rt != RuntimeSymbol::Malloc {
             self.raw(Reg::Rax, args[0]);
-            self.thread_reloc(rt, |asm| {
-                asm.fs_quad(0x83, 7, head + 8, Some(FRAME_CACHE_DEPTH))
-            });
-            self.asm.jcc(Cond::Ae, cold);
-            self.thread_reloc(rt, |asm| asm.fs_quad(0x8B, Reg::Rcx as u8, head, None));
-            self.asm.store(Size::Q, Mem::new(Reg::Rax, 0), Reg::Rcx);
-            self.thread_reloc(rt, |asm| asm.fs_quad(0x89, Reg::Rax as u8, head, None));
-            self.thread_reloc(rt, |asm| asm.fs_quad(0xFF, 0, head + 8, None));
         }
+        self.emit_cached_frame_fast(rt, head, Reg::Rax, cold);
         self.asm.bind(back);
         self.cold_calls.push(ColdCall::FramePreserved(
             cold,
@@ -223,21 +224,7 @@ impl Emit<'_> {
                 }
                 ColdCall::FramePreserved(cold, back, rt, bytes, base_unaligned) => {
                     self.asm.bind(cold);
-                    let saved = saved_leaf
-                        .get_or_insert_with(|| {
-                            let has_dict = self
-                                .func
-                                .signature
-                                .params
-                                .iter()
-                                .any(|p| p.purpose == ArgumentPurpose::Dict);
-                            crate::alloc::used_preserved_leaf_regs(
-                                &super::REGS,
-                                &self.plan.locations,
-                                has_dict,
-                            )
-                        })
-                        .clone();
+                    let saved = self.preserved_leaf_regs(&mut saved_leaf);
                     self.emit_preserved_cold(&saved, back, base_unaligned, |emit| {
                         if rt == RuntimeSymbol::Malloc {
                             emit.asm.mov_imm(Reg::Rdi, i64::from(bytes));
@@ -253,21 +240,7 @@ impl Emit<'_> {
                 }
                 ColdCall::ThreadCell(cold, back, lookup, [slot, size, init], base_unaligned) => {
                     self.asm.bind(cold);
-                    let saved = saved_leaf
-                        .get_or_insert_with(|| {
-                            let has_dict = self
-                                .func
-                                .signature
-                                .params
-                                .iter()
-                                .any(|p| p.purpose == ArgumentPurpose::Dict);
-                            crate::alloc::used_preserved_leaf_regs(
-                                &super::REGS,
-                                &self.plan.locations,
-                                has_dict,
-                            )
-                        })
-                        .clone();
+                    let saved = self.preserved_leaf_regs(&mut saved_leaf);
                     self.emit_preserved_cold(&saved, back, base_unaligned, |emit| {
                         emit.raw(Reg::Rdi, slot);
                         emit.raw(Reg::Rsi, size);

@@ -43,6 +43,7 @@ const PTHREAD_DEPS: &[&str] = &[
 ];
 pub(super) const KERNEL32_DLL: &str = "kernel32.dll";
 pub(super) const UCRTBASE_DLL: &str = "ucrtbase.dll";
+pub(super) const MSVCRT_DLL: &str = "msvcrt.dll";
 
 const WIN_TLS_DEPS: &[(&str, &str)] = &[
     ("TlsAlloc", KERNEL32_DLL),
@@ -100,25 +101,41 @@ pub(super) fn deps(shim: Shim) -> Vec<&'static str> {
     )
 }
 
-pub(super) fn windows_deps(shim: Shim) -> Vec<(&'static str, &'static str)> {
-    let ucrt = |s: &'static str| (s, UCRTBASE_DLL);
+pub(super) fn win_setjmp_name(arch: Arch) -> &'static str {
+    if arch == Arch::Arm64 {
+        "_setjmpex"
+    } else {
+        "_setjmp"
+    }
+}
+
+pub(super) fn windows_crt_dll(name: &str) -> &'static str {
+    match name {
+        "atexit" | "_setjmp" | "_setjmpex" | "longjmp" => MSVCRT_DLL,
+        _ => UCRTBASE_DLL,
+    }
+}
+
+pub(super) fn windows_deps(arch: Arch, shim: Shim) -> Vec<(&'static str, &'static str)> {
+    let crt = |s: &'static str| (s, windows_crt_dll(s));
+    let setjmp = win_setjmp_name(arch);
     match shim {
-        Shim::Alloc => vec![ucrt("_aligned_malloc")],
-        Shim::AllocZeroed => vec![ucrt("_aligned_malloc"), ucrt("memset")],
-        Shim::Dealloc => vec![ucrt("_aligned_free")],
-        Shim::Realloc => vec![ucrt("_aligned_realloc")],
-        Shim::FrameAlloc => vec![ucrt("malloc")],
-        Shim::FrameFree => vec![ucrt("free")],
+        Shim::Alloc => vec![crt("_aligned_malloc")],
+        Shim::AllocZeroed => vec![crt("_aligned_malloc"), crt("memset")],
+        Shim::Dealloc => vec![crt("_aligned_free")],
+        Shim::Realloc => vec![crt("_aligned_realloc")],
+        Shim::FrameAlloc => vec![crt("malloc")],
+        Shim::FrameFree => vec![crt("free")],
         _ => collect_deps(
             shim,
             WIN_TLS_DEPS,
             (
-                ucrt("_aligned_malloc"),
+                crt("_aligned_malloc"),
                 ("SwitchToThread", KERNEL32_DLL),
-                ucrt("free"),
+                crt("free"),
             ),
-            Some((ucrt("_setjmp"), ucrt("longjmp"))),
-            ucrt,
+            Some((crt(setjmp), crt("longjmp"))),
+            crt,
         ),
     }
 }

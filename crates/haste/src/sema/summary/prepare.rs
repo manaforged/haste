@@ -6,7 +6,7 @@ use crate::names::ItemRef;
 
 use super::super::Context;
 use super::super::infer::{BodyTables, Coercion, Res, SiteKey};
-use super::super::ty::{Kind, Ty, Types};
+use super::super::ty::{Kind, Ty};
 use super::{OpCheck, PolyObligation, PolySummary, frozen};
 
 pub(super) fn prepare_summary(
@@ -164,11 +164,6 @@ pub(super) fn is_aggregate(cx: &Context<'_>, ty: Ty) -> bool {
         )
 }
 
-fn has_closure(types: &Types, ty: Ty) -> bool {
-    let kind = types.kind(ty);
-    matches!(kind, Kind::Closure(..)) || kind.children(types).any(|child| has_closure(types, child))
-}
-
 fn owned_tys(summary: &PolySummary) -> impl Iterator<Item = Ty> + '_ {
     summary
         .locals
@@ -193,7 +188,7 @@ fn record_drop_ty(
     fixed_drops: &mut Vec<Res>,
     drop_tys: &mut Vec<Ty>,
 ) -> Result<()> {
-    if cx.types.has_var_flag(ty) || has_closure(&cx.types, ty) {
+    if cx.types.has_var_flag(ty) || cx.types.has_closure(ty) {
         return Ok(());
     }
     if !cx.types.has_params(ty) {
