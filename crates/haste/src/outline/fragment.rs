@@ -311,7 +311,12 @@ fn long(src: &Source, frag: Frag, at: u32, end: u32) -> Option<u32> {
     match frag {
         Frag::Item => scan::item_end(src, at).ok(),
         Frag::Meta => Some(meta(src, at, end)),
-        Frag::Expr | Frag::Stmt => Some(expr(src, at, end)),
+        Frag::Expr => Some(expr(src, at, end)),
+        Frag::Stmt => Some(if src.kind(at) == TokenKind::Semi {
+            at + 1
+        } else {
+            expr(src, at, end)
+        }),
         Frag::Ty | Frag::Path => Some(until(src, at, end, Stop::Ty)),
         Frag::Pat => Some(until(src, at, end, Stop::Pat)),
         _ => Some(until(src, at, end, Stop::PatParam)),

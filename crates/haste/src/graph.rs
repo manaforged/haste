@@ -11,7 +11,7 @@ pub mod manifest;
 pub mod script;
 pub mod store;
 
-use cache::{patch_paths, registries_with_vendor, source_dir, subdirs};
+use cache::{SourceCatalog, patch_paths, source_dir, subdirs};
 use lock::Locked;
 use manifest::{Kind, Manifest};
 
@@ -279,10 +279,10 @@ pub(crate) fn load(
 
 fn load_package(
     entry: Locked,
-    registries: &[PathBuf],
+    catalog: &SourceCatalog,
     paths: &BTreeMap<String, PathBuf>,
 ) -> Result<(Package, Option<anyhow::Error>)> {
-    match source_dir(&entry, registries, paths) {
+    match source_dir(&entry, catalog, paths) {
         Ok(dir) => {
             let owner = if entry.is_registry() {
                 None
@@ -320,10 +320,10 @@ fn load_package(
 
 fn load_packages(
     locked: Vec<Locked>,
-    registries: &[PathBuf],
+    catalog: &SourceCatalog,
     paths: &BTreeMap<String, PathBuf>,
 ) -> Result<(Vec<Package>, Vec<Option<anyhow::Error>>)> {
-    let results = crate::sync::parallel_map(locked, |entry| load_package(entry, registries, paths));
+    let results = crate::sync::parallel_map(locked, |entry| load_package(entry, catalog, paths));
     let mut packages = Vec::with_capacity(results.len());
     let mut missing = Vec::with_capacity(results.len());
     for res in results {
@@ -447,9 +447,9 @@ fn load_filtered(
         .filter(|e| !e.is_registry())
         .map(|e| e.name.clone())
         .collect();
-    let registries = registries_with_vendor(&top)?;
+    let catalog = SourceCatalog::load(&top)?;
     let paths = local_paths(root, &top, workspace.as_ref(), &wanted_local)?;
-    let (mut packages, mut missing) = load_packages(locked, &registries, &paths)?;
+    let (mut packages, mut missing) = load_packages(locked, &catalog, &paths)?;
     if !omit_root_deps.is_empty() {
         for pkg in packages
             .iter_mut()
@@ -497,7 +497,7 @@ fn load_filtered(
             .enumerate()
             .any(|(idx, err)| err.is_some() && is_external(&packages[idx])),
     };
-    let graph = if allow_fetch && needs_fetch {
+    let graph = if allow_fetch && !catalog.offline && needs_fetch {
         eprintln!("haste: fetching missing dependencies with `cargo fetch`...");
         if let Err(fetch_err) = run_cargo(&top, &["fetch", "--locked"]) {
             let first = match &resolved {
@@ -511,14 +511,14 @@ fn load_filtered(
             .unwrap_or_default();
             bail!("{first} (automatic `cargo fetch` failed: {fetch_err:#})");
         }
-        let fresh_regs = registries_with_vendor(&top)?;
+        let fresh_catalog = SourceCatalog::load(&top)?;
         let (retry_idxs, retry_entries): (Vec<usize>, Vec<Locked>) = missing
             .iter()
             .enumerate()
             .filter(|&(idx, err)| err.is_some() && is_external(&packages[idx]))
             .map(|(idx, _)| (idx, packages[idx].locked.clone()))
             .unzip();
-        let (reloaded, retry_missing) = load_packages(retry_entries, &fresh_regs, &paths)?;
+        let (reloaded, retry_missing) = load_packages(retry_entries, &fresh_catalog, &paths)?;
         for ((idx, pkg), err) in retry_idxs.into_iter().zip(reloaded).zip(retry_missing) {
             (packages[idx], missing[idx]) = (pkg, err);
         }
