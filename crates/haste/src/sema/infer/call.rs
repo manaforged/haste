@@ -138,6 +138,15 @@ impl Infer<'_, '_> {
                 self.infer_call_args(args, &params, None)?;
                 Ok(Some(ret))
             }
+            Kind::Param(_) | Kind::Proj(_) if self.poly.is_some() => {
+                if let Some((method, ..)) = self.poly_callable_target(ty) {
+                    self.record_call_steps(
+                        step,
+                        super::by_reference(self.cx, method) == Some(Mut::Mut),
+                    )?;
+                }
+                self.poly_call(step.0, step.1, ty, args).map(Some)
+            }
             _ => Ok(None),
         }
     }
