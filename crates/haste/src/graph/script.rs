@@ -308,7 +308,9 @@ pub fn script_vars(
             .iter()
             .map(|feature| (format!("CARGO_FEATURE_{}", upper(feature)), "1".to_owned())),
     );
-    vars.extend(cfg_vars(target));
+    let apply_flags = rustflags_apply(workspace, targets, unit);
+    let extra_cfgs = apply_flags.then(|| rustflag_cfgs(&workspace.rustflags));
+    vars.extend(cfg_vars(target, extra_cfgs.as_ref()));
     vars.extend(
         manifest
             .links
@@ -317,7 +319,7 @@ pub fn script_vars(
     );
     vars.extend(metadata.iter().cloned());
     let release = crate::profile() == crate::outline::tree::Profile::Release;
-    let encoded_rustflags = if rustflags_apply(workspace, targets, unit) {
+    let encoded_rustflags = if apply_flags {
         workspace.rustflags.join("\x1f")
     } else {
         String::new()
@@ -366,18 +368,34 @@ fn upper(name: &str) -> String {
     name.to_uppercase().replace('-', "_")
 }
 
-fn cfg_vars(target: &super::cfg::Target) -> Vec<(String, String)> {
+fn cfg_vars(
+    target: &super::cfg::Target,
+    extra_cfgs: Option<&(BTreeSet<String>, BTreeSet<(String, String)>)>,
+) -> Vec<(String, String)> {
     let debug = crate::profile() != crate::outline::tree::Profile::Release;
-    let extra = debug.then_some("debug_assertions");
-    let mut vars: Vec<(String, String)> = target
+    let extra_names = extra_cfgs
+        .into_iter()
+        .flat_map(|(names, _)| names.iter().map(String::as_str));
+    let names: BTreeSet<&str> = target
         .names
         .iter()
         .map(String::as_str)
-        .chain(extra)
+        .chain(debug.then_some("debug_assertions"))
+        .chain(extra_names)
+        .collect();
+    let mut vars: Vec<(String, String)> = names
+        .into_iter()
         .map(|name| (format!("CARGO_CFG_{}", upper(name)), String::new()))
         .collect();
+    let extra_pairs = extra_cfgs.into_iter().flat_map(|(_, pairs)| pairs.iter());
+    let pairs: BTreeSet<(&str, &str)> = target
+        .pairs
+        .iter()
+        .chain(extra_pairs)
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
     let mut joined: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
-    for (key, value) in &target.pairs {
+    for (key, value) in pairs {
         joined.entry(key).or_default().push(value);
     }
     vars.extend(
@@ -429,4 +447,89 @@ pub(crate) fn apply_client_env(
     _: &[std::ffi::CString],
     _: &[(std::ffi::CString, std::ffi::CString)],
 ) {
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::graph::{Graph, Manifest, Package, Side, Unit, cfg, lock::Locked};
+
+    #[test]
+    fn script_vars_forwards_rustflags_cfgs_when_applicable() {
+        let host = haste_codegen::Target::host();
+        let cross = haste_codegen::TARGETS
+            .iter()
+            .find(|t| t.triple != host.triple)
+            .expect("non-host target exists");
+        let pkg = Package {
+            locked: Locked {
+                name: "demo".to_owned(),
+                version: semver::Version::new(0, 1, 0),
+                source: None,
+                checksum: None,
+                dependencies: Vec::new(),
+            },
+            manifest: Manifest::default(),
+            resolved: BTreeMap::new(),
+            sysroot: false,
+        };
+        let ws = Workspace {
+            packages: vec![pkg],
+            graph: Graph {
+                units: vec![
+                    Unit {
+                        package: 0,
+                        side: Side::Target,
+                        features: BTreeSet::new(),
+                        deps: Vec::new(),
+                        script: None,
+                    },
+                    Unit {
+                        package: 0,
+                        side: Side::Host,
+                        features: BTreeSet::new(),
+                        deps: Vec::new(),
+                        script: None,
+                    },
+                ],
+                members: vec![0],
+            },
+            rustflags: vec![
+                "--cfg".to_owned(),
+                "my_flag".to_owned(),
+                "--cfg=my_kv=\"abc\"".to_owned(),
+            ],
+            config_env: Vec::new(),
+        };
+        let cross_targets = Targets {
+            target: cfg::Target::of(cross),
+            host: cfg::Target::of(host),
+        };
+        let existing_cfg = cross_targets
+            .target
+            .names
+            .iter()
+            .next()
+            .expect("target has at least one cfg name")
+            .clone();
+        let mut ws = ws;
+        ws.rustflags.push("--cfg".to_owned());
+        ws.rustflags.push(existing_cfg.clone());
+        let existing_env = format!("CARGO_CFG_{}", upper(&existing_cfg));
+        let target_vars = script_vars(&ws, &cross_targets, 0, &[]);
+        assert!(target_vars.contains(&("CARGO_CFG_MY_FLAG".to_owned(), String::new())));
+        assert!(target_vars.contains(&("CARGO_CFG_MY_KV".to_owned(), "abc".to_owned())));
+        assert_eq!(
+            target_vars
+                .iter()
+                .filter(|(k, _)| *k == existing_env)
+                .count(),
+            1
+        );
+        let host_vars = script_vars(&ws, &cross_targets, 1, &[]);
+        assert!(!host_vars.iter().any(|(k, _)| k == "CARGO_CFG_MY_FLAG"));
+        assert!(!host_vars.iter().any(|(k, _)| k == "CARGO_CFG_MY_KV"));
+    }
 }

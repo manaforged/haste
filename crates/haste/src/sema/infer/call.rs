@@ -423,7 +423,10 @@ impl Infer<'_, '_> {
         self.cx.outline.is_sysroot(item.krate)
             && self.cx.name(item) == "transmute"
             && (self.cx.intrinsic(item) == Some(super::super::intrinsic::Intrinsic::Transmute)
-                || self.cx.qualified(item) == "core::mem::transmute")
+                || matches!(
+                    self.cx.qualified(item).as_str(),
+                    "core::mem::transmute" | "core::intrinsics::transmute" | "std::mem::transmute"
+                ))
     }
 
     pub(super) fn check_transmute(
@@ -440,6 +443,9 @@ impl Infer<'_, '_> {
         };
         let (src, dst) = (self.substitute(*src), self.substitute(*dst));
         if !self.cx.types.is_ground(src) || !self.cx.types.is_ground(dst) {
+            if self.has_params(src) || self.has_params(dst) {
+                self.poly_fallback();
+            }
             return Ok(());
         }
         let (src_layout, dst_layout) = (self.cx.layout(src)?, self.cx.layout(dst)?);
@@ -624,6 +630,15 @@ impl Infer<'_, '_> {
         Ok(())
     }
 
+    pub(super) fn in_unsafe_ctx(&self) -> bool {
+        UNSAFE_STATE.with(|cell| {
+            cell.borrow()
+                .depth
+                .unwrap_or_else(|| u32::from(self.sig.is_unsafe))
+                > 0
+        })
+    }
+
     pub(super) fn check_union_field(&self, expr: ExprId, item: ItemRef) -> Result<()> {
         if self.cx.outline.is_sysroot(self.home.krate)
             || self.cx.item(item).1.kind != crate::outline::item::ItemKind::Union
@@ -631,11 +646,8 @@ impl Infer<'_, '_> {
             return Ok(());
         }
         let body_ptr = self.body as *const crate::body::Body as usize;
-        let allowed = UNSAFE_STATE.with(|cell| {
-            let st = cell.borrow();
-            st.depth.unwrap_or_else(|| u32::from(self.sig.is_unsafe)) > 0
-                || st.safe_fields.contains(&(body_ptr, expr))
-        });
+        let allowed = self.in_unsafe_ctx()
+            || UNSAFE_STATE.with(|cell| cell.borrow().safe_fields.contains(&(body_ptr, expr)));
         if allowed {
             return Ok(());
         }

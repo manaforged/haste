@@ -237,6 +237,58 @@ mod unix_ipc {
         Ok(Some(i32::from_le_bytes(status)))
     }
 
+    fn daemon_args(
+        sel: &crate::Selection,
+        release: bool,
+        prepared: bool,
+        jobs: usize,
+    ) -> Vec<String> {
+        let mut args = Vec::new();
+        for (flag, on) in [
+            ("--release", release),
+            ("--prepared", prepared),
+            ("--workspace", sel.workspace),
+            ("--tests", sel.tests),
+            ("--all-targets", sel.all_targets),
+            ("--all-features", sel.all_features),
+            ("--no-default-features", sel.no_default_features),
+            ("--lib", sel.lib),
+            ("--bins", sel.bins),
+            ("--locked", sel.locked),
+            ("--offline", sel.offline),
+            ("-q", sel.quiet),
+            ("--ignored", sel.ignored_only),
+            ("--include-ignored", sel.include_ignored),
+        ] {
+            if on {
+                args.push(flag.to_owned());
+            }
+        }
+        let features = (!sel.features.is_empty()).then(|| sel.features.join(","));
+        let message_format = match sel.message_format {
+            crate::MessageFormat::Human => None,
+            crate::MessageFormat::Short => Some("short"),
+            crate::MessageFormat::Json => Some("json"),
+            crate::MessageFormat::JsonRenderDiagnostics => Some("json-render-diagnostics"),
+        };
+        let jobs = jobs.to_string();
+        for (flag, val) in [
+            ("-p", sel.package.as_deref()),
+            ("--bin", sel.bin.as_deref()),
+            ("--example", sel.example.as_deref()),
+            ("--test", sel.test.as_deref()),
+            ("-F", features.as_deref()),
+            ("--message-format", message_format),
+            ("-j", Some(jobs.as_str())),
+        ] {
+            if let Some(val) = val {
+                args.push(flag.to_owned());
+                args.push(val.to_owned());
+            }
+        }
+        args
+    }
+
     /// Spawns a detached background `serve` daemon for `root` with an idle timeout.
     pub fn spawn(root: &std::path::Path, request: Request, out: Option<&Path>) {
         use std::os::unix::process::CommandExt as _;
@@ -247,33 +299,12 @@ mod unix_ipc {
         let mut cmd = Command::new(exe);
         cmd.arg("serve").arg(root);
         let sel = crate::selection();
-        for (flag, on) in [
-            ("--release", crate::profile() == Profile::Release),
-            ("--prepared", crate::prep::prepared()),
-            ("--all-features", sel.all_features),
-            ("--no-default-features", sel.no_default_features),
-            ("--lib", sel.lib),
-            ("--bins", sel.bins),
-            ("--ignored", sel.ignored_only),
-            ("--include-ignored", sel.include_ignored),
-        ] {
-            if on {
-                cmd.arg(flag);
-            }
-        }
-        for (flag, val) in [
-            ("-p", sel.package.as_deref()),
-            ("--bin", sel.bin.as_deref()),
-            ("--example", sel.example.as_deref()),
-            ("--test", sel.test.as_deref()),
-        ] {
-            if let Some(val) = val {
-                cmd.arg(flag).arg(val);
-            }
-        }
-        if !sel.features.is_empty() {
-            cmd.arg("-F").arg(sel.features.join(","));
-        }
+        cmd.args(daemon_args(
+            &sel,
+            crate::profile() == Profile::Release,
+            crate::prep::prepared(),
+            crate::jobs(),
+        ));
         if std::env::var_os("HASTE_SERVE_IDLE_SECS").is_none() {
             cmd.env("HASTE_SERVE_IDLE_SECS", "900");
         }
@@ -661,6 +692,46 @@ mod unix_ipc {
             variants[6].verify_stencil = !base.verify_stencil;
             for variant in &variants {
                 assert_ne!(socket_key_for(root, variant), k_base);
+            }
+        }
+
+        #[test]
+        fn daemon_args_forwards_all_selection_flags_and_jobs() {
+            let sel = crate::Selection {
+                package: Some("pkg".to_owned()),
+                workspace: true,
+                all_targets: true,
+                tests: true,
+                features: vec!["a".to_owned(), "b".to_owned()],
+                locked: true,
+                offline: true,
+                quiet: true,
+                message_format: crate::MessageFormat::Json,
+                ..crate::Selection::default()
+            };
+            let args = daemon_args(&sel, true, true, 6);
+            for expected in [
+                "--release",
+                "--prepared",
+                "--workspace",
+                "--tests",
+                "--all-targets",
+                "--locked",
+                "--offline",
+                "-q",
+            ] {
+                assert!(args.iter().any(|a| a == expected), "missing {expected}");
+            }
+            for pair in [
+                ["-p", "pkg"],
+                ["-F", "a,b"],
+                ["--message-format", "json"],
+                ["-j", "6"],
+            ] {
+                assert!(
+                    args.windows(2).any(|w| w == pair),
+                    "missing flag pair {pair:?}"
+                );
             }
         }
     }

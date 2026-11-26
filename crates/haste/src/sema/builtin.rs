@@ -29,9 +29,10 @@ pub enum Builtin {
     Include,
     IncludeStr,
     IncludeBytes,
+    CompileError,
 }
 
-const BUILTINS: [(&str, Builtin); 21] = [
+const BUILTINS: [(&str, Builtin); 22] = [
     ("concat", Builtin::Concat),
     ("stringify", Builtin::Stringify),
     ("line", Builtin::Line),
@@ -53,6 +54,7 @@ const BUILTINS: [(&str, Builtin); 21] = [
     ("include", Builtin::Include),
     ("include_str", Builtin::IncludeStr),
     ("include_bytes", Builtin::IncludeBytes),
+    ("compile_error", Builtin::CompileError),
 ];
 
 impl Builtin {

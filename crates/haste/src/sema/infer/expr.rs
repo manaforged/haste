@@ -18,10 +18,8 @@ impl Infer<'_, '_> {
         let root_static = is_root
             .then_some(self.instance)
             .flatten()
-            .filter(|&(item, _)| {
-                self.cx.item(item).1.kind == crate::outline::item::ItemKind::Static
-            })
-            .map(|(item, _)| item);
+            .filter(|&(it, _)| self.cx.item(it).1.kind == crate::outline::item::ItemKind::Static)
+            .map(|(it, _)| it);
         let cycle_frame = self.enter_const_root_cycle(expr, is_root)?;
         let _unsafe = self.push_unsafe_ctx(expr, is_root);
         let prev = self.current_expr;
@@ -68,10 +66,10 @@ impl Infer<'_, '_> {
                 body,
                 capture,
             } => {
-                let deduced = match expected {
-                    Some(ty) => self.dyn_callable_super_sig(ty)?,
-                    None => None,
-                };
+                let deduced = expected
+                    .map(|ty| self.dyn_callable_super_sig(ty))
+                    .transpose()?
+                    .flatten();
                 self.closure_expr(expr, (params, ret, body, capture), deduced.or(expected))
             }
             Expr::Tuple(list) => self.tuple(list, expected),
@@ -81,6 +79,7 @@ impl Infer<'_, '_> {
                 expr: inner,
             } => self.reference(inner, (mutable, raw), expected),
             Expr::TupleField(base, index) => self.tuple_field(expr, base, index),
+            Expr::Repeat(value, len) => self.checked_repeat_expr(value, len, expected),
             _ => self.flow(expr, expected),
         }
     }
@@ -145,10 +144,8 @@ impl Infer<'_, '_> {
 
     fn tuple(&mut self, list: List, expected: Option<Ty>) -> Result<Ty> {
         let wanted = match expected.map(|ty| self.cx.types.kind(self.resolve(ty)).clone()) {
-            Some(Kind::Tuple(wanted))
-                if self.cx.types.substs(wanted).len() == list.len as usize =>
-            {
-                self.cx.types.substs(wanted).to_vec()
+            Some(Kind::Tuple(w)) if self.cx.types.substs(w).len() == list.len as usize => {
+                self.cx.types.substs(w).to_vec()
             }
             _ => Vec::new(),
         };
@@ -192,12 +189,58 @@ impl Infer<'_, '_> {
         if mutable {
             self.note_mut(inner)?;
         }
+        if !raw {
+            self.check_packed_ref(inner, ty)?;
+        }
         let mutability = if mutable { Mut::Mut } else { Mut::Not };
-        Ok(self.cx.types.intern(if raw {
+        let kind = if raw {
             Kind::Ptr(mutability, ty)
         } else {
             Kind::Ref(mutability, ty)
-        }))
+        };
+        Ok(self.cx.types.intern(kind))
+    }
+
+    fn checked_repeat_expr(
+        &mut self,
+        value: ExprId,
+        len: ExprId,
+        expected: Option<Ty>,
+    ) -> Result<Ty> {
+        let ty = self.repeat_expr(value, len, expected)?;
+        if self.root_is_user()
+            && !self.repeat_value_is_const(value)
+            && let Kind::Array(element, _) = *self.cx.types.kind(ty)
+            && let Some(copy) = self.cx.lang_item("copy")
+        {
+            let element = self.resolve(element);
+            self.note_obligation_site(copy, element);
+            self.obligations.push((copy, vec![element]));
+        }
+        Ok(ty)
+    }
+
+    fn repeat_value_is_const(&self, mut expr: ExprId) -> bool {
+        loop {
+            match *self.body.expr(expr) {
+                Expr::Paren(inner) => expr = inner,
+                Expr::Block {
+                    stmts,
+                    tail: Some(tail),
+                    label: None,
+                    kind,
+                } if kind.is_plain_scope() && self.body.list(stmts).is_empty() => expr = tail,
+                Expr::Block {
+                    kind: crate::body::BlockKind::Const,
+                    ..
+                } => return true,
+                _ => {
+                    return matches!(self.out.res.get(&expr), Some(Res::Const(_)))
+                        || matches!(self.out.res.get(&expr), Some(Res::Fn(it, _))
+                            if self.cx.item(*it).1.kind == crate::outline::item::ItemKind::Const);
+                }
+            }
+        }
     }
 
     fn tuple_field(&mut self, expr: ExprId, base: ExprId, index: u32) -> Result<Ty> {
@@ -233,6 +276,7 @@ impl Infer<'_, '_> {
     }
 
     fn flow(&mut self, expr: ExprId, expected: Option<Ty>) -> Result<Ty> {
+        use crate::body::BlockKind;
         match *self.body.expr(expr) {
             Expr::Method {
                 receiver,
@@ -244,12 +288,12 @@ impl Infer<'_, '_> {
                 stmts,
                 tail,
                 label: None,
-                kind: crate::body::BlockKind::Try,
+                kind: BlockKind::Try,
             } => self.try_block(expr, (stmts, tail), expected),
             Expr::Block {
-                kind: kind @ (crate::body::BlockKind::Async | crate::body::BlockKind::AsyncMove),
+                kind: kind @ (BlockKind::Async | BlockKind::AsyncMove),
                 ..
-            } => self.coroutine_expr(expr, (None, kind == crate::body::BlockKind::AsyncMove), &[]),
+            } => self.coroutine_expr(expr, (None, kind == BlockKind::AsyncMove), &[]),
             Expr::Await(inner) => self.await_expr(expr, inner),
             Expr::Block {
                 stmts,
@@ -663,11 +707,12 @@ impl Infer<'_, '_> {
             return Ok(());
         }
         let shown = self.show(ty);
+        let msg = format!("`{shown}` cannot be shared between threads safely");
         Err(self.diag_expr(
             crate::diag::DiagnosticKind::Trait,
             Some(expr),
-            format!("`{shown}` cannot be shared between threads safely"),
-            format!("`{shown}` cannot be shared between threads safely"),
+            msg.clone(),
+            msg,
         ))
     }
 }

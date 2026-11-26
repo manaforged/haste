@@ -108,7 +108,7 @@ pub(in super::super) fn collect_ast_invariant_lifetimes_mode(
         out: &mut out,
         inv_names: None,
     };
-    collect_ast_invariant_rec(&mut walk, ty_id, hint_ty, initial_in_inv);
+    collect_ast_invariant_rec(&mut walk, ty_id, hint_ty, initial_in_inv, false);
     out
 }
 
@@ -143,7 +143,7 @@ fn adt_invariant_param_mask(
     };
     for var in &def.variants {
         for field in &var.fields {
-            collect_ast_invariant_rec(&mut walk, field.ty, None, false);
+            collect_ast_invariant_rec(&mut walk, field.ty, None, false, false);
         }
     }
     seen_adts.remove(&adt_item);
@@ -173,18 +173,19 @@ fn collect_ast_invariant_rec(
     ty_id: TyId,
     hint_ty: Option<Ty>,
     in_inv: bool,
+    in_owned: bool,
 ) {
     let hint_ty = peel_hint_ty(walk.cx, hint_ty);
     match *walk.body.ty(ty_id) {
         AstTy::Paren(inner) | AstTy::Pat(inner, _) => {
-            collect_ast_invariant_rec(walk, inner, hint_ty, in_inv);
+            collect_ast_invariant_rec(walk, inner, hint_ty, in_inv, in_owned);
         }
         AstTy::Slice(inner) | AstTy::Array(inner, _) => {
             let inner_hint = hint_ty.and_then(|t| match *walk.cx.types.kind(t) {
                 Kind::Slice(e) | Kind::Array(e, _) => Some(e),
                 _ => None,
             });
-            collect_ast_invariant_rec(walk, inner, inner_hint, in_inv);
+            collect_ast_invariant_rec(walk, inner, inner_hint, in_inv, in_owned);
         }
         AstTy::Tuple(list) => {
             let elem_hints = hint_ty.and_then(|t| match *walk.cx.types.kind(t) {
@@ -193,7 +194,7 @@ fn collect_ast_invariant_rec(
             });
             for (idx, &t) in walk.body.list(list).iter().enumerate() {
                 let eh = elem_hints.and_then(|s| s.get(idx).copied());
-                collect_ast_invariant_rec(walk, TyId(t), eh, in_inv);
+                collect_ast_invariant_rec(walk, TyId(t), eh, in_inv, in_owned);
             }
         }
         AstTy::Ref {
@@ -211,17 +212,20 @@ fn collect_ast_invariant_rec(
                 Kind::Ref(_, pointee) => Some(pointee),
                 _ => None,
             });
-            collect_ast_invariant_rec(walk, inner, inner_hint, in_inv || mutable);
+            collect_ast_invariant_rec(walk, inner, inner_hint, in_inv || mutable, false);
         }
         AstTy::Ptr { mutable, ty: inner } => {
             let inner_hint = hint_ty.and_then(|t| match *walk.cx.types.kind(t) {
                 Kind::Ptr(_, pointee) => Some(pointee),
                 _ => None,
             });
-            collect_ast_invariant_rec(walk, inner, inner_hint, in_inv || mutable);
+            collect_ast_invariant_rec(walk, inner, inner_hint, in_inv || mutable, true);
         }
-        AstTy::ImplTrait(_, list) | AstTy::DynTrait(list) if in_inv => {
-            collect_bounds_invariant(walk, list);
+        AstTy::ImplTrait(_, list) if in_inv => {
+            collect_bounds_invariant(walk, list, false);
+        }
+        AstTy::DynTrait(list) if in_inv => {
+            collect_bounds_invariant(walk, list, in_owned);
         }
         AstTy::Fn { params, ret, .. } if in_inv => {
             let mut lts = Lifetimes::default();
@@ -243,11 +247,19 @@ fn collect_ast_invariant_rec(
     }
 }
 
-fn collect_bounds_invariant(walk: &mut InvWalk<'_, '_>, list: crate::body::List) {
+fn collect_bounds_invariant(
+    walk: &mut InvWalk<'_, '_>,
+    list: crate::body::List,
+    implicit_static: bool,
+) {
     let mut lts = Lifetimes::default();
+    let mut has_lt = false;
     for &b_id in walk.body.list(list) {
         match walk.body.bounds[b_id as usize] {
-            Bound::Lifetime(lt) => walk.out.push_lt(walk.src.text(lt)),
+            Bound::Lifetime(lt) => {
+                has_lt = true;
+                walk.out.push_lt(walk.src.text(lt));
+            }
             Bound::Trait { path, .. } => {
                 for &seg_id in walk.body.list(walk.body.path(path).segments) {
                     if let Some(Args::Angle(args)) = walk.body.segments[seg_id as usize].args {
@@ -265,6 +277,9 @@ fn collect_bounds_invariant(walk: &mut InvWalk<'_, '_>, list: crate::body::List)
             }
             Bound::Use(_) => {}
         }
+    }
+    if implicit_static && !has_lt {
+        walk.out.saw_static = true;
     }
     walk.out.merge_all(&lts);
     for &n in &lts.names {
@@ -330,6 +345,7 @@ fn collect_path_invariant(
     };
     let mut lt_idx = 0usize;
     let mut ty_idx = 0usize;
+    let next_owned = is_owned_container(last_name);
     for &arg_id in walk.body.list(arg_list) {
         match walk.body.args[arg_id as usize] {
             GenericArg::Lifetime(lt) => {
@@ -343,7 +359,7 @@ fn collect_path_invariant(
                 let is_inv = next_inv || mask_nth_is_inv(&arg_mode, GenericKind::Type, ty_idx);
                 let sub_hint = adt_info.and_then(|(_, substs)| substs.get(ty_idx).copied());
                 ty_idx += 1;
-                collect_ast_invariant_rec(walk, t, sub_hint, is_inv);
+                collect_ast_invariant_rec(walk, t, sub_hint, is_inv, next_owned);
             }
             _ => {}
         }

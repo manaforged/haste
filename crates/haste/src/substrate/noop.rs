@@ -121,6 +121,8 @@ fn compute_stamp(
     super::target_hash(&target).hash(&mut hasher);
     cfg.hash_cache_key(&mut hasher);
     std::env::var_os("CARGO_HOME").hash(&mut hasher);
+    crate::process_env_var("RUSTFLAGS").hash(&mut hasher);
+    crate::process_env_var("CARGO_ENCODED_RUSTFLAGS").hash(&mut hasher);
     root.hash(&mut hasher);
     match out {
         Some(out_path) => {
@@ -327,5 +329,28 @@ mod tests {
         assert_ne!(p_base, p_target);
         assert_ne!(p_base, p_debug);
         assert_ne!(p_feat, p_target);
+    }
+
+    #[test]
+    fn compute_stamp_distinguishes_rustflags_changes() {
+        let stamp_with = |pairs: &[(&str, &str)]| {
+            let map: rustc_hash::FxHashMap<String, String> = pairs
+                .iter()
+                .map(|&(k, v)| (k.to_owned(), v.to_owned()))
+                .collect();
+            crate::with_client_env(Some(std::sync::Arc::new(map)), || {
+                compute_stamp(Path::new("/tmp/sample-ws"), None, &[], &[], &[])
+            })
+            .expect("compute_stamp returns Some when out is None")
+        };
+        let s_unset = stamp_with(&[]);
+        let s_empty = stamp_with(&[("RUSTFLAGS", "")]);
+        let s_flag = stamp_with(&[("RUSTFLAGS", "--cfg my_flag")]);
+        let s_encoded = stamp_with(&[("CARGO_ENCODED_RUSTFLAGS", "--cfg\x1fmy_flag")]);
+        assert_ne!(s_unset, s_empty);
+        assert_ne!(s_unset, s_flag);
+        assert_ne!(s_empty, s_flag);
+        assert_ne!(s_unset, s_encoded);
+        assert_ne!(s_flag, s_encoded);
     }
 }
