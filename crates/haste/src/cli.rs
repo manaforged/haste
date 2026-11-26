@@ -160,22 +160,65 @@ pub(crate) fn test_items(
         .collect()
 }
 
+/// Internal `run_test_captured` exit status indicating a test unwound via a Rust panic.
+pub(crate) const TEST_PANICKED_STATUS: i32 = -101;
+
+fn is_panic_header(line: &str) -> bool {
+    let Some((head, loc)) = line.rsplit_once(" panicked at ") else {
+        return false;
+    };
+    let Some(after_prefix) = head.strip_prefix("thread '") else {
+        return false;
+    };
+    let valid_thread = after_prefix.ends_with('\'')
+        || after_prefix.rsplit_once("' (").is_some_and(|(_, tid)| {
+            tid.strip_suffix(')')
+                .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric()))
+        });
+    if !valid_thread {
+        return false;
+    }
+    let Some(loc) = loc.strip_suffix(':') else {
+        return false;
+    };
+    let mut parts = loc.rsplitn(3, ':');
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(col), Some(line_num), Some(file))
+            if !file.is_empty()
+                && !line_num.is_empty()
+                && !col.is_empty()
+                && line_num.bytes().all(|b| b.is_ascii_digit())
+                && col.bytes().all(|b| b.is_ascii_digit())
+    )
+}
+
 fn panic_payload(stderr: &str) -> Option<&str> {
+    let mut last_rest = None;
     let mut offset = 0;
     for line in stderr.split_inclusive('\n') {
         let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.starts_with("thread '")
-            && trimmed.contains(" panicked at ")
-            && trimmed.ends_with(':')
-        {
-            let rest = &stderr[offset + line.len()..];
-            let body = rest.split("\nnote: run with ").next().unwrap_or(rest);
-            let body = body.split("\nstack backtrace:").next().unwrap_or(body);
-            return Some(body.trim_end_matches(['\r', '\n']));
+        if is_panic_header(trimmed) {
+            last_rest = Some(&stderr[offset + line.len()..]);
         }
         offset += line.len();
     }
-    None
+    let rest = last_rest?;
+    let body = rest.split("\nnote: run with ").next().unwrap_or(rest);
+    let body = body.split("\nstack backtrace:").next().unwrap_or(body);
+    Some(body.trim_end_matches(['\r', '\n']))
+}
+
+fn should_panic_non_panic_msg(status: i32, stderr: Option<&str>) -> String {
+    let note = if status == 0 {
+        "note: test did not panic as expected".to_owned()
+    } else {
+        format!("note: test exited with status {status} instead of panicking")
+    };
+    match stderr.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(out) => format!("{note}\n{out}"),
+        None => note,
+    }
 }
 
 /// Formats and prints standard Rust test output and returns 0 when all tests pass, else 101.
@@ -201,6 +244,7 @@ pub(crate) fn print_test_report(
         };
         match outcome {
             Ok((status, stderr)) => {
+                let panicked = *status == TEST_PANICKED_STATUS;
                 let expected_ok = match (&meta.expected, stderr) {
                     (Some(exp), Some(err)) => {
                         panic_payload(err).is_some_and(|msg| msg.contains(exp.as_str()))
@@ -209,7 +253,7 @@ pub(crate) fn print_test_report(
                     (None, _) => true,
                 };
                 let ok = if meta.should_panic {
-                    *status != 0 && expected_ok
+                    panicked && expected_ok
                 } else {
                     *status == 0
                 };
@@ -223,8 +267,8 @@ pub(crate) fn print_test_report(
                     }
                     passed += 1;
                 } else {
-                    let msg = if meta.should_panic && *status == 0 {
-                        "note: test did not panic as expected".to_owned()
+                    let msg = if meta.should_panic && !panicked {
+                        should_panic_non_panic_msg(*status, stderr.as_deref())
                     } else if let Some(exp) = &meta.expected {
                         format!(
                             "note: panic did not contain expected string `{exp}`\n{}",
@@ -234,6 +278,8 @@ pub(crate) fn print_test_report(
                         stderr.as_deref().map(str::trim).filter(|s| !s.is_empty())
                     {
                         out.to_owned()
+                    } else if panicked {
+                        "test panicked".to_owned()
                     } else {
                         format!("exited with status {status}")
                     };

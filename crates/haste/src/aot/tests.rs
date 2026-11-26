@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use haste_codegen::{Arch, Format, RelocKind, TARGETS, Target};
 
-use super::{Executable, Symbol};
+use super::{ExeSymbol, Executable, Symbol};
 use crate::host::HostSymbol;
 use crate::outline::source::file_key;
 use crate::substrate::read_u32;
@@ -77,8 +77,16 @@ fn minimal_executable_with_imports(
     }
     exe.pointer(false, data, Symbol::Rodata(ro));
     exe.symbols(vec![
-        (lang_start, "lang_start".to_owned()),
-        (user_main, "main".to_owned()),
+        ExeSymbol {
+            offset: lang_start,
+            name: "lang_start".into(),
+            exported: false,
+        },
+        ExeSymbol {
+            offset: user_main,
+            name: "main".into(),
+            exported: false,
+        },
     ]);
     exe
 }
@@ -240,93 +248,156 @@ fn elf_structure_relocs_dynamic_table_and_debug_line_toggle() {
     }
 }
 
+struct MachOView {
+    cmds: Vec<u32>,
+    text_range: std::ops::Range<usize>,
+    entry: (usize, u64, usize),
+    dyld_info: (u32, u32, usize, usize),
+    symtab: (usize, usize, usize, usize),
+    dysymtab: ([u32; 6], usize, usize),
+    uuid: [u8; 16],
+    func_starts: (usize, usize),
+    dylibs: Vec<String>,
+}
+
+fn parse_macho(bytes: &[u8], expected_cpu: u32) -> MachOView {
+    assert_eq!(
+        (
+            read_u32_at(bytes, 0),
+            read_u32_at(bytes, 4),
+            read_u32_at(bytes, 12)
+        ),
+        (0xFEED_FACF, expected_cpu, 2)
+    );
+    let (ncmds, sizeofcmds) = (
+        read_u32_at(bytes, 16) as usize,
+        read_u32_at(bytes, 20) as usize,
+    );
+    let (mut cursor, mut cmds, mut dylibs) = (32usize, Vec::with_capacity(ncmds), Vec::new());
+    let (mut text_range, mut data_off, mut ro_va, mut entry_off) = (None, None, None, None);
+    let (mut dyld_info, mut symtab, mut dysymtab, mut uuid, mut func_starts) =
+        (None, None, None, None, None);
+    for _ in 0..ncmds {
+        let (cmd, cmdsize) = (
+            read_u32_at(bytes, cursor),
+            read_u32_at(bytes, cursor + 4) as usize,
+        );
+        match cmd {
+            0x19 => {
+                let (foff, fsz) = (
+                    read_u64(bytes, cursor + 40) as usize,
+                    read_u64(bytes, cursor + 48) as usize,
+                );
+                assert!(foff + fsz <= bytes.len());
+                if read_cstr(bytes, cursor + 8) == "__TEXT" {
+                    text_range = Some(foff..foff + fsz);
+                }
+                for s in 0..read_u32_at(bytes, cursor + 64) as usize {
+                    let sh = cursor + 72 + s * 80;
+                    match read_cstr(bytes, sh) {
+                        "__data" => data_off = Some(read_u32_at(bytes, sh + 48) as usize),
+                        "__const" => ro_va = Some(read_u64(bytes, sh + 32)),
+                        _ => {}
+                    }
+                }
+            }
+            0x8000_0022 => {
+                dyld_info = Some((
+                    read_u32_at(bytes, cursor + 12),
+                    read_u32_at(bytes, cursor + 20),
+                    read_u32_at(bytes, cursor + 40) as usize,
+                    read_u32_at(bytes, cursor + 44) as usize,
+                ))
+            }
+            0x8000_0028 => entry_off = Some(read_u64(bytes, cursor + 8) as usize),
+            0x1B => {
+                assert_eq!(cmdsize, 24);
+                uuid = Some(bytes[cursor + 8..cursor + 24].try_into().expect("uuid"));
+            }
+            0x26 => {
+                assert_eq!(cmdsize, 16);
+                func_starts = Some((
+                    read_u32_at(bytes, cursor + 8) as usize,
+                    read_u32_at(bytes, cursor + 12) as usize,
+                ));
+            }
+            2 => {
+                symtab = Some((
+                    read_u32_at(bytes, cursor + 8) as usize,
+                    read_u32_at(bytes, cursor + 12) as usize,
+                    read_u32_at(bytes, cursor + 16) as usize,
+                    read_u32_at(bytes, cursor + 20) as usize,
+                ))
+            }
+            11 => {
+                dysymtab = Some((
+                    [0, 1, 2, 3, 4, 5].map(|i| read_u32_at(bytes, cursor + 8 + i * 4)),
+                    read_u32_at(bytes, cursor + 56) as usize,
+                    read_u32_at(bytes, cursor + 60) as usize,
+                ))
+            }
+            12 => dylibs.push(
+                read_cstr(bytes, cursor + read_u32_at(bytes, cursor + 8) as usize).to_owned(),
+            ),
+            _ => {}
+        }
+        cmds.push(cmd);
+        cursor += cmdsize;
+    }
+    assert_eq!(cursor - 32, sizeofcmds);
+    MachOView {
+        cmds,
+        text_range: text_range.expect("__TEXT"),
+        entry: (
+            data_off.expect("__data"),
+            ro_va.expect("__const"),
+            entry_off.expect("LC_MAIN"),
+        ),
+        dyld_info: dyld_info.expect("LC_DYLD_INFO_ONLY"),
+        symtab: symtab.expect("LC_SYMTAB"),
+        dysymtab: dysymtab.expect("LC_DYSYMTAB"),
+        uuid: uuid.expect("LC_UUID"),
+        func_starts: func_starts.expect("LC_FUNCTION_STARTS"),
+        dylibs,
+    }
+}
+
 #[test]
 fn macho_structure_relocs_load_commands_entry_and_symtab_imports() {
     for target in TARGETS.iter().filter(|t| t.format == Format::MachO) {
-        let expected_cpu = match target.arch {
-            Arch::Arm64 => 0x0100_000Cu32,
-            Arch::X64 => 0x0100_0007u32,
+        let cpu = if target.arch == Arch::Arm64 {
+            0x0100_000C
+        } else {
+            0x0100_0007
         };
         let bytes = minimal_executable(target, "puts", false)
             .encode()
             .expect("emit Mach-O");
-        assert_eq!(read_u32_at(&bytes, 0), 0xFEED_FACF);
-        assert_eq!(read_u32_at(&bytes, 4), expected_cpu);
-        assert_eq!(read_u32_at(&bytes, 12), 2);
-        let ncmds = read_u32_at(&bytes, 16) as usize;
-        let sizeofcmds = read_u32_at(&bytes, 20) as usize;
-
-        let mut cursor = 32usize;
-        let mut cmds = Vec::with_capacity(ncmds);
-        let mut text_file_range = None;
-        let mut data_off = None;
-        let mut ro_va = None;
-        let mut entry_off = None;
-        let mut symtab = None;
-        let mut dyld_info = None;
-        let mut dylibs = Vec::new();
-        for _ in 0..ncmds {
-            let cmd = read_u32_at(&bytes, cursor);
-            let cmdsize = read_u32_at(&bytes, cursor + 4) as usize;
-            match cmd {
-                0x19 => {
-                    let segname = read_cstr(&bytes, cursor + 8);
-                    let fileoff = read_u64(&bytes, cursor + 40) as usize;
-                    let filesize = read_u64(&bytes, cursor + 48) as usize;
-                    assert!(fileoff + filesize <= bytes.len());
-                    if segname == "__TEXT" {
-                        text_file_range = Some(fileoff..fileoff + filesize);
-                    }
-                    let nsects = read_u32_at(&bytes, cursor + 64) as usize;
-                    for s in 0..nsects {
-                        let sh = cursor + 72 + s * 80;
-                        let sname = read_cstr(&bytes, sh);
-                        let saddr = read_u64(&bytes, sh + 32);
-                        let soff = read_u32_at(&bytes, sh + 48) as usize;
-                        if sname == "__data" {
-                            data_off = Some(soff);
-                        } else if sname == "__const" {
-                            ro_va = Some(saddr);
-                        }
-                    }
-                }
-                0x8000_0022 => {
-                    let rebase_size = read_u32_at(&bytes, cursor + 12);
-                    let bind_size = read_u32_at(&bytes, cursor + 20);
-                    dyld_info = Some((rebase_size, bind_size));
-                }
-                0x8000_0028 => entry_off = Some(read_u64(&bytes, cursor + 8) as usize),
-                2 => {
-                    let stroff = read_u32_at(&bytes, cursor + 16) as usize;
-                    let strsize = read_u32_at(&bytes, cursor + 20) as usize;
-                    symtab = Some((stroff, strsize));
-                }
-                12 => {
-                    let name_off = read_u32_at(&bytes, cursor + 8) as usize;
-                    dylibs.push(read_cstr(&bytes, cursor + name_off).to_owned());
-                }
-                _ => {}
-            }
-            cmds.push(cmd);
-            cursor += cmdsize;
-        }
-        assert_eq!(cursor - 32, sizeofcmds);
-        let text_range = text_file_range.expect("__TEXT segment");
-        let entry = entry_off.expect("LC_MAIN entryoff");
-        assert!(text_range.contains(&entry));
-        assert_eq!(
-            read_u64(&bytes, data_off.expect("__data section")),
-            ro_va.expect("__const section"),
-            "{} __data pointer relocation must target __const VA",
-            target.triple
+        let view = parse_macho(&bytes, cpu);
+        assert!(view.text_range.contains(&view.entry.2));
+        assert_eq!(read_u64(&bytes, view.entry.0), view.entry.1);
+        assert!(view.dyld_info.0 > 0 && view.dyld_info.1 > 0);
+        assert!(view.cmds.contains(&11) && view.cmds.contains(&14));
+        assert!(
+            view.dylibs
+                .iter()
+                .any(|d| d == "/usr/lib/libSystem.B.dylib")
         );
-        let (rebase_size, bind_size) = dyld_info.expect("LC_DYLD_INFO_ONLY");
-        assert!(rebase_size > 0 && bind_size > 0);
-        assert!(cmds.contains(&11) && cmds.contains(&14));
-        assert!(dylibs.iter().any(|d| d == "/usr/lib/libSystem.B.dylib"));
-        let (stroff, strsize) = symtab.expect("LC_SYMTAB");
-        let strtab = &bytes[stroff..stroff + strsize];
-        assert!(strtab.windows(6).any(|w| w == b"_puts\0"));
+        assert!(view.uuid.iter().any(|&b| b != 0));
+        let (fs_off, fs_len) = view.func_starts;
+        assert!(fs_len >= 2 && fs_off + fs_len <= bytes.len());
+        let starts = decode_func_starts(&bytes[fs_off..fs_off + fs_len]);
+        assert!(
+            starts.contains(&(view.entry.2 as u64))
+                && starts
+                    .iter()
+                    .all(|&o| view.text_range.contains(&(o as usize)))
+        );
+        let strtab = &bytes[view.symtab.2..view.symtab.2 + view.symtab.3];
+        assert!(
+            strtab.windows(6).any(|w| w == b"_puts\0")
+                && strtab.windows(6).any(|w| w == b"_main\0")
+        );
     }
 }
 
@@ -678,3 +749,31 @@ fn pe_shims_patch_rip_relative_into_data_and_route_msvcrt_imports() {
         }
     }
 }
+
+fn read_uleb(bytes: &[u8], pos: &mut usize) -> u64 {
+    let (mut val, mut shift) = (0u64, 0u32);
+    loop {
+        let b = bytes[*pos];
+        *pos += 1;
+        val |= u64::from(b & 0x7F) << shift;
+        if b & 0x80 == 0 {
+            return val;
+        }
+        shift += 7;
+    }
+}
+
+fn decode_func_starts(bytes: &[u8]) -> Vec<u64> {
+    let (mut pos, mut cur, mut out) = (0usize, 0u64, Vec::new());
+    while pos < bytes.len() {
+        let delta = read_uleb(bytes, &mut pos);
+        if delta == 0 {
+            break;
+        }
+        cur += delta;
+        out.push(cur);
+    }
+    out
+}
+
+mod exports;

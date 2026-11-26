@@ -1,6 +1,8 @@
 use rustc_hash::FxHashMap as HashMap;
 
+use crate::body::sig::GenericKind;
 use crate::cli::TestItem;
+use crate::diag::{Diagnostic, DiagnosticKind, Span, format_error};
 use crate::graph::Workspace;
 use crate::names::ItemRef;
 use crate::outline::{self, Outline, item::ItemKind};
@@ -77,6 +79,38 @@ impl TestArgs<'_> {
         (self.filters.is_empty() || self.filters.iter().any(|f| matches(f)))
             && !self.skips.iter().any(|s| matches(s))
     }
+}
+
+fn format_test_sig_error(cx: &mut sema::Context<'_>, item: ItemRef) -> String {
+    let msg = match cx.signature(item) {
+        Err(err) => return format_error(cx.name(item), &err),
+        Ok(sig) if !sig.params.is_empty() || sig.receiver.is_some() || sig.variadic => {
+            "functions used as tests can not have any arguments"
+        }
+        Ok(sig) if sig.is_async => "async functions cannot be used for tests",
+        Ok(sig) if sig.generics.iter().any(|g| g.kind != GenericKind::Lifetime) => {
+            "functions used as tests can not have generic parameters"
+        }
+        Ok(sig) if sig.opaque => "functions used as tests can not return `impl Trait`",
+        Ok(_) => "invalid test function signature",
+    };
+    let (src, entry) = cx.item(item);
+    let span = Span::from_token(src, entry.name.unwrap_or(entry.start));
+    Diagnostic::new(DiagnosticKind::Type, msg)
+        .with_span(span)
+        .to_string()
+}
+
+pub(super) fn validate_test_sigs(cx: &mut sema::Context<'_>, items: &[ItemRef]) -> Vec<String> {
+    items
+        .iter()
+        .copied()
+        .filter_map(|item| {
+            sema::infer::test_sig(cx, item)
+                .is_none()
+                .then(|| format_test_sig_error(cx, item))
+        })
+        .collect()
 }
 
 pub(super) fn select_test_roots(

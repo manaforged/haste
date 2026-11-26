@@ -58,8 +58,14 @@ impl Emit<'_> {
                     self.defs[v.index()]
                 })
         {
+            if imm == 0 {
+                self.asm.alu(Alu::Ands, size, ZR, ZR, ZR);
+                return;
+            }
             let left = self.bits(val, A);
-            if let Some(bitmask) = encode_bitmask_imm(imm, size == Size::X) {
+            if imm == super::size_mask(size) {
+                self.asm.alu(Alu::Ands, size, ZR, left, left);
+            } else if let Some(bitmask) = encode_bitmask_imm(imm, size == Size::X) {
                 self.asm.alu_bitmask(Alu::Ands, size, bitmask, ZR, left);
             } else {
                 self.asm.mov_imm(C, imm as i64);

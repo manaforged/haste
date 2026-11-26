@@ -15,7 +15,9 @@ use crate::sema::{self, Cache, Edited};
 use super::substrate::{
     SubstrateSlot, cache_with_substrate, export_pre_summaries, save_batch_substrate,
 };
-use super::test_args::{check_fn_items, map_tests, select_test_roots, test_label};
+use super::test_args::{
+    check_fn_items, map_tests, select_test_roots, test_label, validate_test_sigs,
+};
 use super::{main_item, require_main};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -29,6 +31,15 @@ pub(super) enum BatchKind {
 }
 
 impl BatchKind {
+    fn forces_unwind(self) -> bool {
+        match self {
+            #[cfg(feature = "diff-harness")]
+            BatchKind::Cases => true,
+            BatchKind::Tests => true,
+            BatchKind::LibCheck | BatchKind::MainCheck | BatchKind::MainAot => false,
+        }
+    }
+
     fn mode(self) -> crate::image::ImageMode {
         match self {
             #[cfg(feature = "diff-harness")]
@@ -156,7 +167,39 @@ fn batch_labels(cx: &mut sema::Context<'_>, kind: BatchKind, items: &[ItemRef]) 
 }
 
 fn main_items(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<ItemRef> {
-    main_item(workspace, outline).into_iter().collect()
+    let mut items: Vec<ItemRef> = main_item(workspace, outline).into_iter().collect();
+    for krate in outline.members(workspace) {
+        let tree = &outline.crates[krate];
+        for (file_idx, file) in tree.files.iter().enumerate() {
+            for (item_idx, entry) in file.items.items.iter().enumerate() {
+                if entry.kind != outline::item::ItemKind::Fn || entry.attrs.is_empty() {
+                    continue;
+                }
+                let exported = tree
+                    .env
+                    .find_attr(&entry.attrs, outline::tree::Truth::Yes, &|attr| {
+                        matches!(
+                            *attr,
+                            outline::item::Attr::Other(at)
+                                if matches!(file.source.text(at), "no_mangle" | "export_name")
+                        )
+                        .then_some(())
+                    })
+                    .is_some();
+                if exported {
+                    let item = ItemRef {
+                        krate: krate as u32,
+                        file: file_idx as u32,
+                        item: item_idx as u32,
+                    };
+                    if !items.contains(&item) {
+                        items.push(item);
+                    }
+                }
+            }
+        }
+    }
+    items
 }
 
 fn check_poly_items(cx: &mut sema::Context<'_>, items: &[ItemRef]) -> Vec<(ItemRef, String)> {
@@ -251,6 +294,31 @@ fn finish_batch(
 ) -> Result<Batch> {
     let mode = kind.mode();
     let reach_span = reach_clock.elapsed();
+    if kind.forces_unwind() {
+        reached.set_force_unwind(true);
+    }
+    if kind == BatchKind::Tests {
+        let member_errors = validate_test_sigs(&mut cx, cases);
+        if !member_errors.is_empty() {
+            let store = cx.release().0;
+            let empty = Reached::default();
+            let image = Image::create(&empty, crate::image::ImageMode::Check, (0, 0, 1))?;
+            return Ok(Batch {
+                kind,
+                store: Some(store),
+                labels: Vec::new(),
+                roots: Vec::new(),
+                tests: Vec::new(),
+                reached: empty,
+                image,
+                broken: HashMap::default(),
+                poly_failures: Vec::new(),
+                member_errors,
+                reach_span,
+                codegen_span: sema::census::Span::default(),
+            });
+        }
+    }
     let codegen_clock = sema::census::Clock::now();
     let pre_builder = export_pre_summaries(&mut cx, drop_finals, substrate.as_ref());
     let mut test_starts: Vec<Option<sema::reach::Instance>> = Vec::new();
@@ -281,7 +349,15 @@ fn finish_batch(
             .map(|item| (*item, sema::substs::Substs::EMPTY))
             .collect(),
     };
-    let extra_starts: Vec<sema::reach::Instance> = test_starts.iter().flatten().copied().collect();
+    let mut extra_starts: Vec<sema::reach::Instance> =
+        test_starts.iter().flatten().copied().collect();
+    if kind == BatchKind::MainAot && cases.len() > 1 {
+        extra_starts.extend(
+            cases[1..]
+                .iter()
+                .map(|&item| (item, sema::substs::Substs::EMPTY)),
+        );
+    }
     let primary_len = root_instances.len();
     root_instances.extend(extra_starts);
     reached.canonicalize(&cx, &root_instances);
@@ -297,7 +373,13 @@ fn finish_batch(
         cx.compact_for_oneshot_codegen();
     }
     let (mut image, broken) = if mode == crate::image::ImageMode::Aot && roots.len() == 2 {
-        Image::build_aot(&mut cx, &reached, [roots[0], roots[1]])?
+        let mut aot_roots = vec![roots[0], roots[1]];
+        for inst in &root_instances[primary_len..] {
+            if let Some(&idx) = reached.index.get(inst) {
+                aot_roots.push(idx);
+            }
+        }
+        Image::build_aot(&mut cx, &reached, &aot_roots)?
     } else {
         Image::build(&mut cx, &reached, mode)?
     };
@@ -392,7 +474,7 @@ impl Batch {
         let mode = kind.mode();
         let reach_clock = sema::census::Clock::now();
         let (cases, root_insts) = if main.is_some() {
-            (Vec::new(), Vec::new())
+            (main_items(workspace, &compilation.outline), Vec::new())
         } else {
             batch_roots(workspace, &compilation.outline, kind)
         };
@@ -428,25 +510,43 @@ impl Batch {
         let mut batch = crate::macros::reach_resolved_with_cache(
             compilation,
             cache,
-            |cx| match (kind, main) {
-                (BatchKind::MainAot, Some(main_ref)) => sema::reach::main_roots(cx, main_ref)
-                    .map_or_else(
-                        |_| vec![(main_ref, sema::substs::Substs::EMPTY)],
-                        Into::into,
-                    ),
-                #[cfg(feature = "diff-harness")]
-                (BatchKind::Cases, _) => root_insts
-                    .iter()
-                    .copied()
-                    .filter(|&(item, _)| sema::infer::is_case_sig(cx, item))
-                    .collect(),
-                (BatchKind::Tests, _) => select_test_roots(cx, &cases, test_filters).2,
-                (BatchKind::LibCheck | BatchKind::MainCheck, _) => root_insts
-                    .iter()
-                    .copied()
-                    .filter(|&(item, _)| sema::infer::is_concrete_fn(cx, item))
-                    .collect(),
-                _ => root_insts.clone(),
+            |cx| {
+                let mut out = match (kind, main) {
+                    (BatchKind::MainAot, Some(main_ref)) => {
+                        let mut roots: Vec<_> = sema::reach::main_roots(cx, main_ref).map_or_else(
+                            |_| vec![(main_ref, sema::substs::Substs::EMPTY)],
+                            Into::into,
+                        );
+                        if cases.len() > 1 {
+                            roots.extend(
+                                cases[1..]
+                                    .iter()
+                                    .map(|&item| (item, sema::substs::Substs::EMPTY)),
+                            );
+                        }
+                        roots
+                    }
+                    #[cfg(feature = "diff-harness")]
+                    (BatchKind::Cases, _) => root_insts
+                        .iter()
+                        .copied()
+                        .filter(|&(item, _)| sema::infer::is_case_sig(cx, item))
+                        .collect(),
+                    (BatchKind::Tests, _) => select_test_roots(cx, &cases, test_filters).2,
+                    (BatchKind::LibCheck | BatchKind::MainCheck, _) => root_insts
+                        .iter()
+                        .copied()
+                        .filter(|&(item, _)| sema::infer::is_concrete_fn(cx, item))
+                        .collect(),
+                    _ => root_insts.clone(),
+                };
+                if kind.forces_unwind()
+                    && crate::profile() == outline::tree::Profile::Release
+                    && let Some(bounds) = cx.lang_item(sema::reach::PANIC_BOUNDS_CHECK)
+                {
+                    out.push((bounds, sema::substs::Substs::EMPTY));
+                }
+                out
             },
             |cx, reached| {
                 finish_batch(

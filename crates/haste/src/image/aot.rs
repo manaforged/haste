@@ -302,7 +302,7 @@ impl Image {
         let mut state = lock(aot);
         state.ensure_len(reached.list.len());
         let mask = vdce::VtableMask::all_live();
-        let live = AotReach::collect(&state, roots, &mask);
+        let live = AotReach::collect(&state, &roots, &mask);
         live.order
             .into_iter()
             .filter(|&idx| {

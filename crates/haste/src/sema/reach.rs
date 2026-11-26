@@ -71,6 +71,7 @@ pub struct Reached {
     catch_unwind_cache: Mutex<CatchUnwindCache>,
     may_unwind_cache: RwLock<Option<(usize, Vec<bool>)>>,
     incremental: bool,
+    force_unwind: bool,
 }
 
 fn is_thread_spawn_name(name: &str, src: &crate::outline::source::Source) -> bool {
@@ -161,6 +162,11 @@ impl Reached {
     /// Whether this reach graph grows incrementally during lazy JIT execution.
     pub fn is_incremental(&self) -> bool {
         self.incremental
+    }
+
+    /// Forces unwinding in release builds (used when compiling test suites).
+    pub fn set_force_unwind(&mut self, force: bool) {
+        self.force_unwind = force;
     }
 
     /// Whether reached function `index` may unwind directly or transitively through any reachable call.
@@ -389,6 +395,7 @@ pub(crate) const PANIC_BOUNDS_CHECK: &str = "panic_bounds_check";
 
 pub(crate) fn unwind_enabled(cx: &Context<'_>, reached: &Reached) -> bool {
     crate::profile() != crate::outline::tree::Profile::Release
+        || reached.force_unwind
         || reached.is_incremental()
         || reached.has_catch_unwind(cx)
 }

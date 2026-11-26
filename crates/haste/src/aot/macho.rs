@@ -1,14 +1,20 @@
+use std::hash::Hasher as _;
+
 use anyhow::Result;
 use haste_codegen::{Arch, Os};
+use rustc_hash::FxHasher;
 
 use super::shims::{emit_main_trampoline, emit_shims, emit_stub, plan_shims};
 use super::tls::TlsLayout;
 use super::{
-    Buf, Executable, MACH_BASE, MACH_PAGE, PatchCtx, Plan, SectionAddrs, Symbol, patch_code,
-    plan_veneers, resolve_sym,
+    Buf, ExeSymbol, Executable, MACH_BASE, MACH_PAGE, PatchCtx, Plan, SectionAddrs, Symbol,
+    patch_code, plan_veneers, push_name, resolve_sym,
 };
 
 const LOCAL_IN_TEXT: u32 = 0x010E;
+const EXT_IN_TEXT: u32 = 0x010F;
+const LC_UUID: u32 = 0x1B;
+const LC_FUNCTION_STARTS: u32 = 0x26;
 const MH_HAS_TLV_DESCRIPTORS: u32 = 0x0080_0000;
 const S_THREAD_LOCAL_ZEROFILL: u32 = 0x12;
 const S_THREAD_LOCAL_VARIABLES: u32 = 0x13;
@@ -19,37 +25,33 @@ struct MachMeta<'a> {
     rebase: &'a [u8],
     bind_off: usize,
     bind: &'a [u8],
+    export_off: usize,
+    export: &'a [u8],
+    func_starts_off: usize,
+    func_starts: &'a [u8],
     symtab_off: usize,
     indirect_off: usize,
     strtab_off: usize,
     strtab_len: usize,
     nimports: usize,
     nlocals: usize,
+    nexports: usize,
     tramp_off: usize,
     libs: &'a [String],
 }
 
-fn write_meta(out: &mut Buf, m: &MachMeta<'_>) {
-    let rebase_sz = if m.rebase.is_empty() {
-        0
+fn slice_off_len(off: usize, data: &[u8]) -> (u32, u32) {
+    if data.is_empty() {
+        (0, 0)
     } else {
-        m.rebase.len() as u32
-    };
-    let rebase_off = if m.rebase.is_empty() {
-        0
-    } else {
-        m.rebase_off as u32
-    };
-    let bind_sz = if m.bind.is_empty() {
-        0
-    } else {
-        m.bind.len() as u32
-    };
-    let bind_off = if m.bind.is_empty() {
-        0
-    } else {
-        m.bind_off as u32
-    };
+        (off as u32, data.len() as u32)
+    }
+}
+
+fn write_meta(out: &mut Buf, m: &MachMeta<'_>) -> usize {
+    let (rebase_off, rebase_sz) = slice_off_len(m.rebase_off, m.rebase);
+    let (bind_off, bind_sz) = slice_off_len(m.bind_off, m.bind);
+    let (export_off, export_sz) = slice_off_len(m.export_off, m.export);
     out.words(&[
         0x8000_0022,
         48,
@@ -61,14 +63,14 @@ fn write_meta(out: &mut Buf, m: &MachMeta<'_>) {
         0,
         0,
         0,
-        0,
-        0,
+        export_off,
+        export_sz,
     ]);
     out.words(&[
         2,
         24,
         m.symtab_off as u32,
-        (m.nlocals + m.nimports) as u32,
+        (m.nlocals + m.nexports + m.nimports) as u32,
         m.strtab_off as u32,
         m.strtab_len as u32,
     ]);
@@ -78,8 +80,8 @@ fn write_meta(out: &mut Buf, m: &MachMeta<'_>) {
         0,
         m.nlocals as u32,
         m.nlocals as u32,
-        0,
-        m.nlocals as u32,
+        m.nexports as u32,
+        (m.nlocals + m.nexports) as u32,
         m.nimports as u32,
         0,
         0,
@@ -98,8 +100,17 @@ fn write_meta(out: &mut Buf, m: &MachMeta<'_>) {
     out.words(&[14, (12 + dylinker.len()).next_multiple_of(8) as u32, 12]);
     out.bytes(dylinker);
     out.align(8);
+    out.words(&[LC_UUID, 24]);
+    let uuid_off = out.pos();
+    out.bytes(&[0; 16]);
     out.words(&[0x32, 24, 1, 0x000E_0000, 0x000E_0000, 0, 0x8000_0028, 24]);
     out.u64s(&[m.tramp_off as u64, 0]);
+    out.words(&[
+        LC_FUNCTION_STARTS,
+        16,
+        m.func_starts_off as u32,
+        m.func_starts.len() as u32,
+    ]);
     for lib in m.libs {
         let size = (24 + lib.len() + 1).next_multiple_of(8);
         out.words(&[12, size as u32, 24, 0, 0x0001_0000, 0x0001_0000]);
@@ -107,6 +118,145 @@ fn write_meta(out: &mut Buf, m: &MachMeta<'_>) {
         out.u8(0);
         out.align(8);
     }
+    uuid_off
+}
+
+struct TrieNode {
+    terminal: Option<u64>,
+    edges: Vec<(Vec<u8>, usize)>,
+}
+
+fn trie_insert(nodes: &mut Vec<TrieNode>, node: usize, rem: &[u8], image_off: u64) {
+    if rem.is_empty() {
+        nodes[node].terminal = Some(image_off);
+        return;
+    }
+    let Some(pos) = nodes[node]
+        .edges
+        .iter()
+        .position(|(label, _)| label[0] == rem[0])
+    else {
+        let leaf = nodes.len();
+        nodes.push(TrieNode {
+            terminal: Some(image_off),
+            edges: Vec::new(),
+        });
+        nodes[node].edges.push((rem.to_vec(), leaf));
+        return;
+    };
+    let common = nodes[node].edges[pos]
+        .0
+        .iter()
+        .zip(rem)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let child = nodes[node].edges[pos].1;
+    if common == nodes[node].edges[pos].0.len() {
+        trie_insert(nodes, child, &rem[common..], image_off);
+        return;
+    }
+    let suffix = nodes[node].edges[pos].0[common..].to_vec();
+    let mid = nodes.len();
+    nodes.push(TrieNode {
+        terminal: None,
+        edges: vec![(suffix, child)],
+    });
+    nodes[node].edges[pos] = (rem[..common].to_vec(), mid);
+    trie_insert(nodes, mid, &rem[common..], image_off);
+}
+
+fn build_export_trie(exports: &[&ExeSymbol], prefix: &str, text_in_seg: u64) -> Vec<u8> {
+    if exports.is_empty() {
+        return Vec::new();
+    }
+    let mut nodes = vec![TrieNode {
+        terminal: None,
+        edges: Vec::new(),
+    }];
+    for sym in exports {
+        let full = format!("{prefix}{}", sym.name);
+        trie_insert(
+            &mut nodes,
+            0,
+            full.as_bytes(),
+            text_in_seg + u64::from(sym.offset),
+        );
+    }
+    let mut offsets = vec![0u64; nodes.len()];
+    let mut buf = Buf::new();
+    loop {
+        buf.0.clear();
+        let mut next = vec![0u64; nodes.len()];
+        for (i, node) in nodes.iter().enumerate() {
+            next[i] = buf.pos() as u64;
+            if let Some(image_off) = node.terminal {
+                let mut term = Buf::new();
+                term.uleb(0);
+                term.uleb(image_off);
+                buf.uleb(term.0.len() as u64);
+                buf.bytes(&term.0);
+            } else {
+                buf.u8(0);
+            }
+            buf.u8(node.edges.len() as u8);
+            for (label, child) in &node.edges {
+                buf.bytes(label);
+                buf.u8(0);
+                buf.uleb(offsets[*child]);
+            }
+        }
+        if next == offsets {
+            return buf.0;
+        }
+        offsets = next;
+    }
+}
+
+fn build_func_starts(
+    exe: &Executable,
+    tramp_off: usize,
+    shim_offs: &[usize],
+    text_off: usize,
+) -> Vec<u8> {
+    let mut starts: Vec<u64> = std::iter::once(tramp_off as u64)
+        .chain(shim_offs.iter().map(|&off| off as u64))
+        .chain(
+            exe.sorted_fn_starts()
+                .into_iter()
+                .map(|off| text_off as u64 + u64::from(off)),
+        )
+        .collect();
+    starts.sort_unstable();
+    starts.dedup();
+    let mut buf = Buf::new();
+    let mut prev = 0u64;
+    for off in starts {
+        buf.uleb(off - prev);
+        prev = off;
+    }
+    buf.u8(0);
+    buf.0
+}
+
+fn deterministic_uuid(bytes: &[u8]) -> [u8; 16] {
+    let mut h1 = FxHasher::default();
+    let mut h2 = FxHasher::default();
+    h1.write_u64(0x9E37_79B9_7F4A_7C15);
+    h2.write_u64(0xBF58_476D_1CE4_E5B9);
+    h1.write_usize(bytes.len());
+    h2.write_usize(bytes.len() ^ 0x5555_5555_5555_5555);
+    h1.write(bytes);
+    for chunk in bytes.chunks(8) {
+        let mut word = [0u8; 8];
+        word[..chunk.len()].copy_from_slice(chunk);
+        h2.write_u64(u64::from_le_bytes(word).swap_bytes());
+    }
+    let mut uuid = [0u8; 16];
+    uuid[..8].copy_from_slice(&h1.finish().to_le_bytes());
+    uuid[8..].copy_from_slice(&h2.finish().to_le_bytes());
+    uuid[6] = (uuid[6] & 0x0F) | 0x40;
+    uuid[8] = (uuid[8] & 0x3F) | 0x80;
+    uuid
 }
 
 fn build_dyld_info(
@@ -234,6 +384,8 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
         + 32
         + 24
         + 24
+        + 24
+        + 16
         + dylib_cmds;
     let tramp_off = (32 + sizeofcmds + 64).next_multiple_of(16);
     let shims_off = (tramp_off + tramp_size).next_multiple_of(16);
@@ -328,13 +480,24 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
             o
         })
         .collect();
-    let fn_strx = exe.symbol_names(exe.target.symbol_prefix, &mut strtab);
-    let nlocals = fn_strx.len();
+    let (locals, exports) = exe.split_symbols();
+    let main_strx = (!locals.is_empty() && !exe.symbols.iter().any(|sym| sym.name == "main"))
+        .then(|| push_name(&mut strtab, &[exe.target.symbol_prefix, "main"]));
+    let local_strx =
+        Executable::push_prefixed_names(&locals, exe.target.symbol_prefix, &mut strtab);
+    let export_strx =
+        Executable::push_prefixed_names(&exports, exe.target.symbol_prefix, &mut strtab);
+    let nlocals = locals.len() + usize::from(main_strx.is_some());
+    let nexports = exports.len();
+    let export_trie = build_export_trie(&exports, exe.target.symbol_prefix, text_off as u64);
+    let func_starts = build_func_starts(exe, tramp_off, &shim_offs, text_off);
     let linkedit_off = data_seg_off + data_seg_filesz;
     let linkedit_va = data_seg_va + data_seg_vmsz as u64;
     let bind_off = (linkedit_off + rebase.len()).next_multiple_of(8);
-    let symtab_off = (bind_off + bind.len()).next_multiple_of(8);
-    let indirect_off = symtab_off + (nlocals + plan.imports.len()) * 16;
+    let export_off = (bind_off + bind.len()).next_multiple_of(8);
+    let func_starts_off = (export_off + export_trie.len()).next_multiple_of(8);
+    let symtab_off = (func_starts_off + func_starts.len()).next_multiple_of(8);
+    let indirect_off = symtab_off + (nlocals + nexports + plan.imports.len()) * 16;
     let strtab_off = indirect_off + plan.imports.len() * 8;
     let linkedit_filesz = (strtab_off + strtab.len()) - linkedit_off;
 
@@ -356,7 +519,7 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
         },
         if arch == Arch::Arm64 { 0 } else { 3 },
         2,
-        10 + libs.len() as u32,
+        12 + libs.len() as u32,
         sizeofcmds as u32,
         flags,
         0,
@@ -496,19 +659,24 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
         1,
         0,
     );
-    write_meta(
+    let uuid_off = write_meta(
         &mut out,
         &MachMeta {
             rebase_off: linkedit_off,
             rebase: &rebase,
             bind_off,
             bind: &bind,
+            export_off,
+            export: &export_trie,
+            func_starts_off,
+            func_starts: &func_starts,
             symtab_off,
             indirect_off,
             strtab_off,
             strtab_len: strtab.len(),
             nimports: plan.imports.len(),
             nlocals,
+            nexports,
             tramp_off,
             libs: &libs,
         },
@@ -576,17 +744,31 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     out.align(8);
     out.bytes(&bind);
     out.align(8);
-    for (&strx, (off, _)) in fn_strx.iter().zip(&exe.symbols) {
+    out.bytes(&export_trie);
+    out.align(8);
+    out.bytes(&func_starts);
+    out.align(8);
+    if let Some(strx) = main_strx {
         out.words(&[strx, LOCAL_IN_TEXT]);
-        out.u64(addrs.text + u64::from(*off));
+        out.u64(MACH_BASE + tramp_off as u64);
+    }
+    for (&strx, sym) in local_strx.iter().zip(&locals) {
+        out.words(&[strx, LOCAL_IN_TEXT]);
+        out.u64(addrs.text + u64::from(sym.offset));
+    }
+    for (&strx, sym) in export_strx.iter().zip(&exports) {
+        out.words(&[strx, EXT_IN_TEXT]);
+        out.u64(addrs.text + u64::from(sym.offset));
     }
     sym_offs.iter().for_each(|&off| {
         out.words(&[off, 1]);
         out.u64(0);
     });
     for _ in 0..2 {
-        (0..plan.imports.len()).for_each(|idx| out.u32((nlocals + idx) as u32));
+        (0..plan.imports.len()).for_each(|idx| out.u32((nlocals + nexports + idx) as u32));
     }
     out.bytes(&strtab);
+    let uuid = deterministic_uuid(&out.0);
+    out.0[uuid_off..uuid_off + 16].copy_from_slice(&uuid);
     Ok(out.0)
 }

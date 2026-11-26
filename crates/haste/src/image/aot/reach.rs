@@ -92,7 +92,7 @@ fn mark_id(seen: &mut Vec<bool>, order: &mut Vec<usize>, work: &mut Vec<usize>, 
 }
 
 impl AotReach {
-    pub(in crate::image) fn new(len: usize, roots: [usize; 2]) -> Self {
+    pub(in crate::image) fn new(len: usize, roots: &[usize]) -> Self {
         let mut this = Self {
             fns: vec![false; len],
             order: Vec::new(),
@@ -108,13 +108,13 @@ impl AotReach {
             work_rodata: Vec::new(),
             work_vtables: Vec::new(),
         };
-        for root in roots {
+        for &root in roots {
             this.mark_fn(root);
         }
         this
     }
 
-    pub(super) fn collect(state: &AotState, roots: [usize; 2], vmask: &VtableMask) -> Self {
+    pub(super) fn collect(state: &AotState, roots: &[usize], vmask: &VtableMask) -> Self {
         let mut this = Self::new(state.functions.len(), roots);
         this.rodata.resize(state.rodata.len(), false);
         this.vtables.resize(state.vtables.len(), false);

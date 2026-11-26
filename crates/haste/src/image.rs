@@ -417,7 +417,7 @@ impl Image {
     pub(crate) fn build_aot(
         cx: &mut Context<'_>,
         reached: &Reached,
-        roots: [usize; 2],
+        roots: &[usize],
     ) -> Result<(Image, HashMap<usize, String>)> {
         Self::build_aot_streaming(cx, reached, roots)
     }
