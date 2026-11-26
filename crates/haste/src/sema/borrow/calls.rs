@@ -211,10 +211,9 @@ impl Checker<'_, '_> {
         let adjust = self.typed.adjusts.get(&expr).copied();
         adjust.and_then(|m| m.autoref).or_else(|| {
             let sig = self.callee_sig(expr, None);
-            let is_by_val = adjust.map_or(0, |a| a.derefs) == 0
-                && sig
-                    .as_deref()
-                    .is_some_and(|s| matches!(s.receiver, Some((SelfKind::Value, _))));
+            let is_by_val = sig
+                .as_deref()
+                .is_some_and(|s| matches!(s.receiver, Some((SelfKind::Value, _))));
             (!is_by_val && self.is_mut_ref_ty(self.expr_ty(receiver))).then(|| {
                 if sig
                     .as_deref()
@@ -323,9 +322,10 @@ impl Checker<'_, '_> {
         depth: u32,
     ) -> Result<()> {
         let recv_borrow = self.method_recv_borrow(expr, receiver);
+        let derefs = self.typed.adjusts.get(&expr).map_or(0, |a| a.derefs);
         if recv_borrow == Some(Mut::Mut)
             && (self.place_behind_shared_ref(receiver)
-                || self.is_shared_ref_or_ptr(self.expr_ty(receiver)))
+                || (derefs > 0 && self.is_shared_ref_or_ptr(self.expr_ty(receiver))))
         {
             return Err(self.borrow_err(
                 Some(expr),
@@ -455,7 +455,7 @@ impl Checker<'_, '_> {
                 return Ok(());
             }
         }
-        self.check_expr(receiver, state, false, outer_live, true, depth)
+        self.check_expr(receiver, state, crossed_ref, outer_live, true, depth)
     }
 
     pub(super) fn check_arg_list_with_refs(
