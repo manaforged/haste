@@ -124,18 +124,24 @@ pub fn run(cx: &mut Context<'_>, instance: &Instance, bits: u32) -> Result<u128>
             }
         }
     };
+    let before_asks = cx.asks.mark();
     let prev_skip = std::mem::replace(&mut cx.store.lookups.skip_warm_sysroot_bodies, false);
     let result = runner.evaluate(cx, instance, bits);
     cx.store.lookups.skip_warm_sysroot_bodies = prev_skip;
-    cx.store.runner.put(runner);
     cx.eval_stack.pop();
+    let asked = cx.asks.mark() != before_asks;
+    if !asked {
+        cx.store.runner.put(runner);
+    }
     match result {
         Ok(value) => {
             cx.store.evaluated.insert(*instance, value);
             Ok(value)
         }
         Err(err) => {
-            cx.eval_errors.insert(*instance, format!("{err:#}"));
+            if !asked {
+                cx.eval_errors.insert(*instance, format!("{err:#}"));
+            }
             Err(err)
         }
     }
