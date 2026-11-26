@@ -740,3 +740,54 @@ fn integration_test_target_tmpdir_is_isolated_per_worktree() {
     drop(std::fs::remove_dir_all(&tmp_a1));
     drop(std::fs::remove_dir_all(&tmp_b));
 }
+
+#[test]
+fn env_macro_change_invalidates_oneshot_and_daemon_executables() {
+    let dir = FixtureDir::write_crate(
+        "env-inval",
+        "app",
+        "env_inval_app",
+        "fn main() { println!(\"{}:{}\", env!(\"BUILD_LABEL\"), option_env!(\"OPT_LABEL\").unwrap_or(\"none\")); }\n",
+    );
+    let haste = env!("CARGO_BIN_EXE_haste");
+    let bin = dir
+        .path()
+        .join(format!("env_out{}", std::env::consts::EXE_SUFFIX));
+
+    let run_build = |daemon: bool, label: &str, opt: Option<&str>| -> String {
+        let mut cmd = Command::new(haste);
+        cmd.args(["build", "-o"]).arg(&bin);
+        if daemon {
+            cmd.arg("--daemon");
+        }
+        cmd.arg(dir.path()).env("BUILD_LABEL", label);
+        match opt {
+            Some(v) => cmd.env("OPT_LABEL", v),
+            None => cmd.env_remove("OPT_LABEL"),
+        };
+        let out = cmd.output().expect("run haste build");
+        assert!(
+            out.status.success(),
+            "build failed (daemon={daemon}, label={label}):\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let ran = Command::new(&bin).output().expect("run built binary");
+        assert!(ran.status.success(), "built binary failed");
+        String::from_utf8_lossy(&ran.stdout).trim().to_owned()
+    };
+
+    assert_eq!(run_build(false, "alpha", None), "alpha:none");
+    assert_eq!(run_build(false, "beta", Some("set")), "beta:set");
+    assert_eq!(run_build(false, "beta", None), "beta:none");
+
+    #[cfg(unix)]
+    {
+        assert_eq!(run_build(true, "gamma", None), "gamma:none");
+        assert_eq!(run_build(true, "delta", Some("on")), "delta:on");
+        assert_eq!(run_build(true, "epsilon", None), "epsilon:none");
+        let _ = Command::new(haste)
+            .args(["serve", "stop"])
+            .arg(dir.path())
+            .output();
+    }
+}

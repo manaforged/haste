@@ -386,6 +386,7 @@ fn root_crate(workspace: &Workspace, targets: &Targets, root: &Root, test: bool)
         release: workspace.packages[unit.package].sysroot,
         fixed: !workspace.packages[unit.package].local(),
         test,
+        env_reads: Default::default(),
     };
     Crate {
         env,

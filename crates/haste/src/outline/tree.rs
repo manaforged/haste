@@ -386,6 +386,8 @@ pub struct Env {
     pub fixed: bool,
     /// Whether `cfg(test)` is enabled for this crate.
     pub test: bool,
+    /// Process/client environment variables read by compile-time `env!`/`option_env!` expansions and the values observed.
+    pub env_reads: std::sync::Mutex<rustc_hash::FxHashMap<String, Option<String>>>,
 }
 
 /// The build profile every crate compiles under: Cargo's dev profile, or its release profile.
@@ -412,17 +414,25 @@ const OFF: [&str; 10] = [
 ];
 
 impl Env {
-    /// The value `env!` gives variable `name`: what the build script or Cargo set for this crate, else the process environment's.
+    /// The value `env!` gives variable `name`: what the build script or Cargo set for this crate, else the process or client environment's.
     pub fn var(&self, name: &str) -> Option<String> {
         let set = self
             .script
             .iter()
             .flat_map(|output| &output.vars)
             .chain(&self.vars);
-        set.filter(|(key, _)| key == name)
+        if let Some(value) = set
+            .filter(|(key, _)| key == name)
             .map(|(_, value)| value.clone())
             .next()
-            .or_else(|| std::env::var(name).ok())
+        {
+            return Some(value);
+        }
+        let value = crate::process_env_var(name);
+        crate::sync::lock(&self.env_reads)
+            .entry(name.to_owned())
+            .or_insert_with(|| value.clone());
+        value
     }
 
     /// Whether `cfg` may hold here: true unless this environment rules it out.

@@ -1,6 +1,8 @@
 //! A resident build of one workspace that answers `build`, `test` and `run` requests over a Unix socket: an abstract one on Linux, which leaves no file behind, else one in the temporary directory.
 
 mod control;
+#[cfg(unix)]
+mod proto;
 
 pub use control::{status, stop};
 
@@ -289,7 +291,7 @@ mod unix_ipc {
         let sent = send(fd, request.byte(), &stdio);
         close_all(&opened);
         sent?;
-        write_payload(&mut conn, out, args)?;
+        proto::write_payload(&mut conn, out, args)?;
         let mut status = [0; 4];
         conn.read_exact(&mut status)?;
         Ok(Some(i32::from_le_bytes(status)))
@@ -478,11 +480,11 @@ mod unix_ipc {
                     drop(conn.write_all(&0_i32.to_le_bytes()));
                     return Ok(());
                 }
-                Ok((byte, fds)) => match read_payload(&mut conn) {
-                    Ok((out, args)) => answer(
+                Ok((byte, fds)) => match proto::read_payload(&mut conn) {
+                    Ok(payload) => answer(
                         &mut build,
                         &mut served,
-                        Request::parse(byte).map(|request| (request, out, args)),
+                        Request::parse(byte).map(|request| (request, payload)),
                         &fds,
                     ),
                     Err(_) => 1,
@@ -558,65 +560,13 @@ mod unix_ipc {
         Ok(fd)
     }
 
-    fn write_payload(conn: &mut std::fs::File, out: Option<&Path>, args: &[String]) -> Result<()> {
-        use std::os::unix::ffi::OsStrExt as _;
-        let out_bytes = out.map_or(&[][..], |p| p.as_os_str().as_bytes());
-        let mut bytes = (out_bytes.len() as u32).to_le_bytes().to_vec();
-        bytes.extend_from_slice(out_bytes);
-        bytes.extend((args.len() as u32).to_le_bytes());
-        for arg in args {
-            bytes.extend((arg.len() as u32).to_le_bytes());
-            bytes.extend(arg.as_bytes());
-        }
-        Ok(conn.write_all(&bytes)?)
-    }
-
-    const MAX_PATH_BYTES: usize = 64 * 1024;
-    const MAX_ARGS: u32 = 4096;
-    const MAX_ARG_BYTES: usize = 1024 * 1024;
-
-    fn read_payload(conn: &mut std::fs::File) -> Result<(Option<PathBuf>, Vec<String>)> {
-        use std::os::unix::ffi::OsStringExt as _;
-        let mut word = [0; 4];
-        let mut next = |conn: &mut std::fs::File| -> Result<u32> {
-            conn.read_exact(&mut word)?;
-            Ok(u32::from_le_bytes(word))
-        };
-        let out_len = next(conn)? as usize;
-        if out_len > MAX_PATH_BYTES {
-            bail!("output path exceeds limit");
-        }
-        let out = if out_len == 0 {
-            None
-        } else {
-            let mut raw = vec![0; out_len];
-            conn.read_exact(&mut raw)?;
-            Some(PathBuf::from(std::ffi::OsString::from_vec(raw)))
-        };
-        let count = next(conn)?;
-        if count > MAX_ARGS {
-            bail!("argument count exceeds limit");
-        }
-        let mut args = Vec::with_capacity(count as usize);
-        for _ in 0..count {
-            let arg_len = next(conn)? as usize;
-            if arg_len > MAX_ARG_BYTES {
-                bail!("argument exceeds limit");
-            }
-            let mut arg = vec![0; arg_len];
-            conn.read_exact(&mut arg)?;
-            args.push(String::from_utf8(arg)?);
-        }
-        Ok((out, args))
-    }
-
     /// The standard input, output and error that a client hands the server for the program it runs.
     const STDIO: [RawFd; 3] = [0, 1, 2];
 
     fn answer(
         build: &mut Option<Build>,
         served: &mut Served<'_>,
-        request: Option<(Request, Option<PathBuf>, Vec<String>)>,
+        request: Option<(Request, proto::Payload)>,
         fds: &[RawFd],
     ) -> i32 {
         let Ok(&client) = <&[RawFd; 3]>::try_from(fds) else {
@@ -626,18 +576,28 @@ mod unix_ipc {
         let saved = redirect(client);
         let started = Instant::now();
         let answered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match request {
-            Some((request, out, args)) => served.reload().and_then(|reloaded| {
-                let kept = build.take().filter(|_| !reloaded);
-                let (workspace, targets) = (&*served.workspace, served.targets);
-                current(kept, workspace, targets).and_then(|fresh| {
-                    finish(
-                        build.insert(fresh),
-                        workspace,
-                        (request, out.as_deref(), &args),
-                        started,
-                    )
+            Some((request, payload)) => {
+                let cenv = Some(std::sync::Arc::new(payload.env));
+                crate::with_client_env(cenv, || {
+                    served.reload().and_then(|reloaded| {
+                        let env_stale = build.as_ref().is_some_and(|b| {
+                            b.env_reads()
+                                .into_iter()
+                                .any(|(name, prev)| crate::process_env_var(&name) != prev)
+                        });
+                        let kept = build.take().filter(|_| !reloaded && !env_stale);
+                        let (workspace, targets) = (&*served.workspace, served.targets);
+                        current(kept, workspace, targets).and_then(|fresh| {
+                            finish(
+                                build.insert(fresh),
+                                workspace,
+                                (request, payload.out.as_deref(), &payload.args),
+                                started,
+                            )
+                        })
+                    })
                 })
-            }),
+            }
             None => Err(anyhow::anyhow!("unknown request")),
         }));
         let done = answered.unwrap_or_else(|_| {

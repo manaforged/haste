@@ -151,14 +151,17 @@ impl<'scope, 'env> Scope<'scope, 'env> {
         let (job_slot, shared) = (Arc::clone(&slot), Arc::clone(&self.shared));
         let cfg = crate::config();
         let in_host = crate::in_host_target();
+        let cenv = crate::client_env();
         let job = move || {
             let result = catch_unwind(AssertUnwindSafe(|| {
                 crate::with_config(cfg, || {
-                    if in_host {
-                        crate::with_host_target(f)
-                    } else {
-                        f()
-                    }
+                    crate::with_client_env(cenv, || {
+                        if in_host {
+                            crate::with_host_target(f)
+                        } else {
+                            f()
+                        }
+                    })
                 })
             }));
             let ok = result.is_ok();
