@@ -1,15 +1,18 @@
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
+use rustc_hash::FxHashMap as HashMap;
 
 use crate::graph::Workspace;
 use crate::names::{Crate as NamesCrate, Symbols};
 use crate::outline::Outline;
 use crate::outline::source::{DiskSource, Outputs, Source, SourceText, SourceTokens};
 use crate::outline::tree::{Crate as OutlineCrate, File, Macro, Textual};
+use crate::sema::impls::Index as ImplIndex;
 use crate::sema::summary::codec::Cursor;
 use crate::substrate::Backing;
 
+use super::super::impls::read_impl_index;
 use super::super::names::read_names_crate;
 use super::super::outline::read_outline_crate;
 use super::super::tokens::{
@@ -19,7 +22,11 @@ use super::super::tokens::{
 use super::super::{CrateIdentity, HEADER_LEN, SYSROOT_MAGIC, SYSROOT_VERSION, match_crates};
 use super::{FIXED_SYM_COUNT, opt_u32_le};
 
-type DecodedCrates = (Vec<(usize, OutlineCrate)>, Vec<(usize, NamesCrate)>);
+type DecodedCrates = (
+    Vec<(usize, OutlineCrate)>,
+    Vec<(usize, NamesCrate)>,
+    HashMap<u32, Arc<ImplIndex>>,
+);
 
 struct WireSections<'a> {
     sym_count: usize,
@@ -30,6 +37,7 @@ struct WireSections<'a> {
     textual_raw: Vec<(String, u32, Option<u32>)>,
     outline_slices: Vec<&'a [u8]>,
     name_slices: Vec<&'a [u8]>,
+    impl_slices: Vec<&'a [u8]>,
 }
 
 fn read_slices<'a>(cur: &mut Cursor<'a>, count: usize) -> Result<Vec<&'a [u8]>> {
@@ -201,6 +209,7 @@ fn decode_macros(
 fn decode_crates(
     outline_slices: Vec<&[u8]>,
     name_slices: Vec<&[u8]>,
+    impl_slices: Vec<&[u8]>,
     files: &[Arc<File>],
     macros: &[Arc<Macro>],
     textuals: &[Arc<Textual>],
@@ -210,25 +219,30 @@ fn decode_crates(
     enum CrateTask<'a> {
         Outline(usize, &'a [u8]),
         Names(usize, &'a [u8]),
+        Impls(usize, &'a [u8]),
     }
     enum CrateOut {
         Outline(usize, OutlineCrate),
         Names(usize, NamesCrate),
+        Impls(usize, Option<Arc<ImplIndex>>),
     }
     let crate_count = local_crates.len();
-    let mut tasks = Vec::with_capacity(crate_count * 2);
+    let mut tasks = Vec::with_capacity(crate_count * 3);
     for (pos, slice) in outline_slices.into_iter().enumerate() {
         tasks.push(CrateTask::Outline(pos, slice));
     }
     for (pos, slice) in name_slices.into_iter().enumerate() {
         tasks.push(CrateTask::Names(pos, slice));
     }
+    for (pos, slice) in impl_slices.into_iter().enumerate() {
+        tasks.push(CrateTask::Impls(pos, slice));
+    }
     tasks.sort_unstable_by(|a, b| {
         let la = match a {
-            CrateTask::Outline(_, s) | CrateTask::Names(_, s) => s.len(),
+            CrateTask::Outline(_, s) | CrateTask::Names(_, s) | CrateTask::Impls(_, s) => s.len(),
         };
         let lb = match b {
-            CrateTask::Outline(_, s) | CrateTask::Names(_, s) => s.len(),
+            CrateTask::Outline(_, s) | CrateTask::Names(_, s) | CrateTask::Impls(_, s) => s.len(),
         };
         lb.cmp(&la)
     });
@@ -250,14 +264,27 @@ fn decode_crates(
                 }
                 Ok(CrateOut::Names(pos, krate))
             }
+            CrateTask::Impls(pos, slice) => {
+                let mut ccur = Cursor::new(slice);
+                let index = read_impl_index(&mut ccur, local_crates[pos] as u32, remap)?;
+                if ccur.pos != slice.len() {
+                    bail!("trailing bytes in sysroot impl index");
+                }
+                Ok(CrateOut::Impls(pos, index))
+            }
         }
     });
     let mut outline_slots: Vec<Option<OutlineCrate>> = (0..crate_count).map(|_| None).collect();
     let mut name_slots: Vec<Option<NamesCrate>> = (0..crate_count).map(|_| None).collect();
+    let mut heads = HashMap::default();
     for item in decoded {
         match item? {
             CrateOut::Outline(pos, krate) => outline_slots[pos] = Some(krate),
             CrateOut::Names(pos, krate) => name_slots[pos] = Some(krate),
+            CrateOut::Impls(pos, Some(index)) => {
+                heads.insert(local_crates[pos] as u32, index);
+            }
+            CrateOut::Impls(_, None) => {}
         }
     }
     let outline_crates = local_crates
@@ -270,7 +297,7 @@ fn decode_crates(
         .zip(name_slots)
         .map(|(&k, s)| (k, s.expect("every names crate decoded")))
         .collect();
-    Ok((outline_crates, name_crates))
+    Ok((outline_crates, name_crates, heads))
 }
 
 fn read_header_and_match(
@@ -324,6 +351,7 @@ fn read_sections<'a>(
     }
     let outline_slices = read_slices(cur, crate_count)?;
     let name_slices = read_slices(cur, crate_count)?;
+    let impl_slices = read_slices(cur, crate_count)?;
     if cur.take(SYSROOT_MAGIC.len())? != SYSROOT_MAGIC || cur.pos != data_len {
         bail!("trailing bytes in sysroot cache");
     }
@@ -336,6 +364,7 @@ fn read_sections<'a>(
         textual_raw,
         outline_slices,
         name_slices,
+        impl_slices,
     })
 }
 
@@ -373,6 +402,7 @@ pub(in super::super) fn decode_sysroot(
         Vec<(usize, OutlineCrate)>,
         Symbols,
         Vec<(usize, NamesCrate)>,
+        HashMap<u32, Arc<ImplIndex>>,
     )>,
 > {
     let data = backing.as_slice();
@@ -392,6 +422,7 @@ pub(in super::super) fn decode_sysroot(
         textual_raw,
         outline_slices,
         name_slices,
+        impl_slices,
     } = read_sections(&mut cur, data.len(), local_crates.len())?;
 
     let decode_rest = || -> Result<DecodedCrates> {
@@ -401,6 +432,7 @@ pub(in super::super) fn decode_sysroot(
         decode_crates(
             outline_slices,
             name_slices,
+            impl_slices,
             &files,
             &macros,
             &textuals,
@@ -409,7 +441,7 @@ pub(in super::super) fn decode_sysroot(
         )
     };
 
-    let (symbols, (outline_crates, name_crates)) = if crate::jobs() > 1 && sym_count >= 256 {
+    let (symbols, (outline_crates, name_crates, heads)) = if crate::jobs() > 1 && sym_count >= 256 {
         crate::sync::scope(|scope| -> Result<(Symbols, DecodedCrates)> {
             let sym_handle = scope.spawn(|| decode_symbols(sym_ends, sym_blob));
             let crates_res = decode_rest();
@@ -423,7 +455,7 @@ pub(in super::super) fn decode_sysroot(
         (decode_symbols(sym_ends, sym_blob)?, decode_rest()?)
     };
 
-    Ok(Some((outline_crates, symbols, name_crates)))
+    Ok(Some((outline_crates, symbols, name_crates, heads)))
 }
 
 fn read_identity(cur: &mut Cursor<'_>) -> Result<CrateIdentity> {

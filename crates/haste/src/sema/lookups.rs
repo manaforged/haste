@@ -178,6 +178,7 @@ pub(super) struct OutlineState {
 pub(super) struct Lookups {
     pub(super) modules: Table<u32, Arc<HashMap<(u32, u32), u32>>>,
     pub(super) heads: Table<impls::Holder, Arc<impls::Index>>,
+    pub(super) sysroot_heads: Option<Arc<HashMap<u32, Arc<impls::Index>>>>,
     pub(super) owners: Table<u32, Arc<HashMap<(u32, Option<u32>), u32>>>,
     pub(super) trait_defs: Table<ItemRef, Arc<traits::TraitGenerics>>,
     pub(super) discriminants: Table<ItemRef, Arc<[i128]>>,
@@ -334,6 +335,9 @@ impl Lookups {
         if reset_sysroot {
             *write_lock(&self.state.langs) = None;
             *write_lock(&self.state.primitives) = None;
+            if same_len {
+                self.sysroot_heads = None;
+            }
         }
         if reset_fixed {
             self.file_index = Arc::new(std::sync::OnceLock::new());
@@ -380,6 +384,18 @@ impl Cache {
         self.lookups
             .file_index
             .get_or_init(|| Arc::new(summary::codec::FileIndex::build(outline)))
+    }
+
+    /// Attaches pre-built sysroot module impl indices if none are attached yet.
+    pub(crate) fn set_sysroot_heads_if_unset(
+        &mut self,
+        heads: &Option<Arc<HashMap<u32, Arc<impls::Index>>>>,
+    ) {
+        if self.lookups.sysroot_heads.is_none()
+            && let Some(heads) = heads
+        {
+            self.lookups.sysroot_heads = Some(Arc::clone(heads));
+        }
     }
 
     /// Attaches a frozen sysroot substrate to serve pre-computed `PolySummary` entries.

@@ -8,8 +8,10 @@ use crate::graph::Workspace;
 use crate::macros::Compilation;
 use crate::names::{Sym, Symbols};
 use crate::outline::tree::{File, Macro, Textual};
+use crate::sema::impls::Index as ImplIndex;
 use crate::sema::summary::codec::{write_u32, write_u64};
 
+use super::impls::{build_sysroot_heads, write_impl_index};
 use super::names::write_names_crate;
 use super::outline::write_outline_crate;
 use super::tokens::{
@@ -137,7 +139,7 @@ pub(super) fn encode_sysroot(
     workspace: &Workspace,
     compilation: &Compilation,
     sysroot_crates: &[usize],
-) -> Option<Vec<u8>> {
+) -> Option<(Vec<u8>, Arc<HashMap<u32, Arc<ImplIndex>>>)> {
     let mut tables = Tables::new(
         compilation.outline.crates.len(),
         sysroot_crates,
@@ -149,6 +151,21 @@ pub(super) fn encode_sysroot(
     let (name_ends, names_blob) = write_chunked(sysroot_crates, |buf, &krate| {
         write_names_crate(buf, &compilation.names.crates[krate], &mut tables)
     })?;
+    let built_heads = build_sysroot_heads(compilation, sysroot_crates);
+    let (impl_ends, impls_blob) = write_chunked(
+        &sysroot_crates
+            .iter()
+            .copied()
+            .zip(built_heads.iter())
+            .collect::<Vec<_>>(),
+        |buf, &(krate, index)| write_impl_index(buf, index.as_ref(), krate as u32, &tables),
+    )?;
+    let mut heads_map = HashMap::default();
+    for (&krate, index) in sysroot_crates.iter().zip(built_heads) {
+        if let Some(index) = index {
+            heads_map.insert(krate as u32, Arc::new(index));
+        }
+    }
 
     let mut files_blob = Vec::new();
     let mut file_table = Vec::with_capacity(tables.files.len() * 8);
@@ -236,10 +253,14 @@ pub(super) fn encode_sysroot(
         write_u32(&mut out, end);
     }
     out.extend_from_slice(&names_blob);
+    for end in impl_ends {
+        write_u32(&mut out, end);
+    }
+    out.extend_from_slice(&impls_blob);
     out.extend_from_slice(&SYSROOT_MAGIC);
     let total_len = out.len() as u64;
     out[len_at..len_at + 8].copy_from_slice(&total_len.to_le_bytes());
-    Some(out)
+    Some((out, Arc::new(heads_map)))
 }
 
 fn write_identity(out: &mut Vec<u8>, ident: &CrateIdentity) -> Option<()> {

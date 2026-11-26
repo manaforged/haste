@@ -78,83 +78,13 @@ pub fn head(kind: &Kind) -> Option<Head> {
     })
 }
 
-#[derive(Default)]
-struct Asked {
-    modules: Vec<ModRef>,
-    names: Vec<(ModRef, crate::names::Sym)>,
-    crates: Vec<u32>,
-    scopes: Vec<ModRef>,
-    procs: Vec<(ItemRef, String)>,
-}
+mod index;
 
-impl Asked {
-    fn from_requests(requests: crate::names::path::Requests) -> Self {
-        Self {
-            modules: requests.modules.into_inner(),
-            names: requests.names.into_inner(),
-            crates: requests.crates.into_inner(),
-            scopes: requests.scopes.into_inner(),
-            procs: requests.procs.into_inner(),
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.modules.is_empty()
-            && self.names.is_empty()
-            && self.crates.is_empty()
-            && self.scopes.is_empty()
-            && self.procs.is_empty()
-    }
-
-    #[inline]
-    fn replay(&self, into: &crate::names::path::Requests) {
-        if self.is_empty() {
-            return;
-        }
-        if !self.modules.is_empty() {
-            into.modules
-                .borrow_mut()
-                .extend(self.modules.iter().copied());
-        }
-        if !self.names.is_empty() {
-            into.names.borrow_mut().extend(self.names.iter().copied());
-        }
-        if !self.crates.is_empty() {
-            into.crates.borrow_mut().extend(self.crates.iter().copied());
-        }
-        if !self.scopes.is_empty() {
-            into.scopes.borrow_mut().extend(self.scopes.iter().copied());
-        }
-        if !self.procs.is_empty() {
-            into.procs.borrow_mut().extend(self.procs.iter().cloned());
-        }
-    }
-}
-
-#[derive(Default)]
-struct TraitBucket {
-    all: Vec<ImplRef>,
-    blanket: Vec<ImplRef>,
-    by_head: HashMap<Head, Vec<ImplRef>>,
-}
-
-/// The impls of one crate: inherent ones by the head of their self type, trait ones by their trait.
-#[derive(Default)]
-pub struct Index {
-    inherent: HashMap<Head, Vec<ImplRef>>,
-    traits: HashMap<ItemRef, TraitBucket>,
-    negative: HashMap<ItemRef, Vec<Head>>,
-    asked: Asked,
-}
+use index::Asked;
+pub use index::Index;
+pub(crate) use index::TraitBucket;
 
 const PRIMITIVE_HOLDERS: [&str; 3] = ["core", "alloc", "std"];
-
-impl Index {
-    /// Whether building the index asked for nothing, so it holds every impl its holder has.
-    pub fn complete(&self) -> bool {
-        self.asked.is_empty()
-    }
-}
 
 fn impl_file_entry(
     outline: &crate::outline::Outline,
@@ -584,6 +514,18 @@ impl<'a> Context<'a> {
         found
     }
 
+    /// Indexes only the module-level impls of `krate` (excluding `impl_bodies`) for sysroot caching.
+    pub(crate) fn index_module_impls(&mut self, krate: u32) -> Index {
+        let mark = self.asks.mark();
+        let count = self.outline.crates[krate as usize].impls.len() as u32;
+        let mut index = Index::default();
+        for idx in 0..count {
+            self.index_block(&mut index, ImplRef::Module { krate, index: idx });
+        }
+        index.asked = Asked::from_requests(self.asks.since(mark));
+        index
+    }
+
     fn index_of(&mut self, holder: Holder) -> Arc<Index> {
         if let Some(found) = self.store.lookups.heads.get(&holder) {
             found.asked.replay(&self.asks);
@@ -593,6 +535,32 @@ impl<'a> Context<'a> {
             && self.expansion(root).is_none()
         {
             return Arc::default();
+        }
+        if let Holder::Crate(krate) = holder
+            && let Some(cached) = self
+                .store
+                .lookups
+                .sysroot_heads
+                .as_ref()
+                .and_then(|map| map.get(&krate))
+                .cloned()
+        {
+            let tree = &self.outline.crates[krate as usize];
+            if tree.impl_bodies.is_empty() && !tree.unsettled() {
+                return cached;
+            }
+            let mark = self.asks.mark();
+            if tree.unsettled() {
+                self.asks.crates.borrow_mut().push(krate);
+            }
+            let mut index = (*cached).clone();
+            for block in self.crate_body_impls(krate) {
+                self.index_block(&mut index, block);
+            }
+            index.asked = Asked::from_requests(self.asks.since(mark));
+            let index = Arc::new(index);
+            self.store.lookups.heads.insert(holder, Arc::clone(&index));
+            return index;
         }
         let mark = self.asks.mark();
         if let Holder::Crate(krate) = holder
@@ -616,11 +584,18 @@ impl<'a> Context<'a> {
 
     /// The impls of crate `krate`: those of its modules, then those in the bodies of its module-level `const _` items and functions.
     fn crate_impls(&mut self, krate: u32) -> Vec<ImplRef> {
-        let tree = &self.outline.crates[krate as usize];
-        let mut blocks: Vec<ImplRef> = (0..tree.impls.len() as u32)
+        let count = self.outline.crates[krate as usize].impls.len() as u32;
+        let mut blocks: Vec<ImplRef> = (0..count)
             .map(|index| ImplRef::Module { krate, index })
             .collect();
-        for &(file, item) in &tree.impl_bodies {
+        blocks.extend(self.crate_body_impls(krate));
+        blocks
+    }
+
+    fn crate_body_impls(&mut self, krate: u32) -> Vec<ImplRef> {
+        let bodies = self.outline.crates[krate as usize].impl_bodies.clone();
+        let mut blocks = Vec::new();
+        for (file, item) in bodies {
             let root = ItemRef {
                 krate,
                 file: file as u32,

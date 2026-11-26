@@ -1,5 +1,6 @@
 //! Persistent disk cache for settled sysroot crate outlines, macros, and resolved name scopes.
 
+mod impls;
 mod names;
 mod outline;
 pub(crate) mod tokens;
@@ -8,12 +9,15 @@ mod wire;
 use std::path::Path;
 use std::sync::Arc;
 
+use rustc_hash::FxHashMap as HashMap;
+
 use crate::graph::{Side, Targets, Workspace};
 use crate::macros::Compilation;
 use crate::names::{Crate as NamesCrate, Symbols};
 use crate::outline::{Outline, Role};
+use crate::sema::impls::Index as ImplIndex;
 
-pub(crate) const SYSROOT_VERSION: u32 = 9;
+pub(crate) const SYSROOT_VERSION: u32 = 10;
 const SYSROOT_MAGIC: [u8; 8] = *b"HSTSYS01";
 const HEADER_LEN: usize = 32;
 const KEPT_SYSROOTS: usize = 2;
@@ -123,12 +127,19 @@ fn is_sysroot_cache(path: &Path) -> bool {
     name.starts_with("sysroot-") && name.ends_with(".bin")
 }
 
-/// Attempts to load cached settled sysroot crates into `outline` and return their `Symbols` and `Names`.
+/// Cached sysroot name symbols, resolved crate scopes, and pre-built module impl indices.
+pub(crate) type CachedSysroot = (
+    Symbols,
+    Vec<(usize, NamesCrate)>,
+    HashMap<u32, Arc<ImplIndex>>,
+);
+
+/// Attempts to load cached settled sysroot crates into `outline` and return their `Symbols`, `Names`, and impl indices.
 pub(crate) fn try_load(
     workspace: &Workspace,
     targets: &Targets,
     outline: &mut Outline,
-) -> Option<(Symbols, Vec<(usize, NamesCrate)>)> {
+) -> Option<CachedSysroot> {
     if !super::enabled() {
         return None;
     }
@@ -136,12 +147,12 @@ pub(crate) fn try_load(
     let path = super::sysroot_cache_path(key);
     let backing = Arc::new(super::Backing::open(&path, HEADER_LEN).ok()?);
     match wire::decode_sysroot(&backing, key, workspace, outline) {
-        Ok(Some((crates, symbols, names))) => {
+        Ok(Some((crates, symbols, names, heads))) => {
             for (krate, mut tree) in crates {
                 tree.env = std::mem::take(&mut outline.crates[krate].env);
                 outline.crates[krate] = tree;
             }
-            Some((symbols, names))
+            Some((symbols, names, heads))
         }
         Ok(None) | Err(_) => {
             drop(std::fs::remove_file(&path));
@@ -150,25 +161,28 @@ pub(crate) fn try_load(
     }
 }
 
-/// Atomically persists the settled sysroot crates from `compilation` to the toolchain cache directory.
-pub(crate) fn save(workspace: &Workspace, targets: &Targets, compilation: &Compilation) {
+/// Atomically persists the settled sysroot crates from `compilation` to the toolchain cache directory and returns their impl indices.
+pub(crate) fn save(
+    workspace: &Workspace,
+    targets: &Targets,
+    compilation: &Compilation,
+) -> Option<Arc<HashMap<u32, Arc<ImplIndex>>>> {
     if !super::enabled() {
-        return;
+        return None;
     }
     let sysroot_crates = sysroot_crate_order(workspace, &compilation.outline);
     if sysroot_crates.is_empty() {
-        return;
+        return None;
     }
     let key = super::sysroot_key(workspace, targets);
     let path = super::sysroot_cache_path(key);
-    let Some(bytes) = wire::encode_sysroot(key, workspace, compilation, &sysroot_crates) else {
-        return;
-    };
+    let (bytes, heads) = wire::encode_sysroot(key, workspace, compilation, &sysroot_crates)?;
     if let Err(error) = super::backing::write_compressed(&path, &[&bytes]) {
         eprintln!("haste: cannot save sysroot cache: {error:#}");
-        return;
+        return Some(heads);
     }
     if let Some(dir) = path.parent() {
         super::prune_stale(dir, &path, KEPT_SYSROOTS, is_sysroot_cache);
     }
+    Some(heads)
 }
