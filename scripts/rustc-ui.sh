@@ -20,7 +20,7 @@ To fetch tests/ui/ sparsely without cloning the full rust-lang/rust history:
 
 Options:
   --borrowck    Test negative borrow-checker tests (tests/ui/borrowck/)
-  --run-pass    Test runnable pass tests
+  --run-pass    Test pass tests (run-pass, check-pass, build-pass)
   --all         Run both --borrowck and --run-pass (default)
   --limit N     Test at most N candidate files per suite
   --aot         Also verify AOT compilation & execution (haste --release build -o) for --run-pass
@@ -301,6 +301,21 @@ stdout_matches() {
     ' "$actual" "$expected" "$work" "$HASTE_BIN"
 }
 
+verify_stdout() {
+    local actual=$1 work=$2 label=$3 pass_kind=$4 rel=$5 res_file=$6
+    if stdout_matches "$actual" "$work/rustc.out" "$work"; then
+        return 0
+    fi
+    local r2=0
+    with_timeout 30 "$work/rustc_bin" </dev/null >"$work/rustc2.out" 2>/dev/null || r2=$?
+    if [ "$r2" -ne 0 ] || cmp -s "$work/rustc.out" "$work/rustc2.out"; then
+        printf 'FAIL\t%s\t%s\t%s stdout mismatch\n' "$pass_kind" "$rel" "$label" >"$res_file"
+        return 1
+    fi
+    printf 'SKIP\t%s\t%s\tnondeterministic stdout\n' "$pass_kind" "$rel" >"$res_file"
+    return 1
+}
+
 run_borrowck_one() {
     local file=$1 work=$2 res_file=$3 expected_lines=${4:-}
     local rel crate_type="lib" r_status=0 h_status=0 line_ok=0
@@ -313,7 +328,7 @@ run_borrowck_one() {
 
     with_timeout 30 rustc --edition=2021 --crate-type="$crate_type" --out-dir "$work/rustc_out" "$file" </dev/null >/dev/null 2>"$work/rustc.err" || r_status=$?
     if [ "$r_status" -eq 0 ]; then
-        printf 'SKIP\t%s\trustc accepted under edition 2021\n' "$rel" >"$res_file"
+        printf 'SKIP\tborrowck\t%s\trustc accepted under edition 2021\n' "$rel" >"$res_file"
         return 0
     fi
 
@@ -322,37 +337,41 @@ run_borrowck_one() {
     cat "$work/haste.out" "$work/haste.err" >"$work/haste.combined"
 
     if is_crash "$h_status" "$work/haste.combined"; then
-        printf 'CRASH\t%s\texit %s\n' "$rel" "$h_status" >"$res_file"
+        printf 'CRASH\tborrowck\t%s\texit %s\n' "$rel" "$h_status" >"$res_file"
     elif [ "$h_status" -ne 0 ]; then
         if grep -q 'error\[borrow\]:' "$work/haste.combined"; then
             if borrowck_line_matches "$expected_lines" "$work/haste.combined"; then
                 line_ok=1
             fi
-            printf 'PASS\t%s\t%d\n' "$rel" "$line_ok" >"$res_file"
+            printf 'PASS\tborrowck\t%s\t%d\n' "$rel" "$line_ok" >"$res_file"
         else
             local reason
             reason=$(grep -Em1 '^(error|Error)' "$work/haste.combined" || true)
             reason=$(printf '%s' "$reason" | tr '\t' ' ' | cut -c1-120)
-            printf 'OTHER\t%s\t%s\n' "$rel" "${reason:-non-borrow error}" >"$res_file"
+            printf 'OTHER\tborrowck\t%s\t%s\n' "$rel" "${reason:-non-borrow error}" >"$res_file"
         fi
     else
-        printf 'FAIL\t%s\taccepted\n' "$rel" >"$res_file"
+        printf 'FAIL\tborrowck\t%s\taccepted\n' "$rel" >"$res_file"
     fi
 }
 
 run_pass_one() {
     local file=$1 work=$2 res_file=$3
-    local rel r_build=0 r_status=0 h_status=0 aot_b=0 aot_r=0 build_only=0
+    local rel r_build=0 r_status=0 h_status=0 aot_b=0 aot_r=0 build_only=0 pass_kind="run-pass"
     rel=$(rel_path "$file")
     mkdir -p "$work/rustc_out"
 
-    if grep -Eq '//@ (check-pass|build-pass)' "$file" && ! grep -Eq '//@ run-pass' "$file"; then
+    if grep -Eq '//@[[:space:]]*check-pass' "$file" && ! grep -Eq '//@[[:space:]]*run-pass' "$file"; then
         build_only=1
+        pass_kind="check-pass"
+    elif grep -Eq '//@[[:space:]]*build-pass' "$file" && ! grep -Eq '//@[[:space:]]*run-pass' "$file"; then
+        build_only=1
+        pass_kind="build-pass"
     fi
 
     with_timeout 30 rustc --edition=2021 --out-dir "$work/rustc_out" -o "$work/rustc_bin" "$file" </dev/null >/dev/null 2>"$work/rustc.err" || r_build=$?
     if [ "$r_build" -ne 0 ]; then
-        printf 'SKIP\t%s\trustc failed under edition 2021\n' "$rel" >"$res_file"
+        printf 'SKIP\t%s\t%s\trustc failed under edition 2021\n' "$pass_kind" "$rel" >"$res_file"
         return 0
     fi
 
@@ -360,67 +379,53 @@ run_pass_one() {
     if [ "$build_only" -eq 1 ]; then
         with_timeout 30 "$HASTE_BIN" build "$work/crate" </dev/null >"$work/haste.out" 2>"$work/haste.err" || h_status=$?
         if is_crash "$h_status" "$work/haste.err"; then
-            printf 'CRASH\t%s\tbuild crash (exit %s)\n' "$rel" "$h_status" >"$res_file"
+            printf 'CRASH\t%s\t%s\tbuild crash (exit %s)\n' "$pass_kind" "$rel" "$h_status" >"$res_file"
             return 0
         fi
         if [ "$h_status" -ne 0 ]; then
-            printf 'FAIL\t%s\tbuild failed (exit %s)\n' "$rel" "$h_status" >"$res_file"
+            printf 'FAIL\t%s\t%s\tbuild failed (exit %s)\n' "$pass_kind" "$rel" "$h_status" >"$res_file"
             return 0
         fi
     else
         with_timeout 30 "$work/rustc_bin" </dev/null >"$work/rustc.out" 2>"$work/rustc.run_err" || r_status=$?
-        if [ "$r_status" -ne 0 ] && grep -Eq '//@ run-pass' "$file"; then
-            printf 'SKIP\t%s\trustc run failed on //@ run-pass (exit %s)\n' "$rel" "$r_status" >"$res_file"
+        if [ "$r_status" -ne 0 ] && grep -Eq '//@[[:space:]]*run-pass' "$file"; then
+            printf 'SKIP\t%s\t%s\trustc run failed on //@ run-pass (exit %s)\n' "$pass_kind" "$rel" "$r_status" >"$res_file"
             return 0
         fi
 
         with_timeout 30 "$HASTE_BIN" run "$work/crate" </dev/null >"$work/haste.out" 2>"$work/haste.err" || h_status=$?
         if is_crash "$h_status" "$work/haste.err"; then
-            printf 'CRASH\t%s\tjit crash (exit %s)\n' "$rel" "$h_status" >"$res_file"
+            printf 'CRASH\t%s\t%s\tjit crash (exit %s)\n' "$pass_kind" "$rel" "$h_status" >"$res_file"
             return 0
         fi
         if [ "$h_status" -ne "$r_status" ]; then
-            printf 'FAIL\t%s\tjit exit %s vs rustc %s\n' "$rel" "$h_status" "$r_status" >"$res_file"
+            printf 'FAIL\t%s\t%s\tjit exit %s vs rustc %s\n' "$pass_kind" "$rel" "$h_status" "$r_status" >"$res_file"
             return 0
         fi
-        if ! stdout_matches "$work/haste.out" "$work/rustc.out" "$work"; then
-            local r2=0
-            with_timeout 30 "$work/rustc_bin" </dev/null >"$work/rustc2.out" 2>/dev/null || r2=$?
-            if [ "$r2" -ne 0 ] || cmp -s "$work/rustc.out" "$work/rustc2.out"; then
-                printf 'FAIL\t%s\tjit stdout mismatch\n' "$rel" >"$res_file"
-                return 0
-            fi
-        fi
+        verify_stdout "$work/haste.out" "$work" "jit" "$pass_kind" "$rel" "$res_file" || return 0
     fi
 
     if [ "$run_aot" -eq 1 ]; then
         with_timeout 30 "$HASTE_BIN" --release build -o "$work/aot_bin" "$work/crate" </dev/null >/dev/null 2>"$work/aot.err" || aot_b=$?
         if is_crash "$aot_b" "$work/aot.err"; then
-            printf 'CRASH\t%s\taot build crash (exit %s)\n' "$rel" "$aot_b" >"$res_file"
+            printf 'CRASH\t%s\t%s\taot build crash (exit %s)\n' "$pass_kind" "$rel" "$aot_b" >"$res_file"
             return 0
         fi
         if [ "$aot_b" -ne 0 ]; then
-            printf 'FAIL\t%s\taot build failed (exit %s)\n' "$rel" "$aot_b" >"$res_file"
+            printf 'FAIL\t%s\t%s\taot build failed (exit %s)\n' "$pass_kind" "$rel" "$aot_b" >"$res_file"
             return 0
         fi
         if [ "$build_only" -eq 0 ]; then
             with_timeout 30 "$work/aot_bin" </dev/null >"$work/aot.out" 2>"$work/aot.run_err" || aot_r=$?
             if [ "$aot_r" -ne "$r_status" ]; then
-                printf 'FAIL\t%s\taot exit %s vs rustc %s\n' "$rel" "$aot_r" "$r_status" >"$res_file"
+                printf 'FAIL\t%s\t%s\taot exit %s vs rustc %s\n' "$pass_kind" "$rel" "$aot_r" "$r_status" >"$res_file"
                 return 0
             fi
-            if ! stdout_matches "$work/aot.out" "$work/rustc.out" "$work"; then
-                local r2=0
-                with_timeout 30 "$work/rustc_bin" </dev/null >"$work/rustc2.out" 2>/dev/null || r2=$?
-                if [ "$r2" -ne 0 ] || cmp -s "$work/rustc.out" "$work/rustc2.out"; then
-                    printf 'FAIL\t%s\taot stdout mismatch\n' "$rel" >"$res_file"
-                    return 0
-                fi
-            fi
+            verify_stdout "$work/aot.out" "$work" "aot" "$pass_kind" "$rel" "$res_file" || return 0
         fi
     fi
 
-    printf 'PASS\t%s\n' "$rel" >"$res_file"
+    printf 'PASS\t%s\t%s\t%s\n' "$pass_kind" "$rel" "$pass_kind" >"$res_file"
 }
 
 pct() {
@@ -475,9 +480,11 @@ run_suite() {
     fi
 
     local ran=0 passed=0 line_matched=0 located_ran=0 other_err=0 failed=0 crashed=0
-    local kind name reason
+    local rp_ran=0 rp_passed=0 rp_failed=0 rp_crashed=0
+    local cb_ran=0 cb_passed=0 cb_failed=0 cb_crashed=0
+    local kind subkind name reason
     for ((i = 0; i < total; i++)); do
-        IFS=$'\t' read -r kind name reason <"$suite_tmp/res/$i.res"
+        IFS=$'\t' read -r kind subkind name reason <"$suite_tmp/res/$i.res"
         if [ "$kind" = "SKIP" ]; then
             s_other=$((s_other + 1))
             continue
@@ -486,24 +493,51 @@ run_suite() {
         if [ -n "${cand_lines[$i]:-}" ]; then
             located_ran=$((located_ran + 1))
         fi
+        if [ "$suite" != "borrowck" ]; then
+            if [ "$subkind" = "run-pass" ]; then
+                rp_ran=$((rp_ran + 1))
+            else
+                cb_ran=$((cb_ran + 1))
+            fi
+        fi
         case "$kind" in
             PASS)
                 passed=$((passed + 1))
-                if [ "${reason:-0}" = "1" ]; then
-                    line_matched=$((line_matched + 1))
+                if [ "$suite" = "borrowck" ]; then
+                    if [ "${reason:-0}" = "1" ]; then
+                        line_matched=$((line_matched + 1))
+                    fi
+                elif [ "$subkind" = "run-pass" ]; then
+                    rp_passed=$((rp_passed + 1))
+                else
+                    cb_passed=$((cb_passed + 1))
                 fi
                 ;;
             OTHER)
                 other_err=$((other_err + 1))
-                printf '%s\t%s\tother-err: %s\n' "$suite" "$name" "$reason" >>"$tmp/failures.tsv"
+                printf '%s\t%s\tother-err: %s\n' "$subkind" "$name" "$reason" >>"$tmp/failures.tsv"
                 ;;
             FAIL)
                 failed=$((failed + 1))
-                printf '%s\t%s\t%s\n' "$suite" "$name" "$reason" >>"$tmp/failures.tsv"
+                if [ "$suite" != "borrowck" ]; then
+                    if [ "$subkind" = "run-pass" ]; then
+                        rp_failed=$((rp_failed + 1))
+                    else
+                        cb_failed=$((cb_failed + 1))
+                    fi
+                fi
+                printf '%s\t%s\t%s\n' "$subkind" "$name" "$reason" >>"$tmp/failures.tsv"
                 ;;
             CRASH)
                 crashed=$((crashed + 1))
-                printf '%s\t%s\t%s (crash)\n' "$suite" "$name" "$reason" >>"$tmp/failures.tsv"
+                if [ "$suite" != "borrowck" ]; then
+                    if [ "$subkind" = "run-pass" ]; then
+                        rp_crashed=$((rp_crashed + 1))
+                    else
+                        cb_crashed=$((cb_crashed + 1))
+                    fi
+                fi
+                printf '%s\t%s\t%s (crash)\n' "$subkind" "$name" "$reason" >>"$tmp/failures.tsv"
                 ;;
         esac
     done
@@ -511,14 +545,14 @@ run_suite() {
     local suite_skipped=$((s_feat + s_aux + s_flags + s_rev + s_only + s_other + s_limit))
     local rate
     rate=$(pct "$passed" "$ran")
-    printf '| %s | %d | %d | %d | %d | %d | %d | %d | %s |\n' \
-        "$suite" "$discovered_total" "$suite_skipped" "$ran" "$passed" "$other_err" "$failed" "$crashed" "$rate" >>"$tmp/summary.rows"
 
     local skip_detail="feature=$s_feat aux-build=$s_aux compile-flags=$s_flags revisions=$s_rev only/ignore=$s_only other=$s_other"
     if [ "$s_limit" -gt 0 ]; then
         skip_detail="$skip_detail limit=$s_limit"
     fi
     if [ "$suite" = "borrowck" ]; then
+        printf '| %s | %d | %d | %d | %d | %d | %d | %d | %s |\n' \
+            "$suite" "$discovered_total" "$suite_skipped" "$ran" "$passed" "$other_err" "$failed" "$crashed" "$rate" >>"$tmp/summary.rows"
         printf -- '- `%s`: total=%d skipped=%d (%s) ran=%d passed=%d other-err=%d failed=%d crashed=%d\n' \
             "$suite" "$discovered_total" "$suite_skipped" "$skip_detail" "$ran" "$passed" "$other_err" "$failed" "$crashed" >>"$tmp/breakdown.lines"
         borrow_ran=$ran
@@ -526,8 +560,20 @@ run_suite() {
         borrow_line_match=$line_matched
         borrow_located=$located_ran
     else
-        printf -- '- `%s`: total=%d skipped=%d (%s) ran=%d passed=%d failed=%d crashed=%d\n' \
-            "$suite" "$discovered_total" "$suite_skipped" "$skip_detail" "$ran" "$passed" "$failed" "$crashed" >>"$tmp/breakdown.lines"
+        printf '| pass (all) | %d | %d | %d | %d | %d | %d | %d | %s |\n' \
+            "$discovered_total" "$suite_skipped" "$ran" "$passed" "$other_err" "$failed" "$crashed" "$rate" >>"$tmp/summary.rows"
+        printf '|   run-pass | - | - | %d | %d | 0 | %d | %d | %s |\n' \
+            "$rp_ran" "$rp_passed" "$rp_failed" "$rp_crashed" "$(pct "$rp_passed" "$rp_ran")" >>"$tmp/summary.rows"
+        printf '|   check/build-pass | - | - | %d | %d | 0 | %d | %d | %s |\n' \
+            "$cb_ran" "$cb_passed" "$cb_failed" "$cb_crashed" "$(pct "$cb_passed" "$cb_ran")" >>"$tmp/summary.rows"
+        printf -- '- `pass`: total=%d skipped=%d (%s) ran=%d passed=%d failed=%d crashed=%d (run-pass: ran=%d passed=%d failed=%d crashed=%d; check/build-pass: ran=%d passed=%d failed=%d crashed=%d)\n' \
+            "$discovered_total" "$suite_skipped" "$skip_detail" "$ran" "$passed" "$failed" "$crashed" \
+            "$rp_ran" "$rp_passed" "$rp_failed" "$rp_crashed" \
+            "$cb_ran" "$cb_passed" "$cb_failed" "$cb_crashed" >>"$tmp/breakdown.lines"
+        pass_rp_ran=$rp_ran
+        pass_rp_passed=$rp_passed
+        pass_cb_ran=$cb_ran
+        pass_cb_passed=$cb_passed
     fi
 
     last_discovered_total="$discovered_total"
@@ -551,17 +597,21 @@ borrow_ran=0
 borrow_diag_match=0
 borrow_line_match=0
 borrow_located=0
+pass_rp_ran=0
+pass_rp_passed=0
+pass_cb_ran=0
+pass_cb_passed=0
 
 case "$mode" in
     borrowck)
         run_suite "borrowck"
         ;;
     run-pass)
-        run_suite "run-pass"
+        run_suite "pass"
         ;;
     all)
         run_suite "borrowck"
-        run_suite "run-pass"
+        run_suite "pass"
         ;;
 esac
 
@@ -593,6 +643,17 @@ if [ "$mode" = "borrowck" ] || [ "$mode" = "all" ]; then
             "$borrow_diag_match" "$borrow_ran" "$diag_rate" \
             "$borrow_line_match" "$borrow_located" "$line_rate"
     fi
+fi
+
+if [ "$mode" = "run-pass" ] || [ "$mode" = "all" ]; then
+    pass_mode="jit"
+    [ "$run_aot" -eq 1 ] && pass_mode="jit+aot"
+    rp_rate=$(pct "$pass_rp_passed" "$pass_rp_ran")
+    cb_rate=$(pct "$pass_cb_passed" "$pass_cb_ran")
+    printf '\nPass accuracy (%s): run-pass=%d/%d (%s) check/build-pass=%d/%d (%s)\n' \
+        "$pass_mode" \
+        "$pass_rp_passed" "$pass_rp_ran" "$rp_rate" \
+        "$pass_cb_passed" "$pass_cb_ran" "$cb_rate"
 fi
 
 if [ -n "${HASTE_UI_TSV:-}" ] && [ -f "$tmp/failures.tsv" ]; then
