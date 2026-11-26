@@ -190,6 +190,8 @@ pub(in super::super) fn receiver_has_any_named(src: &Source, item: &Item, named:
 fn impl_self_lifetimes(
     cx: &mut crate::sema::Context<'_>,
     item: crate::names::ItemRef,
+    sig: &crate::body::sig::Signature,
+    src: &Source,
 ) -> (bool, bool, Vec<String>) {
     let Some(block) = cx.owner_impl(item) else {
         return (false, false, Vec::new());
@@ -202,9 +204,28 @@ fn impl_self_lifetimes(
         .iter()
         .any(|g| g.kind == crate::body::sig::GenericKind::Lifetime);
     let impl_src = &cx.impl_file(block).source;
+    let bounded_static = |body: &Body, s: &Source, bounds: crate::body::List| {
+        body.list(bounds).iter().any(
+            |&b| matches!(body.bounds[b as usize], Bound::Lifetime(lt) if s.text(lt) == LT_STATIC),
+        )
+    };
+    let has_non_static_ty = hdr.generics.iter().any(|g| {
+        if g.kind != crate::body::sig::GenericKind::Type {
+            return false;
+        }
+        let name = impl_src.text(g.name);
+        !(bounded_static(&hdr.body, impl_src, g.bounds)
+            || hdr.predicates.iter().any(|p| {
+                pred_matches_name_in(&hdr.body, impl_src, p, name)
+                    && bounded_static(&hdr.body, impl_src, p.bounds)
+            })
+            || sig.predicates.iter().any(|p| {
+                pred_matches_name(sig, src, p, name) && bounded_static(&sig.body, src, p.bounds)
+            }))
+    });
     let mut lts = Lifetimes::default();
     collect_ty_lifetimes(&hdr.body, impl_src, hdr.self_ty, &mut lts);
-    let has_lt = has_lt_generic || lts.has_elided || !lts.named.is_empty();
+    let has_lt = has_lt_generic || has_non_static_ty || lts.has_elided || !lts.named.is_empty();
     let has_elided = has_lt && lts.named.is_empty();
     (has_lt, has_elided, owned_lts(lts.named))
 }
@@ -312,7 +333,7 @@ pub(in super::super) fn compute_param_lifetimes(
             *slot = false;
         }
     }
-    let (impl_has_lt, impl_has_elided, impl_named) = impl_self_lifetimes(cx, item);
+    let (impl_has_lt, impl_has_elided, impl_named) = impl_self_lifetimes(cx, item, sig, src);
     let mut cursor = 0usize;
     if let Some((kind, _)) = sig.receiver {
         if let Some(&local) = typed.params.get(cursor)

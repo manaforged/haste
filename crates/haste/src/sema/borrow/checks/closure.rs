@@ -79,7 +79,7 @@ pub(in super::super) struct ClosureEffects {
     pub(in super::super) borrows_local: bool,
     pub(in super::super) outer_loans: Vec<(u32, BorrowSource)>,
     pub(in super::super) param_loans: Vec<ClosureParamLoan>,
-    pub(in super::super) ret_params: Vec<usize>,
+    pub(in super::super) ret_params: Vec<(usize, bool)>,
     pub(in super::super) ret_targets: Option<(HashSet<u32>, HashSet<u32>)>,
 }
 
@@ -503,11 +503,14 @@ impl Checker<'_, '_> {
                 .hrtb_params
                 .iter()
                 .any(|&(idx, nested)| idx == pl.param_idx && (nested || !pl.derefs_past_outer_ref))
-        }) || eff
-            .ret_params
-            .iter()
-            .any(|p| bounds.hrtb_non_ret.contains(p))
-        {
+        }) || eff.ret_params.iter().any(|&(p, derefs_past)| {
+            bounds.hrtb_non_ret.contains(&p)
+                && (!derefs_past
+                    || bounds
+                        .hrtb_params
+                        .iter()
+                        .any(|&(idx, nested)| idx == p && nested))
+        }) {
             return Err(self.borrow_err(Some(expr), "borrowed data escapes outside of closure"));
         }
         self.check_closure_effects(
@@ -653,7 +656,7 @@ impl Checker<'_, '_> {
         body_state: &State,
         state: &mut State,
         (moves_capture, mutates_capture, borrows_local): (bool, bool, bool),
-        (ret_params, ret_targets): (Vec<usize>, Option<(HashSet<u32>, HashSet<u32>)>),
+        (ret_params, ret_targets): (Vec<(usize, bool)>, Option<(HashSet<u32>, HashSet<u32>)>),
     ) {
         let mut outer_loans = Vec::new();
         let mut param_loans = Vec::new();
@@ -777,8 +780,11 @@ fn caller_lt_req_for_ty<'s>(
         .filter(|&&lt| sig_has_lifetime(sig, src, lt))
         .map(|&lt| lt.to_owned())
         .collect();
-    let req = (in_lts.saw_static || !caller_named.is_empty()).then(|| {
-        let elems = match *sig.body.ty(ty_id) {
+    let req = (in_lts.saw_static || !caller_named.is_empty()).then(|| CallerLtReq {
+        outer_hrtb: outer_elided || outer_named_hrtb.is_some(),
+        requires_static: in_lts.saw_static,
+        named_lts: caller_named,
+        elems: match *sig.body.ty(ty_id) {
             AstTy::Tuple(list) => sig
                 .body
                 .list(list)
@@ -786,13 +792,7 @@ fn caller_lt_req_for_ty<'s>(
                 .map(|&t| caller_lt_req_for_ty(sig, src, TyId(t)).2)
                 .collect(),
             _ => Vec::new(),
-        };
-        CallerLtReq {
-            outer_hrtb: outer_elided || outer_named_hrtb.is_some(),
-            requires_static: in_lts.saw_static,
-            named_lts: caller_named,
-            elems,
-        }
+        },
     });
     (in_lts, outer_named_hrtb, req)
 }

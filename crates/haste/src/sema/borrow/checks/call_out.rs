@@ -1,7 +1,7 @@
 use anyhow::Result;
 
 use crate::body::sig::{GenericKind, Signature};
-use crate::body::{Expr, ExprId, Ty as AstTy, TyId};
+use crate::body::{Args, Body, Bound, Expr, ExprId, GenericArg, Ty as AstTy, TyId};
 use crate::outline::source::Source;
 use crate::sema::ty::{Kind, Mut, Ty};
 
@@ -159,20 +159,33 @@ impl Checker<'_, '_> {
         dst_arg: ExprId,
         arg_unwrapped: ExprId,
     ) -> Option<CallOutDst> {
-        let mut place = match *self.body.expr(arg_unwrapped) {
+        let (mut place, pointee_ty) = match *self.body.expr(arg_unwrapped) {
             Expr::Ref {
                 mutable: true,
                 raw: false,
                 expr: inner,
-            } => self.root_place(inner)?,
+            } => {
+                let p = self.root_place(inner)?;
+                let ety = self.expr_ty(inner);
+                let pty = if ety != Ty::NONE {
+                    ety
+                } else {
+                    self.local_ty(p.local)
+                };
+                (p, pty)
+            }
             _ if self.is_mut_ref_ty(self.expr_ty(dst_arg)) => {
+                let ety = self.expr_ty(dst_arg);
                 let mut p = self.root_place(arg_unwrapped)?;
-                self.apply_deref_steps(dst_arg, self.expr_ty(dst_arg), 1, &mut p);
-                p
+                let pty = match *self.cx.types.kind(ety) {
+                    Kind::Ref(_, pointee) => pointee,
+                    _ => self.local_ty(p.local),
+                };
+                self.apply_deref_steps(dst_arg, ety, 1, &mut p);
+                (p, pty)
             }
             _ => return None,
         };
-        let dst_ty = self.local_ty(place.local);
         let inner_inv = collect_ast_invariant_lifetimes(
             self.cx,
             fn_item,
@@ -181,11 +194,11 @@ impl Checker<'_, '_> {
             dst_ast,
             Some(self.expr_ty(dst_arg)),
         );
-        if self.ty_holds_borrow(dst_ty)
-            || self.ty_has_borrow_interior_mut(dst_ty)
+        if self.ty_holds_borrow(pointee_ty)
+            || self.ty_has_borrow_interior_mut(pointee_ty)
             || !inner_inv.is_empty()
         {
-            if self.is_mut_ptr_ty(dst_ty) {
+            if self.is_mut_ptr_ty(pointee_ty) {
                 place.through_ref = true;
             }
             Some(CallOutDst::Place {
@@ -300,6 +313,23 @@ impl Checker<'_, '_> {
         let match_ty = match dst {
             CallOutDst::Place { match_ty, .. } | CallOutDst::Value { match_ty, .. } => *match_ty,
         };
+        if let (AstTy::Tuple(ptys), Expr::Tuple(aexprs)) = (
+            *sig.body.ty(src_ast),
+            *self.body.expr(self.unwrap_parens(src_id)),
+        ) && ptys.len == aexprs.len
+        {
+            let pairs: Vec<(u32, u32)> = sig
+                .body
+                .list(ptys)
+                .iter()
+                .copied()
+                .zip(self.body.list(aexprs).iter().copied())
+                .collect();
+            for (pt, ae) in pairs {
+                self.check_call_out_pair(sig, fn_src, dst, (ExprId(ae), TyId(pt), None), state)?;
+            }
+            return Ok(());
+        }
         if !self.sig_params_share_lt_or_ty(sig, fn_src, match_ty, src_ast) {
             return Ok(());
         }
@@ -468,11 +498,86 @@ impl Checker<'_, '_> {
         if lts_a.named.iter().any(|n| lts_b.named.contains(n)) {
             return true;
         }
+        let mut b_value_names = Vec::new();
+        collect_non_callable_input_names(&sig.body, src, b, &mut b_value_names);
         sig.generics.iter().any(|g| {
             g.kind == GenericKind::Type && {
                 let name = src.text(g.name);
-                lts_a.names.contains(&name) && lts_b.names.contains(&name)
+                lts_a.names.contains(&name) && b_value_names.contains(&name)
             }
         })
+    }
+}
+
+fn collect_non_callable_input_names<'s>(
+    body: &Body,
+    src: &'s Source,
+    ty: TyId,
+    out: &mut Vec<&'s str>,
+) {
+    match *body.ty(ty) {
+        AstTy::Ref { ty: inner, .. }
+        | AstTy::Ptr { ty: inner, .. }
+        | AstTy::Slice(inner)
+        | AstTy::Array(inner, _)
+        | AstTy::Paren(inner)
+        | AstTy::Pat(inner, _) => collect_non_callable_input_names(body, src, inner, out),
+        AstTy::Tuple(list) => {
+            for &t in body.list(list) {
+                collect_non_callable_input_names(body, src, TyId(t), out);
+            }
+        }
+        AstTy::Path(path) => {
+            let p = body.path(path);
+            let segs = body.list(p.segments);
+            if let Some(&first) = segs.first() {
+                let name = src.text(body.segments[first as usize].name);
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+            for &seg_id in segs {
+                collect_seg_non_callable_names(body, src, body.segments[seg_id as usize].args, out);
+            }
+        }
+        AstTy::ImplTrait(_, list) | AstTy::DynTrait(list) => {
+            for &b_id in body.list(list) {
+                if let Bound::Trait { path, .. } = body.bounds[b_id as usize] {
+                    for &seg_id in body.list(body.path(path).segments) {
+                        collect_seg_non_callable_names(
+                            body,
+                            src,
+                            body.segments[seg_id as usize].args,
+                            out,
+                        );
+                    }
+                }
+            }
+        }
+        AstTy::Fn { ret: Some(r), .. } => collect_non_callable_input_names(body, src, r, out),
+        _ => {}
+    }
+}
+
+fn collect_seg_non_callable_names<'s>(
+    body: &Body,
+    src: &'s Source,
+    args: Option<Args>,
+    out: &mut Vec<&'s str>,
+) {
+    match args {
+        Some(Args::Angle(list)) => {
+            for &arg_id in body.list(list) {
+                if let GenericArg::Ty(t) | GenericArg::Binding { ty: t, .. } =
+                    body.args[arg_id as usize]
+                {
+                    collect_non_callable_input_names(body, src, t, out);
+                }
+            }
+        }
+        Some(Args::Paren {
+            output: Some(o), ..
+        }) => collect_non_callable_input_names(body, src, o, out),
+        _ => {}
     }
 }

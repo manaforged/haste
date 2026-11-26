@@ -698,7 +698,6 @@ impl Infer<'_, '_> {
                 st.depth.unwrap_or_else(|| u32::from(self.sig.is_unsafe))
             };
             st.depth = Some(match *self.body.expr(expr) {
-                Expr::Closure { .. } => 0,
                 Expr::Block { kind, .. } => match kind {
                     BlockKind::Unsafe => base + 1,
                     BlockKind::Const | BlockKind::Async | BlockKind::AsyncMove => 0,

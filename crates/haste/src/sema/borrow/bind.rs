@@ -338,7 +338,15 @@ impl Checker<'_, '_> {
             elem_tuple: tuple_fallback.as_ref(),
             ..target
         };
-        self.bind_positional_pat(&pat_ids, elem_exprs.as_deref(), pos_target, state, ctx)
+        let ctor_pat = (is_ctor && elem_exprs.is_none()).then_some(pat);
+        self.bind_positional_pat(
+            &pat_ids,
+            elem_exprs.as_deref(),
+            ctor_pat,
+            pos_target,
+            state,
+            ctx,
+        )
     }
 
     fn bind_pat_slice(
@@ -556,6 +564,7 @@ impl Checker<'_, '_> {
         &mut self,
         pat_ids: &[u32],
         elem_exprs: Option<&[u32]>,
+        ctor_pat: Option<PatId>,
         target: PatTarget<'_>,
         state: &mut State,
         ctx: PatCtx,
@@ -590,7 +599,15 @@ impl Checker<'_, '_> {
             };
             let elem_ts = elem_tuples.and_then(|es| tuple_idx.and_then(|ti| es.get(ti)));
             let mut split_sources = Vec::new();
-            let fallback_sources = if let Some(ts) = elem_ts {
+            let static_field = ctor_pat.is_some_and(|cp| {
+                !saw_rest
+                    && target
+                        .init
+                        .is_some_and(|s| self.scrut_variant_field_is_static(cp, s, idx))
+            });
+            let fallback_sources = if static_field {
+                &[][..]
+            } else if let Some(ts) = elem_ts {
                 ts.flatten_into(&mut split_sources);
                 split_sources.as_slice()
             } else {

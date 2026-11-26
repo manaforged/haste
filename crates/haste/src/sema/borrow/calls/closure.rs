@@ -12,7 +12,7 @@ use super::super::{Checker, Loan, State};
 
 pub(in super::super) struct ActiveClosure {
     pub(in super::super) params: Vec<u32>,
-    pub(in super::super) ret_params: Vec<usize>,
+    pub(in super::super) ret_params: Vec<(usize, bool)>,
     pub(in super::super) ret_real: HashSet<u32>,
     pub(in super::super) ret_orig: HashSet<u32>,
 }
@@ -256,7 +256,7 @@ impl Checker<'_, '_> {
                             .get(*i)
                             .is_some_and(|bs| inner_caps.iter().any(|c| bs.contains(c)))
                 })
-                .map(|(i, _)| i)
+                .map(|(i, _)| (i, false))
                 .collect();
             (params, None)
         } else if let Some(a) = active {

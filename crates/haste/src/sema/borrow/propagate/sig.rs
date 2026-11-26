@@ -392,6 +392,16 @@ impl<'a> Checker<'_, 'a> {
             && arg_ids.first().is_some_and(|&a| {
                 self.closure_copies_inner_ref(ExprId(a)) || self.closure_peels_outer_ref(ExprId(a))
             });
+        if flags.is_opt_fn
+            && flags.fn_name == "take"
+            && self
+                .typed
+                .adjusts
+                .get(&call_expr)
+                .is_some_and(|a| a.derefs > 0)
+        {
+            return self.guard_take_recv_sources(call_expr, recv, recv_sources, state);
+        }
         let owns_dyn_only =
             recv_is_by_ref(sig) && ret_ty != Ty::NONE && !self.ty_holds_non_dyn_borrow(ret_ty);
         if ((flags.is_iter_fn || flags.is_opt_fn) && matches!(flags.fn_name, "copied" | "cloned"))
@@ -406,16 +416,6 @@ impl<'a> Checker<'_, 'a> {
                 state,
                 flags.is_opt_fn || flags.is_owned_copy_fn || owns_dyn_only,
             );
-        }
-        if flags.is_opt_fn
-            && flags.fn_name == "take"
-            && self
-                .typed
-                .adjusts
-                .get(&call_expr)
-                .is_some_and(|a| a.derefs > 0)
-        {
-            return self.guard_take_recv_sources(call_expr, recv, recv_sources, state);
         }
         let mut closure_arg = |idx: usize| {
             arg_ids

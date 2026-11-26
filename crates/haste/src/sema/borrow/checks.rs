@@ -33,6 +33,7 @@ pub(in crate::sema) use types::is_copy_ty;
 pub(super) use variance::VarianceMeta;
 pub(super) use variance_ast::{
     ContraLifetimes, VarianceLifetimes, collect_ast_invariant_lifetimes, collect_ast_variance,
+    resolve_ast_type_path,
 };
 
 fn trait_has_static_supertrait(
