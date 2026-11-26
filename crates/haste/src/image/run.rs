@@ -283,6 +283,7 @@ pub(crate) fn fork_child(child: impl FnOnce() -> i32) -> Result<libc::pid_t> {
         bail!("fork failed: {}", std::io::Error::last_os_error());
     }
     if pid == 0 {
+        super::statics::reset_after_fork();
         #[cfg(target_os = "linux")]
         // SAFETY: PR_SET_DUMPABLE with 0 only clears this child's dumpable flag, so a crash dumps no core of the whole compiler.
         unsafe {
