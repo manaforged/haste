@@ -276,8 +276,8 @@ pub(super) fn check(
     } else {
         (false, Vec::new())
     };
-    let param_lts = calls::compute_param_lifetimes(cx, item, sig, src, typed, n);
-    let static_type_params = checks::compute_static_type_params(cx, item, sig, src);
+    let (static_type_params, static_names) = checks::compute_static_type_params(cx, item, sig, src);
+    let param_lts = calls::compute_param_lifetimes(cx, item, sig, src, typed, (n, &static_names));
     let mut checker = Checker {
         cx,
         item,

@@ -252,11 +252,13 @@ impl Checker<'_, '_> {
         let base_ty = self.expr_ty(base);
         let sources = self.expr_borrow_sources_inner(base, state, false, None);
         if !sources.is_empty()
+            && self.is_static_field_read(expr, base)
             && sources.iter().all(|s| {
                 self.from_caller(s.target, s.through_ref)
                     || (self.is_closure_param(s.target) && s.through_ref)
+                    || (super::checks::is_temp_target(s.target).is_none()
+                        && state.loans.iter().all(|l| l.holder != Some(s.target)))
             })
-            && self.is_static_field_read(expr, base)
         {
             return Vec::new();
         }
@@ -603,7 +605,7 @@ impl Checker<'_, '_> {
     }
 
     pub(super) fn place_to_sources(
-        &self,
+        &mut self,
         p: &super::places::Place,
         mutable: bool,
         state: &State,
@@ -616,19 +618,40 @@ impl Checker<'_, '_> {
             .loans
             .iter()
             .filter(|l| l.holder == Some(local))
+            .cloned()
             .collect();
+        let steps = &p.steps;
+        let tail_steps = match steps.first() {
+            Some(PlaceStep::Deref) => &steps[1..],
+            _ => steps,
+        };
         if p.reborrows_shared_field {
+            if existing.is_empty() && self.is_closure_param(local) {
+                return vec![BorrowSource {
+                    target: local,
+                    steps: steps.to_vec(),
+                    mutable,
+                    through_ref: true,
+                    env_only: false,
+                    origin_only: false,
+                }];
+            }
             return dedup_sources(
                 existing
-                    .into_iter()
-                    .map(|l| BorrowSource {
-                        mutable: mutable && l.mutable,
-                        ..BorrowSource::from_loan(l)
+                    .iter()
+                    .map(|l| {
+                        if self.is_closure_param(l.target) {
+                            self.combine_closure_loan_source(local, l, steps, tail_steps, mutable)
+                        } else {
+                            BorrowSource {
+                                mutable: mutable && l.mutable,
+                                ..BorrowSource::from_loan(l)
+                            }
+                        }
                     })
                     .collect(),
             );
         }
-        let steps = &p.steps;
         if !p.through_ref {
             let mut out = vec![BorrowSource {
                 target: local,
@@ -638,7 +661,7 @@ impl Checker<'_, '_> {
                 env_only: false,
                 origin_only: false,
             }];
-            for l in existing {
+            for l in &existing {
                 out.push(BorrowSource {
                     mutable: mutable && l.mutable,
                     ..BorrowSource::from_loan(l)
@@ -647,13 +670,13 @@ impl Checker<'_, '_> {
             return dedup_sources(out);
         }
         if !existing.is_empty() {
-            let tail_steps = match steps.first() {
-                Some(PlaceStep::Deref) => &steps[1..],
-                _ => steps,
-            };
             let mut out = Vec::new();
-            for l in existing {
-                if steps_conflict(&l.steps, tail_steps)
+            for l in &existing {
+                if self.is_closure_param(l.target) {
+                    out.push(
+                        self.combine_closure_loan_source(local, l, steps, tail_steps, mutable),
+                    );
+                } else if steps_conflict(&l.steps, tail_steps)
                     || tail_steps.is_empty()
                     || l.steps.is_empty()
                 {

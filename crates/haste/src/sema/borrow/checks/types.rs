@@ -1,15 +1,17 @@
 use rustc_hash::FxHashSet as HashSet;
 
-use crate::body::sig::GenericKind;
-use crate::body::{BlockKind, Expr, ExprId, Stmt};
-use crate::names::ItemRef;
+use crate::body::sig::{GenericKind, Signature};
+use crate::body::{Args, BlockKind, Bound, Expr, ExprId, GenericArg, Stmt, Ty as AstTy, TyId};
+use crate::names::{ItemRef, plain};
 use crate::outline::item::ItemKind;
+use crate::outline::source::Source;
 use crate::sema::Context;
 use crate::sema::impls::ImplRef;
 use crate::sema::infer::{By, Res, Typed};
 use crate::sema::ty::{Kind, Mut, Ty};
 
 use super::super::Checker;
+use super::super::places::{FieldKey, PlaceStep};
 
 /// Whether `ty` is `Copy` in `item`, resolving closures declared inside `typed` directly and defaulting conservatively to `false`.
 pub(in crate::sema) fn is_copy_ty(
@@ -50,70 +52,6 @@ pub(in crate::sema) fn is_copy_ty(
         }
         _ => super::super::super::infer::is_copy(cx, item, ty).unwrap_or(false),
     }
-}
-
-/// Returns the `Kind::Param` indices of type parameters explicitly bounded by `'static` on `item` or its enclosing impl/trait.
-pub(in super::super) fn compute_static_type_params(
-    cx: &mut Context<'_>,
-    item: ItemRef,
-    sig: &crate::body::sig::Signature,
-    src: &crate::outline::source::Source,
-) -> Vec<u16> {
-    let has_static = |body: &crate::body::Body,
-                      s: &crate::outline::source::Source,
-                      generics: &[crate::body::sig::Generic],
-                      preds: &[crate::body::sig::Predicate],
-                      name: &str| {
-        crate::sema::infer::scope::named_bounds(body, s, (generics, preds), name)
-            .into_iter()
-            .any(|b| {
-                matches!(body.bounds[b as usize], crate::body::Bound::Lifetime(lt) if s.text(lt) == "'static")
-            })
-    };
-    let mut out = Vec::new();
-    let mut idx = 0u16;
-    if let Some(impl_ref) = cx.owner_impl(item) {
-        if let Ok(header) = cx.impl_header(impl_ref) {
-            let impl_src = &cx.impl_file(impl_ref).source;
-            for g in crate::sema::infer::scope::type_params(&header.generics) {
-                let name = impl_src.text(g.name);
-                if has_static(
-                    &header.body,
-                    impl_src,
-                    &header.generics,
-                    &header.predicates,
-                    name,
-                ) || has_static(&sig.body, src, &sig.generics, &sig.predicates, name)
-                {
-                    out.push(idx);
-                }
-                idx += 1;
-            }
-        }
-    } else if let Some(trait_ref) = cx.owner_trait(item) {
-        idx += 1;
-        if let Ok(tg) = cx.trait_generics(trait_ref) {
-            let (tbody, tgen) = &*tg;
-            let tsrc = &cx.file(trait_ref).source;
-            for g in crate::sema::infer::scope::type_params(&tgen.params) {
-                let name = tsrc.text(g.name);
-                if has_static(tbody, tsrc, &tgen.params, &tgen.predicates, name)
-                    || has_static(&sig.body, src, &sig.generics, &sig.predicates, name)
-                {
-                    out.push(idx);
-                }
-                idx += 1;
-            }
-        }
-    }
-    for g in crate::sema::infer::scope::type_params(&sig.generics) {
-        let name = src.text(g.name);
-        if has_static(&sig.body, src, &sig.generics, &sig.predicates, name) {
-            out.push(idx);
-        }
-        idx += 1;
-    }
-    out
 }
 
 impl Checker<'_, '_> {
@@ -565,4 +503,213 @@ impl Checker<'_, '_> {
         let (src, entry) = self.cx.item(item);
         (entry.start..entry.name.unwrap_or(entry.start)).any(|t| src.text(t) == "const")
     }
+
+    pub(in super::super) fn ty_holds_mut_ref(&mut self, ty: Ty) -> bool {
+        let mut seen = HashSet::default();
+        self.ty_holds_mut_ref_inner(ty, &mut seen)
+    }
+
+    fn ty_holds_mut_ref_inner(&mut self, ty: Ty, seen: &mut HashSet<Ty>) -> bool {
+        if ty == Ty::NONE || !seen.insert(ty) {
+            return false;
+        }
+        match self.cx.types.kind(ty).clone() {
+            Kind::Ref(Mut::Mut, _) => true,
+            Kind::Ref(Mut::Not, inner)
+            | Kind::Slice(inner)
+            | Kind::Array(inner, _)
+            | Kind::Pat(inner, ..) => self.ty_holds_mut_ref_inner(inner, seen),
+            Kind::Tuple(items) | Kind::Adt(_, items) => {
+                let items = self.cx.types.substs(items).to_vec();
+                items
+                    .into_iter()
+                    .any(|item| self.ty_holds_mut_ref_inner(item, seen))
+            }
+            _ => false,
+        }
+    }
+
+    pub(in super::super) fn closure_param_loan_flags(
+        &mut self,
+        target_ty: Ty,
+        steps: &[PlaceStep],
+    ) -> (bool, bool) {
+        let mut cur = target_ty;
+        let (mut crossed_outer, mut outer_shared, mut blocked, mut crossed_inner_shared) =
+            (false, false, false, false);
+        for step in steps {
+            if cur == Ty::NONE {
+                break;
+            }
+            cur = if matches!(step, PlaceStep::Deref) {
+                self.advance_deref_flags(
+                    cur,
+                    &mut crossed_outer,
+                    &mut outer_shared,
+                    &mut blocked,
+                    &mut crossed_inner_shared,
+                )
+            } else {
+                self.step_place_ty(cur, step)
+            };
+        }
+        let all_derefs = !steps.is_empty() && steps.iter().all(|s| matches!(s, PlaceStep::Deref));
+        let inner_shared_ref = target_ty != Ty::NONE
+            && matches!(
+                *self.cx.types.kind(target_ty),
+                Kind::Ref(_, inner) if matches!(*self.cx.types.kind(inner), Kind::Ref(Mut::Not, _))
+            );
+        (
+            crossed_inner_shared || (all_derefs && inner_shared_ref),
+            crossed_inner_shared,
+        )
+    }
+
+    fn advance_deref_flags(
+        &self,
+        cur: Ty,
+        crossed_outer: &mut bool,
+        outer_shared: &mut bool,
+        blocked: &mut bool,
+        crossed_inner_shared: &mut bool,
+    ) -> Ty {
+        match *self.cx.types.kind(cur) {
+            Kind::Ref(m, inner) => {
+                if !*crossed_outer {
+                    *crossed_outer = true;
+                    *outer_shared = m == Mut::Not;
+                } else if m == Mut::Mut && *outer_shared {
+                    *blocked = true;
+                } else if m == Mut::Not && !*blocked {
+                    *crossed_inner_shared = true;
+                }
+                inner
+            }
+            Kind::Ptr(_, inner) => inner,
+            _ => self.cx.boxed(cur).unwrap_or(Ty::NONE),
+        }
+    }
+
+    pub(in super::super) fn step_place_ty(&mut self, cur: Ty, step: &PlaceStep) -> Ty {
+        match (self.cx.types.kind(cur).clone(), step) {
+            (Kind::Tuple(items), PlaceStep::Field(FieldKey::Tuple(idx))) => self
+                .cx
+                .types
+                .substs(items)
+                .get(*idx as usize)
+                .copied()
+                .unwrap_or(Ty::NONE),
+            (Kind::Adt(item, args), PlaceStep::Field(key)) => {
+                let Ok(def) = self.cx.adt_def(item) else {
+                    return Ty::NONE;
+                };
+                if def.variants.len() != 1 {
+                    return Ty::NONE;
+                }
+                let adt_src = &self.cx.file(item).source;
+                let fidx = match key {
+                    FieldKey::Tuple(idx) => Some(*idx as usize),
+                    FieldKey::Named(name) => def.variants[0]
+                        .fields
+                        .iter()
+                        .position(|f| f.name.is_some_and(|n| plain(adt_src.text(n)) == *name)),
+                };
+                let Some(idx) = fidx else { return Ty::NONE };
+                let svec = self.cx.types.substs(args).to_vec();
+                super::super::super::infer::detached(self.cx, item, |infer| {
+                    infer.adt_fields(item, &svec)
+                })
+                .ok()
+                .and_then(|all| all.first().and_then(|fs| fs.get(idx).copied()))
+                .unwrap_or(Ty::NONE)
+            }
+            (Kind::Slice(elem) | Kind::Array(elem, _), PlaceStep::SliceElem { .. }) => elem,
+            (_, PlaceStep::SliceSub { .. }) => cur,
+            _ => Ty::NONE,
+        }
+    }
+}
+
+pub(in super::super) fn has_nested_hrtb_ref(
+    sig: &Signature,
+    src: &Source,
+    mut ty_id: TyId,
+) -> bool {
+    while let AstTy::Paren(inner) = *sig.body.ty(ty_id) {
+        ty_id = inner;
+    }
+    let check_ty = match *sig.body.ty(ty_id) {
+        AstTy::Ref { ty, .. } => ty,
+        _ => ty_id,
+    };
+    ast_ty_has_hrtb_ref(sig, src, check_ty)
+}
+
+fn ast_ty_has_hrtb_ref(sig: &Signature, src: &Source, ty_id: TyId) -> bool {
+    match *sig.body.ty(ty_id) {
+        AstTy::Ref {
+            lifetime,
+            ty: inner,
+            ..
+        } => {
+            let is_hrtb = match lifetime {
+                None => true,
+                Some(lt) => {
+                    let name = src.text(lt);
+                    name != "'static"
+                        && !sig
+                            .generics
+                            .iter()
+                            .any(|g| g.kind == GenericKind::Lifetime && src.text(g.name) == name)
+                }
+            };
+            is_hrtb || ast_ty_has_hrtb_ref(sig, src, inner)
+        }
+        AstTy::Paren(t)
+        | AstTy::Slice(t)
+        | AstTy::Array(t, _)
+        | AstTy::Ptr { ty: t, .. }
+        | AstTy::Pat(t, _) => ast_ty_has_hrtb_ref(sig, src, t),
+        AstTy::Tuple(list) => sig
+            .body
+            .list(list)
+            .iter()
+            .any(|&t| ast_ty_has_hrtb_ref(sig, src, TyId(t))),
+        AstTy::Path(path) => path_has_hrtb_ref(sig, src, path),
+        AstTy::ImplTrait(_, list) | AstTy::DynTrait(list) => sig.body.list(list).iter().any(|&b| {
+            matches!(sig.body.bounds[b as usize], Bound::Trait { path, .. }
+                    if path_has_hrtb_ref(sig, src, path))
+        }),
+        AstTy::Fn { params, ret, .. } => {
+            sig.body
+                .list(params)
+                .iter()
+                .any(|&t| ast_ty_has_hrtb_ref(sig, src, TyId(t)))
+                || ret.is_some_and(|r| ast_ty_has_hrtb_ref(sig, src, r))
+        }
+        _ => false,
+    }
+}
+
+fn path_has_hrtb_ref(sig: &Signature, src: &Source, path: crate::body::PathId) -> bool {
+    sig.body
+        .list(sig.body.path(path).segments)
+        .iter()
+        .any(|&seg| match sig.body.segments[seg as usize].args {
+            Some(Args::Angle(args)) => sig.body.list(args).iter().any(|&a| {
+                matches!(
+                    sig.body.args[a as usize],
+                    GenericArg::Ty(t) | GenericArg::Binding { ty: t, .. }
+                        if ast_ty_has_hrtb_ref(sig, src, t)
+                )
+            }),
+            Some(Args::Paren { inputs, output }) => {
+                sig.body
+                    .list(inputs)
+                    .iter()
+                    .any(|&t| ast_ty_has_hrtb_ref(sig, src, TyId(t)))
+                    || output.is_some_and(|o| ast_ty_has_hrtb_ref(sig, src, o))
+            }
+            _ => false,
+        })
 }

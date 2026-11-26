@@ -3,10 +3,14 @@ pub(super) mod closure;
 mod types;
 
 use anyhow::Result;
-use rustc_hash::FxHashSet as HashSet;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use crate::body::{Expr, ExprId, List, Pat, PatId, UnOp};
+use crate::body::sig::{Generic, Predicate, Signature};
+use crate::body::{Body, Bound, Expr, ExprId, List, Pat, PatId, UnOp};
+use crate::names::ItemRef;
 use crate::outline::item::ItemKind;
+use crate::outline::source::Source;
+use crate::sema::Context;
 use crate::sema::infer::Res;
 use crate::sema::ty::{Kind, Ty};
 
@@ -18,8 +22,174 @@ use super::{Checker, PartialMove, State, is_temp_holder, loan_conflicts_borrow, 
 pub(super) const TEMP_TARGET_BASE: u32 = u32::MAX - 262_144;
 
 pub(super) use closure::ClosureEffects;
-pub(super) use types::compute_static_type_params;
 pub(in crate::sema) use types::is_copy_ty;
+
+fn trait_has_static_supertrait(
+    cx: &mut Context<'_>,
+    tr: ItemRef,
+    seen: &mut HashSet<ItemRef>,
+    cache: &mut HashMap<ItemRef, bool>,
+) -> bool {
+    if let Some(&cached) = cache.get(&tr) {
+        return cached;
+    }
+    if !seen.insert(tr) {
+        return false;
+    }
+    let Ok(tg) = cx.trait_generics(tr) else {
+        return false;
+    };
+    let (tbody, tgen) = (&tg.0, &tg.1);
+    let tsrc = &cx.file(tr).source;
+    let supers = tbody.list(tgen.supers);
+    if supers.iter().any(
+        |&b| matches!(tbody.bounds[b as usize], Bound::Lifetime(lt) if tsrc.text(lt) == "'static"),
+    ) {
+        cache.insert(tr, true);
+        return true;
+    }
+    let Ok(thome) = cx.module_of(tr) else {
+        return false;
+    };
+    let sub_traits = super::super::infer::detached(cx, tr, |infer| {
+        Ok(supers
+            .iter()
+            .filter_map(|&b| infer.bound_trait_at(tbody, b, thome).map(|(sub, _)| sub))
+            .collect::<Vec<_>>())
+    })
+    .unwrap_or_default();
+    let hit = sub_traits
+        .into_iter()
+        .any(|sub| trait_has_static_supertrait(cx, sub, seen, cache));
+    if hit {
+        cache.insert(tr, true);
+    }
+    hit
+}
+
+fn param_bounds_static(
+    cx: &mut Context<'_>,
+    scope: (ItemRef, &Body, &Source),
+    (generics, preds): (&[Generic], &[Predicate]),
+    name: &str,
+    cache: &mut HashMap<ItemRef, bool>,
+) -> bool {
+    let (home_item, body, src) = scope;
+    let bounds = crate::sema::infer::scope::named_bounds(body, src, (generics, preds), name);
+    if bounds.iter().any(
+        |&b| matches!(body.bounds[b as usize], Bound::Lifetime(lt) if src.text(lt) == "'static"),
+    ) {
+        return true;
+    }
+    let trait_bounds: Vec<u32> = bounds
+        .into_iter()
+        .filter(|&b| matches!(body.bounds[b as usize], Bound::Trait { maybe: false, .. }))
+        .collect();
+    if trait_bounds.is_empty() {
+        return false;
+    }
+    let Ok(home) = cx.module_of(home_item) else {
+        return false;
+    };
+    let traits = super::super::infer::detached(cx, home_item, |infer| {
+        Ok(trait_bounds
+            .into_iter()
+            .filter_map(|b| infer.bound_trait_at(body, b, home).map(|(tr, _)| tr))
+            .collect::<Vec<_>>())
+    })
+    .unwrap_or_default();
+    traits
+        .into_iter()
+        .any(|tr| trait_has_static_supertrait(cx, tr, &mut HashSet::default(), cache))
+}
+
+/// Returns `(static_param_indices, sig_static_param_names)` for type parameters bounded by `'static` directly or via supertraits.
+pub(super) fn compute_static_type_params(
+    cx: &mut Context<'_>,
+    item: ItemRef,
+    sig: &Signature,
+    src: &Source,
+) -> (Vec<u16>, Vec<String>) {
+    let mut cache = HashMap::default();
+    let mut out = Vec::new();
+    let mut sig_names = Vec::new();
+    let mut idx = 0u16;
+    if let Some(impl_ref) = cx.owner_impl(item) {
+        if let Ok(header) = cx.impl_header(impl_ref) {
+            let impl_src = &cx.impl_file(impl_ref).source;
+            for g in crate::sema::infer::scope::type_params(&header.generics) {
+                let name = impl_src.text(g.name);
+                if param_bounds_static(
+                    cx,
+                    (item, &header.body, impl_src),
+                    (&header.generics, &header.predicates),
+                    name,
+                    &mut cache,
+                ) || param_bounds_static(
+                    cx,
+                    (item, &sig.body, src),
+                    (&sig.generics, &sig.predicates),
+                    name,
+                    &mut cache,
+                ) {
+                    out.push(idx);
+                }
+                idx += 1;
+            }
+        }
+    } else if let Some(trait_ref) = cx.owner_trait(item) {
+        if trait_has_static_supertrait(cx, trait_ref, &mut HashSet::default(), &mut cache)
+            || param_bounds_static(
+                cx,
+                (item, &sig.body, src),
+                (&sig.generics, &sig.predicates),
+                "Self",
+                &mut cache,
+            )
+        {
+            out.push(idx);
+        }
+        idx += 1;
+        if let Ok(tg) = cx.trait_generics(trait_ref) {
+            let (tbody, tgen) = &*tg;
+            let tsrc = &cx.file(trait_ref).source;
+            for g in crate::sema::infer::scope::type_params(&tgen.params) {
+                let name = tsrc.text(g.name);
+                if param_bounds_static(
+                    cx,
+                    (trait_ref, tbody, tsrc),
+                    (&tgen.params, &tgen.predicates),
+                    name,
+                    &mut cache,
+                ) || param_bounds_static(
+                    cx,
+                    (item, &sig.body, src),
+                    (&sig.generics, &sig.predicates),
+                    name,
+                    &mut cache,
+                ) {
+                    out.push(idx);
+                }
+                idx += 1;
+            }
+        }
+    }
+    for g in crate::sema::infer::scope::type_params(&sig.generics) {
+        let name = src.text(g.name);
+        if param_bounds_static(
+            cx,
+            (item, &sig.body, src),
+            (&sig.generics, &sig.predicates),
+            name,
+            &mut cache,
+        ) {
+            out.push(idx);
+            sig_names.push(name.to_owned());
+        }
+        idx += 1;
+    }
+    (out, sig_names)
+}
 
 pub(super) fn is_temp_target(target: u32) -> Option<u32> {
     (target >= TEMP_TARGET_BASE && target < super::ITER_HOLDER_BASE)

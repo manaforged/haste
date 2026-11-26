@@ -10,9 +10,8 @@ use super::super::calls::{
     Lifetimes, collect_ty_lifetimes, receiver_has_any_named, recv_is_by_ref, recv_ref_mut,
     sig_returns_only_static, ty_shares_name,
 };
-use super::super::checks;
 use super::super::{Checker, State};
-use super::{BorrowSource, dedup_sources, state_holds_other_target, unwrap_container_loans};
+use super::{BorrowSource, dedup_sources, unwrap_container_loans};
 
 pub(super) struct SigCall<'a, 'b> {
     pub(super) expr: ExprId,
@@ -290,7 +289,10 @@ impl<'a> Checker<'_, 'a> {
                             .and_then(|b| self.cx.impl_trait(b))
                     })
                     .is_some_and(|tr| self.item_in_std_mod(tr, "clone")))
-                || (fn_name == "to_vec" && self.item_in_std_mod(fn_item, "slice")));
+                || (fn_name == "to_vec" && self.item_in_std_mod(fn_item, "slice"))
+                || sig
+                    .ret
+                    .is_some_and(|ret| self.sig_returns_type_param(fn_item, sig, ret)));
         let is_by_ref = is_iter_fn && fn_name == "by_ref";
         SigFnFlags {
             fn_name,
@@ -386,16 +388,19 @@ impl<'a> Checker<'_, 'a> {
             && arg_ids.first().is_some_and(|&a| {
                 self.closure_copies_inner_ref(ExprId(a)) || self.closure_peels_outer_ref(ExprId(a))
             });
+        let owns_dyn_only =
+            recv_is_by_ref(sig) && ret_ty != Ty::NONE && !self.ty_holds_non_dyn_borrow(ret_ty);
         if ((flags.is_iter_fn || flags.is_opt_fn) && matches!(flags.fn_name, "copied" | "cloned"))
             || flags.is_owned_copy_fn
             || maps_inner_copy
+            || owns_dyn_only
         {
             return self.copied_recv_sources(
                 call_expr,
                 recv,
                 recv_sources,
                 state,
-                flags.is_opt_fn || flags.is_owned_copy_fn,
+                flags.is_opt_fn || flags.is_owned_copy_fn || owns_dyn_only,
             );
         }
         if flags.is_opt_fn
@@ -573,91 +578,48 @@ impl<'a> Checker<'_, 'a> {
         state: &State,
         unwrap: bool,
     ) -> Vec<BorrowSource> {
-        let mut cur = recv;
-        loop {
-            match *self.body.expr(cur) {
-                Expr::Paren(inner)
-                | Expr::Method {
-                    receiver: inner, ..
-                } => cur = inner,
-                _ => break,
-            }
+        if unwrap && self.expr_is_any_downcast(recv, state) {
+            return Vec::new();
         }
-        let root = (!matches!(*self.body.expr(cur), Expr::Ref { .. }))
-            .then(|| self.root_place(cur).map(|p| p.local))
-            .flatten();
-        let indirect = root.is_some_and(|r| {
-            let r_ty = self.local_ty(r);
-            cur == recv || self.is_ref_ty(r_ty) || self.ty_holds_closure(r_ty)
-        });
+        let (root, indirect) = self.copied_recv_root(call_expr, recv);
         let call_ty = self.expr_ty(call_expr);
         let call_owned = !self.ty_holds_non_dyn_borrow(call_ty);
+        let static_field = unwrap
+            && !self.is_ref_ty(call_ty)
+            && call_owned
+            && self.recv_is_static_field_read(recv);
         let targets: Vec<u32> = recv_sources.iter().map(|s| s.target).collect();
         let mut container_targets = Vec::new();
         for s in &recv_sources {
-            let held_by_other = state_holds_other_target(&targets, s.target, state);
-            let is_container =
-                if self.is_non_static_param(s.target) || self.is_closure_param(s.target) {
-                    if held_by_other {
-                        false
-                    } else {
-                        let target_ty = self.local_ty(s.target);
-                        let pointee = if target_ty != Ty::NONE {
-                            match *self.cx.types.kind(target_ty) {
-                                Kind::Ref(_, pointee) => Some(pointee),
-                                _ => None,
-                            }
-                        } else {
-                            None
-                        };
-                        pointee.is_some_and(|p| {
-                            (!unwrap && self.ty_is_borrow_free(p))
-                                || (((unwrap && !self.is_ref_ty(call_ty)) || call_owned)
-                                    && !self.ty_holds_non_dyn_borrow(p))
-                        }) || self.can_unwrap_inner_static_param(s, call_ty, false)
-                    }
-                } else if checks::is_temp_target(s.target).is_some() || Some(s.target) == root {
-                    true
-                } else if let Some(r) = root.filter(|_| indirect) {
-                    state
-                        .loans
-                        .iter()
-                        .any(|l| l.holder == Some(r) && l.target == s.target)
-                        && self.ty_holds_borrow(self.local_ty(s.target))
-                        && !held_by_other
-                } else {
-                    false
-                };
-            if is_container {
+            if (static_field && Some(s.target) == root)
+                || self.is_copied_container_target(
+                    s,
+                    (call_ty, call_owned, unwrap),
+                    (root, indirect, &targets),
+                    state,
+                )
+            {
                 container_targets.push(s.target);
             }
         }
         if unwrap {
-            let mut out = unwrap_container_loans(recv_sources, state, |s| {
+            let out = unwrap_container_loans(recv_sources, state, |s| {
                 container_targets.contains(&s.target)
             });
-            let call_depth = self.ty_max_ref_depth(call_ty);
-            for s in &mut out {
-                if Some(s.target) == root && self.is_param_local(s.target) {
-                    let target_ty = self.local_ty(s.target);
-                    if target_ty == Ty::NONE {
-                        continue;
-                    }
-                    let inner = match *self.cx.types.kind(target_ty) {
-                        Kind::Ref(_, pointee) => pointee,
-                        _ => target_ty,
-                    };
-                    if call_depth <= self.ty_max_ref_depth(inner) && self.ty_holds_borrow(inner) {
-                        s.origin_only = true;
-                        s.mutable = false;
-                    }
-                }
-            }
-            out
+            let recv_is_mut_ref = self.is_mut_ref_ty(self.expr_ty(recv));
+            self.finish_unwrapped_copied_sources(call_ty, recv_is_mut_ref, root, out, state)
         } else {
+            let call_depth = self.ty_max_ref_depth(call_ty);
             for s in &mut recv_sources {
                 if container_targets.contains(&s.target) {
                     s.env_only = true;
+                    if self.is_param_local(s.target)
+                        && self.param_inner_is_static(s.target)
+                        && let Kind::Ref(_, pointee) = *self.cx.types.kind(self.local_ty(s.target))
+                        && call_depth <= self.ty_max_ref_depth(pointee)
+                    {
+                        s.origin_only = true;
+                    }
                 }
             }
             recv_sources
