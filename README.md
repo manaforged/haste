@@ -52,7 +52,7 @@ haste serve stop haste-demo
 
 ### Live hot-reload
 
-Run `haste run --watch <path>` on a long-running Unix process (such as a loop or server). When you save a file, `haste` recompiles only the affected functions and patches them in memory on their next call.
+Run `haste run --watch <path>` on a long-running Unix process (such as a loop or server). When you save a file, `haste` recompiles only the affected functions and patches them in memory on their next call. On a local TCP handler (macOS ARM64), save-to-first-changed-response measured `85.3 ms` on a body edit; a compile error keeps serving the previous code and recovers in `135.3 ms` once fixed, while a structural edit keeps serving and prints a restart-required notice.
 
 ### Zero-linker cross-compilation
 
@@ -86,6 +86,8 @@ Resident-daemon edits (`--daemon`) compare a warm background `haste serve` proce
 | Unchanged no-op (`haste build -o` vs `cargo build`) | Linux x86-64 (`rustc 1.99.1`) | 0.7 ms | 7.1 ms | 11.0x |
 | Warm cache (`haste build` vs `cargo check`) | Linux x86-64 (`rustc 1.99.1`) | 113 ms | 202 ms | 1.8x |
 | Warm cache (`haste build -o` vs `cargo build`) | Linux x86-64 (`rustc 1.99.1`) | 345 ms | 506 ms | 1.5x |
+
+On a larger real workspace (`340` crates, `45` build scripts, `17,521` functions, macOS ARM64, 6 CPUs): cold check from an empty `HASTE_HOME` completed in `18.7 s` (`159 MiB` shared cache, `+6–18 MiB` per additional workspace) versus `34.6 s` for cold `cargo check --workspace -j 6`; leaf edits took `22.3 ms` median (`22.1–37.3 ms`) with `--daemon` versus `1.95 s` (`1.85–2.39 s`) for `cargo check` and `2.35 s` (`2.33–2.49 s`) for one-shot `haste build`.
 
 ### AOT codegen runtime (`haste --release` vs `rustc`, baseline-subtracted median of 5, warmed)
 
@@ -192,6 +194,7 @@ Before running or emitting code, `haste` type-checks and borrow-checks the full 
 | `HASTE_HOME` | `$XDG_CACHE_HOME/haste`, else `~/.cache/haste` (`%LOCALAPPDATA%\haste` on Windows) | Cache directory for stdlib index, substrates, `build.rs` outputs, and daemon registry. |
 | `HASTE_LIBRARY` | Active `rustc --print sysroot` `rust-src` library, else newest `rustup` toolchain with `rust-src` | Explicit path to the Rust standard library `library/` directory. |
 | `HASTE_NO_DAEMON` | Unset (`0`) | Set to `1` to bypass running `haste serve` daemons. |
+| `HASTE_SERVE_IDLE_SECS` | `900` (15 min) | Idle timeout in seconds before a background `haste serve` daemon exits. |
 | `HASTE_NO_NOOP` | Unset (`0`) | Set to `1` to disable the unchanged-workspace skip check on one-shot `haste build`. |
 | `HASTE_X64_BASELINE` | Unset (`0`) | Set to `1` on x86-64 to disable host CPU feature detection beyond baseline SSE2. |
 | `HASTE_FN_ALIGN` | `16` (loop-free) / `64` (with loops) | Uniform function alignment override in bytes (power of two, `>= 16`) for AOT binaries. |

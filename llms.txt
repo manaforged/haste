@@ -8,8 +8,9 @@
 
 ## Key Capabilities
 
-- Incremental edit checks: `8.4–9.0 ms` with `haste build --daemon` on Unix (`6.2x–7.4x` faster than one-shot `cargo check`); unchanged no-ops in `0.7–2.3 ms`.
-- In-memory execution & tests (Unix): `haste run`, `haste test` (including `#[tokio::test]`), and `haste run --watch` (live function hot-reload).
+- Incremental edit checks: `8.4–9.0 ms` on small crates and `22.3 ms` median on a 340-crate workspace with `haste build --daemon` on Unix (`900 s` default idle timeout); unchanged no-ops in `0.7–2.3 ms`.
+- In-memory execution & tests (Unix): `haste run`, `haste test` (including `#[tokio::test]` and pre-lowering test filtering), and `haste run --watch` (live function hot-reload, `85.3 ms` save-to-first-changed-response on a local TCP handler).
+- Shared cache footprint: `159 MiB` isolated `HASTE_HOME` after a cold 340-crate check (`+6–18 MiB` per additional workspace), with no per-project `target/` directory.
 - Zero-linker AOT & cross-compilation: `haste --release build --target <TRIPLE> -o <OUT>` for Linux/macOS/Windows x86-64 and ARM64.
 - Embeddable Rust library API: `haste::Compiler` / `CompilerBuilder`.
 
