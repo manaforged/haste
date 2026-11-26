@@ -463,8 +463,8 @@ fn read_file(
     let path = read_path(cur)?;
     let (text, tokens) = match cur.u8()? {
         1 => {
-            let text_len = cur.count()?;
-            let tok_count = cur.count()?;
+            let text_len = cur.u32()? as usize;
+            let tok_count = cur.u32()? as usize;
             let disk = Arc::new(DiskSource::new(path.clone(), text_len, tok_count));
             (
                 SourceText::disk(Arc::clone(&disk)),
@@ -477,7 +477,7 @@ fn read_file(
             cur.take(text_len)?;
             let text_end = file_off + cur.pos;
             let text = SourceText::mapped_trusted(Arc::clone(backing), text_start, text_end)?;
-            let tok_count = cur.count()?;
+            let tok_count = cur.u32()? as usize;
             let tok_bytes = cur.count()?;
             let tok_start = file_off + cur.pos;
             cur.take(tok_bytes)?;
