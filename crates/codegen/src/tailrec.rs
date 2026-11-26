@@ -299,22 +299,9 @@ fn clone_pure_insts(
 ) -> bool {
     for &inst in insts {
         let mut data = func.insts[inst.index()].clone();
-        if matches!(
-            data.op,
-            Op::Call { .. }
-                | Op::TryCall { .. }
-                | Op::Store(..)
-                | Op::StackStore(..)
-                | Op::Copy(..)
-                | Op::Move(..)
-                | Op::AtomicLoad(..)
-                | Op::AtomicStore(..)
-                | Op::AtomicRmw(..)
-                | Op::AtomicCas(..)
-                | Op::Fence(..)
-                | Op::Trap
-                | Op::Trapz(..)
-        ) {
+        if crate::mem::is_atomic_barrier(&data.op)
+            || matches!(data.op, Op::Call { .. } | Op::TryCall { .. } | Op::Store(..) | Op::StackStore(..) | Op::Copy(..) | Op::Move(..) | Op::Trap | Op::Trapz(..))
+        {
             return false;
         }
         let mut ok = true;
@@ -559,8 +546,8 @@ fn static_values(func: &Function) -> Vec<bool> {
     vals.into_iter().map(|v| v != StaticVal::Dynamic).collect()
 }
 
-fn fusable_cmp_flags(func: &Function) -> Vec<bool> {
-    let (uses, mut out) = (func.use_counts(), vec![false; func.types.len()]);
+fn fusable_cmp_flags(func: &Function, uses: &[u32]) -> Vec<bool> {
+    let mut out = vec![false; func.types.len()];
     for block in &func.blocks {
         let Some(&last) = block.insts.last() else { continue };
         let (Op::Brif(cond, ..) | Op::Trapz(cond)) = func.insts[last.index()].op else { continue };
@@ -765,7 +752,14 @@ fn split_innermost_loops(func: &mut Function, target: &crate::Target) -> Domain 
     if loop_budget == 0 { return Domain::NONE; }
     let has_call = func.blocks.iter().any(|b| (0..b.insts.len()).any(|i| is_call_site(func, &b.insts, i)));
     if func.coroutine.is_some() || func.entry.is_none() || func.blocks.len() < 2 || !has_call { return Domain::NONE; }
-    let (static_vals, def_blocks, fusable) = (static_values(func), func.def_blocks(), fusable_cmp_flags(func));
+    let uses = func.use_counts();
+    let (mut static_vals, def_blocks, fusable) = (static_values(func), func.def_blocks(), fusable_cmp_flags(func, &uses));
+    if target.arch == crate::Arch::X64 {
+        let defs = crate::fold::defs(func);
+        for (s, a) in static_vals.iter_mut().zip(crate::alloc::atomic_elidable_addrs(func, &defs, &uses)) {
+            *s |= a;
+        }
+    }
     let excluded: Vec<bool> = static_vals.iter().zip(&fusable).map(|(&s, &f)| s || f).collect();
     let plans: Vec<(Loop, Vec<Block>, Vec<usize>)> = {
         let cfg = func.cfg();

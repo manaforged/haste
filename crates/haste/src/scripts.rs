@@ -286,6 +286,7 @@ fn run(workspace: &Workspace, targets: &Targets, units: &[usize], dag: &ScriptDa
     let (entries, store) = image::entries(&mut compilation, (crate::sema::Cache::default(), &mains))?;
     let mut demand = Jit::new(store)?;
     demand.set_fast(true);
+    demand.set_ahead(false);
     let mut unit_set = HashSet::default();
     for &(unit, _) in &scripts {
         unit_set.insert(unit);

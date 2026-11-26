@@ -188,7 +188,7 @@ impl PairKind {
 }
 
 #[derive(Clone, Copy)]
-struct LastMem { end_pos: u32, binds: u32, kind: PairKind, reg: u8, base: Reg, disp: i32 }
+struct LastMem { end_pos: u32, binds: u32, pair: Option<PairKind>, base_op: u32, is_int: bool, reg: u8, base: Reg, disp: i32 }
 
 #[derive(Default)]
 pub(crate) struct Asm {
@@ -199,6 +199,7 @@ pub(crate) struct Asm {
     binds: u32,
     last_mem: Option<LastMem>,
     last_anchor: Option<(u32, Reg, i64)>,
+    last_imm: Option<(u32, Reg, i64)>,
 }
 
 fn sized(base: u32, size: Size) -> u32 {
@@ -210,34 +211,20 @@ impl Asm {
 
     pub fn word(&mut self, word: u32) { self.code.extend(word.to_le_bytes()); }
 
-    pub(super) fn clear_anchor(&mut self) { self.last_anchor = None; }
+    pub(super) fn clear_anchor(&mut self) { self.last_anchor = None; self.last_imm = None; }
 
     pub(super) fn clobber_anchor(&mut self, reg: Reg) {
-        if reg == Reg(17) || self.last_anchor.is_some_and(|(_, base, _)| base == reg) {
-            self.last_anchor = None;
-        }
+        if reg == Reg(17) || self.last_anchor.is_some_and(|(_, base, _)| base == reg) { self.last_anchor = None; }
+        if self.last_imm.is_some_and(|(_, r, _)| r == reg) { self.last_imm = None; }
     }
 
-    pub(in crate::arm64) fn emit_gp(&mut self, dst: Reg, word: u32) {
-        self.clobber_anchor(dst);
-        self.word(word);
-    }
+    pub(in crate::arm64) fn emit_gp(&mut self, dst: Reg, word: u32) { self.clobber_anchor(dst); self.word(word); }
 
-    fn clear_word(&mut self, word: u32) {
-        self.clear_anchor();
-        self.word(word);
-    }
+    fn clear_word(&mut self, word: u32) { self.clear_anchor(); self.word(word); }
 
-    pub fn label(&mut self) -> Label {
-        self.labels.push(None);
-        Label(self.labels.len() - 1)
-    }
+    pub fn label(&mut self) -> Label { self.labels.push(None); Label(self.labels.len() - 1) }
 
-    pub fn bind(&mut self, label: Label) {
-        self.labels[label.0] = Some(self.pos());
-        self.binds = self.binds.wrapping_add(1);
-        self.clear_anchor();
-    }
+    pub fn bind(&mut self, label: Label) { self.labels[label.0] = Some(self.pos()); self.binds = self.binds.wrapping_add(1); self.clear_anchor(); }
 
     fn jump(&mut self, word: u32, label: Label, kind: Fixup) {
         self.fixups.push((self.pos(), label.0, kind));
@@ -398,6 +385,19 @@ impl Asm {
 
     /// `dst = a +/- imm` for `imm < 4096` or a multiple of 4096 below 2^24, where `a` or `dst` may be the stack pointer; sets the flags when `flags`.
     pub fn add_imm(&mut self, sub: bool, flags: bool, size: Size, dst: Reg, a: Reg, imm: u32) {
+        if !flags && size == Size::X && dst == a && dst != SP && imm != 0
+            && let Some(prev) = self.last_mem
+            && prev.end_pos == self.pos() && prev.binds == self.binds && prev.disp == 0 && prev.base == dst
+            && (!prev.is_int || prev.reg != dst.0)
+        {
+            let delta = if sub { -i64::from(imm) } else { i64::from(imm) };
+            if (-256..=255).contains(&delta) {
+                self.code.truncate((prev.end_pos - 4) as usize);
+                self.last_mem = None;
+                self.emit_gp(dst, prev.base_op | ((delta as u32) & 0x1FF) << 12 | 1 << 10 | u32::from(dst.0) << 5 | u32::from(prev.reg));
+                return;
+            }
+        }
         let (imm, shifted) = if imm >= 4096 { (imm >> 12, 1) } else { (imm, 0) };
         let base = 0x9100_0000 | u32::from(sub) << 30 | u32::from(flags) << 29 | shifted << 22;
         self.emit_gp(dst, sized(base, size) | (imm & 0xFFF) << 10 | u32::from(a.0) << 5 | u32::from(dst.0));
@@ -472,23 +472,26 @@ impl Asm {
     }
 
     pub fn mov_imm(&mut self, dst: Reg, imm: i64) {
+        if dst != ZR && self.last_imm == Some((self.binds, dst, imm)) { return; }
         self.clobber_anchor(dst);
         let value = imm as u64;
         let (ones, zeros) = Self::half_counts(value);
-        if self.try_emit_bitmask_imm(dst, value, ones, zeros) { return; }
-        let (inverted, skip, mut first) = (ones > zeros, if ones > zeros { 0xFFFF } else { 0 }, true);
-        for half in 0..4 {
-            let bits = (value >> (16 * half)) as u16;
-            if bits == skip && !(first && half == 3) { continue; }
-            let shift = (half as u32) << 21;
-            let word = match (first, inverted) {
-                (true, true) => 0x9280_0000 | shift | u32::from(!bits) << 5,
-                (true, false) => 0xD280_0000 | shift | u32::from(bits) << 5,
-                (false, _) => Self::MOVK | shift | u32::from(bits) << 5,
-            };
-            self.word(word | u32::from(dst.0));
-            first = false;
+        if !self.try_emit_bitmask_imm(dst, value, ones, zeros) {
+            let (inverted, skip, mut first) = (ones > zeros, if ones > zeros { 0xFFFF } else { 0 }, true);
+            for half in 0..4 {
+                let bits = (value >> (16 * half)) as u16;
+                if bits == skip && !(first && half == 3) { continue; }
+                let shift = (half as u32) << 21;
+                let word = match (first, inverted) {
+                    (true, true) => 0x9280_0000 | shift | u32::from(!bits) << 5,
+                    (true, false) => 0xD280_0000 | shift | u32::from(bits) << 5,
+                    (false, _) => Self::MOVK | shift | u32::from(bits) << 5,
+                };
+                self.word(word | u32::from(dst.0));
+                first = false;
+            }
         }
+        if dst != ZR { self.last_imm = Some((self.binds, dst, imm)); }
     }
 
     pub fn mov_symbol(&mut self, dst: Reg) -> u32 {
@@ -590,7 +593,7 @@ impl Asm {
     }
 
     fn pair_match(prev: LastMem, (kind, reg): (PairKind, u8), mem: Mem, (pos, binds): (u32, u32)) -> Option<(u8, u8, i32)> {
-        if prev.end_pos != pos || prev.binds != binds || prev.kind != kind || prev.base != mem.base {
+        if prev.end_pos != pos || prev.binds != binds || prev.pair != Some(kind) || prev.base != mem.base {
             return None;
         }
         let step = kind.step();
@@ -637,7 +640,7 @@ impl Asm {
         Mem::new(Reg(17), rem as i32)
     }
 
-    fn access_pair(&mut self, pair: Option<(PairKind, u8)>, base: u32, scale: u32, rt: u32, mem: Mem) {
+    fn access_pair(&mut self, pair: Option<(PairKind, u8)>, is_int: bool, base: u32, scale: u32, rt: u32, mem: Mem) {
         let mem = self.anchor_mem(scale, mem);
         if let Some((kind, reg)) = pair
             && let Some(prev) = self.last_mem
@@ -653,19 +656,21 @@ impl Asm {
             return;
         }
         let single = self.access(base, scale, rt, mem);
-        self.last_mem = pair.filter(|_| single).map(|(kind, reg)| LastMem { end_pos: self.pos(), binds: self.binds, kind, reg, base: mem.base, disp: mem.disp });
+        self.last_mem = single.then(|| LastMem {
+            end_pos: self.pos(), binds: self.binds, pair: pair.map(|(k, _)| k), base_op: base, is_int, reg: rt as u8, base: mem.base, disp: mem.disp,
+        });
     }
 
     /// Loads `size` bytes at `mem` into `dst`, sign-extending to 64 bits when `signed`, else zero-extending.
     pub fn load(&mut self, size: Size, signed: bool, dst: Reg, mem: Mem) {
         let pair = (!signed && matches!(size, Size::W | Size::X)).then_some((PairKind::IntLoad(size), dst.0));
-        self.access_pair(pair, Self::load_base(size, signed), size.log2(), u32::from(dst.0), mem);
+        self.access_pair(pair, true, Self::load_base(size, signed), size.log2(), u32::from(dst.0), mem);
         self.clobber_anchor(dst);
     }
 
     pub fn store(&mut self, size: Size, mem: Mem, src: Reg) {
         let pair = matches!(size, Size::W | Size::X).then_some((PairKind::IntStore(size), src.0));
-        self.access_pair(pair, Self::store_base(size), size.log2(), u32::from(src.0), mem);
+        self.access_pair(pair, true, Self::store_base(size), size.log2(), u32::from(src.0), mem);
     }
 
     fn vpair(bytes: u32, reg: u8, load: bool) -> Option<(PairKind, u8)> {
@@ -676,12 +681,12 @@ impl Asm {
     /// Loads a float or vector register of `bytes` 4, 8 or 16.
     pub fn vload(&mut self, bytes: u32, dst: Vreg, mem: Mem) {
         let (base, scale) = Self::vbase(bytes);
-        self.access_pair(Self::vpair(bytes, dst.0, true), base | 0x40_0000, scale, u32::from(dst.0), mem);
+        self.access_pair(Self::vpair(bytes, dst.0, true), false, base | 0x40_0000, scale, u32::from(dst.0), mem);
     }
 
     pub fn vstore(&mut self, bytes: u32, mem: Mem, src: Vreg) {
         let (base, scale) = Self::vbase(bytes);
-        self.access_pair(Self::vpair(bytes, src.0, false), base, scale, u32::from(src.0), mem);
+        self.access_pair(Self::vpair(bytes, src.0, false), false, base, scale, u32::from(src.0), mem);
     }
 
     /// Loads `size` bytes at `base + (index << shift)` into `dst`.
@@ -748,8 +753,9 @@ impl Asm {
     }
 
     pub fn fstp_offset(&mut self, a: Vreg, b: Vreg, base: Reg, offset: i32) { self.pair_offset(0x6D00_0000, 8, a.0, b.0, base, offset); }
-
     pub fn fldp_offset(&mut self, a: Vreg, b: Vreg, base: Reg, offset: i32) { self.pair_offset(0x6D40_0000, 8, a.0, b.0, base, offset); }
+    pub(super) fn qstp_offset(&mut self, a: Vreg, b: Vreg, base: Reg, offset: i32) { self.pair_offset(0xAD00_0000, 16, a.0, b.0, base, offset); }
+    pub(super) fn qldp_offset(&mut self, a: Vreg, b: Vreg, base: Reg, offset: i32) { self.pair_offset(0xAD40_0000, 16, a.0, b.0, base, offset); }
 
     pub fn stp_pre(&mut self, a: Reg, b: Reg, base: Reg, offset: i32) {
         self.word(0xA980_0000 | (((offset / 8) as u32) & 0x7F) << 15 | u32::from(b.0) << 10 | u32::from(base.0) << 5 | u32::from(a.0));

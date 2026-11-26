@@ -1,6 +1,7 @@
 use crate::cfg::Cfg;
-use crate::ir::{ArgumentPurpose, Binary, Block, Convert, Function, Inst, Op, StackSlot, Value};
-use crate::mem::{MemLoc, MemRoot, Provenance, clobbers, may_alias};
+use crate::ir::{ArgumentPurpose, AtomicOrd, AtomicRmwOp, Binary, Block, Convert, Function, Inst, Op, StackSlot, Type, Value};
+use crate::mem::{KnownLoads, MemBase, MemLoc, MemRoot, Provenance, clobbers, may_alias};
+use crate::merge::find as find_val;
 
 /// A place in the function: a block and a position in it.
 type Site = (Block, usize);
@@ -253,4 +254,204 @@ fn drop_unread_moves(func: &mut Function, prov: &Provenance) -> bool {
 pub(super) fn forward_moves(func: &mut Function, prov: &Provenance) -> bool {
     let forwarded = forward_moved_loads(func, prov);
     forwarded | drop_unread_moves(func, prov)
+}
+
+fn op_keeps_alloc_private(op: &Op, addr: Value, subst: &[Value]) -> bool {
+    let mut used = false;
+    op.for_operands(|v| used |= find_val(subst, v) == addr);
+    if !used {
+        return true;
+    }
+    match *op {
+        Op::Load(a, _) => find_val(subst, a) == addr,
+        Op::Store(v, a, _) => find_val(subst, a) == addr && find_val(subst, v) != addr,
+        Op::Move(dst, src, _) => find_val(subst, dst) == addr && find_val(subst, src) != addr,
+        Op::Icmp(..) | Op::Trapz(_) => true,
+        Op::Brif(_, _, ref ta, _, ref ea) => !ta.iter().chain(ea).any(|&v| find_val(subst, v) == addr),
+        _ => false,
+    }
+}
+
+fn scan_fresh_alloc(func: &Function, insts: impl Iterator<Item = Inst>, subst: &[Value], addr: Value) -> Option<bool> {
+    for inst in insts {
+        let op = &func.insts[inst.index()].op;
+        if let Op::Call { callee, results, .. } = op
+            && func.is_fresh_alloc(*callee)
+            && results.first().is_some_and(|&r| find_val(subst, r) == addr)
+        {
+            return Some(true);
+        }
+        if !op_keeps_alloc_private(op, addr, subst) {
+            return Some(false);
+        }
+    }
+    None
+}
+
+fn is_unescaped_fresh_alloc(func: &Function, cfg: &Cfg, block: Block, kept: &[Option<Inst>], subst: &[Value], addr: Value) -> bool {
+    if let Some(found) = scan_fresh_alloc(func, kept.iter().rev().flatten().copied(), subst, addr) {
+        return found;
+    }
+    let mut cur = block;
+    for _ in 0..4 {
+        let Some(pred) = cfg.single_pred(cur) else { return false };
+        if pred == block {
+            return false;
+        }
+        if let Some(found) = scan_fresh_alloc(func, func.blocks[pred.index()].insts.iter().rev().copied(), subst, addr) {
+            return found;
+        }
+        cur = pred;
+    }
+    false
+}
+
+/// Folds a `Relaxed` `Add` RMW on a freshly allocated, unescaped heap pointer whose previous constant value is known into a plain constant store.
+pub(super) fn try_fold_private_rmw(
+    func: &mut Function,
+    (cfg, prov, block, inst): (&Cfg, &Provenance, Block, Inst),
+    (consts, subst): (&mut Vec<Option<i64>>, &mut Vec<Value>),
+    (known, kept): (&mut KnownLoads, &mut Vec<Option<Inst>>),
+) -> Option<(MemLoc, Type, Value)> {
+    let (Op::AtomicRmw(AtomicRmwOp::Add, AtomicOrd::Relaxed, raw_addr, raw_delta), Some(res)) =
+        (func.insts[inst.index()].op.clone(), func.insts[inst.index()].result)
+    else {
+        return None;
+    };
+    let addr = find_val(subst, raw_addr);
+    let delta = find_val(subst, raw_delta);
+    let ty = func.ty(res);
+    if !ty.is_small_int() {
+        return None;
+    }
+    let d = consts.get(delta.index()).copied().flatten()?;
+    let loc = prov.loc(addr, 0, ty.bytes());
+    let prev_val = known.get(loc.base, 0, ty)?;
+    let prev = consts.get(find_val(subst, prev_val).index()).copied().flatten()?;
+    if !is_unescaped_fresh_alloc(func, cfg, block, kept, subst, addr) {
+        return None;
+    }
+    let prev_ext = crate::fold::extend(prev, ty, false);
+    let next_ext = crate::fold::extend(prev.wrapping_add(d), ty, false);
+    func.insts[inst.index()].op = Op::Const(prev_ext);
+    consts[res.index()] = Some(prev_ext);
+    kept.push(Some(inst));
+    let c_new = func.value(ty);
+    subst.push(c_new);
+    consts.push(Some(next_ext));
+    kept.push(Some(func.add(Op::Const(next_ext), Some(c_new))));
+    kept.push(Some(func.add(Op::Store(c_new, addr, 0), None)));
+    known.write(loc, ty, c_new, prov);
+    Some((loc, ty, c_new))
+}
+
+fn slot_op_sealed(func: &Function, prov: &Provenance, inst: Inst, other: Inst, slot: StackSlot) -> bool {
+    if other == inst {
+        return true;
+    }
+    let data = &func.insts[other.index()];
+    let stays = |v: Value| data.result.is_some_and(|r| slot_of(prov, r) == Some(slot) && slot_of(prov, v) == Some(slot));
+    let mut ok = true;
+    data.op.for_operands(|v| {
+        if slot_of(prov, v) != Some(slot) {
+            return;
+        }
+        ok &= match &data.op {
+            Op::Load(..) | Op::Icmp(..) => true,
+            Op::Store(stored, ..) => *stored != v,
+            Op::Binary(Binary::Iadd | Binary::Isub, ..) | Op::Convert(Convert::Bitcast, _) => stays(v),
+            _ => false,
+        };
+    });
+    ok
+}
+
+fn slot_writes_covered(func: &Function, cfg: &Cfg, prov: &Provenance, (block, inst): (Block, Inst), slot: StackSlot, entries: &[(i64, Type, Value)]) -> bool {
+    let pred = cfg.single_pred(block);
+    let covered = |off: i64, size: u32| -> bool {
+        let Some(end) = off.checked_add(i64::from(size)) else { return false };
+        (off..end).all(|b| entries.iter().any(|&(eo, et, _)| eo <= b && eo.checked_add(i64::from(et.bytes())).is_some_and(|ee| b < ee)))
+    };
+    for (bi, bdata) in func.blocks.iter().enumerate() {
+        let cur = Block(bi as u32);
+        let in_cur = cur == block;
+        let allowed_block = in_cur || pred == Some(cur);
+        let mut past_inst = false;
+        for &other in &bdata.insts {
+            if !slot_op_sealed(func, prov, inst, other, slot) {
+                return false;
+            }
+            if in_cur && other == inst {
+                past_inst = true;
+                continue;
+            }
+            let op = &func.insts[other.index()].op;
+            let write = match *op {
+                Op::StackStore(v, s, off) if s == slot => Some((i64::from(off), func.ty(v).bytes())),
+                Op::Store(v, a, off) => {
+                    let l = prov.loc(a, i64::from(off), func.ty(v).bytes());
+                    (l.root == MemRoot::Slot(slot)).then_some((l.offset, l.size))
+                }
+                _ => None,
+            };
+            if let Some((off, size)) = write
+                && (!allowed_block || (in_cur && past_inst) || !covered(off, size))
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Replaces a whole-slot `Move` into a fresh heap allocation with direct scalar stores for every initialized field of the slot, dropping copies of uninitialized padding.
+pub(super) fn try_scalarize_slot_move(
+    func: &mut Function,
+    (cfg, prov, block, inst): (&Cfg, &Provenance, Block, Inst),
+    (dst, src, bytes): (Value, Value, u32),
+    subst: &[Value],
+    known: &mut KnownLoads,
+) -> Option<Vec<(MemLoc, Inst)>> {
+    if bytes == 0 {
+        return None;
+    }
+    let dst = find_val(subst, dst);
+    let src = find_val(subst, src);
+    let src_loc = prov.loc(src, 0, bytes);
+    let dst_loc = prov.loc(dst, 0, bytes);
+    let MemRoot::Slot(slot) = src_loc.root else { return None };
+    if src_loc.offset != 0
+        || func.slots[slot.index()].size != bytes
+        || !matches!(dst_loc.root, MemRoot::UniqueHeap(_))
+        || may_alias(dst_loc, src_loc, prov)
+    {
+        return None;
+    }
+    let mut entries: Vec<(i64, Type, Value)> = known
+        .entries_for(MemBase::Slot(slot))
+        .iter()
+        .copied()
+        .filter(|&(off, ty, _)| off >= 0 && off.checked_add(i64::from(ty.bytes())).is_some_and(|e| e <= i64::from(bytes)))
+        .collect();
+    let move_ops = 2 * crate::copy::vec_words(bytes).len();
+    if entries.is_empty() || entries.len() > 8 || entries.len() >= move_ops {
+        return None;
+    }
+    entries.sort_by_key(|&(off, ..)| off);
+    if entries.iter().any(|&(off, ty, _)| i32::try_from(off).is_err() || !super::fits_mem_imm(ty, off)) {
+        return None;
+    }
+    if !slot_writes_covered(func, cfg, prov, (block, inst), slot, &entries) {
+        return None;
+    }
+    func.insts[inst.index()].op = Op::Trap;
+    let mut emitted = Vec::with_capacity(entries.len());
+    for (off, ty, raw_val) in entries {
+        let val = find_val(subst, raw_val);
+        let store = func.add(Op::Store(val, dst, off as i32), None);
+        let wloc = prov.loc(dst, off, ty.bytes());
+        known.write(wloc, ty, val, prov);
+        emitted.push((wloc, store));
+    }
+    Some(emitted)
 }

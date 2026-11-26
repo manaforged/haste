@@ -385,6 +385,10 @@ fn hash_shape_kind(cx: &mut Context<'_>, typed: &Typed, bins: &mut HashBins) {
             bins.k.byte(8);
             bins.k.usize(calls.len());
         }
+        Shape::GlobalAlloc(shim) => {
+            bins.k.byte(9);
+            bins.k.byte(shim.op as u8);
+        }
     }
 }
 

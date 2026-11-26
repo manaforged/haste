@@ -255,7 +255,8 @@ fn take_edge_to_pad(op: &mut Op, branch: EdgeArm, pad: Block) -> Vec<Value> {
 fn emit_exit_stores(state: &mut PromoteState<'_>, cand: PromoteCand, exits: Vec<ExitEdge>) {
     for edge in exits {
         let store_op = base_mem_op(cand, Some(edge.val));
-        let single = state.cfg.preds.get(edge.target.index()).is_some_and(|ps| ps.as_slice() == [edge.src])
+        let single = edge.target.index() < state.cfg.reachable.len()
+            && state.cfg.preds_of(edge.target) == [edge.src]
             && state.func.entry != Some(edge.target);
         if single {
             let store_inst = state.func.add(store_op, None);
@@ -271,12 +272,7 @@ fn emit_exit_stores(state: &mut PromoteState<'_>, cand: PromoteCand, exits: Vec<
         state.func.blocks.push(BlockData { params: Vec::new(), insts: vec![store_inst, jump_inst] });
         state.home.resize(state.func.types.len(), None);
         let cfg = Arc::make_mut(&mut *state.cfg);
-        if let Some(ps) = cfg.preds.get_mut(edge.target.index())
-            && let Some(slot) = ps.iter_mut().find(|p| **p == edge.src)
-        {
-            *slot = pad;
-        }
-        cfg.preds.push(vec![edge.src]);
+        cfg.replace_pred_and_add(edge.target, edge.src, pad);
         cfg.reachable.push(true);
         cfg.idom.push(Some(edge.src));
         insert_rpo(&mut cfg.rpo, edge.src, pad, true);
@@ -741,17 +737,8 @@ pub(crate) fn run(func: &mut Function) -> Domain {
             made.push((pre, found.list[idx].head));
             home.resize(func.types.len(), Some(pre));
             let head_idx = found.list[idx].head.index();
-            let mut pre_preds = Vec::new();
             let cfg = Arc::make_mut(&mut cfg);
-            cfg.preds[head_idx].retain(|p| {
-                let inside = is_in_loop(&found.list[idx], *p);
-                if !inside {
-                    pre_preds.push(*p);
-                }
-                inside
-            });
-            cfg.preds[head_idx].push(pre);
-            cfg.preds.push(pre_preds);
+            cfg.split_preds_for_preheader(found.list[idx].head, pre, |p| is_in_loop(&found.list[idx], p));
             cfg.reachable.push(true);
             cfg.idom.push(cfg.idom[head_idx]);
             cfg.idom[head_idx] = Some(pre);

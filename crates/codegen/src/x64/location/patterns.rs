@@ -753,8 +753,8 @@ pub(super) fn mid_preserves_flags(
         Op::Const(_) | Op::StackAddr(..) | Op::FramePointer | Op::Symbol(_) | Op::SlotAddr(_) => res_ok,
         Op::Load(addr, _) => res_ok && !addr_clobbers_flags(func, plan, addr),
         Op::StackLoad(..) => res_ok,
-        Op::Store(val, addr, _) => !func.ty(val).is_vector() && func.ty(val) != Type::I128 && !addr_clobbers_flags(func, plan, addr),
-        Op::StackStore(val, ..) => !func.ty(val).is_vector() && func.ty(val) != Type::I128,
+        Op::Store(val, addr, _) => !plan.elided[val.index()] && !func.ty(val).is_vector() && func.ty(val) != Type::I128 && !addr_clobbers_flags(func, plan, addr),
+        Op::StackStore(val, ..) => !plan.elided[val.index()] && !func.ty(val).is_vector() && func.ty(val) != Type::I128,
         Op::Convert(Convert::Uextend | Convert::Sextend | Convert::Ireduce, src) => {
             res_ok && !func.ty(src).is_vector() && !operand_clobbers_flags(func, plan, defs, src)
         }

@@ -17,22 +17,8 @@ fn order_pair(a: Operand, b: Operand) -> (Operand, Operand) {
 fn is_commutative_binary(op: Binary) -> bool {
     matches!(
         op,
-        Binary::Iadd
-            | Binary::Imul
-            | Binary::Umulhi
-            | Binary::Smulhi
-            | Binary::Smin
-            | Binary::Smax
-            | Binary::Umin
-            | Binary::Umax
-            | Binary::SaddSat
-            | Binary::UaddSat
-            | Binary::AvgRound
-            | Binary::Fmin
-            | Binary::Fmax
-            | Binary::Band
-            | Binary::Bor
-            | Binary::Bxor
+        Binary::Iadd | Binary::Imul | Binary::Umulhi | Binary::Smulhi | Binary::Smin | Binary::Smax | Binary::Umin | Binary::Umax
+            | Binary::SaddSat | Binary::UaddSat | Binary::AvgRound | Binary::Fmin | Binary::Fmax | Binary::Band | Binary::Bor | Binary::Bxor
     )
 }
 
@@ -175,6 +161,7 @@ enum Key {
     StackAddr(StackSlot, i32),
     SlotAddr(u32),
     Symbol(u32),
+    ThreadCell(Operand, Operand, Operand),
 }
 
 fn operand(consts: &[Option<i64>], types: &[Type], subst: &[Value], value: Value) -> Operand {
@@ -282,6 +269,7 @@ struct Table {
     conv_src: Vec<Option<(Convert, Value, Type)>>,
     select_def: Vec<Option<(Value, Value, Value)>>,
     drop_buf: Vec<Key>,
+    const_count: usize,
 }
 
 impl Table {
@@ -527,67 +515,72 @@ impl Table {
 
     /// Drops from `block` every pure instruction a dominating one already computed, recording its replacement in `subst`; true when it dropped or simplified any.
     fn scan(&mut self, func: &mut Function, block: Block, subst: &mut [Value]) -> bool {
-        let insts = std::mem::take(&mut func.blocks[block.index()].insts);
+        let mut insts = std::mem::take(&mut func.blocks[block.index()].insts);
         let mut mutated = false;
-        let kept: Vec<Inst> = insts
-            .into_iter()
-            .filter(|inst| {
-                let data = &func.insts[inst.index()];
-                if matches!(data.op, Op::Call { .. } | Op::TryCall { .. }) {
+        insts.retain(|&inst| {
+            let data = &func.insts[inst.index()];
+            if matches!(data.op, Op::Call { .. } | Op::TryCall { .. }) {
+                if let Op::Call { callee, ref args, ref results, .. } = data.op
+                    && (func.is_thread_cell(callee) || func.is_thread_cell(find(subst, callee)))
+                    && let ([slot, size, init], [result]) = (args.as_slice(), results.as_slice())
+                {
+                    let opnd = |v: Value| operand(&self.consts, &func.types, subst, v);
+                    let tc_key = Key::ThreadCell(opnd(*slot), opnd(*size), opnd(*init));
+                    if let Some(&earlier) = self.known.get(&tc_key) {
+                        subst[result.index()] = earlier;
+                        mutated = true;
+                        return false;
+                    }
+                    let prev = self.known.insert(tc_key, *result);
+                    self.added.push((tc_key, prev));
+                }
+                if self.const_count > 0 {
                     self.drop_buf.clear();
                     self.drop_buf.extend(self.known.keys().copied().filter(|k| matches!(k, Key::Const(..))));
                     for k in self.drop_buf.drain(..) {
                         let prev = self.known.remove(&k);
+                        self.const_count -= usize::from(prev.is_some());
                         self.added.push((k, prev));
                     }
-                    return true;
                 }
-                let Some(result) = data.result else { return true };
-                let Some(norm) = self.normalized_key(&data.op, &func.types, func.ty(result), result, subst) else {
-                    return true;
-                };
-                let key = match norm {
-                    Ok(key) => key,
-                    Err(alias) => {
-                        subst[result.index()] = alias;
-                        mutated = true;
-                        return false;
-                    }
-                };
-                if let Some(&earlier) = self.known.get(&key) {
-                    if self.local_flag_only[result.index()] && self.def_block[earlier.index()] != block_tag(block) {
-                        return true;
-                    }
-                    subst[result.index()] = earlier;
-                    mutated = true;
-                    false
-                } else if let Some(earlier) = self.alt_select(&func.insts[inst.index()].op, &func.types, subst) {
-                    subst[result.index()] = earlier;
-                    mutated = true;
-                    false
-                } else {
-                    if let Op::Select(c, x, y) = func.insts[inst.index()].op {
-                        let (cond, sx, sy, flat) = self.simplify_select(c, x, y, &func.types, result, subst);
-                        if flat {
-                            func.insts[inst.index()].op = Op::Select(cond, sx, sy);
-                            mutated = true;
-                        }
-                    }
-                    let prev = self.known.insert(key, result);
-                    self.added.push((key, prev));
-                    true
+                return true;
+            }
+            let Some(result) = data.result else { return true };
+            let Some(norm) = self.normalized_key(&data.op, &func.types, func.ty(result), result, subst) else { return true };
+            let key = match norm {
+                Ok(key) => key,
+                Err(alias) => { subst[result.index()] = alias; mutated = true; return false; }
+            };
+            if let Some(&earlier) = self.known.get(&key) {
+                if self.local_flag_only[result.index()] && self.def_block[earlier.index()] != block_tag(block) { return true; }
+                subst[result.index()] = earlier;
+                mutated = true;
+                false
+            } else if let Some(earlier) = self.alt_select(&func.insts[inst.index()].op, &func.types, subst) {
+                subst[result.index()] = earlier;
+                mutated = true;
+                false
+            } else {
+                if let Op::Select(c, x, y) = func.insts[inst.index()].op {
+                    let (cond, sx, sy, flat) = self.simplify_select(c, x, y, &func.types, result, subst);
+                    if flat { func.insts[inst.index()].op = Op::Select(cond, sx, sy); mutated = true; }
                 }
-            })
-            .collect();
-        func.blocks[block.index()].insts = kept;
+                let prev = self.known.insert(key, result);
+                self.const_count += usize::from(prev.is_none() && matches!(key, Key::Const(..)));
+                self.added.push((key, prev));
+                true
+            }
+        });
+        func.blocks[block.index()].insts = insts;
         mutated
     }
 
     fn forget(&mut self, mark: usize) {
         for (key, prev) in self.added.drain(mark..).rev() {
+            let is_const = matches!(key, Key::Const(..));
             match prev {
-                Some(v) => { self.known.insert(key, v); }
-                None => { self.known.remove(&key); }
+                Some(v) => self.const_count += usize::from(self.known.insert(key, v).is_none() && is_const),
+                None => self.const_count -= usize::from(self.known.remove(&key).is_some() && is_const),
             }
         }
     }
@@ -608,14 +601,18 @@ pub(crate) fn run(func: &mut Function) -> Domain {
     let mut icmp_def = vec![None; func.types.len()];
     let mut def_block = vec![0_u32; func.types.len()];
     let mut local_flag_only = vec![false; func.types.len()];
-    let uses = func.use_counts();
+    let mut uses = vec![0_u32; func.types.len()];
+    let mut flag_cands: Vec<(Value, u32)> = Vec::new();
+    let mut has_narrow_uext = false;
     for &b in &cfg.rpo {
         let blk = &func.blocks[b.index()];
+        let btag = block_tag(b);
         for &inst in &blk.insts {
             let data = &func.insts[inst.index()];
+            data.op.for_operands(|v| uses[v.index()] += 1);
             if let Some(res) = data.result {
                 let ri = res.index();
-                def_block[ri] = block_tag(b);
+                def_block[ri] = btag;
                 match data.op {
                     Op::Const(imm) if func.ty(res).is_small_int() => {
                         let z = extend(imm, func.ty(res), false);
@@ -631,7 +628,10 @@ pub(crate) fn run(func: &mut Function) -> Domain {
                         }
                     }
                     Op::Fcmp(..) | Op::Fits(..) => bool_val[ri] = true,
-                    Op::Convert(Convert::Uextend, x) if bool_val[x.index()] => bool_val[ri] = true,
+                    Op::Convert(Convert::Uextend, x) => {
+                        if bool_val[x.index()] { bool_val[ri] = true; }
+                        if matches!(func.ty(x), Type::I8 | Type::I16) { has_narrow_uext = true; }
+                    }
                     Op::Binary(Binary::Band, x, y) if bool_val[x.index()] || bool_val[y.index()] => bool_val[ri] = true,
                     Op::Binary(Binary::Bor, x, y) if bool_val[x.index()] && bool_val[y.index()] => bool_val[ri] = true,
                     Op::Binary(Binary::Bxor, x, y) => {
@@ -644,12 +644,13 @@ pub(crate) fn run(func: &mut Function) -> Domain {
                     _ => {}
                 }
             }
-            if let Op::Brif(c, ..) | Op::Trapz(c) | Op::Select(c, ..) = data.op && uses[c.index()] == 1 && def_block[c.index()] == block_tag(b)
-                && blk.insts.iter().find(|&&i| func.insts[i.index()].result == Some(c)).is_some_and(|&c_def| matches!(func.insts[c_def.index()].op, Op::Icmp(..)))
-            {
-                local_flag_only[c.index()] = true;
+            if let Op::Brif(c, ..) | Op::Trapz(c) | Op::Select(c, ..) = data.op && def_block[c.index()] == btag && icmp_def[c.index()].is_some() {
+                flag_cands.push((c, btag));
             }
         }
+    }
+    for (c, _) in flag_cands {
+        if uses[c.index()] == 1 { local_flag_only[c.index()] = true; }
     }
     let affine = identity(func.types.len()).into_iter().map(|v| (v, 0_i64)).collect();
     let nvals = func.types.len();
@@ -670,7 +671,7 @@ pub(crate) fn run(func: &mut Function) -> Domain {
         }
     }
     if dropped { rename(func, &subst); }
-    let changed = narrow_widened_subs(func, &cfg, &table.consts, &table.bool_val);
+    let changed = has_narrow_uext && narrow_widened_subs(func, &cfg, &table.consts, &table.bool_val);
     if dropped || changed { Domain::VALUES } else { Domain::NONE }
 }
 

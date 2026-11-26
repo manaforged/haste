@@ -2,7 +2,7 @@ use super::fuse::{FuseCtx, preserved};
 use super::patterns::{FOLD_LIMIT, SibMatch, odd_scale_source, scaled_op};
 use super::super::asm::Reg;
 use crate::alloc::{Location, Plan};
-use crate::ir::{Convert, Function, Inst, Op, Type, Value};
+use crate::ir::{AtomicRmwOp, Binary, Convert, Function, Inst, IntCC, Op, Type, Value};
 use crate::live::{Sib, SibBase};
 
 pub(super) fn sib_ok(ctx: &FuseCtx<'_>, m: &SibMatch, extra_skips: &[usize], end_pos: usize) -> bool {
@@ -213,7 +213,7 @@ fn eval_uext_group(ctx: &FuseCtx<'_>, core: Value, items: &[(Value, usize, Sib)]
 pub(super) fn apply_sib_groups(
     func: &Function,
     plan: &mut Plan<Reg>,
-    (uses, pos_of, defs): (&[u32], &[Option<(usize, usize, Inst)>], &[Option<Inst>]),
+    (uses, pos_of, defs): (&[u32], &[super::Site], &[Option<Inst>]),
     ls_uses: &[Vec<(usize, usize, i32)>],
 ) {
     for unscaled_only in [true, false] {
@@ -251,50 +251,228 @@ pub(super) fn double(ctx: &FuseCtx<'_>, root: Value, root_pos: usize) -> Option<
     base.then_some(SibMatch { sib: Sib { base: SibBase::Value(x), index: x, shift: 0, disp: i32::try_from(disp).ok()? }, elide, base_start: start, idx_start: start })
 }
 
-/// Elides each `Iadd`/`Isub` by an `i32` constant whose only uses are atomic-operation addresses in its own block, so `atomic_target` folds the displacement directly into the memory operand.
-pub(super) fn fuse_atomic_addrs(func: &Function, plan: &mut Plan<Reg>, (uses, pos_of): (&[u32], &[Option<(usize, usize, Inst)>])) {
-    let mut atomic_uses: Vec<(u32, usize, usize)> = vec![(0, usize::MAX, 0); func.types.len()];
+/// Elides single-use `Load + Alu + Store` (and stack equivalents) to the same address so `Store` emits one memory read-modify-write instruction.
+pub(super) fn fuse_mem_rmw(
+    func: &Function,
+    plan: &mut Plan<Reg>,
+    (uses, pos_of, defs): (&[u32], &[super::Site], &[Option<Inst>]),
+) {
     for (b_idx, block) in func.blocks.iter().enumerate() {
-        for (pos, &inst) in block.insts.iter().enumerate() {
-            let addr = match func.insts[inst.index()].op {
-                Op::AtomicLoad(addr, _) => Some(addr),
-                Op::AtomicStore(val, addr, _) if val != addr => Some(addr),
-                Op::AtomicRmw(_, _, addr, val) if val != addr => Some(addr),
-                Op::AtomicCas(_, addr, exp, rep) if exp != addr && rep != addr => Some(addr),
-                _ => None,
+        for (spos, &sinst) in block.insts.iter().enumerate() {
+            let (val, addr_match): (Value, Option<(Value, i32)>) = match func.insts[sinst.index()].op {
+                Op::Store(v, a, off) => (v, Some((a, off))),
+                Op::StackStore(v, _, _) => (v, None),
+                _ => continue,
             };
-            if let Some(addr) = addr {
-                let entry = &mut atomic_uses[addr.index()];
-                if entry.0 == 0 {
-                    *entry = (1, b_idx, pos);
-                } else if entry.1 == b_idx {
-                    entry.0 += 1;
-                    entry.2 = entry.2.max(pos);
+            let ty = func.ty(val);
+            if !ty.is_small_int() || uses[val.index()] != 1 || plan.elided[val.index()] || plan.fused[val.index()] || plan.sib[val.index()].is_some() {
+                continue;
+            }
+            let Some((rb, rpos, rinst)) = pos_of[val.index()] else { continue };
+            if rb != b_idx || rpos >= spos { continue; }
+            let Op::Binary(op @ (Binary::Iadd | Binary::Isub | Binary::Band | Binary::Bor | Binary::Bxor), a, b) = func.insts[rinst.index()].op else { continue };
+            let matches_load = |v: Value| -> Option<usize> {
+                if uses[v.index()] != 1 || plan.elided[v.index()] || func.ty(v) != ty { return None; }
+                let (lb, lpos, linst) = pos_of[v.index()]?;
+                if lb != b_idx || lpos >= rpos { return None; }
+                let same = match (func.insts[sinst.index()].op.clone(), func.insts[linst.index()].op.clone()) {
+                    (Op::Store(_, sa, so), Op::Load(la, lo)) => sa == la && so == lo,
+                    (Op::StackStore(_, ss, so), Op::StackLoad(ls, lo)) => ss == ls && so == lo,
+                    _ => false,
+                };
+                same.then_some(lpos)
+            };
+            let Some((lpos, load_v, other)) = matches_load(a).map(|lp| (lp, a, b)).or_else(|| (op != Binary::Isub).then(|| matches_load(b).map(|lp| (lp, b, a))).flatten()) else { continue };
+            if block.insts[lpos + 1..spos].iter().any(|&mid| super::fuse::may_barrier_mem(&func.insts[mid.index()].op)) {
+                continue;
+            }
+            if let Some((addr, _)) = addr_match {
+                let addr_ok = if plan.elided[addr.index()] {
+                    plan.sib[addr.index()].is_some_and(|m| {
+                        let base_ok = match m.base {
+                            SibBase::Frame(_) => true,
+                            SibBase::Value(bv) => preserved(func, plan, b_idx, lpos, spos, &[rpos], bv),
+                        };
+                        base_ok && preserved(func, plan, b_idx, lpos, spos, &[rpos], idx_source(func, plan, defs, m.index))
+                    })
                 } else {
-                    entry.0 = u32::MAX;
-                }
+                    preserved(func, plan, b_idx, lpos, spos, &[rpos], addr)
+                };
+                if !addr_ok { continue; }
+            }
+            let imm_ok = plan.const_of(other).is_some_and(|c| ty.bytes() < 8 || i32::try_from(c).is_ok());
+            let reg_ok = !plan.elided[other.index()] && plan.reg_of(other).is_some() && preserved(func, plan, b_idx, rpos, spos, &[], other);
+            if !imm_ok && !reg_ok { continue; }
+            plan.elided[load_v.index()] = true;
+            plan.elided[val.index()] = true;
+        }
+    }
+}
+
+/// Elides single-use variable `Ushr(word, k)` feeding a flag-tested `Band(ushr, 1)` so x64 emits `bt k, word`.
+pub(super) fn fuse_bt_shifts(
+    func: &Function,
+    plan: &mut Plan<Reg>,
+    (uses, pos_of): (&[u32], &[super::Site]),
+    tst_end: &[Option<usize>],
+    pure_test: &[bool],
+) {
+    for (b_idx, block) in func.blocks.iter().enumerate() {
+        for (bpos, &inst) in block.insts.iter().enumerate() {
+            let data = &func.insts[inst.index()];
+            let (Op::Binary(Binary::Band, x, y), Some(band)) = (&data.op, data.result) else { continue };
+            let end = if pure_test[band.index()] {
+                bpos
+            } else if plan.elided[band.index()] {
+                let Some(e) = tst_end[band.index()] else { continue };
+                e
+            } else {
+                continue;
+            };
+            if !matches!(func.ty(band), Type::I32 | Type::I64) { continue; }
+            let Some(shifted) = [(*x, *y), (*y, *x)].into_iter().find_map(|(s, m)| (plan.const_of(m) == Some(1)).then_some(s)) else { continue };
+            if uses[shifted.index()] != 1 || plan.elided[shifted.index()] { continue; }
+            let Some((sb, upos, uinst)) = pos_of[shifted.index()] else { continue };
+            if sb != b_idx || upos >= end { continue; }
+            let Op::Binary(Binary::Ushr, word, k) = func.insts[uinst.index()].op else { continue };
+            if plan.const_of(k).is_some() || plan.elided[word.index()] || plan.elided[k.index()] || plan.reg_of(word).is_none() {
+                continue;
+            }
+            if preserved(func, plan, b_idx, upos, end, &[], word) && preserved(func, plan, b_idx, upos, end, &[], k) {
+                plan.elided[shifted.index()] = true;
             }
         }
     }
+}
+
+/// Whether a spilled single-use load may fold directly into a store without scratch-register collision.
+pub(super) fn store_load_ok(func: &Function, plan: &Plan<Reg>, linst: Inst, load_res: Value, op: &Op) -> bool {
+    if !matches!(plan.location(load_res), Location::Slot) || !func.ty(load_res).is_small_int() {
+        return false;
+    }
+    match *op {
+        Op::StackStore(val, ..) => val == load_res,
+        Op::Store(val, addr, _) => {
+            val == load_res
+                && addr != load_res
+                && (matches!(func.insts[linst.index()].op, Op::StackLoad(..))
+                    || (!plan.elided[addr.index()] && matches!(plan.location(addr), Location::Reg(_) | Location::Frame(..))))
+        }
+        _ => false,
+    }
+}
+
+fn eq_val(plan: &Plan<Reg>, ty: Type, a: Value, b: Value) -> bool {
+    a == b
+        || plan.const_of(a).zip(plan.const_of(b)).is_some_and(|(c1, c2)| {
+            crate::fold::extend(c1, ty, false) == crate::fold::extend(c2, ty, false)
+        })
+}
+
+fn quiet_between(func: &Function, plan: &Plan<Reg>, block: usize, mut range: std::ops::Range<usize>, skip: Option<usize>) -> bool {
+    range.all(|p| {
+        skip == Some(p) || {
+            let mid = &func.insts[func.blocks[block].insts[p].index()];
+            !matches!(mid.op, Op::Call { .. } | Op::TryCall { .. })
+                && mid.result.is_some_and(|r| {
+                    plan.elided[r.index()]
+                        || (plan.is_static(r) && matches!(mid.op, Op::Const(_) | Op::StackAddr(..) | Op::Symbol(_) | Op::SlotAddr(_)))
+                })
+        }
+    })
+}
+
+fn cas_brif_edge_ok(func: &Function, plan: &Plan<Reg>, uses: &[u32], (block, start, res, expected, ty): (usize, usize, Value, Value, Type)) -> bool {
+    let insts = &func.blocks[block].insts;
+    let Some(bpos) = insts.len().checked_sub(1) else { return false };
+    if bpos <= start + 1 { return false; }
+    let Op::Brif(cond, then, ref ta, otherwise, ref ea) = func.insts[insts[bpos].index()].op else { return false };
+    let arm_uses = ta.iter().chain(ea).filter(|&&a| a == res).count() as u32;
+    if arm_uses == 0 || uses[res.index()] != 1 + arm_uses || !(plan.fused[cond.index()] || plan.elided[cond.index()]) {
+        return false;
+    }
+    let Some(cpos) = (start + 1..bpos).find(|&p| func.insts[insts[p].index()].result == Some(cond)) else { return false };
+    let Op::Icmp(IntCC::Equal | IntCC::NotEqual, lhs, rhs) = func.insts[insts[cpos].index()].op else { return false };
+    if !((lhs == res && eq_val(plan, ty, rhs, expected)) || (rhs == res && eq_val(plan, ty, lhs, expected)))
+        || !quiet_between(func, plan, block, start + 1..bpos, Some(cpos))
+    {
+        return false;
+    }
+    for (target, args) in [(then, ta.as_slice()), (otherwise, ea.as_slice())] {
+        if !args.contains(&res) { continue; }
+        let params = &func.blocks[target.index()].params;
+        if args.len() != params.len() { return false; }
+        for (&arg, &param) in args.iter().zip(params) {
+            if arg != res { continue; }
+            if !matches!(plan.location(param), Location::Reg(_) | Location::Slot)
+                || plan.reg_of(res).is_some_and(|r| plan.reg_of(param) == Some(r))
+            {
+                return false;
+            }
+            let pr = plan.reg_of(param);
+            if args.iter().any(|&o| o != res && (o == param || pr.is_some_and(|r| plan.reg_of(o) == Some(r)))) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Marks dead or flag-only `AtomicRmw`/`AtomicCas` results (and `AtomicCas` results consumed only by a fused compare and its `Brif` edge) as fused.
+pub(super) fn fuse_atomic_rmws(
+    func: &Function,
+    plan: &mut Plan<Reg>,
+    (uses, pos_of, use_of): (&[u32], &[super::Site], &[super::Site]),
+) {
     for (v, def) in pos_of.iter().enumerate() {
         let Some((block, start, inst)) = *def else { continue };
-        let (count, use_block, max_end) = atomic_uses[v];
-        if count == 0 || count != uses[v] || use_block != block || max_end <= start {
+        let (res, ty) = (Value(v as u32), func.ty(Value(v as u32)));
+        if !ty.is_small_int() || plan.elided[v] || plan.fused[v] {
             continue;
         }
-        let val = Value(v as u32);
-        if func.ty(val) != Type::I64 || plan.elided[v] || plan.is_static(val) || plan.sib[v].is_some() {
-            continue;
-        }
-        let Some((base, delta)) = super::fuse::iadd_sub_const(plan, &func.insts[inst.index()].op) else { continue };
-        if i32::try_from(delta).is_err() || plan.elided[base.index()] {
-            continue;
-        }
-        if count > 1 && plan.reg_of(base).is_none() && !matches!(plan.location(base), Location::Frame(..)) {
-            continue;
-        }
-        if preserved(func, plan, block, start, max_end, &[], base) {
-            plan.elided[v] = true;
+        let expected = match func.insts[inst.index()].op {
+            Op::AtomicRmw(rmw, _, _, value) => {
+                if uses[v] == 0 && matches!(rmw, AtomicRmwOp::Add | AtomicRmwOp::Sub | AtomicRmwOp::Or | AtomicRmwOp::And | AtomicRmwOp::Xor | AtomicRmwOp::Xchg) {
+                    plan.fused[v] = true;
+                    if let Some((_, bit)) = super::super::bits::lock_bt_shift_bit(func, plan, |x| pos_of[x.index()].map(|(_, _, i)| i), rmw, value)
+                        && uses[value.index()] == 1
+                        && !plan.elided[value.index()]
+                        && let Some((mb, mpos, _)) = pos_of[value.index()]
+                        && mb == block
+                        && mpos < start
+                        && preserved(func, plan, block, mpos, start, &[], bit)
+                    {
+                        plan.elided[value.index()] = true;
+                    }
+                    continue;
+                }
+                if rmw != AtomicRmwOp::Sub || uses[v] != 1 { continue; }
+                value
+            }
+            Op::AtomicCas(_, _, expected, _) => {
+                if uses[v] == 0 || (uses[v] >= 2 && cas_brif_edge_ok(func, plan, uses, (block, start, res, expected, ty))) {
+                    plan.fused[v] = true;
+                    continue;
+                }
+                if uses[v] != 1 { continue; }
+                expected
+            }
+            _ => continue,
+        };
+        let Some((used_in, end, user)) = use_of[v] else { continue };
+        let udata = &func.insts[user.index()];
+        let zero_expected = plan.const_of(expected).is_some_and(|c| crate::fold::extend(c, ty, false) == 0);
+        let ok_user = match udata.op {
+            Op::Icmp(IntCC::Equal | IntCC::NotEqual, lhs, rhs) => {
+                udata.result.is_some_and(|r| !plan.elided[r.index()] && !plan.is_static(r))
+                    && ((lhs == res && eq_val(plan, ty, rhs, expected)) || (rhs == res && eq_val(plan, ty, lhs, expected)))
+            }
+            Op::Brif(cond, _, ref ta, _, ref ea) => cond == res && zero_expected && ta.is_empty() && ea.is_empty(),
+            Op::Trapz(cond) => cond == res && zero_expected,
+            _ => false,
+        };
+        if used_in == block && end > start && ok_user && quiet_between(func, plan, block, start + 1..end, None) {
+            plan.fused[v] = true;
         }
     }
 }

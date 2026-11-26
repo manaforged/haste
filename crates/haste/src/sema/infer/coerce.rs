@@ -2,6 +2,7 @@ use anyhow::{Result, bail};
 
 use crate::RECURSION_LIMIT;
 use crate::names::ItemRef;
+use crate::outline::item::ItemKind;
 
 use super::super::ty::{Kind, Mut, Ty};
 use super::object::Vtable;
@@ -111,7 +112,7 @@ impl Infer<'_, '_> {
                 Kind::Ref(..) | Kind::Ptr(..) => return Ok(true),
                 Kind::Pat(base, ..) => cur = self.resolve(base),
                 Kind::Adt(item, args) => {
-                    if self.cx.item(item).1.kind != crate::outline::item::ItemKind::Struct {
+                    if self.cx.item(item).1.kind != ItemKind::Struct {
                         return Ok(false);
                     }
                     let slice = self.cx.types.substs(args).to_vec();
@@ -156,7 +157,7 @@ impl Infer<'_, '_> {
                     }
                 }
                 Kind::Adt(item, args) => {
-                    if self.cx.item(item).1.kind != crate::outline::item::ItemKind::Struct {
+                    if self.cx.item(item).1.kind != ItemKind::Struct {
                         return Ok(false);
                     }
                     let slice = self.cx.types.substs(args).to_vec();

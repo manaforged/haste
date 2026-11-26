@@ -174,11 +174,13 @@ fn pointee_bytes(cx: &mut Context<'_>, ty: Ty) -> Option<u32> {
 }
 
 fn is_unpin_like(cx: &mut Context<'_>, ty: Ty, depth: u32) -> bool {
-    auto_reach(cx, Auto::Unpin, ty, depth).holds
+    let mut seen = Vec::new();
+    auto_reach(cx, Auto::Unpin, ty, depth, &mut seen).holds
 }
 
 pub(crate) fn is_freeze_ty(cx: &mut Context<'_>, ty: Ty, depth: u32) -> bool {
-    auto_reach(cx, Auto::Freeze, ty, depth).holds
+    let mut seen = Vec::new();
+    auto_reach(cx, Auto::Freeze, ty, depth, &mut seen).holds
 }
 
 /// An auto trait whose structural answer the store keeps per type.
@@ -191,8 +193,7 @@ enum Auto {
 impl Auto {
     const fn cap(self) -> u32 {
         match self {
-            Auto::Unpin => 8,
-            Auto::Freeze => 16,
+            Auto::Unpin | Auto::Freeze => 16,
         }
     }
 
@@ -204,66 +205,74 @@ impl Auto {
     }
 }
 
-/// Whether an auto trait holds for a type, how many levels below it the answer looked, and whether the answer is final rather than cut off by the depth cap or a part not yet known.
+/// Whether an auto trait holds for a type, how many levels below it the answer looked, whether it hit a depth/lookup cut, and whether it depended on an active cycle.
 #[derive(Clone, Copy)]
 struct Reach {
     holds: bool,
     height: u32,
-    exact: bool,
+    cut: bool,
+    cycled: bool,
 }
 
 impl Reach {
-    const UNKNOWN: Reach = Reach { holds: false, height: 0, exact: false };
+    const UNKNOWN: Reach = Reach { holds: false, height: 0, cut: true, cycled: false };
 
     const fn known(holds: bool) -> Self {
-        Self { holds, height: 0, exact: true }
+        Self { holds, height: 0, cut: false, cycled: false }
     }
 
     fn join(&mut self, part: Reach) -> bool {
         self.height = self.height.max(part.height + 1);
-        self.exact &= part.exact;
+        self.cut |= part.cut;
+        self.cycled |= part.cycled;
         self.holds &= part.holds;
         part.holds
     }
 }
 
-fn auto_reach(cx: &mut Context<'_>, auto: Auto, ty: Ty, depth: u32) -> Reach {
+fn auto_reach(cx: &mut Context<'_>, auto: Auto, ty: Ty, depth: u32, seen: &mut Vec<Ty>) -> Reach {
     if depth > auto.cap() {
         return Reach::UNKNOWN;
     }
     if ty == Ty::NONE || cx.types.has_params(ty) {
         return Reach::known(false);
     }
+    if seen.contains(&ty) {
+        return Reach { holds: true, height: 0, cut: false, cycled: true };
+    }
     if let Some((holds, height)) = auto.memo(cx).get(&ty)
         && depth + height <= auto.cap()
     {
-        return Reach { holds, height, exact: true };
+        return Reach { holds, height, cut: false, cycled: false };
     }
-    let found = auto_parts(cx, auto, ty, depth);
-    if found.exact {
-        auto.memo(cx).insert(ty, (found.holds, found.height));
+    seen.push(ty);
+    let found = auto_parts(cx, auto, ty, depth, seen);
+    seen.pop();
+    if !found.cut && (!found.cycled || depth == 0) {
+        let height = if found.cycled { 0 } else { found.height };
+        auto.memo(cx).insert(ty, (found.holds, height));
     }
     found
 }
 
-fn auto_parts(cx: &mut Context<'_>, auto: Auto, ty: Ty, depth: u32) -> Reach {
+fn auto_parts(cx: &mut Context<'_>, auto: Auto, ty: Ty, depth: u32, seen: &mut Vec<Ty>) -> Reach {
     let mut out = Reach::known(true);
     match *cx.types.kind(ty) {
         Kind::Pat(inner, ..) | Kind::Array(inner, _) => {
-            out.join(auto_reach(cx, auto, inner, depth + 1));
+            out.join(auto_reach(cx, auto, inner, depth + 1, seen));
         }
         Kind::Slice(inner) if auto == Auto::Freeze => {
-            out.join(auto_reach(cx, auto, inner, depth + 1));
+            out.join(auto_reach(cx, auto, inner, depth + 1, seen));
         }
         Kind::Tuple(items) => {
             for at in 0..cx.types.substs(items).len() {
                 let part = cx.types.substs(items)[at];
-                if !out.join(auto_reach(cx, auto, part, depth + 1)) {
+                if !out.join(auto_reach(cx, auto, part, depth + 1, seen)) {
                     break;
                 }
             }
         }
-        Kind::Adt(item, args) => return adt_reach(cx, auto, (item, args), depth),
+        Kind::Adt(item, args) => return adt_reach(cx, auto, ty, (item, args), depth, seen),
         Kind::Closure(..) if auto == Auto::Unpin => {
             return cx.ensure_closure(ty).map_or(Reach { holds: true, ..Reach::UNKNOWN }, |info| Reach::known(!info.closure.coroutine));
         }
@@ -273,9 +282,12 @@ fn auto_parts(cx: &mut Context<'_>, auto: Auto, ty: Ty, depth: u32) -> Reach {
     out
 }
 
-fn adt_reach(cx: &mut Context<'_>, auto: Auto, (item, args): (ItemRef, Substs), depth: u32) -> Reach {
+fn adt_reach(cx: &mut Context<'_>, auto: Auto, ty: Ty, (item, args): (ItemRef, Substs), depth: u32, seen: &mut Vec<Ty>) -> Reach {
     if cx.types.substs_have_params(args) {
         return Reach::known(false);
+    }
+    if auto == Auto::Unpin && cx.boxed(ty).is_some() {
+        return Reach::known(true);
     }
     let blocked = match auto {
         Auto::Unpin => {
@@ -293,7 +305,7 @@ fn adt_reach(cx: &mut Context<'_>, auto: Auto, (item, args): (ItemRef, Substs), 
     };
     let mut out = Reach::known(true);
     for &field in variants.iter().flatten() {
-        if !out.join(auto_reach(cx, auto, field, depth + 1)) {
+        if !out.join(auto_reach(cx, auto, field, depth + 1, seen)) {
             break;
         }
     }

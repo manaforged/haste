@@ -33,7 +33,7 @@ pub(super) use abi::is_freeze_ty;
 pub(crate) use object::VTABLE_HEADER;
 pub use plan::eval_footprint;
 pub use reloc::{RelocPlan, eval_relocs};
-pub use stencil::{Bodies, FootprintId, RelocVec, RodataId, RodataReloc, RodataTarget, StencilOutput, SymbolSource, VtableEntry, VtableId, lower_dict, lower_stencil};
+pub use stencil::{Bodies, FootprintId, RelocVec, RodataId, RodataReloc, RodataTarget, StencilOutput, SymbolSource, VtableEntry, VtableId, lower_dict, lower_stencil, warm_inline};
 
 use std::sync::Arc;
 
@@ -242,6 +242,8 @@ pub(super) struct Inline {
     pub max_callee_height: u8,
     pub max_callee_size: u16,
     pub host: budget::Copies,
+    pub warming: bool,
+    pub aborted: bool,
 }
 
 impl Inline {
@@ -401,6 +403,7 @@ impl<'l, 'a> Lower<'l, 'a> {
             &Shape::Ctor(variant) => self.ctor_body(variant),
             Shape::Clone(calls) => self.clone_body(calls.clone()),
             Shape::Asm(_) => bail!("global_asm function is assembled directly"),
+            Shape::GlobalAlloc(shim) => self.global_alloc_body(shim.clone()),
             Shape::Anon(anon) => self.expr(anon.root),
             Shape::Closure(closure) if closure.closure.coroutine => self.resume_root(closure.closure.body),
             Shape::Closure(closure) => {

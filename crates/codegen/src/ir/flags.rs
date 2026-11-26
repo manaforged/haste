@@ -5,6 +5,7 @@ const UNPREDICTABLE: u8 = 2;
 const IMAGE_ADDR: u8 = 4;
 const THREAD_CELL: u8 = 8;
 const FRAME_PTR: u8 = 16;
+const FRESH_ALLOC: u8 = 32;
 
 impl Function {
     /// Marks `value` as a pointer that a `Box` or `Unique` owner holds, to a heap allocation apart from the owner's own.
@@ -40,6 +41,77 @@ impl Function {
     /// Whether `value` is the runtime's thread-cell lookup.
     pub(crate) fn is_thread_cell(&self, value: Value) -> bool {
         self.flags(value) & THREAD_CELL != 0
+    }
+
+    /// Marks `value` as a fresh-heap allocator symbol (`__rust_alloc` / `__rust_alloc_zeroed`) that never reads `CallerLoc` or aliases live memory.
+    pub fn mark_fresh_alloc(&mut self, value: Value) {
+        self.set_flags(value, FRESH_ALLOC);
+    }
+
+    /// Whether `value` is a fresh-heap allocator symbol.
+    pub(crate) fn is_fresh_alloc(&self, value: Value) -> bool {
+        self.flags(value) & FRESH_ALLOC != 0
+    }
+
+    /// Table of constant integer values defined by `Op::Const` instructions across this function.
+    pub(crate) fn const_values(&self) -> Vec<Option<i64>> {
+        let mut consts = vec![None; self.types.len()];
+        for inst in &self.insts {
+            if let (super::Op::Const(imm), Some(res)) = (&inst.op, inst.result) {
+                consts[res.index()] = Some(*imm);
+            }
+        }
+        consts
+    }
+
+    /// Whether any value carries the thread-cell lookup mark.
+    pub(crate) fn has_thread_cell(&self) -> bool {
+        self.value_flags.iter().any(|&bits| bits & THREAD_CELL != 0)
+    }
+
+    /// Mask of values defined by `Op::Const(0)`, empty when no thread-cell lookup is present.
+    pub(crate) fn thread_cell_zeros(&self) -> Vec<bool> {
+        if !self.has_thread_cell() {
+            return Vec::new();
+        }
+        let mut zeros = vec![false; self.types.len()];
+        for inst in &self.insts {
+            if let (super::Op::Const(0), Some(res)) = (&inst.op, inst.result) {
+                zeros[res.index()] = true;
+            }
+        }
+        zeros
+    }
+
+    /// Result value of `op` when it is a zero-initialized `ThreadCell` lookup with no user-visible memory effects.
+    pub(crate) fn pure_thread_cell_result(&self, op: &super::Op, is_zero: impl Fn(Value) -> bool) -> Option<Value> {
+        match op {
+            super::Op::Call { callee, args, results, .. }
+                if self.is_thread_cell(*callee) && args.get(2).is_some_and(|&v| is_zero(v)) => results.first().copied(),
+            _ => None,
+        }
+    }
+
+    /// Result value and constant slot index of `op` when it is a `ThreadCell` lookup.
+    pub(crate) fn thread_cell_slot(&self, op: &super::Op, const_val: impl Fn(Value) -> Option<i64>) -> Option<(Value, u32)> {
+        match op {
+            super::Op::Call { callee, args, results, .. } if self.is_thread_cell(*callee) => {
+                let slot = args.first().and_then(|&v| const_val(v)).and_then(|k| u32::try_from(k).ok())?;
+                Some((*results.first()?, slot))
+            }
+            _ => None,
+        }
+    }
+
+    /// Result value of `op` when it looks up the internal `#[track_caller]` cell (`slot == 0`, `init == 0`).
+    pub(crate) fn caller_loc_result(&self, op: &super::Op, is_zero: impl Fn(Value) -> bool) -> Option<Value> {
+        match op {
+            super::Op::Call { callee, args, results, .. }
+                if self.is_thread_cell(*callee)
+                    && args.first().is_some_and(|&v| is_zero(v))
+                    && args.get(2).is_some_and(|&v| is_zero(v)) => results.first().copied(),
+            _ => None,
+        }
     }
 
     /// Whether `value` is the address of data that the output image holds.

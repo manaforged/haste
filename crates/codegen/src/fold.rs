@@ -177,6 +177,12 @@ pub(crate) fn known_bits(func: &Function, def_of: &dyn Fn(Value) -> Option<Inst>
     }
 }
 
+/// Whether `v` is proven to hold only `0` or `1` via `known_bits`.
+pub(crate) fn is_unit_bool(func: &Function, def_of: &dyn Fn(Value) -> Option<Inst>, known: &dyn Fn(Value) -> Option<i64>, v: Value) -> bool {
+    let ty = func.ty(v);
+    ty.is_small_int() && (known_bits(func, def_of, known, v, 0).0 | 1) == ty.unsigned_max()
+}
+
 const DEREF_SCAN: usize = 256;
 
 /// Where a value is read: after `prefix` in its block, and below every block that dominates `block`.
@@ -184,19 +190,6 @@ const DEREF_SCAN: usize = 256;
 pub(crate) struct Before<'a> {
     pub(crate) prefix: &'a [Inst],
     pub(crate) block: Option<Block>,
-}
-
-impl<'a> Before<'a> {
-    fn insts(self, func: &'a Function) -> impl Iterator<Item = Inst> + 'a {
-        let (mut at, mut cfg) = (self.block, None);
-        let above = std::iter::from_fn(move || {
-            let block = at?;
-            let idom = &cfg.get_or_insert_with(|| func.cfg()).idom;
-            at = idom.get(block.index()).copied().flatten().filter(|parent| *parent != block);
-            at
-        });
-        self.prefix.iter().rev().chain(above.flat_map(move |block| func.blocks[block.index()].insts.iter().rev())).copied().take(DEREF_SCAN)
-    }
 }
 
 /// Whether `v` is a non-null address where `at` reads it: by its definition, or because a load or store that ran before touched a byte range that holds or ends at `v`.
@@ -212,16 +205,42 @@ pub(crate) fn non_null_at(func: &Function, def_of: &dyn Fn(Value) -> Option<Inst
         Some(&Op::Binary(Binary::Isub, a, b)) => known(b).map_or((v, 0), |c| (a, c.wrapping_neg())),
         _ => (v, 0),
     };
-    at.insts(func).any(|inst| {
-        let data = &func.insts[inst.index()];
-        let (addr, off, bytes) = match data.op {
-            Op::Load(addr, off) => (addr, off, data.result.map_or(0, |result| func.ty(result).bytes())),
-            Op::Store(value, addr, off) => (addr, off, func.ty(value).bytes()),
-            _ => return false,
-        };
-        let touched = i64::from(off)..=i64::from(off) + i64::from(bytes);
-        bytes != 0 && ((addr == v && touched.contains(&0)) || (addr == base && touched.contains(&disp)))
-    })
+    let stop = def_of(base);
+    let mut left = DEREF_SCAN;
+    let check_slice = |insts: &[Inst], left: &mut usize| -> Option<bool> {
+        for &inst in insts.iter().rev() {
+            if *left == 0 {
+                return Some(false);
+            }
+            *left -= 1;
+            if stop == Some(inst) {
+                return Some(false);
+            }
+            let data = &func.insts[inst.index()];
+            let (addr, off, bytes) = match data.op {
+                Op::Load(addr, off) => (addr, off, data.result.map_or(0, |result| func.ty(result).bytes())),
+                Op::Store(value, addr, off) => (addr, off, func.ty(value).bytes()),
+                _ => continue,
+            };
+            let touched = i64::from(off)..=i64::from(off) + i64::from(bytes);
+            if bytes != 0 && ((addr == v && touched.contains(&0)) || (addr == base && touched.contains(&disp))) {
+                return Some(true);
+            }
+        }
+        None
+    };
+    if let Some(hit) = check_slice(at.prefix, &mut left) {
+        return hit;
+    }
+    let Some(mut cur) = at.block else { return false };
+    let cfg = func.cfg();
+    while let Some(parent) = cfg.idom.get(cur.index()).copied().flatten().filter(|p| *p != cur) {
+        if let Some(hit) = check_slice(&func.blocks[parent.index()].insts, &mut left) {
+            return hit;
+        }
+        cur = parent;
+    }
+    false
 }
 
 pub(super) struct Fold {
@@ -284,23 +303,7 @@ impl Fold {
 
     /// Whether `value` is 0 or 1 in its low byte because a comparison, overflow check, or boolean op defines it.
     fn boolean(&self, func: &Function, value: Value) -> bool {
-        self.boolean_at(func, value, 0)
-    }
-
-    fn boolean_at(&self, func: &Function, value: Value, depth: u8) -> bool {
-        if depth >= 8 || func.ty(value).is_vector() {
-            return false;
-        }
-        let is_01 = |v: Value| matches!(self.known(v), Some(0 | 1)) || self.boolean_at(func, v, depth + 1);
-        match self.def(func, value) {
-            Some(Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..)) => true,
-            Some(Op::Convert(Convert::Uextend, inner)) => self.boolean_at(func, *inner, depth + 1),
-            Some(Op::Binary(Binary::Band, a, b)) => {
-                matches!(self.known(*a), Some(0 | 1)) || matches!(self.known(*b), Some(0 | 1)) || (is_01(*a) && is_01(*b))
-            }
-            Some(Op::Binary(Binary::Bor | Binary::Bxor, a, b) | Op::Select(_, a, b)) => is_01(*a) && is_01(*b),
-            _ => false,
-        }
+        self.known(value).is_none() && is_unit_bool(func, &|v| self.def_inst(v), &|v| self.known(v), value)
     }
 
     /// Whether `x` and `y` of type `ty` hold the same bits at that width.
@@ -346,15 +349,11 @@ impl Fold {
     fn neutral(&self, func: &Function, op: Binary, ty: Type, x: Value, y: Value) -> Option<Value> {
         let is = |value: Value, want: i64| self.known(value).is_some_and(|imm| extend(imm, ty, false) == extend(want, ty, false));
         if let Some(unit) = unit(op) {
-            if is(y, unit) {
-                return Some(x);
-            }
+            if is(y, unit) { return Some(x); }
             return (!matches!(op, Binary::Isub | Binary::Sdiv | Binary::Udiv) && is(x, unit)).then_some(y);
         }
         let shift = matches!(op, Binary::Ishl | Binary::Ushr | Binary::Sshr | Binary::Rotl | Binary::Rotr);
-        if shift && self.known(y).is_some_and(|count| count & i64::from(ty.bits() - 1) == 0) {
-            return Some(x);
-        }
+        if shift && self.known(y).is_some_and(|count| count & i64::from(ty.bits() - 1) == 0) { return Some(x); }
         if op == Binary::Band {
             for (val, other) in [(x, y), (y, x)] {
                 if let Some(mask) = self.known(other) {
@@ -389,42 +388,53 @@ impl Fold {
 
     /// Finds, in one pass in block order, the small integers that are constants, wrapped to their type, and the results that equal an existing value.
     fn constants(&mut self, func: &Function) {
-        for (block, pos, inst) in func.blocks.iter().enumerate().flat_map(|(block, data)| data.insts.iter().enumerate().map(move |(pos, inst)| (block, pos, inst))) {
-            let data = &func.insts[inst.index()];
-            let Some(result) = data.result.filter(|result| self.subst[result.index()] == *result && self.consts[result.index()].is_none()) else { continue };
-            let ty = func.ty(result);
-            let at = Before { prefix: &func.blocks[block].insts[..pos], block: Some(Block(block as u32)) };
-            if let Some(imm) = self.evaluate(func, at, &data.op, ty) {
-                self.consts[result.index()] = Some(imm);
-            } else if let Some(value) = self.identity(func, &data.op, ty) {
-                self.subst[result.index()] = value;
+        for (block, data_b) in func.blocks.iter().enumerate() {
+            for (pos, inst) in data_b.insts.iter().enumerate() {
+                let data = &func.insts[inst.index()];
+                let Some(result) = data.result.filter(|r| self.subst[r.index()] == *r && self.consts[r.index()].is_none()) else { continue };
+                let ty = func.ty(result);
+                match data.op {
+                    Op::Const(imm) => { if ty.is_small_int() { self.consts[result.index()] = Some(extend(imm, ty, true)); } continue; }
+                    Op::StackLoad(..) | Op::StackAddr(..) | Op::Symbol(_) | Op::SlotAddr(_) | Op::Runtime(_) | Op::Call { .. } | Op::TryCall { .. } | Op::AtomicLoad(..) | Op::AtomicRmw(..) | Op::AtomicCas(..) | Op::Insert(..) => continue,
+                    _ => {}
+                }
+                let at = Before { prefix: &data_b.insts[..pos], block: Some(Block(block as u32)) };
+                if let Some(imm) = self.evaluate(func, at, &data.op, ty) { self.consts[result.index()] = Some(imm); } else if let Some(v) = self.identity(func, &data.op, ty) { self.subst[result.index()] = v; }
             }
         }
     }
 
     /// Turns the branches `decide` settles into jumps, inverts `xor(b, 1)` branches, branches on the condition of a select between zero and a non-zero value, jumps straight to one of two returns that agree on the edge's equality, drops traps that cannot fire, rewrites always-firing traps to `Op::Trap`, and truncates after `Op::Trap`.
     fn branches(&self, func: &mut Function) -> bool {
-        func.bump_cfg();
         let mut changed = false;
+        let mut cfg_dirty = false;
         for block in 0..func.blocks.len() {
-            let mut trapped = false;
-            let mut keep = std::mem::take(&mut func.blocks[block].insts);
-            keep.retain(|&inst| {
-                if trapped { func.insts[inst.index()].op = Op::Trap; changed = true; return false; }
-                match func.insts[inst.index()].op {
-                    Op::Trapz(x) => {
-                        if let Some(k) = self.known(x) {
-                            trapped = extend(k, func.types[x.index()], false) == 0;
-                            func.insts[inst.index()].op = Op::Trap; changed = true; return trapped;
+            let mut dropped_after_trap = false;
+            if func.blocks[block].insts.iter().any(|&i| matches!(func.insts[i.index()].op, Op::Trap | Op::Trapz(_))) {
+                let mut trapped = false;
+                let mut keep = std::mem::take(&mut func.blocks[block].insts);
+                keep.retain(|&inst| {
+                    if trapped { func.insts[inst.index()].op = Op::Trap; changed = true; dropped_after_trap = true; return false; }
+                    match func.insts[inst.index()].op {
+                        Op::Trapz(x) => {
+                            if let Some(k) = self.known(x) {
+                                trapped = extend(k, func.types[x.index()], false) == 0;
+                                func.insts[inst.index()].op = Op::Trap; changed = true; return trapped;
+                            }
+                            if self.non_null(func, Before { prefix: &[], block: None }, x) { func.insts[inst.index()].op = Op::Trap; changed = true; return false; }
+                            true
                         }
-                        if self.non_null(func, Before { prefix: &[], block: None }, x) { func.insts[inst.index()].op = Op::Trap; changed = true; return false; }
-                        true
+                        Op::Trap => { trapped = true; true }
+                        _ => true,
                     }
-                    Op::Trap => { trapped = true; true }
-                    _ => true,
-                }
-            });
-            func.blocks[block].insts = keep;
+                });
+                func.blocks[block].insts = keep;
+            }
+            if dropped_after_trap { cfg_dirty = true; }
+            if cfg_dirty && func.blocks[block].insts.last().is_some_and(|&i| matches!(func.insts[i.index()].op, Op::Brif(..))) {
+                func.bump_cfg();
+                cfg_dirty = false;
+            }
             let Some((&last, prefix)) = func.blocks[block].insts.split_last() else { continue };
             let at = Before { prefix, block: Some(Block(block as u32)) };
             let through = match func.insts[last.index()].op {
@@ -445,7 +455,13 @@ impl Fold {
                 if swap { std::mem::swap(then, otherwise); std::mem::swap(then_args, else_args); }
                 changed = true;
             }
-            changed |= self.decide(&func.types, non_null_br, &mut func.insts[last.index()].op) || self.exits(func, last);
+            if self.decide(&func.types, non_null_br, &mut func.insts[last.index()].op) || self.exits(func, last) {
+                changed = true;
+                cfg_dirty = true;
+            }
+        }
+        if cfg_dirty {
+            func.bump_cfg();
         }
         changed
     }
@@ -473,9 +489,28 @@ impl Fold {
 
     /// Sends each edge that passes a constant to a block holding only a branch on that parameter straight to the target the branch takes.
     fn thread(&self, func: &mut Function, pinned: &[bool]) -> bool {
-        let hop = func.blocks.iter().any(|block| matches!(block.insts[..], [only] if matches!(func.insts[only.index()].op, Op::Jump(..) | Op::Brif(..))) || matches!(block.insts[..], [_, last] if matches!(func.insts[last.index()].op, Op::Brif(..))));
+        let (mut hop, mut need_uses) = (false, false);
+        for block in &func.blocks {
+            match block.insts[..] {
+                [only] => match func.insts[only.index()].op {
+                    Op::Jump(next, _) if !pinned[next.index()] => { hop = true; need_uses |= !block.params.is_empty(); }
+                    Op::Brif(cond, ..) if block.params.contains(&cond) => (hop, need_uses) = (true, true),
+                    _ => {}
+                },
+                [cmp, last] => {
+                    let c = &func.insts[cmp.index()];
+                    if let (Op::Icmp(_, x, y), Some(res), Op::Brif(cond, ..)) = (&c.op, c.result, &func.insts[last.index()].op)
+                        && res == *cond && func.ty(*x).is_small_int() && (!block.params.is_empty() || (self.known(*x).is_some() && self.known(*y).is_some()))
+                    {
+                        (hop, need_uses) = (true, true);
+                    }
+                }
+                _ => {}
+            }
+            if hop && need_uses { break; }
+        }
         if !hop { return false; }
-        let mut uses = func.use_counts();
+        let mut uses = if need_uses { func.use_counts() } else { Vec::new() };
         let mut changed = false;
         for block in 0..func.blocks.len() {
             let Some(&last) = func.blocks[block].insts.last() else { continue };
@@ -504,8 +539,10 @@ impl Fold {
             (at, values) = (next, next_values);
         }
         if !self.agrees(func, at, &values) { return false; }
-        args.iter().for_each(|value| uses[value.index()] -= 1);
-        values.iter().for_each(|value| uses[value.index()] += 1);
+        if !uses.is_empty() {
+            args.iter().for_each(|value| uses[value.index()] -= 1);
+            values.iter().for_each(|value| uses[value.index()] += 1);
+        }
         (*target, *args) = (at, values);
         true
     }
@@ -544,23 +581,28 @@ impl Fold {
         let Some(compare) = compare else { return self.known(arg(condition)?) };
         let data = &func.insts[compare.index()];
         let (Op::Icmp(cc, x, y), Some(result)) = (&data.op, data.result) else { return None };
-        if result != condition || uses[result.index()] != 1 || !func.ty(*x).is_small_int() {
-            return None;
-        }
+        if result != condition || !func.ty(*x).is_small_int() { return None; }
         let value = |operand: Value| arg(operand).map_or_else(|| self.known(operand), |given| self.known(given));
-        Some(i64::from(holds(*cc, func.ty(*x), value(*x)?, value(*y)?)))
+        let (vx, vy) = (value(*x)?, value(*y)?);
+        if uses[result.index()] != 1 { return None; }
+        Some(i64::from(holds(*cc, func.ty(*x), vx, vy)))
     }
 
     /// Replaces each block parameter that every reachable edge gives one value, other than itself, or the value of an earlier parameter of its block.
     fn params(&mut self, func: &Function, reachable: &[bool], pinned: &[bool]) -> bool {
-        for param in func.blocks.iter().flat_map(|block| &block.params) {
-            self.incoming[param.index()] = None;
-            self.mixed[param.index()] = false;
+        let (mut any, mut multi) = (false, false);
+        for (b, data) in func.blocks.iter().enumerate() {
+            if reachable[b] && !pinned[b] && !data.params.is_empty() { any = true; multi |= data.params.len() > 1; }
         }
-        let mut into: Vec<Vec<&[Value]>> = vec![Vec::new(); func.blocks.len()];
+        if !any { return false; }
+        if self.incoming.is_empty() { (self.incoming, self.mixed) = (vec![None; func.types.len()], vec![false; func.types.len()]); }
+        for param in func.blocks.iter().flat_map(|block| &block.params) {
+            (self.incoming[param.index()], self.mixed[param.index()]) = (None, false);
+        }
+        let mut into: Vec<Vec<&[Value]>> = if multi { vec![Vec::new(); func.blocks.len()] } else { Vec::new() };
         for (block, _) in reachable.iter().enumerate().filter(|(_, live)| **live) {
             for_edges(func, block, |target, args| {
-                if func.blocks[target.index()].params.len() > 1 { into[target.index()].push(args); }
+                if multi && func.blocks[target.index()].params.len() > 1 { into[target.index()].push(args); }
                 for (param, arg) in func.blocks[target.index()].params.iter().zip(args) {
                     let arg = self.find(*arg);
                     match self.incoming[param.index()] {
@@ -576,11 +618,10 @@ impl Fold {
         for (block, data) in func.blocks.iter().enumerate().filter(|(block, _)| reachable[*block] && !pinned[*block]) {
             for param in &data.params {
                 if let (Some(value), false) = (self.incoming[param.index()], self.mixed[param.index()]) && self.subst[param.index()] == *param {
-                    self.subst[param.index()] = value;
-                    changed = true;
+                    (self.subst[param.index()], changed) = (value, true);
                 }
             }
-            changed |= self.twins(func, &data.params, &into[block]);
+            if multi && data.params.len() > 1 { changed |= self.twins(func, &data.params, &into[block]); }
         }
         changed
     }
@@ -611,71 +652,53 @@ impl Fold {
     }
 
     fn entry_guards(&mut self, func: &mut Function, reachable: &[bool], pinned: &[bool]) -> bool {
-        let (cfg, def_blocks) = (func.cfg(), func.def_blocks());
-        self.defs = defs(func);
-        let env = crate::cse::CmpEnv { defs: &self.defs, consts: &self.consts, subst: &self.subst, bool_val: None };
-        let mut incoming: Vec<Vec<(Block, Vec<Value>)>> = vec![Vec::new(); func.blocks.len()];
-        for (b, _) in reachable.iter().enumerate().filter(|(_, live)| **live) { for_edges(func, b, |t, a| incoming[t.index()].push((Block(b as u32), a.to_vec()))); }
-        let mut changed = false;
-        for (b, edges) in incoming.iter().enumerate() {
-            if !reachable[b] || pinned[b] || edges.is_empty() { continue; }
-            let (block, params, mut drop) = (Block(b as u32), &func.blocks[b].params, Vec::new());
-            for &inst in &func.blocks[b].insts {
-                let (cond, brif) = match func.insts[inst.index()].op { Op::Trapz(c) => (c, None), Op::Brif(c, tb, ref ta, eb, ref ea) if tb != eb => (c, Some((tb, ta.clone(), eb, ea.clone()))), _ => continue };
-                let Some((cc, ty, x, y)) = extract_cmp(func, &env, cond) else { continue };
-                let check = |wc: IntCC| edges.iter().all(|(pred, args)| entry_map_val(&env, &def_blocks, block, params, args, x).zip(entry_map_val(&env, &def_blocks, block, params, args, y)).is_some_and(|(mx, my)| edge_proves_want(func, &cfg, &env, (*pred, block), ty, (wc, mx, my))));
-                match (check(cc).then_some(true).or_else(|| check(cc.inverse()).then_some(false)), brif) {
-                    (Some(true), None) => { drop.push(inst); changed = true; }
-                    (Some(false), None) => { func.insts[inst.index()].op = Op::Trap; changed = true; }
-                    (Some(t), Some((tb, ta, eb, ea))) => { func.insts[inst.index()].op = Op::Jump(if t { tb } else { eb }, if t { ta } else { ea }); changed = true; }
-                    _ => {}
+        if func.blocks.len() <= 1 { return false; }
+        let (entry_idx, env) = (func.entry.map_or(usize::MAX, |e| e.index()), crate::cse::CmpEnv { defs: &self.defs, consts: &self.consts, subst: &self.subst, bool_val: None });
+        let has_cmp = |b: usize| b != entry_idx && reachable[b] && !pinned[b] && func.blocks[b].insts.iter().any(|&inst| match func.insts[inst.index()].op {
+            Op::Trapz(c) => extract_cmp(func, &env, c).is_some(),
+            Op::Brif(c, tb, _, eb, _) if tb != eb => extract_cmp(func, &env, c).is_some(),
+            _ => false,
+        });
+        let want: Vec<bool> = (0..func.blocks.len()).map(has_cmp).collect();
+        if !want.iter().any(|&w| w) { return false; }
+        let (cfg, mut edits) = (func.cfg(), Vec::new());
+        {
+            let mut incoming: Vec<Vec<(Block, &[Value])>> = vec![Vec::new(); func.blocks.len()];
+            for (b, _) in reachable.iter().enumerate().filter(|(_, live)| **live) { for_edges(func, b, |t, a| if want[t.index()] { incoming[t.index()].push((Block(b as u32), a)); }); }
+            for (b, edges) in incoming.iter().enumerate() {
+                if !want[b] || edges.is_empty() { continue; }
+                let (block, params, insts) = (Block(b as u32), &func.blocks[b].params, &func.blocks[b].insts);
+                for &inst in insts {
+                    let (cond, is_brif) = match func.insts[inst.index()].op { Op::Trapz(c) => (c, false), Op::Brif(c, tb, _, eb, _) if tb != eb => (c, true), _ => continue };
+                    let Some((cc, ty, x, y)) = extract_cmp(func, &env, cond) else { continue };
+                    let (vx, vy) = (env.find(x), env.find(y));
+                    let local = |v: Value| env.defs.get(v.index()).copied().flatten().is_some_and(|di| insts.contains(&di));
+                    let (lx, ly) = (local(vx), local(vy));
+                    let check = |wc: IntCC| edges.iter().all(|&(pred, args)| entry_map_val(&env, params, args, vx, lx).zip(entry_map_val(&env, params, args, vy, ly)).is_some_and(|(mx, my)| edge_proves_want(func, &cfg, &env, (pred, block), ty, (wc, mx, my))));
+                    if let Some(t) = check(cc).then_some(true).or_else(|| check(cc.inverse()).then_some(false)) { edits.push((b, inst, if is_brif { Some(t) } else if t { None } else { Some(false) })); }
                 }
             }
-            if !drop.is_empty() { func.blocks[b].insts.retain(|i| !drop.contains(i)); }
         }
-        changed
+        if edits.is_empty() { return false; }
+        for (b, inst, kind) in edits {
+            match (kind, std::mem::replace(&mut func.insts[inst.index()].op, Op::Trap)) {
+                (Some(t), Op::Brif(_, tb, ta, eb, ea)) => func.insts[inst.index()].op = Op::Jump(if t { tb } else { eb }, if t { ta } else { ea }),
+                (None, Op::Trapz(_)) => func.blocks[b].insts.retain(|&i| i != inst),
+                _ => {}
+            }
+        }
+        true
     }
 }
 
 /// Calls `f` with each block the terminator of `block` jumps to with arguments, and those arguments.
 pub(crate) fn for_edges<'a>(func: &'a Function, block: usize, mut f: impl FnMut(Block, &'a [Value])) {
     let Some(last) = func.blocks[block].insts.last() else { return };
-    match &func.insts[last.index()].op {
-        Op::Jump(target, args) => f(*target, args),
-        Op::Brif(_, then, then_args, otherwise, else_args) => { f(*then, then_args); f(*otherwise, else_args); }
-        _ => {}
-    }
+    match &func.insts[last.index()].op { Op::Jump(target, args) => f(*target, args), Op::Brif(_, then, then_args, otherwise, else_args) => { f(*then, then_args); f(*otherwise, else_args); } _ => {} }
 }
 
-/// The entry and every block a call enters, whose parameters are not edge arguments.
-fn pinned(func: &Function, entry: Block) -> Vec<bool> {
-    let mut pinned = vec![false; func.blocks.len()];
-    pinned[entry.index()] = true;
-    for block in 0..func.blocks.len() as u32 {
-        match func.last(Block(block)) {
-            Some(Op::TryCall { normal, handler, .. }) => { pinned[normal.index()] = true; pinned[handler.index()] = true; }
-            Some(Op::BrTable(_, d, t)) => { pinned[d.index()] = true; t.iter().for_each(|x| pinned[x.index()] = true); }
-            _ => {}
-        }
-    }
-    pinned
-}
-
-/// Drops the parameters `fold` replaced, and their arguments on every edge.
-fn drop_params(func: &mut Function, fold: &Fold) {
-    let gone = |param: &Value| fold.subst[param.index()] != *param;
-    let blocks = &func.blocks;
-    let keep = |args: &mut Vec<Value>, target: Block| { let mut i = 0; let p = &blocks[target.index()].params; args.retain(|_| { i += 1; !p.get(i - 1).is_some_and(gone) }); };
-    for block in blocks {
-        let Some(&last) = block.insts.last() else { continue };
-        match &mut func.insts[last.index()].op {
-            Op::Jump(target, args) => keep(args, *target),
-            Op::Brif(_, then, then_args, otherwise, else_args) => { keep(then_args, *then); keep(else_args, *otherwise); }
-            _ => {}
-        }
-    }
-    for block in &mut func.blocks { block.params.retain(|param| !gone(param)); }
-}
+fn pinned(func: &Function, entry: Block) -> Vec<bool> { unused::pinned(func, entry) }
+fn drop_params(func: &mut Function, fold: &Fold) -> bool { unused::drop_params(func, &fold.subst) }
 
 /// The instruction in a block that defines each value.
 pub(crate) fn defs(func: &Function) -> Vec<Option<Inst>> {
@@ -707,7 +730,7 @@ fn rewrite_folded_inst(func: &mut Function, fold: &Fold, inst: Inst) -> bool {
         _ => vector::vec_zero_fold(func, fold, &func.insts[inst.index()].op, func.insts[inst.index()].result)
             .or_else(|| func.insts[inst.index()].result.and_then(|result| fold.consts[result.index()]).map(Op::Const)),
     };
-    if let Some(op) = replacement && func.insts[inst.index()].op != op { func.insts[inst.index()].op = op; changed = true; }
+    if let Some(op) = replacement && func.insts[inst.index()].op != op { (func.insts[inst.index()].op, changed) = (op, true); }
     changed
 }
 
@@ -723,10 +746,9 @@ fn extract_cmp(func: &Function, env: &crate::cse::CmpEnv<'_>, cond: Value) -> Op
     func.ty(x).is_small_int().then_some((if taken { cc } else { cc.inverse() }, func.ty(x), x, y))
 }
 
-fn entry_map_val(env: &crate::cse::CmpEnv<'_>, def_blocks: &[Option<Block>], block: Block, params: &[Value], args: &[Value], raw: Value) -> Option<crate::cse::EdgeVal> {
-    let v = env.find(raw);
+fn entry_map_val(env: &crate::cse::CmpEnv<'_>, params: &[Value], args: &[Value], v: Value, is_local: bool) -> Option<crate::cse::EdgeVal> {
     if let Some(k) = params.iter().position(|&p| p == v) { return Some(env.edge_val(args[k])); }
-    env.consts.get(v.index()).copied().flatten().map(crate::cse::EdgeVal::Const).or_else(|| (def_blocks[v.index()] != Some(block)).then_some(crate::cse::EdgeVal::Val(v)))
+    env.consts.get(v.index()).copied().flatten().map(crate::cse::EdgeVal::Const).or_else(|| (!is_local).then_some(crate::cse::EdgeVal::Val(v)))
 }
 
 fn settle_cfg_and_params(func: &mut Function, fold: &mut Fold, entry: Block, effort: crate::Effort, pinned: &[bool]) -> (bool, bool) {
@@ -762,17 +784,15 @@ pub(crate) fn table_target(index: u64, default: Block, targets: &[Block]) -> Blo
 pub(crate) fn run(func: &mut Function, effort: crate::Effort) -> Domain {
     let Some(entry) = func.entry else { return Domain::NONE };
     let count = func.types.len();
-    let mut fold = Fold { consts: vec![None; count], subst: (0..count as u32).map(Value).collect(), incoming: vec![None; count], mixed: vec![false; count], defs: defs(func) };
+    let mut fold = Fold { consts: vec![None; count], subst: (0..count as u32).map(Value).collect(), incoming: Vec::new(), mixed: Vec::new(), defs: defs(func) };
     let pinned = pinned(func, entry);
     let (mut changed, mut cfg_changed) = settle_cfg_and_params(func, &mut fold, entry, effort, &pinned);
-    drop_params(func, &fold);
-    for b in 0..func.blocks.len() { for idx in 0..func.blocks[b].insts.len() { changed |= rewrite_folded_inst(func, &fold, func.blocks[b].insts[idx]); } }
-    changed |= crate::algebra::rewrite(func, &fold.defs) | crate::algebra::invert(func) | vector::fold_bitcast_loads(func) | unused::run(func, &pinned) | unused::dead(func);
-    if fold.thread(func, &pinned) | fold.branches(func) {
-        func.bump_cfg(); unused::prune_changed(func, entry, false); unused::dead(func); (changed, cfg_changed) = (true, true);
-    }
+    let (dropped_params, mut body_changed) = (drop_params(func, &fold), false);
+    for b in 0..func.blocks.len() { for idx in 0..func.blocks[b].insts.len() { body_changed |= rewrite_folded_inst(func, &fold, func.blocks[b].insts[idx]); } }
+    body_changed |= crate::algebra::rewrite(func, &fold.defs) | crate::algebra::invert(func) | vector::fold_bitcast_loads(func) | unused::run(func, &pinned) | unused::dead(func);
+    changed |= body_changed;
+    if (body_changed || dropped_params) && (fold.thread(func, &pinned) | fold.branches(func)) { func.bump_cfg(); unused::prune_changed(func, entry, false); unused::dead(func); (changed, cfg_changed) = (true, true); }
     if crate::algebra::devirt_vtables(func, &fold.defs) | crate::algebra::fold_bxor_conds(func) | range::fold_range_checks(func) { unused::dead(func); changed = true; }
     if !changed { Domain::NONE } else if cfg_changed { Domain::VALUES | Domain::CFG } else { Domain::VALUES }
 }
-
-pub(crate) use crate::thread::compact;
+pub(crate) use crate::ir::compact;

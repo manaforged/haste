@@ -534,11 +534,11 @@ impl Emit<'_> {
 
     fn divide(&mut self, op: Binary, (x, y): (Value, Value), dst: Reg) {
         let signed = matches!(op, Binary::Sdiv | Binary::Srem);
-        let (left, right) = self.pair_opt(x, y, signed);
-        let div = if signed { Alu::Sdiv } else { Alu::Udiv };
-        if matches!(op, Binary::Sdiv | Binary::Udiv) { return self.asm.alu(div, Size::X, dst, left, right); }
         let size = if self.ty(x).bits() <= 32 { Size::W } else { Size::X };
-        self.asm.alu(div, Size::X, IP, left, right);
+        let (left, right) = if self.ty(x) == Type::I32 { self.bits_pair(x, y) } else { self.pair_opt(x, y, signed) };
+        let div = if signed { Alu::Sdiv } else { Alu::Udiv };
+        if matches!(op, Binary::Sdiv | Binary::Udiv) { return self.asm.alu(div, size, dst, left, right); }
+        self.asm.alu(div, size, IP, left, right);
         self.asm.madd(true, size, dst, (IP, right), left);
         self.clobber_reg(IP);
     }

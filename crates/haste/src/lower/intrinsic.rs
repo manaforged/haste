@@ -72,9 +72,58 @@ impl Lower<'_, '_> {
         self.close();
     }
 
+    /// Marks `code` as a pure fresh-heap allocator when `host` is an allocator symbol and no custom `#[global_allocator]` is installed.
+    pub(super) fn mark_if_fresh_alloc(&mut self, host: &HostSymbol, code: Value) {
+        if host.is_fresh_alloc() && self.cx.global_allocator().is_none() {
+            self.b.func.mark_fresh_alloc(code);
+        }
+    }
+
+    /// Lowers a `__rust_*alloc*` shim by dispatching to the crate graph's `#[global_allocator]` static.
+    pub(super) fn global_alloc_body(&mut self, shim: crate::sema::infer::GlobalAllocShim) -> Result<Option<Value>> {
+        use crate::sema::infer::Res;
+        use crate::sema::traits::GlobalAllocOp;
+        let Res::Fn(alloc_static, _) = shim.allocator else { bail!("global allocator shim has no static") };
+        let Res::Fn(method_item, method_substs) = shim.method else { bail!("global allocator shim has no method") };
+        let alloc_place = self.static_place((alloc_static, crate::sema::substs::Substs::EMPTY), shim.alloc_ty)?;
+        let self_ref = self.address(alloc_place);
+        let param_word = |this: &mut Self, idx: usize| -> Result<Value> {
+            let Some(place) = this.locals.get(idx).copied().flatten() else { bail!("global allocator shim missing param {idx}") };
+            let scalar = match place.repr {
+                Repr::Scalar(_) => place,
+                Repr::Mem { .. } => place.at(0, Repr::Scalar(Type::I64)),
+                Repr::Zst => bail!("global allocator shim param {idx} is zero-sized"),
+            };
+            this.read(scalar).ok_or_else(|| anyhow::anyhow!("global allocator shim param {idx} has no value"))
+        };
+        let (ptr, size, align, new_size) = match shim.op {
+            GlobalAllocOp::Alloc | GlobalAllocOp::AllocZeroed => (None, param_word(self, 0)?, param_word(self, 1)?, None),
+            GlobalAllocOp::Dealloc => (Some(param_word(self, 0)?), param_word(self, 1)?, param_word(self, 2)?, None),
+            GlobalAllocOp::Realloc => (Some(param_word(self, 0)?), param_word(self, 1)?, param_word(self, 2)?, Some(param_word(self, 3)?)),
+        };
+        let lrepr = repr(self.cx, shim.layout_ty)?;
+        let Some(slot) = self.slot(lrepr) else { bail!("Layout has no stack slot") };
+        let lo = self.cx.layout(shim.layout_ty)?;
+        let size_off = lo.fields.offset(0).bytes() as i32;
+        let align_off = lo.fields.offset(1).bytes() as i32;
+        self.ins().stack_store(size, slot, size_off);
+        self.ins().stack_store(align, slot, align_off);
+        let layout_val = self.read(super::place::Place::slot(slot, lrepr)).ok_or_else(|| anyhow::anyhow!("Layout has no value"))?;
+        let mut args = vec![self_ref];
+        if let Some(p) = ptr {
+            args.push(p);
+        }
+        args.push(layout_val);
+        if let Some(ns) = new_size {
+            args.push(ns);
+        }
+        self.invoke(SiteOrigin::Known(method_item, method_substs), method_item, method_substs, args)
+    }
+
     /// Calls the host function `host` in the platform convention with `args`, and returns its result of machine type `ret`.
     pub(super) fn call_host(&mut self, host: HostSymbol, args: &[Value], ret: Option<Type>) -> Option<Value> {
-        let code = self.emit_symbol(SymbolSource::Host(host));
+        let code = self.emit_symbol(SymbolSource::Host(host.clone()));
+        self.mark_if_fresh_alloc(&host, code);
         let mut signature = Signature::new(CallConv::Native);
         signature.params.extend(args.iter().map(|&arg| AbiParam::new(self.b.func.ty(arg))));
         signature.returns.extend(ret.map(AbiParam::new));
@@ -162,16 +211,40 @@ impl Lower<'_, '_> {
         Ok(())
     }
 
-    pub(super) fn wrap_inlined_caller_loc(&mut self, from_blk: usize, to_blk: usize) -> Result<()> {
+    pub(super) fn wrap_inlined_caller_loc(&mut self, caller_blk: Option<haste_codegen::Block>, from_blk: usize, to_blk: usize) -> Result<()> {
+        let after = self.b.block_at(to_blk);
+        let mut hits = Vec::new();
+        let mut flows_inlined = false;
         for b_idx in from_blk..to_blk {
             let block = self.b.block_at(b_idx);
-            let Some((first_call, can_fall_through)) = self.b.block_first_tracked(block, self.dict_param, |sym, arg0| match self.relocs.get(sym as usize) {
-                Some(SymbolSource::Slot(idx)) => self.cx.track_caller(self.reached.list[*idx].0.0),
+            let (b, cx, relocs, reached, dict_param) = (&self.b, &mut self.cx, &self.relocs, self.reached, self.dict_param);
+            if let Some((first_call, can_fall_through, flows)) = b.block_first_tracked(block, after, dict_param, |sym, arg0| match sym.and_then(|s| relocs.get(s as usize)) {
+                Some(SymbolSource::Slot(idx)) => cx.track_caller(reached.list[*idx].0.0),
                 Some(SymbolSource::Host(HostSymbol::ThreadCell)) => arg0 == Some(0),
+                None => sym.is_none(),
                 _ => false,
-            }) else {
-                continue;
-            };
+            }) {
+                flows_inlined |= flows;
+                hits.push((block, first_call, can_fall_through));
+            }
+        }
+        if hits.is_empty() {
+            return Ok(());
+        }
+        if flows_inlined && let Some(cblk) = caller_blk {
+            let jump_pos = self.b.block_len(cblk).saturating_sub(1);
+            let (saved, tail) = self.b.splice_open(cblk, jump_pos);
+            let slot = self.caller_loc_slot()?;
+            let prev = self.ins().load(Type::I64, slot, 0);
+            let loc = self.current_site_location()?;
+            self.ins().store(loc, slot, 0);
+            self.b.splice_append(&tail, saved);
+            if self.open {
+                self.ins().store(prev, slot, 0);
+            }
+            return Ok(());
+        }
+        for (block, first_call, can_fall_through) in hits {
             let (saved, tail) = self.b.splice_open(block, first_call);
             let slot = self.caller_loc_slot()?;
             let prev = self.ins().load(Type::I64, slot, 0);

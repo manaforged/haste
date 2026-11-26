@@ -1,8 +1,14 @@
 use super::Emit;
 use super::asm::{Asm, Cond, Label, Mem, Reg, Size};
 use crate::alloc::CallTarget;
+use crate::CallAbi;
 use crate::ir::{Op, Value};
 use crate::reloc::{FRAME_CACHE_DEPTH, FRAME_CACHE_LIMIT, RelocKind, RuntimeSymbol, StencilReloc};
+
+pub(super) enum ColdCall {
+    Frame(Label, Label, StencilReloc),
+    ThreadCell(Label, Label, u32, [Value; 3]),
+}
 
 impl Asm {
     /// Encodes `opcode` with REX.W on the quadword `disp` bytes from the thread pointer, register field `r`, then `imm`; returns the offset of `disp`.
@@ -51,22 +57,47 @@ impl Emit<'_> {
             self.thread_reloc(rt, |asm| asm.fs_quad(0xFF, 0, head + 8, None));
         }
         self.asm.bind(back);
-        self.cold_calls.push((cold, back, StencilReloc::runtime(0, rt, RelocKind::PcRel32)));
+        self.cold_calls.push(ColdCall::Frame(cold, back, StencilReloc::runtime(0, rt, RelocKind::PcRel32)));
         true
     }
 
-    /// Reads the calling thread's cell of thread slot `slot` from the static TLS slot table into rax and jumps to the returned label when the cell is made, so only a miss runs the call that follows; `None` when the table does not apply.
-    pub(super) fn thread_cell_hit(&mut self, slot: Value) -> Option<Label> {
-        let Some(&Op::Symbol(slot_sym)) = self.defs[slot.index()].map(|inst| &self.func.insts[inst.index()].op) else { return None };
+    fn thread_cell_sym(&self, slot: Value, lookup: u32) -> Option<u32> {
         if !self.frame_cache {
             return None;
         }
+        match self.defs[slot.index()].map(|inst| &self.func.insts[inst.index()].op) {
+            Some(&Op::Symbol(slot_sym)) => Some(slot_sym),
+            _ if self.const_of(slot) == Some(0) => Some(lookup),
+            _ => None,
+        }
+    }
+
+    /// Reads the calling thread's cell of thread slot `slot` from the static TLS slot table into rax and jumps to the returned label when the cell is made, so only a miss runs the call that follows; `None` when the table does not apply.
+    pub(super) fn thread_cell_hit(&mut self, slot: Value, lookup: u32) -> Option<Label> {
+        let target_sym = self.thread_cell_sym(slot, lookup)?;
         let hit = self.asm.label();
         let at = self.asm.fs_quad(0x8B, Reg::Rax as u8, 0, None);
-        self.relocs.push(StencilReloc::symbol(at, slot_sym, RelocKind::ThreadOff32));
+        self.relocs.push(StencilReloc::symbol(at, target_sym, RelocKind::ThreadOff32));
         self.asm.test(Reg::Rax, Reg::Rax);
         self.asm.jcc(Cond::Ne, hit);
         Some(hit)
+    }
+
+    /// Reads a thread cell inline with a straight-line fast path and an out-of-line cold miss stub when all arguments are static.
+    pub(super) fn thread_cell_cold(&mut self, lookup: u32, args: &[Value]) -> bool {
+        let [slot, size, init] = *args else { return false };
+        if self.abi_kind != CallAbi::SysV || !args.iter().all(|&a| self.is_static(a)) {
+            return false;
+        }
+        let Some(target_sym) = self.thread_cell_sym(slot, lookup) else { return false };
+        let (cold, back) = (self.asm.label(), self.asm.label());
+        let at = self.asm.fs_quad(0x8B, Reg::Rax as u8, 0, None);
+        self.relocs.push(StencilReloc::symbol(at, target_sym, RelocKind::ThreadOff32));
+        self.asm.test(Reg::Rax, Reg::Rax);
+        self.asm.jcc(Cond::E, cold);
+        self.asm.bind(back);
+        self.cold_calls.push(ColdCall::ThreadCell(cold, back, lookup, [slot, size, init]));
+        true
     }
 
     fn thread_reloc(&mut self, rt: RuntimeSymbol, encode: impl FnOnce(&mut Asm) -> u32) {
@@ -76,11 +107,26 @@ impl Emit<'_> {
 
     /// Emits the out-of-line runtime calls of cache misses, each returning to the code after its inline path.
     pub(super) fn emit_cold_calls(&mut self) {
-        for (cold, back, target) in std::mem::take(&mut self.cold_calls) {
-            self.asm.bind(cold);
-            let offset = self.asm.call_pcrel32();
-            self.relocs.push(StencilReloc { offset, ..target });
-            self.asm.jmp(back);
+        self.invalidate_spills();
+        for call in std::mem::take(&mut self.cold_calls) {
+            match call {
+                ColdCall::Frame(cold, back, target) => {
+                    self.asm.bind(cold);
+                    let offset = self.asm.call_pcrel32();
+                    self.relocs.push(StencilReloc { offset, ..target });
+                    self.asm.jmp(back);
+                }
+                ColdCall::ThreadCell(cold, back, lookup, [slot, size, init]) => {
+                    self.asm.bind(cold);
+                    self.raw(Reg::Rdi, slot);
+                    self.raw(Reg::Rsi, size);
+                    self.raw(Reg::Rdx, init);
+                    self.asm.flags_overwritten();
+                    let offset = self.asm.call_pcrel32();
+                    self.relocs.push(StencilReloc::symbol(offset, lookup, RelocKind::PcRel32));
+                    self.asm.jmp(back);
+                }
+            }
         }
     }
 }

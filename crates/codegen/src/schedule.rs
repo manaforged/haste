@@ -108,6 +108,7 @@ static FULL_RULES: &[Rule] = &[
     Rule { pass: Pass::Lsr, reads: Domain::CFG.union(Domain::VALUES) },
 ];
 static FULL_FINISH: &[Pass] = &[Pass::Switch, Pass::Returns, Pass::TailRec];
+static INLINE_FINISH: &[Pass] = &[Pass::Returns];
 
 fn run_pass(func: &mut Function, pass: Pass, moves: promote::Moves, effort: Effort, target: &crate::Target) -> Domain {
     let tracing = crate::trace::enabled();
@@ -117,7 +118,13 @@ fn run_pass(func: &mut Function, pass: Pass, moves: promote::Moves, effort: Effo
         Pass::Fill => fill::run(func),
         Pass::Fold => fold::run(func, effort),
         Pass::Merge => merge::run(func),
-        Pass::Promote => promote::step(func, moves),
+        Pass::Promote => {
+            let did = promote::step(func, moves);
+            if !did.is_empty() && func.slots.len() > 64 {
+                crate::ir::compact_slots(func);
+            }
+            did
+        }
         Pass::Cse => cse::run(func),
         Pass::Loads => loads::run(func, moves == promote::Moves::Split, target),
         Pass::Thread => thread::run(func),
@@ -382,6 +389,14 @@ fn build_plan<'t>(moves: promote::Moves, target: &'t crate::Target) -> Plan<'t> 
             budget: 6,
             finish: QUICK_FINISH,
         },
+        Effort::Full if moves == promote::Moves::Guided => Plan {
+            moves,
+            effort,
+            target,
+            rules: FULL_RULES,
+            budget: 32,
+            finish: INLINE_FINISH,
+        },
         Effort::Full => Plan {
             moves,
             effort,
@@ -403,6 +418,10 @@ fn run_late_lowering(func: &mut Function, plan: &Plan, state: &mut PassState) {
     if plan.moves == promote::Moves::Guided {
         return;
     }
+    if (plan.effort == Effort::Full || func.elide_drops) && func.elide_dead_unwind_drops_post_init(true) {
+        *state = PassState::new();
+        run_fixpoint(func, plan, state);
+    }
     if strip_assumes(func) {
         rerun_after_rewrite(func, plan, state);
     }
@@ -418,7 +437,7 @@ fn run_late_lowering(func: &mut Function, plan: &Plan, state: &mut PassState) {
 }
 
 fn invert_unlikely_branches(func: &mut Function) {
-    let cfg = func.cfg().clone();
+    let cfg = func.cfg();
     let loops = cfg.loops();
     if loops.list.is_empty() {
         return;
@@ -426,10 +445,7 @@ fn invert_unlikely_branches(func: &mut Function) {
     let cold = crate::live::cold(func);
     let mut is_latch = vec![false; func.blocks.len()];
     loops.list.iter().flat_map(|each| &each.latches).for_each(|l| is_latch[l.index()] = true);
-    let uses = func.use_counts();
-    let defs = crate::fold::defs(func);
-    let const_val = |func: &Function, v: Value| defs[v.index()].and_then(|inst| match func.insts[inst.index()].op { Op::Const(k) => Some(k), _ => None });
-    let mut changed = false;
+    let mut cands = Vec::new();
     for b in 0..func.blocks.len() {
         let block = Block(b as u32);
         let depth = loops.depth_of(block);
@@ -438,14 +454,31 @@ fn invert_unlikely_branches(func: &mut Function) {
         }
         let Some(&term) = func.blocks[b].insts.last() else { continue };
         let Op::Brif(cond, then_b, _, else_b, _) = func.insts[term.index()].op else { continue };
-        if then_b == else_b
-            || cold[then_b.index()]
-            || cold[else_b.index()]
-            || is_latch[then_b.index()] != is_latch[else_b.index()]
-            || loops.depth_of(then_b) != loops.depth_of(else_b)
-            || loops.depth_of(then_b) < depth
-            || uses[cond.index()] != 1
+        if then_b != else_b
+            && !cold[then_b.index()]
+            && !cold[else_b.index()]
+            && is_latch[then_b.index()] == is_latch[else_b.index()]
+            && loops.depth_of(then_b) == loops.depth_of(else_b)
+            && loops.depth_of(then_b) >= depth
         {
+            cands.push((term, cond));
+        }
+    }
+    drop(cfg);
+    if cands.is_empty() {
+        return;
+    }
+    let mut uses = vec![0_u32; func.types.len()];
+    let mut defs = vec![None; func.types.len()];
+    for &i in func.blocks.iter().flat_map(|b| &b.insts) {
+        let data = &func.insts[i.index()];
+        data.op.for_operands(|v| uses[v.index()] += 1);
+        if let Some(r) = data.result { defs[r.index()] = Some(i); }
+    }
+    let const_val = |func: &Function, v: Value| defs[v.index()].and_then(|inst| match func.insts[inst.index()].op { Op::Const(k) => Some(k), _ => None });
+    let mut changed = false;
+    for (term, cond) in cands {
+        if uses[cond.index()] != 1 {
             continue;
         }
         let Some(cmp_inst) = defs[cond.index()] else { continue };
@@ -466,12 +499,13 @@ fn invert_unlikely_branches(func: &mut Function) {
 }
 
 fn run_backend_prep(func: &mut Function, plan: &Plan) {
-    if plan.moves != promote::Moves::Guided {
-        if has_live_op(func, |op| matches!(op, Op::Binary(Binary::Isub | Binary::Bxor, ..))) {
-            crate::algebra::compare_offsets(func);
-        }
-        sink::run(func, plan.moves == promote::Moves::Split && plan.effort == Effort::Full);
+    if plan.moves == promote::Moves::Guided {
+        return;
     }
+    if has_live_op(func, |op| matches!(op, Op::Binary(Binary::Isub | Binary::Bxor, ..))) {
+        crate::algebra::compare_offsets(func);
+    }
+    sink::run(func, plan.moves == promote::Moves::Split && plan.effort == Effort::Full);
     let x64_full = plan.target.arch == crate::Arch::X64 && plan.effort == Effort::Full;
     if x64_full {
         branches::split_conditions(func);
@@ -494,6 +528,12 @@ pub(crate) fn run(func: &mut Function, moves: promote::Moves, target: &crate::Ta
     let merge_init = run_step(func, &plan, &mut state, INIT[2]);
     state.fold_clean = fold_init.is_empty() && merge_init.is_empty();
     state.merge_clean = merge_init.is_empty();
+    if moves != promote::Moves::Guided
+        && (plan.effort == Effort::Full || func.elide_drops)
+        && func.elide_dead_unwind_drops_post_init(false)
+    {
+        state = PassState::new();
+    }
     if moves == promote::Moves::Split && plan.effort == Effort::Full && crate::loads::elide_early(func) {
         state.fold_clean = false;
         state.merge_clean = false;

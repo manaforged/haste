@@ -69,20 +69,39 @@ pub(super) fn low_bits(cx: &mut RewriteCx, x: Value, y: Value) -> Option<Op> {
     Some(Op::Binary(Binary::Band, x, mask))
 }
 
-/// Tests a variable bit `k` by shifting the word instead of building a mask: `w & (1 << k) != 0` becomes `(w >> k) & 1 != 0`.
+/// Tests a variable bit `k` by shifting the word instead of building a mask: `w & (1 << k) != 0` and `(w & (1 << k)) == (1 << k)` become `(w >> k) & 1 != 0`.
 pub(super) fn shifted_bit_test(cx: &mut RewriteCx, cc: IntCC, x: Value, y: Value) -> Option<Op> {
     let ty = cx.func.ty(x);
-    if !matches!(cc, IntCC::Equal | IntCC::NotEqual) || !ty.is_small_int() || cx.uconst(y, ty) != Some(0) || !cx.single_use(x) {
+    if !matches!(cc, IntCC::Equal | IntCC::NotEqual) || !ty.is_small_int() {
         return None;
     }
-    let Some(&Op::Binary(Binary::Band, a, b)) = cx.op(x) else { return None };
     let is_bit = |m: Value| matches!(cx.op(m), Some(&Op::Binary(Binary::Ishl, one, k)) if cx.uconst(one, ty) == Some(1) && cx.sconst(k).is_none());
-    let (word, mask) = [(a, b), (b, a)].into_iter().find(|&(_, m)| is_bit(m) && cx.single_use(m))?;
-    let Some(&Op::Binary(Binary::Ishl, _, k)) = cx.op(mask) else { return None };
+    let (word, k, out_cc, zero) = if cx.uconst(y, ty) == Some(0) && cx.single_use(x)
+        && let Some(&Op::Binary(Binary::Band, a, b)) = cx.op(x)
+        && let Some((w, mask)) = [(a, b), (b, a)].into_iter().find(|&(_, m)| is_bit(m) && cx.single_use(m))
+        && let Some(&Op::Binary(Binary::Ishl, _, k)) = cx.op(mask)
+    {
+        (w, k, cc, Some(y))
+    } else if matches!(ty, Type::I32 | Type::I64)
+        && let Some((w, k)) = [(x, y), (y, x)].into_iter().find_map(|(band, mask)| {
+            if !cx.single_use(band) || !is_bit(mask) || cx.uses.get(mask.index()).copied().unwrap_or(3) > 2 {
+                return None;
+            }
+            let &Op::Binary(Binary::Band, a, b) = cx.op(band)? else { return None };
+            let w = if a == mask { b } else if b == mask { a } else { return None };
+            let &Op::Binary(Binary::Ishl, _, k) = cx.op(mask)? else { return None };
+            Some((w, k))
+        })
+    {
+        (w, k, cc.inverse(), None)
+    } else {
+        return None;
+    };
     let shifted = cx.emit(ty, Op::Binary(Binary::Ushr, word, k));
     let one = cx.emit(ty, Op::Const(1));
     let hit = cx.emit(ty, Op::Binary(Binary::Band, shifted, one));
-    Some(Op::Icmp(cc, hit, y))
+    let z = zero.unwrap_or_else(|| cx.emit(ty, Op::Const(0)));
+    Some(Op::Icmp(out_cc, hit, z))
 }
 
 /// Rewrites `(x >> k) == 0` / `!= 0` (logical right shift by constant `k`) into a sign test or unsigned range compare against `1 << k`.
@@ -147,10 +166,10 @@ pub(super) fn zero_compare(cx: &mut RewriteCx, cc: IntCC, x: Value, y: Value) ->
         (IntCC::SignedGreaterThan, _, Some(c)) if c == umax => (x, IntCC::SignedGreaterThanOrEqual, None),
         (IntCC::SignedLessThan, Some(c), _) if c == umax => (y, IntCC::SignedGreaterThanOrEqual, None),
         (IntCC::Equal | IntCC::NotEqual, _, Some(k)) if k.is_power_of_two() && ((cx.known(x).0 & umax) | k) == umax => {
-            (x, if cc == IntCC::Equal { IntCC::NotEqual } else { IntCC::Equal }, None)
+            (x, cc.inverse(), None)
         }
         (IntCC::Equal | IntCC::NotEqual, Some(k), _) if k.is_power_of_two() && ((cx.known(y).0 & umax) | k) == umax => {
-            (y, if cc == IntCC::Equal { IntCC::NotEqual } else { IntCC::Equal }, None)
+            (y, cc.inverse(), None)
         }
         _ => return None,
     };

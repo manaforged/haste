@@ -178,6 +178,11 @@ impl Checker<'_, '_> {
             Expr::Closure { params, body, .. } => {
                 let mut body_live = HashSet::default();
                 self.collect_live_expr(body, &mut body_live);
+                if let Some(closure) = self.typed.closures.get(&expr) {
+                    for &local in &closure.params {
+                        body_live.remove(&local);
+                    }
+                }
                 for &p in self.body.list(params) {
                     let param = self.body.params[p as usize];
                     let mut bound = HashSet::default();

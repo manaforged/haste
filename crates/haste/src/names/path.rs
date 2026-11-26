@@ -377,6 +377,60 @@ impl<'a> Paths<'a> {
         }
         Some(def)
     }
+
+    fn first_guarded(&self, word: Sym, at: ModRef, path: &Path<'_>) -> Option<(Def, super::collect::ImportGuard)> {
+        use super::collect::ImportGuard;
+        if let Some(def) = self.keyword(word, at, path.dollar) {
+            return def.map(|d| (d, ImportGuard::Solid));
+        }
+        let external = self.extern_crate(word);
+        if path.absolute && self.edition_2015 {
+            let root = self.member(module(self.krate, 0), word);
+            if let Some(binding) = root.types {
+                let guard = if binding.origin != Origin::Glob { ImportGuard::Solid } else { ImportGuard::None };
+                return Some((binding.def, guard));
+            }
+            return external.map(|def| (def, ImportGuard::None));
+        }
+        if path.absolute {
+            let guard = if self.edition_2015 { ImportGuard::None } else { ImportGuard::Extern(0, self.externs.len() as u32) };
+            return external.map(|def| (def, guard));
+        }
+        let local = self.member(Def::Module(at), word);
+        if let Some(binding) = local.types {
+            let guard = if binding.origin != Origin::Glob { ImportGuard::Solid } else { ImportGuard::None };
+            return Some((binding.def, guard));
+        }
+        if let Some(def) = external {
+            let guard = match (!self.edition_2015).then(|| self.scope(at)).flatten() {
+                Some(scope) => ImportGuard::Extern(scope.version(), self.externs.len() as u32),
+                None => ImportGuard::None,
+            };
+            return Some((def, guard));
+        }
+        let prelude = self.prelude.and_then(|prelude| self.member(Def::Module(prelude), word).types).map(|b| b.def);
+        prelude.or_else(|| Symbols::primitive(word).map(Def::Primitive)).map(|def| (def, ImportGuard::None))
+    }
+
+    /// Resolves every segment of `path` in the type namespace, also returning when the prefix cannot change on later passes.
+    pub fn resolve_guarded(&self, path: &Path<'_>, at: ModRef) -> Option<(Def, super::collect::ImportGuard)> {
+        use super::collect::ImportGuard;
+        let (first, rest) = path.segments.split_first()?;
+        let (mut def, mut guard) = self.first_guarded(*first, at, path)?;
+        for segment in rest {
+            match (*segment, def) {
+                (SUPER, Def::Module(current)) => def = Def::Module(self.parent(current)?),
+                _ => {
+                    let binding = self.member(def, *segment).types?;
+                    if binding.origin == Origin::Glob {
+                        guard = ImportGuard::None;
+                    }
+                    def = binding.def;
+                }
+            }
+        }
+        Some((def, guard))
+    }
 }
 
 /// The names of the variants of the enum whose body opens at token `open` of `src`, in order.

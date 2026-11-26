@@ -1,5 +1,5 @@
 use crate::ir::{Block, Convert, Function, Inst, Op, Type, Value};
-use crate::mem::{KnownLoads, MemLoc, MemRoot, Provenance, is_hard_barrier, may_alias};
+use crate::mem::{KnownLoads, MemLoc, MemRoot, Provenance, is_hard_barrier, may_alias_at};
 use crate::merge::find;
 
 use super::coalesce::ScanBuf;
@@ -22,14 +22,23 @@ pub(super) struct FarCseGuard {
     cur_pos: usize,
     cur_defs: usize,
     loads: Vec<Option<LoadTrack>>,
+    touched: Vec<usize>,
 }
 
 impl FarCseGuard {
-    pub(super) fn new(block_len: usize, num_values: usize) -> Self {
-        if block_len < MIN_BLOCK_INSTS {
-            return Self { active: false, cur_pos: 0, cur_defs: 0, loads: Vec::new() };
+    pub(super) fn empty() -> Self {
+        Self { active: false, cur_pos: 0, cur_defs: 0, loads: Vec::new(), touched: Vec::new() }
+    }
+
+    pub(super) fn reset(&mut self, block_len: usize, num_values: usize) {
+        for idx in self.touched.drain(..) {
+            if idx < self.loads.len() { self.loads[idx] = None; }
         }
-        Self { active: true, cur_pos: 0, cur_defs: 0, loads: vec![None; num_values] }
+        (self.cur_pos, self.cur_defs) = (0, 0);
+        self.active = block_len >= MIN_BLOCK_INSTS;
+        if self.active && self.loads.len() < num_values {
+            self.loads.resize(num_values, None);
+        }
     }
 
     pub(super) fn should_skip_value(&self, op: &Op, ty: Type, dom_val: Value) -> bool {
@@ -79,6 +88,7 @@ impl FarCseGuard {
             && matches!(data.op, Op::Load(..))
             && is_scalar_remat_ty(func.ty(res))
         {
+            if self.loads[res.index()].is_none() { self.touched.push(res.index()); }
             self.loads[res.index()] = Some(LoadTrack {
                 last_use_pos: self.cur_pos,
                 last_use_defs: next_defs,
@@ -533,7 +543,7 @@ impl SubwordSlices {
         Self(Vec::new())
     }
 
-    pub(super) fn prune_on_write(&mut self, func: &Function, prov: &Provenance, wloc: MemLoc) {
+    pub(super) fn prune_on_write(&mut self, func: &Function, prov: &Provenance, wloc: MemLoc, at: Option<Inst>) {
         let Some(w_hi) = wloc.offset.checked_add(i64::from(wloc.size)) else {
             self.0.retain(|s| loc_immutable(func, s.loc));
             return;
@@ -545,7 +555,7 @@ impl SubwordSlices {
                     push_clipped_slice(&mut self.0, wloc, (wloc.offset, w_hi), (s.orig_off, s.ty, s.val), (s.loc.offset, s_hi));
                 }
             } else if (loc_immutable(func, s.loc) && (matches!(s.loc.root, MemRoot::Global(_)) || wloc.root != s.loc.root))
-                || !may_alias(wloc, s.loc, prov)
+                || !may_alias_at(wloc, s.loc, prov, at)
             {
                 self.0.push(s);
             }
@@ -661,10 +671,29 @@ fn for_term_args(op: &Op, mut f: impl FnMut(Value)) -> bool {
 }
 
 pub(super) fn sink_terminator_defs(func: &mut Function) -> bool {
+    let mut any_cand = false;
+    for b in &func.blocks {
+        if b.insts.len() < 2 { continue; }
+        let last = b.insts[b.insts.len() - 1];
+        match &func.insts[last.index()].op {
+            Op::Jump(_, args) if !args.is_empty() => { any_cand = true; break; }
+            Op::Brif(c, _, t_args, _, e_args) => {
+                if !t_args.is_empty() || !e_args.is_empty() || func.insts[b.insts[b.insts.len() - 2].index()].result != Some(*c) {
+                    any_cand = true;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    if !any_cand {
+        return false;
+    }
     let uses = func.use_counts();
-    let mut fits_used = vec![false; func.types.len()];
+    let mut fits_used: Vec<bool> = Vec::new();
     for inst in func.blocks.iter().flat_map(|b| &b.insts) {
         if let Op::Fits(_, _, x, y) = func.insts[inst.index()].op {
+            if fits_used.is_empty() { fits_used.resize(func.types.len(), false); }
             fits_used[x.index()] = true;
             fits_used[y.index()] = true;
         }
@@ -672,19 +701,41 @@ pub(super) fn sink_terminator_defs(func: &mut Function) -> bool {
     let mut term_uses = vec![0_u32; func.types.len()];
     let mut changed = false;
     for b in 0..func.blocks.len() {
-        if func.blocks[b].insts.len() < 2 {
-            continue;
-        }
-        let Some(&last) = func.blocks[b].insts.last() else { continue };
-        if !for_term_args(&func.insts[last.index()].op, |v| term_uses[v.index()] += 1) {
+        let len = func.blocks[b].insts.len();
+        if len < 2 { continue; }
+        let last = func.blocks[b].insts[len - 1];
+        let mut arg_count = 0_u32;
+        if !for_term_args(&func.insts[last.index()].op, |v| { term_uses[v.index()] += 1; arg_count += 1; }) {
             continue;
         }
         let cond = match func.insts[last.index()].op {
             Op::Brif(c, ..) if uses[c.index()] == 1 => Some(c),
             _ => None,
         };
+        if arg_count == 0 && cond.is_none_or(|c| func.insts[func.blocks[b].insts[len - 2].index()].result == Some(c)) {
+            continue;
+        }
+        let mut needs_move = false;
+        for (pos, &inst) in func.blocks[b].insts[..len - 1].iter().enumerate() {
+            let data = &func.insts[inst.index()];
+            if data.result.is_some() && data.result == cond && crate::schedule::is_condition(func, inst) {
+                if pos != len - 2 { needs_move = true; break; }
+            } else if arg_count > 0
+                && let Some(res) = data.result
+                && data.op.is_speculable()
+                && !fits_used.get(res.index()).copied().unwrap_or(false)
+                && term_uses[res.index()] > 0
+                && uses[res.index()] == term_uses[res.index()]
+            {
+                needs_move = true;
+                break;
+            }
+        }
+        if !needs_move {
+            if arg_count > 0 { for_term_args(&func.insts[last.index()].op, |v| term_uses[v.index()] = 0); }
+            continue;
+        }
         let insts = std::mem::take(&mut func.blocks[b].insts);
-        let len = insts.len();
         let mut kept = Vec::with_capacity(len);
         let mut sunk = Vec::new();
         let mut tail = None;
@@ -694,7 +745,7 @@ pub(super) fn sink_terminator_defs(func: &mut Function) -> bool {
                 tail = Some(inst);
             } else if let Some(res) = data.result
                 && data.op.is_speculable()
-                && !fits_used[res.index()]
+                && !fits_used.get(res.index()).copied().unwrap_or(false)
                 && term_uses[res.index()] > 0
                 && uses[res.index()] == term_uses[res.index()]
             {
@@ -708,7 +759,7 @@ pub(super) fn sink_terminator_defs(func: &mut Function) -> bool {
         kept.push(last);
         changed |= kept != insts;
         func.blocks[b].insts = kept;
-        for_term_args(&func.insts[last.index()].op, |v| term_uses[v.index()] = 0);
+        if arg_count > 0 { for_term_args(&func.insts[last.index()].op, |v| term_uses[v.index()] = 0); }
     }
     changed
 }

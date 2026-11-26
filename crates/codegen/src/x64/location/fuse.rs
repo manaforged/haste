@@ -15,7 +15,7 @@ pub(super) struct FuseCtx<'a> {
     pub(super) func: &'a Function,
     pub(super) plan: &'a Plan<Reg>,
     pub(super) uses: &'a [u32],
-    pub(super) pos_of: &'a [Option<(usize, usize, Inst)>],
+    pub(super) pos_of: &'a [super::Site],
     pub(super) defs: &'a [Option<Inst>],
     pub(super) b_idx: usize,
 }
@@ -32,7 +32,7 @@ fn zero_cmp_band(
     func: &Function,
     plan: &Plan<Reg>,
     uses: &[u32],
-    pos_of: &[Option<(usize, usize, Inst)>],
+    pos_of: &[super::Site],
     b_idx: usize,
     lhs: Value,
     rhs: Value,
@@ -40,7 +40,7 @@ fn zero_cmp_band(
     crate::emit::zero_cmp_band(func, plan, (uses, pos_of), b_idx, (lhs, rhs), |v| is_zero_const(func, plan, v))
 }
 
-fn may_barrier_mem(op: &Op) -> bool {
+pub(super) fn may_barrier_mem(op: &Op) -> bool {
     matches!(
         op,
         Op::Store(..)
@@ -110,15 +110,7 @@ fn load_dst_clobber(ctx: &FuseCtx<'_>, linst: Inst, load_res: Value, (u_res, op)
 }
 
 pub(in crate::x64) fn iadd_sub_const(plan: &Plan<Reg>, op: &Op) -> Option<(Value, i64)> {
-    match *op {
-        Op::Binary(Binary::Iadd, a, b) => match (plan.const_of(a), plan.const_of(b)) {
-            (None, Some(c)) => Some((a, c)),
-            (Some(c), None) => Some((b, c)),
-            _ => None,
-        },
-        Op::Binary(Binary::Isub, a, b) if plan.const_of(a).is_none() => plan.const_of(b).and_then(|c| c.checked_neg()).map(|c| (a, c)),
-        _ => None,
-    }
+    crate::alloc::iadd_sub_const(op, |v| plan.const_of(v))
 }
 
 fn cmp_band_arg_ok(ctx: &FuseCtx<'_>, (mpos, cpos, last_pos): (usize, usize, usize), u: Value) -> bool {
@@ -153,7 +145,7 @@ fn cmp_operand_ok(ctx: &FuseCtx<'_>, tst_end: &[Option<usize>], cpos: usize, las
 fn push_branch_tst(
     func: &Function,
     plan: &Plan<Reg>,
-    (uses, pos_of): (&[u32], &[Option<(usize, usize, Inst)>]),
+    (uses, pos_of): (&[u32], &[super::Site]),
     (b_idx, pos, cond_val): (usize, usize, Value),
     out: &mut Vec<(usize, Value, Option<Value>)>,
 ) {
@@ -216,7 +208,7 @@ fn select_leaf_ok(ctx: &FuseCtx<'_>, tst_end: &[Option<usize>], (pos, skip): (us
 fn apply_select_at(
     func: &Function,
     plan: &mut Plan<Reg>,
-    (uses, pos_of, defs): (&[u32], &[Option<(usize, usize, Inst)>], &[Option<Inst>]),
+    (uses, pos_of, defs): (&[u32], &[super::Site], &[Option<Inst>]),
     (b_idx, pos, inst): (usize, usize, Inst),
     (tst_end, roots): (&mut [Option<usize>], &mut [Option<Root>]),
 ) {
@@ -253,7 +245,7 @@ fn apply_select_at(
 fn apply_select_trees(
     func: &Function,
     plan: &mut Plan<Reg>,
-    tables: (&[u32], &[Option<(usize, usize, Inst)>], &[Option<Inst>]),
+    tables: (&[u32], &[super::Site], &[Option<Inst>]),
     tst_end: &mut [Option<usize>],
     roots: &mut [Option<Root>],
 ) {
@@ -339,6 +331,8 @@ fn load_elide_ok(ctx: &FuseCtx<'_>, features: &Features, linst: Inst, load_res: 
     let non_wide = udata.result.is_some_and(|r| ctx.func.ty(r) != Type::I128);
     match udata.op {
         Op::Icmp(..) => true,
+        Op::Brif(cond, ..) | Op::Trapz(cond) => cond == load_res,
+        Op::Store(..) | Op::StackStore(..) => super::sib::store_load_ok(ctx.func, ctx.plan, linst, load_res, &udata.op),
         Op::Convert(Convert::Uextend | Convert::Sextend, _) => ty.bytes() <= 4 && non_wide,
         Op::Convert(Convert::Ireduce, _) => ty.bytes() <= 8 && non_wide,
         Op::Binary(..) => load_binop_ok(ctx, features, linst, load_res, udata),
@@ -358,11 +352,11 @@ pub(in super::super) fn narrows_exactly(func: &Function, plan: &Plan<Reg>, def: 
     func.ty(x).unsigned_max() & !to.unsigned_max() & !zeros == 0
 }
 
-pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &Features) -> Vec<Option<Root>> {
+pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &Features) -> (Vec<Option<Root>>, Vec<bool>) {
     let n = func.types.len();
-    let mut roots = vec![None; n];
+    let (mut roots, mut pure_test) = (vec![None; n], vec![false; n]);
     if func.size() > 8192 {
-        return roots;
+        return (roots, pure_test);
     }
     let defs = crate::fold::defs(func);
     let (mut uses, mut pos_of, mut ls_uses, mut use_of) = (vec![0_u32; n], vec![None; n], vec![Vec::new(); n], vec![None; n]);
@@ -621,31 +615,27 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
         }
     }
     apply_select_trees(func, plan, (&uses, &pos_of, &defs), &mut tst_end, &mut roots);
+    super::sib::fuse_mem_rmw(func, plan, (&uses, &pos_of, &defs));
     for (b_idx, lpos, load_res) in cand_loads {
+        if plan.elided[load_res.index()] { continue; }
         let Some((ub, upos, uinst)) = use_of[load_res.index()] else { continue };
-        if ub != b_idx || upos <= lpos {
-            continue;
-        }
+        if ub != b_idx || upos <= lpos { continue; }
         let ctx = FuseCtx { func, plan, uses: &uses, pos_of: &pos_of, defs: &defs, b_idx };
         let udata = &func.insts[uinst.index()];
         let eff_pos = if let Some(ur) = udata.result.filter(|r| plan.elided[r.index()]) {
             let Some(fpos) = tst_end[ur.index()] else { continue };
             fpos
         } else {
-            if !load_elide_ok(&ctx, features, func.blocks[b_idx].insts[lpos], load_res, udata) {
-                continue;
-            }
+            if !load_elide_ok(&ctx, features, func.blocks[b_idx].insts[lpos], load_res, udata) { continue; }
             upos
         };
-        if load_fuses(&ctx, lpos, eff_pos, &[]) {
-            plan.elided[load_res.index()] = true;
-        }
+        if load_fuses(&ctx, lpos, eff_pos, &[]) { plan.elided[load_res.index()] = true; }
     }
     for (b_idx, pos, res, op, x, y) in cand_alu {
         if plan.elided[res.index()] || plan.deferred[res.index()] || plan.fused[res.index()] || plan.sib[res.index()].is_some() || skip_flags[res.index()] {
             continue;
         }
-        if op == Binary::Band && [x, y].into_iter().any(|v| plan.const_of(v).is_some_and(|m| matches!(m, 0xFF | 0xFFFF | 0xFFFF_FFFF))) {
+        if op == Binary::Band && ((uses[res.index()] > 0 && !non_flag_use[res.index()]) || [x, y].into_iter().any(|v| plan.const_of(v).is_some_and(|m| matches!(m, 0xFF | 0xFFFF | 0xFFFF_FFFF)))) {
             continue;
         }
         if op == Binary::Ushr && !plan.const_of(y).is_some_and(|c| (c & i64::from(func.ty(res).bits() - 1)) != 0) && bextr_parts(func, plan, func.ty(res), op, (x, y), |v| plan.elided[v.index()], def_inst).is_none() {
@@ -696,26 +686,26 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
             if plan.elided[cmp_res.index()] || plan.fused[cmp_res.index()] || uses[cmp_res.index()] == 0 || non_flag_use[cmp_res.index()] {
                 continue;
             }
-            if !flag_cmp(func, &data.op) {
-                continue;
-            }
+            let is_band = matches!(data.op, Op::Binary(Binary::Band, a, _) if func.ty(a).is_small_int());
+            if !flag_cmp(func, &data.op) && !is_band { continue; }
             let Some((ub, last_pos)) = last_flag_use[cmp_res.index()] else { continue };
-            if ub != b_idx || last_pos <= cpos {
-                continue;
-            }
+            if ub != b_idx || last_pos <= cpos { continue; }
             if (cpos + 1..=last_pos).all(|pos| mid_preserves_flags(func, plan, &defs, &roots, cmp_res, block.insts[pos], pos == last_pos)) {
                 plan.fused[cmp_res.index()] = true;
+                pure_test[cmp_res.index()] = is_band;
             } else if let Op::Icmp(_, a, b) = data.op {
                 let ctx = FuseCtx { func, plan, uses: &uses, pos_of: &pos_of, defs: &defs, b_idx };
                 if !parked(plan, cmp_res) && [a, b].into_iter().all(|v| cmp_operand_ok(&ctx, &tst_end, cpos, last_pos, v)) {
                     plan.elided[cmp_res.index()] = true;
+                    for v in [a, b] { if tst_end[v.index()].is_some() { tst_end[v.index()] = Some(last_pos); } }
                 }
             }
         }
     }
+    super::sib::fuse_bt_shifts(func, plan, (&uses, &pos_of), &tst_end, &pure_test);
     fold_products(func, plan, &uses, &defs);
     if features.avx2 { super::elide_broadcast_inserts(func, plan, &defs, (&uses, &pos_of, &use_of)); }
-    super::fuse_atomic_rmws(func, plan, (&uses, &pos_of, &use_of));
+    super::sib::fuse_atomic_rmws(func, plan, (&uses, &pos_of, &use_of));
     elide_zero_bases(func, plan, &defs);
     for (low, operands) in paired {
         if plan.is_static(low) || plan.deferred[low.index()] {
@@ -724,7 +714,7 @@ pub(in super::super) fn fuse(func: &Function, plan: &mut Plan<Reg>, features: &F
             }
         }
     }
-    roots
+    (roots, pure_test)
 }
 
 /// Elides each zero vector read only as the base of integer lane-0 inserts, which write their scalar into a zeroed register without reading the base.

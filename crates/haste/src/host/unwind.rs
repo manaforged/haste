@@ -49,7 +49,7 @@ pub(crate) fn set_jit_unwind_head(head: usize) {
 /// Clears the active JIT unwind-list head if it still matches `head`.
 pub(crate) fn clear_jit_unwind_head(head: usize) {
     if head != 0 {
-        let _ = JIT_UNWIND_HEAD.compare_exchange(head, 0, Ordering::AcqRel, Ordering::Relaxed);
+        JIT_UNWIND_HEAD.compare_exchange(head, 0, Ordering::AcqRel, Ordering::Relaxed).ok();
     }
 }
 
@@ -225,6 +225,10 @@ pub extern "C" fn drop_pop(node: *mut DropNode) {
     }
 }
 
+/// Drains linked stack drop nodes above `mark` (and below `limit_addr` when non-zero).
+///
+/// # Safety
+/// Every node on `CURRENT_DROPS` above `mark` must point to a live, initialized `DropNode` on an active unwound frame.
 unsafe fn drain_drops_until(mark: *mut DropNode, limit_addr: usize) {
     loop {
         let node = CURRENT_DROPS.get();
@@ -243,6 +247,10 @@ unsafe fn drain_drops_until(mark: *mut DropNode, limit_addr: usize) {
     }
 }
 
+/// Runs registered frame-table drop entries for the JIT frame at `fp` and return site `call_pc`.
+///
+/// # Safety
+/// `fp` must be a live JIT frame pointer matching the layout recorded for `call_pc`.
 unsafe fn run_jit_frame_drops(fp: usize, call_pc: usize) {
     let Some(drops) = lookup_jit_drops(call_pc) else {
         return;
@@ -266,6 +274,10 @@ unsafe fn run_jit_frame_drops(fp: usize, call_pc: usize) {
     }
 }
 
+/// Walks active JIT frames up to `stop_fp` and drains interleaved linked drop nodes down to `mark`.
+///
+/// # Safety
+/// `fp`, `stop_fp`, and `mark` must bound active frames on the current thread's stack above `catch_unwind`.
 unsafe fn drain_jit_frames(mut fp: usize, mut ret_pc: usize, stop_fp: usize, mark: *mut DropNode) {
     while fp != 0 && (stop_fp == 0 || fp < stop_fp) {
         // SAFETY: `mark` and `fp` bound active stack frames between the panic site and `catch_unwind`.
@@ -378,6 +390,7 @@ std::arch::global_asm!(
     inner = sym start_panic_inner,
 );
 
+// SAFETY: `haste_start_panic_tramp` is defined by `global_asm!` above with the C ABI signature below.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 unsafe extern "C" {
     fn haste_start_panic_tramp(payload_data: usize, payload_vtable: usize) -> u32;

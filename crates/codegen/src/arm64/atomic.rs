@@ -1,6 +1,6 @@
 use super::asm::{Alu, Cond, FP, Mem, Reg, Size, ZR};
 use super::{A, C, D, Emit, IP, S, T};
-use crate::ir::{AtomicRmwOp, Binary, Convert, Function, IntCC, Lane, Op, ReduceOp, Type, Unary, Value};
+use crate::ir::{AtomicOrd, AtomicRmwOp, Binary, Convert, Function, IntCC, Lane, Op, ReduceOp, Type, Unary, Value};
 use crate::reloc::{RelocKind, StencilReloc};
 
 const COPY_SCRATCH: [Reg; 4] = [A, D, S, T];
@@ -109,8 +109,9 @@ impl Emit<'_> {
             Op::StackLoad(slot, offset) => self.read(result()?, self.slot(*slot, *offset)),
             Op::StackStore(value, slot, offset) => self.write(*value, self.slot(*slot, *offset)),
             Op::Fence(ord) => match ord {
-                crate::ir::AtomicOrd::Relaxed => {}
-                crate::ir::AtomicOrd::Acquire => self.asm.dmb_ld(),
+                AtomicOrd::Relaxed => {}
+                AtomicOrd::Acquire => self.asm.dmb_ld(),
+                AtomicOrd::Isb => self.asm.word(0xD503_3FDF),
                 _ => self.asm.dmb(),
             },
             Op::FramePointer => self.put(result()?, FP),
@@ -192,17 +193,36 @@ impl Emit<'_> {
     fn move_bytes(&mut self, to: Value, from: Value, bytes: u32) {
         let source = self.address_in(from, 0, S);
         let target = self.address_in(to, 0, C);
-        let whole = bytes / 16 * 16;
-        for at in (0..whole).step_by(16) {
+        let qpair_ok = |d: i32| d % 16 == 0 && (-1024..=1008).contains(&d);
+        let mut at = 0_u32;
+        let mut used_v0 = false;
+        let mut used_v1 = false;
+        while at + 32 <= bytes
+            && let (Some(sd), Some(td)) = (source.disp.checked_add(at as i32), target.disp.checked_add(at as i32))
+            && qpair_ok(sd)
+            && qpair_ok(td)
+        {
+            self.asm.qldp_offset(super::V0, super::V1, source.base, sd);
+            self.asm.qstp_offset(super::V0, super::V1, target.base, td);
+            used_v0 = true;
+            used_v1 = true;
+            at += 32;
+        }
+        while at + 16 <= bytes {
             self.asm.vload(16, super::V1, source.offset(at as i32));
             self.asm.vstore(16, target.offset(at as i32), super::V1);
+            used_v1 = true;
+            at += 16;
         }
-        for (ty, at) in crate::copy::words(bytes - whole) {
-            let at = (whole + at) as i32;
-            self.asm.load(Size::of(ty.bytes()), false, A, source.offset(at));
-            self.asm.store(Size::of(ty.bytes()), target.offset(at), A);
+        for (ty, off) in crate::copy::words(bytes - at) {
+            let off = (at + off) as i32;
+            self.asm.load(Size::of(ty.bytes()), false, A, source.offset(off));
+            self.asm.store(Size::of(ty.bytes()), target.offset(off), A);
         }
-        if whole > 0 {
+        if used_v0 {
+            self.clobber_vreg(super::V0);
+        }
+        if used_v1 {
             self.clobber_vreg(super::V1);
         }
         self.clobber_regs(&[A, C, S]);
@@ -334,6 +354,12 @@ impl Emit<'_> {
         }
     }
 
+    pub(super) fn preserves_flags(&self, op: &Op, result: Option<Value>) -> bool {
+        matches!(*op, Op::Brif(..))
+            || matches!(*op, Op::Select(cond, ..) | Op::Trapz(cond) if self.flags.is_some_and(|(v, _)| v == cond))
+            || super::fuse::preserves_flags(self.func, &self.plan, op, result, true)
+    }
+
     fn select_cond(&mut self, condition: Value) -> Cond {
         if let Some((val, c)) = self.flags
             && val == condition
@@ -352,6 +378,7 @@ impl Emit<'_> {
             let size = if self.ty(condition).bytes() <= 4 { Size::W } else { Size::X };
             self.asm.add_imm(true, true, size, ZR, flag, 0);
         }
+        self.flags = Some((condition, Cond::Ne));
         Cond::Ne
     }
 
@@ -475,6 +502,25 @@ impl Emit<'_> {
         }
     }
 
+    fn relaxed_atomic_target(&self, addr: Value) -> (Value, i32) {
+        if !self.plan.elided[addr.index()] || self.plan.sib[addr.index()].is_some() {
+            return (addr, 0);
+        }
+        let Some(inst) = self.defs[addr.index()] else { return (addr, 0) };
+        let c = |v: Value| super::fuse::const_of(self.func, &self.plan, v, |x| self.defs[x.index()]);
+        match self.func.insts[inst.index()].op {
+            Op::Binary(crate::ir::Binary::Iadd, x, y) => {
+                if let Some(imm) = c(y).and_then(|v| i32::try_from(v).ok()) { return (x, imm); }
+                if let Some(imm) = c(x).and_then(|v| i32::try_from(v).ok()) { return (y, imm); }
+            }
+            Op::Binary(crate::ir::Binary::Isub, base, rhs) => {
+                if let Some(imm) = c(rhs).and_then(|v| v.checked_neg()).and_then(|v| i32::try_from(v).ok()) { return (base, imm); }
+            }
+            _ => {}
+        }
+        (addr, 0)
+    }
+
     fn atomic(&mut self, op: &Op, result: impl Fn() -> Result<Value, String>) -> Result<(), String> {
         self.invalidate_spills();
         let ty = match op {
@@ -487,22 +533,24 @@ impl Emit<'_> {
         let size = Size::of(ty.bytes());
         match op {
             Op::AtomicLoad(addr, ord) => {
-                let at = self.bits(*addr, C);
-                let dst = self.dst(result()?);
                 if ord.has_acquire() {
+                    let at = self.bits(*addr, C);
+                    let dst = self.dst(result()?);
                     self.asm.load_acquire(size, dst, at);
+                    self.put(result()?, dst);
                 } else {
-                    self.asm.load(size, false, dst, Mem::new(at, 0));
+                    let (base, off) = self.relaxed_atomic_target(*addr);
+                    self.load_at(result()?, base, off);
                 }
-                self.put(result()?, dst);
             }
             Op::AtomicStore(value, addr, ord) => {
-                let at = self.bits(*addr, C);
-                let source = self.bits(*value, A);
                 if ord.has_release() {
+                    let at = self.bits(*addr, C);
+                    let source = self.store_src(*value);
                     self.asm.store_release(size, at, source);
                 } else {
-                    self.asm.store(size, Mem::new(at, 0), source);
+                    let (base, off) = self.relaxed_atomic_target(*addr);
+                    self.store_at(*value, base, off);
                 }
             }
             Op::AtomicRmw(rmw, ord, addr, value) => {
@@ -528,7 +576,7 @@ impl Emit<'_> {
         Ok(())
     }
 
-    fn lse_rmw(&mut self, op: AtomicRmwOp, ord: crate::ir::AtomicOrd, size: Size, addr: Value, value: Value, result: Value) {
+    fn lse_rmw(&mut self, op: AtomicRmwOp, ord: AtomicOrd, size: Size, addr: Value, value: Value, result: Value) {
         let signed = matches!(op, AtomicRmwOp::Smin | AtomicRmwOp::Smax);
         let at = self.bits(addr, C);
         let val = match (op, self.plan.const_of(value)) {
@@ -569,7 +617,7 @@ impl Emit<'_> {
         }
     }
 
-    fn lse_cas(&mut self, ord: crate::ir::AtomicOrd, size: Size, addr: Value, (expected, replacement): (Value, Value), result: Value) {
+    fn lse_cas(&mut self, ord: AtomicOrd, size: Size, addr: Value, (expected, replacement): (Value, Value), result: Value) {
         let at = self.bits(addr, C);
         let dst = self.dst(result);
         let rep_reg = self.plan.reg_of(replacement);
@@ -580,7 +628,7 @@ impl Emit<'_> {
         self.put(result, old);
     }
 
-    fn rmw(&mut self, op: AtomicRmwOp, ord: crate::ir::AtomicOrd, size: Size, addr: Value, value: Value) {
+    fn rmw(&mut self, op: AtomicRmwOp, ord: AtomicOrd, size: Size, addr: Value, value: Value) {
         let signed = matches!(op, AtomicRmwOp::Smin | AtomicRmwOp::Smax);
         let bytes = [1, 2, 4, 8][size as usize];
         self.raw(S, addr);
@@ -621,7 +669,7 @@ impl Emit<'_> {
         self.asm.cbz(true, Size::W, T, again);
     }
 
-    fn cas(&mut self, ord: crate::ir::AtomicOrd, size: Size, addr: Value, (expected, replacement): (Value, Value)) {
+    fn cas(&mut self, ord: AtomicOrd, size: Size, addr: Value, (expected, replacement): (Value, Value)) {
         let bytes = [1, 2, 4, 8][size as usize];
         self.raw(S, addr);
         self.zext_get(D, expected);

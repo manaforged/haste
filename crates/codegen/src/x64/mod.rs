@@ -21,7 +21,7 @@ use features::Features;
 pub(crate) use ymm::host_avx2;
 use frame::{Abi, Loc, SAVED, SAVED_RBP, classify};
 use crate::alloc::{CallTarget, Location, Plan, Regs};
-use crate::emit::{Backend, Tails, emit_brif, emit_call, emit_goto, emit_slow_prologue, emit_stubs, emit_try_call, intake_params};
+use crate::emit::{Backend, Tails, emit_brif, emit_call, emit_goto, emit_stubs, emit_try_call, intake_params};
 use crate::frame::{ArgStep, EdgeScratch, Emitter, Ext, Frame, INCOMING, PAGE, Prepared, ShrinkWrap, Step, arg_steps, drive, edge_steps, emit_body, prepare_split, reg_steps, save_offset, shrink_wrap};
 use crate::ir::{ArgumentPurpose, Binary, Block, Function, Inst, Op, SigRef, TargetOpId, Type, Value};
 use crate::park::ParkReg;
@@ -84,7 +84,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
     let features = Features::host();
     let dropped = |plan: &Plan<Reg>| plan.elided.iter().chain(&plan.fused).filter(|&&e| e).count();
     let dropped_before = dropped(&plan);
-    let roots = location::fuse(func, &mut plan, &features);
+    let (roots, pure_test) = location::fuse(func, &mut plan, &features);
     if dropped(&plan) != dropped_before {
         crate::frame::repack_after_elide(func, &plan, &abi, &mut frame, &mut framed, |sig| classify(sig, abi_kind))?;
     }
@@ -93,7 +93,6 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
     let mut asm = Asm::default();
     asm.avx = features.avx;
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
-    let slow_thunk = asm.label();
     let defs = crate::fold::defs(func);
     let overflow_read = wide::overflow_reads(func);
     let adc_sum = wide::adc_sums(func, &plan, &defs);
@@ -114,6 +113,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         plan,
         defs,
         roots,
+        pure_test,
         flags: None,
         last_spill: crate::spills::SpillCache::new(),
         last_fspill: None,
@@ -130,9 +130,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         frame_cache: target.direct_calls && target.os == crate::target::Os::Linux,
         cold_calls: Vec::new(),
         shrink,
-        slow_thunk,
-        in_shrink_entry: false,
-        in_fast_ret: false,
+        in_fast: false,
         low_product: None,
         overflow_read,
         adc_sum,
@@ -192,6 +190,7 @@ pub(super) struct Emit<'a> {
     plan: Plan<Reg>,
     defs: Vec<Option<Inst>>,
     roots: Vec<Option<location::Root>>,
+    pure_test: Vec<bool>,
     flags: Option<(Value, Cond)>,
     last_spill: crate::spills::SpillCache<Reg>,
     last_fspill: Option<(i32, Xmm, Type)>,
@@ -206,11 +205,9 @@ pub(super) struct Emit<'a> {
     copied: Vec<bool>,
     direct_calls: bool,
     frame_cache: bool,
-    cold_calls: Vec<(Label, Label, StencilReloc)>,
+    cold_calls: Vec<frames::ColdCall>,
     shrink: Option<ShrinkWrap>,
-    slow_thunk: Label,
-    in_shrink_entry: bool,
-    in_fast_ret: bool,
+    in_fast: bool,
     low_product: Option<(Value, Value)>,
     overflow_read: Vec<bool>,
     /// The sums whose carry an adc or sbb reads through a compare it absorbed.
@@ -278,30 +275,8 @@ impl<'a> Emitter<'a> for Emit<'a> {
 
     fn deferred_prologue(&self) -> bool { self.shrink.is_some() }
 
-    fn blocks_fallthrough_to(&self, block: Block) -> bool {
-        self.shrink.is_some_and(|s| s.use_slow_thunk && s.slow_entry == block)
-    }
-
-    fn before_block_bind(&mut self, block: Block) -> Result<(), String> {
-        if let Some(shrink) = self.shrink
-            && shrink.use_slow_thunk
-            && block == shrink.slow_entry
-        {
-            self.asm.bind(self.slow_thunk);
-            emit_slow_prologue(self, shrink.slow_entry)?;
-        }
-        Ok(())
-    }
-
     fn on_block_bound(&mut self, block: Block) -> Result<(), String> {
-        self.in_shrink_entry = self.shrink.is_some() && self.func.entry == Some(block);
-        self.in_fast_ret = self.shrink.is_some_and(|s| s.fast_ret == block);
-        if let Some(shrink) = self.shrink
-            && !shrink.use_slow_thunk
-            && block == shrink.slow_entry
-        {
-            emit_slow_prologue(self, shrink.slow_entry)?;
-        }
+        self.in_fast = self.shrink.as_ref().is_some_and(|s| s.fast[block.index()]);
         Ok(())
     }
 
@@ -330,7 +305,6 @@ impl<'a> Emitter<'a> for Emit<'a> {
             Op::Call { sig, callee, args, results } => {
                 let res = emit_call(self, inst, (*sig, *callee), args, results);
                 self.clear_flags();
-                self.invalidate_spills();
                 res
             }
             Op::TryCall { sig, callee, args, normal, handler } => {
@@ -339,18 +313,26 @@ impl<'a> Emitter<'a> for Emit<'a> {
                 res
             }
             Op::Jump(block, args) => {
+                if self.is_split_ret(*block) {
+                    self.edge(*block, args)?;
+                    return self.fast_ret(*block);
+                }
+                if self.exits_fast(*block) {
+                    self.prologue();
+                    self.in_fast = false;
+                }
                 self.edge(*block, args)?;
                 if self.copied[inst.index()] {
                     return emit_body(self, *block);
                 }
-                self.carry_spills(args.is_empty());
-                self.invalidate_spills();
                 emit_goto(self, *block, true);
+                self.carry_spills(self.next == Some(*block));
+                self.invalidate_spills();
                 Ok(())
             }
             Op::Brif(condition, then, then_args, otherwise, else_args) => {
                 let res = emit_brif(self, *condition, (*then, then_args), (*otherwise, else_args));
-                self.carry_spills(then_args.is_empty() && else_args.is_empty());
+                self.carry_spills(then != otherwise && (self.next == Some(*then) || self.next == Some(*otherwise)));
                 self.invalidate_spills();
                 res
             }
@@ -456,6 +438,7 @@ impl Emit<'_> {
         if self.framed && self.base == Reg::Rsp {
             self.asm.alu_imm(Alu::Add, Reg::Rsp, self.bias + 8);
         }
+        self.asm.flags_overwritten();
         self.asm.bytes(if self.framed && self.base == Reg::Rbp { &[0xC9, 0xC3] } else { &[0xC3] });
     }
 
@@ -517,8 +500,18 @@ impl Emit<'_> {
     }
 
     fn edge(&mut self, block: Block, args: &[Value]) -> Result<(), String> {
+        let params = &self.func.blocks[block.index()].params;
+        let (mut rem_a, mut rem_p) = (Vec::new(), Vec::new());
+        let (a_slice, p_slice) = if args.iter().any(|&a| self.is_fused_cas(a)) {
+            for (&arg, &param) in args.iter().zip(params) {
+                if self.is_fused_cas(arg) { self.put(param, Reg::Rax); } else { rem_a.push(arg); rem_p.push(param); }
+            }
+            (&rem_a[..], &rem_p[..])
+        } else {
+            (args, &params[..])
+        };
         let float_scratch = [Xmm(0), Xmm(1)];
-        for step in edge_steps(self.func, &self.plan.locations, &self.frame.values, args, &self.func.blocks[block.index()].params) {
+        for step in edge_steps(self.func, &self.plan.locations, &self.frame.values, a_slice, p_slice) {
             match step {
                 Step::Move(arg, param) => self.assign(param, arg),
                 Step::Save(arg, EdgeScratch::Int(i)) => self.save_edge(i, arg),
@@ -578,7 +571,7 @@ impl Emit<'_> {
         }
         self.leave_wide(&func.signature.returns);
         self.asm.flags_overwritten();
-        if self.in_fast_ret {
+        if self.in_fast {
             self.asm.bytes(&[0xC3]);
         } else {
             self.epilogue();
@@ -604,7 +597,6 @@ impl Emit<'_> {
                 self.high(high, val);
             }
         }
-        self.invalidate_spills();
         float_targets.len()
     }
 
@@ -651,8 +643,7 @@ impl Emit<'_> {
         self.clobber_reg(Reg::Rcx);
     }
 
-    fn arguments(&mut self, sig: SigRef, callee: Value, args: &[Value]) -> Result<Abi, String> {
-        self.invalidate_spills();
+    fn arguments(&mut self, sig: SigRef, callee: Value, args: &[Value], is_try: bool) -> Result<Abi, String> {
         let abi = classify(&self.func.sigs[sig.index()], self.abi_kind)?;
         for (arg, loc) in args.iter().zip(&abi.params) {
             match *loc {
@@ -662,10 +653,21 @@ impl Emit<'_> {
             }
         }
         let direct = self.plan.through[callee.index()];
+        if !is_try
+            && let Some(CallTarget::Symbol(lookup)) = direct
+            && self.func.is_thread_cell(callee)
+            && self.thread_cell_cold(lookup, args)
+        {
+            self.clobber_call_spills();
+            return Ok(abi);
+        }
         let cell = match direct {
-            Some(CallTarget::Symbol(lookup)) if self.func.is_thread_cell(callee) => args.first().and_then(|&slot| self.thread_cell_hit(slot)).map(|hit| (lookup, hit)),
+            Some(CallTarget::Symbol(lookup)) if self.func.is_thread_cell(callee) => args.first().and_then(|&slot| self.thread_cell_hit(slot, lookup)).map(|hit| (lookup, hit)),
             _ => None,
         };
+        if cell.is_some() {
+            self.clobber_reg(Reg::Rax);
+        }
         let held = self.reg_of(callee).filter(|&reg| !matches!(reg, Reg::Rax | Reg::Rcx) && !abi.clobbers(reg));
         let (mut values, mut locs) = (args.to_vec(), abi.params.clone());
         if direct.is_none() && held.is_none() {
@@ -683,11 +685,11 @@ impl Emit<'_> {
             let at = self.asm.call_pcrel32();
             self.relocs.push(StencilReloc::symbol(at, lookup, crate::reloc::RelocKind::PcRel32));
             self.asm.bind(hit);
-            self.invalidate_spills();
+            self.clobber_call_spills();
             return Ok(abi);
         }
         if self.inline_call(direct, args) {
-            self.invalidate_spills();
+            self.clobber_call_spills();
             return Ok(abi);
         }
         match direct {
@@ -716,7 +718,7 @@ impl Emit<'_> {
             }
             None => self.asm.call(held.unwrap_or(Reg::R11)),
         }
-        self.invalidate_spills();
+        self.clobber_call_spills();
         Ok(abi)
     }
 }
@@ -726,9 +728,12 @@ impl<'a> Backend<'a, Reg, Label> for Emit<'a> {
     fn plan_mut(&mut self) -> &mut Plan<Reg> { &mut self.plan }
     fn frame(&self) -> &Frame<Reg> { &self.frame }
     fn abi(&self) -> &Abi { &self.abi }
-    fn shrink(&self) -> Option<ShrinkWrap> { self.shrink }
-    fn slow_thunk(&self) -> Label { self.slow_thunk }
-    fn in_shrink_entry(&self) -> bool { self.in_shrink_entry }
+    fn shrink(&self) -> Option<&ShrinkWrap> { self.shrink.as_ref() }
+    fn in_fast(&self) -> bool { self.in_fast }
+    fn ret_fast(&mut self, values: &[Value]) -> Result<(), String> {
+        self.in_fast = true;
+        self.ret(values)
+    }
     fn next_block(&self) -> Option<Block> { self.next }
     fn block_label(&self, block: Block) -> Label { self.blocks[block.index()] }
     fn new_label(&mut self) -> Label { self.asm.label() }
@@ -748,11 +753,8 @@ impl<'a> Backend<'a, Reg, Label> for Emit<'a> {
         self.asm.jcc(if invert { cond.invert() } else { cond }, label);
     }
     fn edge(&mut self, block: Block, args: &[Value]) -> Result<(), String> { self.edge(block, args) }
-    fn arguments(&mut self, sig: SigRef, callee: Value, args: &[Value]) -> Result<Abi, String> { self.arguments(sig, callee, args) }
-    fn store_locs(&mut self, values: &[Value], locs: &[Loc]) {
-        self.store_locs(values, locs);
-        self.invalidate_spills();
-    }
+    fn arguments(&mut self, sig: SigRef, callee: Value, args: &[Value], is_try: bool) -> Result<Abi, String> { self.arguments(sig, callee, args, is_try) }
+    fn store_locs(&mut self, values: &[Value], locs: &[Loc]) { self.store_locs(values, locs); }
     fn store_loc(&mut self, value: Value, loc: Loc) { self.store_loc(value, loc); }
     fn load_incoming(&mut self, value: Value, offset: u32) { self.load_home(value, self.frame_mem(INCOMING + offset as i32), INTAKE_XMM); }
     fn intake_struct(&mut self, value: Value, offset: u32) {

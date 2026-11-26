@@ -180,7 +180,7 @@ impl Emit<'_> {
         match self.plan.location(value) {
             Location::Imm(imm) => {
                 self.asm.mov_imm(reg, imm);
-                self.clobber_reg(reg);
+                self.last_spill.clobber(reg);
             }
             Location::SlotAddr(sym) | Location::Symbol(sym) if self.direct_calls => {
                 let at = self.asm.adrp_add_reloc(reg);
@@ -259,7 +259,7 @@ impl Emit<'_> {
         match self.plan.location(value) {
             Location::Imm(imm) => {
                 self.asm.mov_imm(reg, crate::fold::extend(imm, ty, signed));
-                self.clobber_reg(reg);
+                self.last_spill.clobber(reg);
             }
             Location::Frame(..) | Location::SlotAddr(_) | Location::Symbol(_) => self.raw(reg, value),
             Location::Reg(from) if full => {

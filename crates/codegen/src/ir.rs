@@ -1,6 +1,7 @@
 use std::fmt;
 
 mod atomic;
+mod compact;
 mod consts;
 mod edges;
 mod flags;
@@ -8,6 +9,7 @@ mod rodata;
 mod vector;
 
 pub use atomic::{AtomicOrd, AtomicRmwOp};
+pub(crate) use compact::{compact, compact_slots};
 pub use vector::{Lane, ReduceOp, ShuffleMask, TargetOpId, TinyArgs};
 pub(crate) use vector::{CfgCache, Domain};
 
@@ -419,6 +421,7 @@ impl Op {
     }
 
     /// Calls `f` with every value this instruction reads, once per read.
+    #[inline]
     pub(crate) fn for_operands(&self, mut f: impl FnMut(Value)) {
         match self {
             Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::StackAddr(..) | Op::StackLoad(..) | Op::Fence(_) | Op::FramePointer | Op::Trap => {}
@@ -538,6 +541,8 @@ pub struct Function {
     /// Whether this function must keep a standard frame pointer chain for unwind stack walking.
     pub keep_fp: bool,
     pub(crate) unwind_drops: Vec<crate::UnwindDrop>,
+    pub(crate) no_unwind_syms: Vec<u32>,
+    pub(crate) elide_drops: bool,
     /// The bytes at the start of this coroutine's own frame that no code outside the frame can address.
     pub(crate) frame_private: u32,
     pub(crate) cfg_rev: u32,
@@ -547,7 +552,7 @@ pub struct Function {
 impl Function {
     /// An empty function with `signature`.
     pub fn new(signature: Signature) -> Self {
-        Self { signature, types: Vec::new(), blocks: Vec::new(), insts: Vec::new(), slots: Vec::new(), sigs: Vec::new(), entry: None, coroutine: None, self_slots: Vec::new(), vtable_slots: Vec::new(), rodata_bytes: Vec::new(), value_flags: Vec::new(), keep_fp: false, unwind_drops: Vec::new(), frame_private: 0, cfg_rev: 0, cfg_cache: CfgCache::default() }
+        Self { signature, types: Vec::new(), blocks: Vec::new(), insts: Vec::new(), slots: Vec::new(), sigs: Vec::new(), entry: None, coroutine: None, self_slots: Vec::new(), vtable_slots: Vec::new(), rodata_bytes: Vec::new(), value_flags: Vec::new(), keep_fp: false, unwind_drops: Vec::new(), no_unwind_syms: Vec::new(), elide_drops: false, frame_private: 0, cfg_rev: 0, cfg_cache: CfgCache::default() }
     }
 
     pub(crate) fn bump_cfg(&mut self) {
@@ -585,6 +590,21 @@ impl Function {
     /// Whether this function has any static vtable-slot entries recorded.
     pub fn has_vtable_slots(&self) -> bool {
         !self.vtable_slots.is_empty()
+    }
+
+    /// Whether this function contains any `Call` or `TryCall` instruction.
+    pub fn has_call(&self) -> bool {
+        self.blocks.iter().any(|b| b.insts.iter().any(|&i| matches!(self.insts[i.index()].op, Op::Call { .. } | Op::TryCall { .. })))
+    }
+
+    /// Marks relocation symbol `sym` as guaranteed not to unwind.
+    pub fn mark_no_unwind_sym(&mut self, sym: u32) {
+        self.no_unwind_syms.push(sym);
+    }
+
+    /// Requests post-optimization unwind-drop elision even at quick effort.
+    pub fn enable_drop_elision(&mut self) {
+        self.elide_drops = true;
     }
 
     /// Whether this function is an unsplit coroutine body.
@@ -719,8 +739,10 @@ impl Function {
 
     /// Resolves each value derived from a stack slot plus constant offsets, returning `(slot_offsets, addr_insts)`.
     pub(crate) fn slot_offsets(&self, eval_const: impl Fn(Value) -> Option<i64>) -> (Vec<Option<(StackSlot, i64)>>, Vec<(Inst, StackSlot)>) {
-        let mut consts = vec![None; self.types.len()];
         let mut addrs = vec![None; self.types.len()];
+        if self.slots.is_empty() {
+            return (addrs, Vec::new());
+        }
         let mut addr_insts = Vec::new();
         let mut adds = Vec::new();
         for inst in self.blocks.iter().flat_map(|block| &block.insts) {
@@ -731,11 +753,14 @@ impl Function {
                     addrs[result.index()] = Some((*slot, i64::from(*offset)));
                     addr_insts.push((*inst, *slot));
                 }
-                Op::Const(imm) => consts[result.index()] = Some(*imm),
                 Op::Binary(Binary::Iadd, x, c) => adds.push((*inst, result, *x, *c)),
                 _ => {}
             }
         }
+        if addr_insts.is_empty() || adds.is_empty() {
+            return (addrs, addr_insts);
+        }
+        let consts = self.const_values();
         loop {
             let before = adds.len();
             adds.retain(|&(inst, result, x, c)| {

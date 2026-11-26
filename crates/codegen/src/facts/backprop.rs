@@ -2,7 +2,7 @@ use std::cell::RefCell;
 
 use crate::ir::{Binary, Convert, Function, Op, Type, Value};
 
-use super::rel::{Path, Rel, RelKind, UNSIGNED};
+use super::rel::{Path, Rel, RelKind, UNSIGNED, kind_bit};
 use super::transfer::{transfer, unwrapped, valid};
 use super::{Fact, Ranges};
 
@@ -19,7 +19,8 @@ pub(super) struct Uppers(RefCell<Bounded>);
 #[derive(Default)]
 struct Bounded {
     ty: Option<Type>,
-    values: Vec<(Value, Option<Steps>)>,
+    any_add: bool,
+    values: Vec<(Value, bool, Option<Steps>)>,
 }
 
 impl Clone for Uppers {
@@ -36,9 +37,10 @@ impl Uppers {
 }
 
 impl Bounded {
-    fn of(&mut self, rels: &[Rel], ty: Type) -> &mut [(Value, Option<Steps>)] {
+    fn of(&mut self, func: &Function, ranges: &Ranges, rels: &[Rel], ty: Type) -> (&mut [(Value, bool, Option<Steps>)], bool) {
         if self.ty != Some(ty) {
             self.values.clear();
+            self.any_add = false;
             for r in rels.iter().filter(|r| r.ty == ty) {
                 let ends = match r.kind {
                     RelKind::Ult | RelKind::Ule => [Some(r.lhs), None],
@@ -46,14 +48,16 @@ impl Bounded {
                     _ => [None, None],
                 };
                 for s in ends.into_iter().flatten() {
-                    if !self.values.iter().any(|&(seen, _)| seen == s) {
-                        self.values.push((s, None));
+                    if !self.values.iter().any(|&(seen, _, _)| seen == s) {
+                        let is_add = matches!(ranges.op(func, s), Some(Op::Binary(Binary::Iadd, ..)));
+                        self.any_add |= is_add;
+                        self.values.push((s, is_add, None));
                     }
                 }
             }
             self.ty = Some(ty);
         }
-        &mut self.values
+        (&mut self.values, self.any_add)
     }
 }
 
@@ -73,7 +77,9 @@ impl Path {
     }
 
     pub(super) fn add_with_backprop(&mut self, func: &Function, ranges: &Ranges, value: Value, fact: Fact, depth: u8) {
-        self.add(ranges, value, fact);
+        if !self.add(ranges, value, fact) {
+            return;
+        }
         let merged = self.fact(ranges, value);
         if depth >= 3 || merged.lo > merged.hi {
             return;
@@ -148,9 +154,21 @@ impl Path {
 
     /// Everything known about `value` here, with its definition evaluated again on what the path knows of its operands.
     pub(super) fn refined_fact(&self, func: &Function, ranges: &Ranges, value: Value, depth: u8) -> Fact {
+        if self.is_empty() {
+            return ranges.of(value);
+        }
         let fact = self.fact(ranges, value);
+        if fact.exact().is_some() {
+            return fact;
+        }
         let ty = func.ty(value);
-        let Some(op) = ranges.op(func, value).filter(|_| depth < 3 && ty.is_small_int()) else { return fact };
+        let Some(op) = ranges.op(func, value).filter(|op| {
+            depth < 3
+                && ty.is_small_int()
+                && matches!(op, Op::Binary(..) | Op::Unary(..) | Op::Convert(..) | Op::Select(..) | Op::Icmp(..) | Op::Fits(..))
+        }) else {
+            return fact;
+        };
         let memo: RefCell<[Option<(Value, Fact)>; OPERAND_MEMO]> = RefCell::new(std::array::from_fn(|_| None));
         let operand = |inner: Value| {
             if let Some((_, known)) = memo.borrow().iter().flatten().find(|(at, _)| *at == inner) {
@@ -227,7 +245,7 @@ impl Path {
 
     fn min_reachable_hi(&self, ranges: &Ranges, ty: Type, start: Value) -> u64 {
         let mut best = self.fact(ranges, start).hi;
-        if self.rels().is_empty() {
+        if !self.steps_from(ty, start, UNSIGNED) {
             return best;
         }
         self.walk(ty, start, UNSIGNED, |next, next_strict| {
@@ -277,7 +295,7 @@ impl Path {
                 let mut rhs_hi = None;
                 let (steps, len) = self.non_wrap_iadd_chain(func, ranges, lhs, ty);
                 for &(s_base, k) in &steps[..len] {
-                    if self.reaches_in(*from_x.get_or_insert_with(|| self.reached(ty, x, UNSIGNED)), s_base) {
+                    if x == s_base || self.reaches_in(*from_x.get_or_insert_with(|| self.reached(ty, x, UNSIGNED)), s_base) {
                         let rhi = *rhs_hi.get_or_insert_with(|| self.min_reachable_hi(ranges, ty, rhs));
                         if let Some(bound) = k.checked_add(extra).and_then(|d| rhi.checked_sub(d)) {
                             hi = hi.min(bound);
@@ -291,48 +309,103 @@ impl Path {
 
     pub(super) fn proves_add_rel(&self, func: &Function, ranges: &Ranges, ty: Type, a: Value, b: Value, strict: bool) -> bool {
         let is_add = |v: Value| matches!(ranges.op(func, v), Some(Op::Binary(Binary::Iadd, ..)));
-        if self.rels().is_empty() && !is_add(b) {
+        let b_is_add = is_add(b);
+        let has_u = self.has_rel_kind(kind_bit(RelKind::Ult) | kind_bit(RelKind::Ule) | kind_bit(RelKind::Eq));
+        if !has_u && !b_is_add {
             return false;
         }
-        let (forms, len) = self.add_const_chain(func, ranges, a, ty);
+        let into_b = has_u && self.steps_into(ty, b, UNSIGNED);
+        let a_is_add = is_add(a);
+        if !b_is_add && !into_b && !a_is_add {
+            return false;
+        }
+        let (forms, len) = if a_is_add { self.add_const_chain(func, ranges, a, ty) } else { ([(a, 0); CHAIN_STEPS + 1], 1) };
         let a_forms = &forms[..len];
-        let into_b = self.steps_into(ty, b, UNSIGNED);
-        let (b_steps, b_len) = if is_add(b) { self.non_wrap_iadd_chain(func, ranges, b, ty) } else { ([(b, 0); CHAIN_STEPS], 0) };
+        let multi = a_forms.len() > 1;
+        if !b_is_add && !into_b && !multi {
+            return false;
+        }
+        let (b_steps, b_len) = if b_is_add { self.non_wrap_iadd_chain(func, ranges, b, ty) } else { ([(b, 0); CHAIN_STEPS], 0) };
+        let need_uppers = has_u && (multi || into_b);
+        if !need_uppers {
+            if b_len == 0 || (!multi && !b_steps[..b_len].iter().any(|&(_, k)| k > 0)) {
+                return false;
+            }
+            for &(a_base, c) in a_forms {
+                let mut from_a = None;
+                for &(b_base, k) in &b_steps[..b_len] {
+                    let ok_k = if c <= k { !(strict && c == k) } else { false };
+                    if ok_k && (a_base == b_base || self.reaches_in(*from_a.get_or_insert_with(|| self.reached(ty, a_base, UNSIGNED)), b_base)) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
         let mut uppers = self.uppers.0.borrow_mut();
-        let values = uppers.of(self.rels(), ty);
-        if into_b {
-            for (s, steps) in values.iter_mut().filter(|(s, _)| *s != b) {
-                steps.get_or_insert_with(|| self.non_wrap_iadd_chain(func, ranges, *s, ty));
+        let (values, any_add) = uppers.of(func, ranges, self.rels(), ty);
+        if !multi && b_len == 0 && !(into_b && any_add) {
+            return false;
+        }
+        if into_b && any_add {
+            for (s, s_is_add, steps) in values.iter_mut() {
+                if *s_is_add && *s != b {
+                    steps.get_or_insert_with(|| self.non_wrap_iadd_chain(func, ranges, *s, ty));
+                }
             }
         }
-        let multi = a_forms.len() > 1;
-        let upper_terms = b_steps[..b_len].iter().map(|&(b_base, k)| (b, b_base, k)).chain(
-            values.iter().filter(|(s, _)| into_b || *s == b).flat_map(|&(s, ref steps)| {
-                let chain = match steps {
-                    Some((steps, len)) if s != b => &steps[..*len],
-                    _ => &[][..],
-                };
-                multi.then_some((s, s, 0)).into_iter().chain(chain.iter().map(move |&(s_base, k)| (s, s_base, k)))
-            }),
-        );
-        if upper_terms.clone().next().is_none() || (!multi && !upper_terms.clone().any(|(_, _, k)| k > 0)) {
-            return false;
+        let mut has_any_term = b_len > 0;
+        let mut any_pos = b_steps[..b_len].iter().any(|&(_, k)| k > 0);
+        if !has_any_term || (!multi && !any_pos) {
+            for &(s, s_is_add, ref steps) in values.iter().filter(|(s, _, _)| into_b || *s == b) {
+                if multi {
+                    has_any_term = true;
+                }
+                if s_is_add
+                    && s != b
+                    && let Some((st, slen)) = steps
+                    && *slen > 0
+                {
+                    has_any_term = true;
+                    any_pos |= st[..*slen].iter().any(|&(_, k)| k > 0);
+                }
+            }
+            if !has_any_term || (!multi && !any_pos) {
+                return false;
+            }
         }
         for &(a_base, c) in a_forms {
             let mut from_a = None;
-            for (s, s_base, k) in upper_terms.clone() {
+            let mut try_term = |s: Value, s_base: Value, k: u64| -> bool {
                 let require_strict = if c <= k {
                     strict && c == k
                 } else if !strict && k.checked_add(1) == Some(c) {
                     true
                 } else {
-                    continue;
+                    return false;
                 };
-                if (s == b || into_b)
-                    && self.reaches_in(*from_a.get_or_insert_with(|| self.reached(ty, a_base, UNSIGNED)), s_base)
-                    && self.reaches(ty, s, b, UNSIGNED, require_strict)
-                {
+                (s == b || into_b)
+                    && (a_base == s_base || self.reaches_in(*from_a.get_or_insert_with(|| self.reached(ty, a_base, UNSIGNED)), s_base))
+                    && (if s == b { !require_strict } else { self.reaches(ty, s, b, UNSIGNED, require_strict) })
+            };
+            for &(b_base, k) in &b_steps[..b_len] {
+                if try_term(b, b_base, k) {
                     return true;
+                }
+            }
+            for &(s, s_is_add, ref steps) in values.iter().filter(|(s, _, _)| into_b || *s == b) {
+                if multi && try_term(s, s, 0) {
+                    return true;
+                }
+                if s_is_add
+                    && s != b
+                    && let Some((st, slen)) = steps
+                {
+                    for &(s_base, k) in &st[..*slen] {
+                        if try_term(s, s_base, k) {
+                            return true;
+                        }
+                    }
                 }
             }
         }

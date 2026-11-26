@@ -15,8 +15,13 @@ use crate::sema::table::Table;
 use crate::sync::write_lock;
 
 mod cycles;
+mod inflight;
 mod persist;
 mod splice;
+mod tally;
+
+pub(super) use tally::{Tally, simplify_tallied};
+use tally::tally;
 
 use super::plan::{BodyFootprintPlan, eval_footprint_with_cycle};
 use super::reloc::{RelocPlan, RelocStep, SiteOrigin, eval_relocs};
@@ -152,38 +157,6 @@ const MAX_INLINE_HEIGHT: u8 = 12;
 
 pub(super) type InlineMeta = (ItemRef, FootprintId, bool, u8, u16);
 
-#[derive(Clone, Copy)]
-pub(super) enum Tally {
-    Hit,
-    Miss,
-    Built,
-    Raced,
-    OpenCycle,
-    Deferred,
-    Devirt,
-    Trim,
-    Flush,
-    Retry,
-    Compact,
-    Disk,
-    Stale,
-}
-
-const TALLY_NAMES: [&str; 13] = [
-    "template_hit", "template_miss", "template_simplify", "template_raced", "unstored_cycle", "unstored_deferred", "devirt_simplify", "trim_partial", "trim_full", "compact_retry", "compact_fit",
-    "template_disk", "template_stale",
-];
-static TALLIES: [AtomicUsize; TALLY_NAMES.len()] = [const { AtomicUsize::new(0) }; TALLY_NAMES.len()];
-
-fn tally(kind: Tally) {
-    TALLIES[kind as usize].fetch_add(1, Ordering::Relaxed);
-}
-
-pub(super) fn simplify_tallied(func: &mut Function, kind: Tally) {
-    tally(kind);
-    haste_codegen::simplify(func, crate::profile().into());
-}
-
 /// Cached inlineable callee stencils and footprints across a compilation.
 #[derive(Default)]
 pub struct Bodies {
@@ -194,6 +167,7 @@ pub struct Bodies {
     templates: Table<TemplateKey, Arc<InlineTemplate>>,
     rejected: Table<TemplateKey, ()>,
     cyclic: RwLock<FxHashMap<usize, cycles::CycleState>>,
+    inflight: inflight::InFlight,
     persist: std::sync::OnceLock<persist::Persist>,
     transient_entries: AtomicUsize,
     evict_cursor: AtomicUsize,
@@ -259,15 +233,7 @@ impl Bodies {
 
     /// Formats the inline template cache counters as one line, or nothing unless `HASTE_MISSED` is set.
     pub(crate) fn inline_report() -> String {
-        if haste_codegen::missed_report().is_empty() {
-            return String::new();
-        }
-        let mut out = String::from("inline:");
-        for (name, count) in TALLY_NAMES.iter().zip(&TALLIES) {
-            out.push_str(&format!(" {name}={}", count.load(Ordering::Relaxed)));
-        }
-        out.push('\n');
-        out
+        tally::report()
     }
 }
 
@@ -277,14 +243,22 @@ pub(super) fn item_bits(item: ItemRef) -> u128 {
 
 /// Lowers reached function `index` into an SSA stencil with symbolic relocations.
 pub fn lower_stencil(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, index: usize) -> Result<StencilOutput> {
-    let (func, relocs, reloc_plan, _) = run_with_cycle(cx, (reached, slots), &mut Inline::default(), index, LowerMode::Stencil)?;
+    let (func, relocs, reloc_plan, _, _) = run_with_cycle(cx, (reached, slots), &mut Inline::default(), index, LowerMode::Stencil, false)?;
     Ok(StencilOutput { func, relocs, reloc_plan })
 }
 
 /// Lowers reached function `index` into a shared dictionary-parameterized SSA body and its relocation vector.
 pub fn lower_dict(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, index: usize) -> Result<(Function, RelocVec, Arc<RelocPlan>)> {
-    let (func, relocs, reloc_plan, _) = run_with_cycle(cx, (reached, slots), &mut Inline::default(), index, LowerMode::Dict)?;
+    let (func, relocs, reloc_plan, _, _) = run_with_cycle(cx, (reached, slots), &mut Inline::default(), index, LowerMode::Dict, false)?;
     Ok((func, relocs, reloc_plan))
+}
+
+/// Pre-populates the shared inline template cache for reached function `index` when it is inlineable.
+pub fn warm_inline(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, index: usize) {
+    if let Some(limit) = super::budget::inline_limit(cx, reached, index) {
+        let mut inline = Inline { warming: true, ..Inline::default() };
+        let _ = resolve_inline(cx, (reached, slots), &mut inline, index, (limit, false));
+    }
 }
 
 /// Whether a template under construction must keep a callee of height `height` as a call, so that its own height stays within `MAX_INLINE_HEIGHT`.
@@ -311,6 +285,13 @@ fn record_callee_height(inline: &mut Inline, callee: Option<Arc<InlinedCallee>>)
 
 fn run_inline_probe(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, (limit, shape_only, compact): (usize, bool, bool)) -> Result<(Option<InlineHit>, usize, usize, Quiet)> {
     let (depth, quiet) = (inline.stack.len(), Quiet::mark(cx, slots));
+    if inline.aborted {
+        return Ok((None, usize::MAX, depth, quiet));
+    }
+    let Some(_guard) = slots.bodies().inflight.enter(index, inline.warming && depth == 0) else {
+        inline.aborted = true;
+        return Ok((None, usize::MAX, depth, quiet));
+    };
     inline.stack.push(index);
     let saved = std::mem::take(&mut inline.host);
     inline.host.compact = compact;
@@ -354,6 +335,12 @@ fn cached_inline(bodies: &Bodies, inline: &Inline, (index, limit, std_limit): (u
     if let Some(meta) = bodies.inline_meta.get(&(index, limit)).filter(|m| shape_only || m.is_none()) {
         return Some((None, meta, usize::MAX));
     }
+    if neg_valid
+        && let Some(sl) = std_limit.filter(|&sl| sl != limit)
+        && let Some(None) = bodies.inline_meta.get(&(index, sl))
+    {
+        return Some((None, None, usize::MAX));
+    }
     if let Some(pos) = inline.stack.iter().position(|&at| at == index) {
         return Some((None, None, pos));
     }
@@ -392,6 +379,9 @@ pub(super) fn resolve_inline_meta(cx: &mut Context<'_>, (reached, slots): (&Reac
     }
     let item = reached.list[index].0.0;
     let (tmpl, cycle, depth, quiet) = run_inline_probe(cx, (reached, slots), inline, index, (limit, true, false))?;
+    if inline.aborted {
+        return Ok((None, usize::MAX));
+    }
     let (meta, inlined) = match tmpl {
         Some((footprint, Found::Body(t, relocs))) => (
             Some((item, footprint, t.returns, t.height, t.size)),
@@ -433,6 +423,9 @@ pub(super) fn resolve_inline(cx: &mut Context<'_>, (reached, slots): (&Reached, 
     }
     let item = reached.list[index].0.0;
     let (tmpl, cycle, depth, quiet) = run_inline_probe(cx, (reached, slots), inline, index, (limit, false, compact))?;
+    if inline.aborted {
+        return Ok((None, usize::MAX));
+    }
     let result = match tmpl {
         Some((footprint, Found::Body(t, Some(relocs)))) => Some(build_inlined(item, footprint, &t, relocs)),
         Some((footprint, Found::Body(t, None))) => {
@@ -580,6 +573,9 @@ fn lower_with_compact(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Sl
 fn ensure_inline_template_inner(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, (limit, shape_only, quiet): (usize, bool, &Quiet)) -> Result<(Option<InlineHit>, usize)> {
     let item = reached.list[index].0.0;
     let fp_res = eval_footprint_with_cycle(cx, (reached, slots), inline, index);
+    if inline.aborted {
+        return Ok((None, usize::MAX));
+    }
     let fp_h = std::mem::replace(&mut inline.max_callee_height, 0);
     let fp_sz = std::mem::replace(&mut inline.max_callee_size, 0);
     let Some((footprint, fp_cycle)) = quiet.lowered(slots, fp_res)? else { return Ok((None, usize::MAX)) };
@@ -592,6 +588,9 @@ fn ensure_inline_template_inner(cx: &mut Context<'_>, (reached, slots): (&Reache
         Err(disk) => disk,
     };
     let (lowered, retried) = lower_with_compact(cx, (reached, slots), inline, index, (limit, key.compact, quiet))?;
+    if inline.aborted {
+        return Ok((None, usize::MAX));
+    }
     let form = if inline.host.compact { Form::Compact } else { inline.host.seen.max(super::budget::own_form(cx, reached, index)) };
     let (ir_h, ir_sz) = (inline.max_callee_height, inline.max_callee_size);
     let Some((fit, relocs, reloc_plan, ir_cycle)) = lowered else {
@@ -609,31 +608,40 @@ fn ensure_inline_template_inner(cx: &mut Context<'_>, (reached, slots): (&Reache
     Ok((template.map(|t| (footprint, Found::Body(t, Some(relocs)))), cycle))
 }
 
+fn sym_may_unwind(cx: &mut Context<'_>, reached: &Reached, src: Option<&SymbolSource>) -> bool {
+    match src {
+        Some(SymbolSource::Slot(idx)) => reached.may_unwind(cx, *idx),
+        Some(SymbolSource::Host(h)) => crate::sema::reach::host_symbol_may_unwind(h),
+        _ => true,
+    }
+}
+
 fn lower_template(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, (limit, quiet): (usize, &Quiet)) -> Result<Option<Lowered>> {
-    let lowered = run_with_cycle(cx, (reached, slots), inline, index, LowerMode::Stencil);
-    Ok(quiet.lowered(slots, lowered)?.map(|(func, relocs, plan, cycle)| {
+    let lowered = run_with_cycle(cx, (reached, slots), inline, index, LowerMode::Stencil, true);
+    Ok(quiet.lowered(slots, lowered)?.map(|(func, relocs, plan, cycle, simplified)| {
         let limit = if plan.has_calls() { limit } else { super::budget::leaf_limit(cx, reached, index, limit) };
+        let elide = !reached.is_incremental() || slots.allow_inline();
         let res = if haste_codegen::trace_enabled() {
-            haste_codegen::with_trace_label(cx.name(reached.list[index].0.0), || simplify_inline(func, limit))
+            let label = cx.name(reached.list[index].0.0).to_owned();
+            haste_codegen::with_trace_label(&label, || simplify_inline(cx, reached, func, &relocs, (limit, simplified, elide)))
         } else {
-            simplify_inline(func, limit)
+            simplify_inline(cx, reached, func, &relocs, (limit, simplified, elide))
         };
         (res, relocs, plan, cycle)
     }))
 }
 
-fn simplify_inline(mut func: Function, limit: usize) -> std::result::Result<(Arc<Function>, bool), Miss> {
-    if func.size() > limit.saturating_mul(6).max(1600) {
-        return Err(Miss::Shape);
-    }
+fn simplify_inline(cx: &mut Context<'_>, reached: &Reached, mut func: Function, relocs: &[SymbolSource], (limit, simplified, elide): (usize, bool, bool)) -> std::result::Result<(Arc<Function>, bool), Miss> {
+    if func.size() > limit.saturating_mul(6).max(1600) { return Err(Miss::Shape); }
     haste_codegen::split_coroutine(&mut func);
-    simplify_tallied(&mut func, Tally::Built);
-    if !func.can_inline() {
-        return Err(Miss::Shape);
+    if !simplified { simplify_tallied(&mut func, Tally::Built); }
+    if !func.unwind_drops().is_empty() {
+        let elided = elide && func.elide_dead_unwind_drops(|sym| sym_may_unwind(cx, reached, relocs.get(sym as usize)));
+        func.zero_init_unwind_flags();
+        if elided { simplify_tallied(&mut func, Tally::Built); }
     }
-    if func.inline_size() > limit {
-        return Err(Miss::Over);
-    }
+    if !func.can_inline() { return Err(Miss::Shape); }
+    if func.inline_size() > limit { return Err(Miss::Over); }
     let returns = func.has_return();
     Ok((Arc::new(func), returns))
 }
@@ -642,11 +650,11 @@ fn body_arena(cx: &mut Context<'_>, source: ItemRef, shape: &Shape) -> Result<Ar
     match shape {
         Shape::Body | Shape::Closure(_) => Ok(Arena::Body(cx.body(source)?)),
         Shape::Anon(anon) => Ok(anon.arena.clone()),
-        Shape::Glue(_) | Shape::Virtual(_) | Shape::Untuple(_) | Shape::Ctor(_) | Shape::Clone(_) | Shape::Asm(_) => Ok(Arena::Body(Arc::default())),
+        Shape::Glue(_) | Shape::Virtual(_) | Shape::Untuple(_) | Shape::Ctor(_) | Shape::Clone(_) | Shape::Asm(_) | Shape::GlobalAlloc(_) => Ok(Arena::Body(Arc::default())),
     }
 }
 
-fn run_with_cycle(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, mode: LowerMode) -> Result<(Function, RelocVec, Arc<RelocPlan>, usize)> {
+fn run_with_cycle(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots), inline: &mut Inline, index: usize, mode: LowerMode, is_template: bool) -> Result<(Function, RelocVec, Arc<RelocPlan>, usize, bool)> {
     let (item, substs) = &reached.list[index].0;
     let concrete = substs.is_empty();
     let typed = reached.typed(index, cx.name(*item))?;
@@ -670,33 +678,29 @@ fn run_with_cycle(cx: &mut Context<'_>, (reached, slots): (&Reached, &dyn Slots)
         lower.run()?;
         lower.cycle_root
     };
+    let mut simplified = false;
     if splice::should_splice_devirt(slots, &func, mode, &reloc_plan) {
         cycle = splice::splice_devirt_vtable_calls(cx, (reached, slots), inline, (&mut func, &mut relocs, &mut reloc_plan), (cycle, concrete))?;
+        simplified = true;
     }
     if mode == LowerMode::Stencil {
         splice::canonicalize_const_symbols((cx, reached), &mut func, (&reloc_plan, &relocs), (concrete, inline.stack.is_empty()));
-        let has_drop_push = relocs.iter().any(|src| matches!(src, SymbolSource::Host(HostSymbol::DropPush)));
-        if !func.is_coroutine() && (!func.unwind_drops().is_empty() || has_drop_push) {
-            simplify_tallied(&mut func, Tally::Built);
-            let mut sym_may_unwind = |sym: u32| match relocs.get(sym as usize) {
-                Some(SymbolSource::Slot(idx)) => reached.may_unwind(cx, *idx),
-                Some(SymbolSource::Host(h)) => crate::sema::reach::host_symbol_may_unwind(h),
-                _ => true,
-            };
-            func.elide_dead_unwind_drops(&mut sym_may_unwind);
-            if has_drop_push {
-                func.elide_dead_drop_guards(
-                    |sym| matches!(relocs.get(sym as usize), Some(SymbolSource::Host(HostSymbol::DropPush))),
-                    |sym| matches!(relocs.get(sym as usize), Some(SymbolSource::Host(HostSymbol::DropPop))),
-                    sym_may_unwind,
-                );
+        if !is_template {
+            if func.is_coroutine() {
+                haste_codegen::split_coroutine(&mut func);
             }
-        }
-        if !func.is_coroutine() {
+            if !func.unwind_drops().is_empty() && (!reached.is_incremental() || slots.allow_inline()) {
+                func.enable_drop_elision();
+                for (sym, src) in relocs.iter().enumerate() {
+                    if !sym_may_unwind(cx, reached, Some(src)) {
+                        func.mark_no_unwind_sym(sym as u32);
+                    }
+                }
+            }
             func.zero_init_unwind_flags();
         }
     }
-    Ok((func, relocs, Arc::new(RelocPlan::from_vec(reloc_plan)), cycle))
+    Ok((func, relocs, Arc::new(RelocPlan::from_vec(reloc_plan)), cycle, simplified))
 }
 
 impl Lower<'_, '_> {

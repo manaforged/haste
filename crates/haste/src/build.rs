@@ -15,7 +15,7 @@ use rustc_hash::FxHashMap as HashMap;
 
 use crate::cli::{Failures, TestItem, case_items, error_kind, lib_fn_items, print_failures, print_test_report, test_items};
 
-mod substrate;
+pub(crate) mod substrate;
 mod test_args;
 mod watch;
 
@@ -267,10 +267,8 @@ impl Batch {
         let mut substrate = open_batch_substrate(workspace);
         let mut cache = Cache::default();
         cache.set_warm_sysroot_bodies(mode != crate::image::ImageMode::Check);
-        if let Some(slot) = &substrate
-            && let Some(sub) = slot.workspace.as_ref().or(slot.deps.as_ref()).or(slot.toolchain.as_ref())
-        {
-            cache.set_substrate(Some(std::sync::Arc::clone(sub)));
+        if let Some(sub) = substrate.as_ref().and_then(SubstrateSlot::top) {
+            cache.set_substrate(Some(sub));
         }
         let batch = crate::macros::reach_resolved_with_cache(
             compilation,

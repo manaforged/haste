@@ -349,21 +349,27 @@ fn reassociate_block_adds(st: &mut ReassocState<'_>, blk: Block) -> bool {
 
 /// Whether some small-int add or sub in `blk` reads a value homed in `blk` that is not plainly defined there by a non-add instruction, the only shape `flatten_add` can absorb.
 fn may_chain(func: &Function, blk: Block, home: &[Option<Block>]) -> bool {
-    let is_add = |op: &Op| matches!(op, Op::Binary(Binary::Iadd | Binary::Isub, ..));
-    let mut other: Vec<Value> = Vec::new();
-    for inst in &func.blocks[blk.index()].insts {
+    let mut add_mask = 0_u128;
+    let mut add_defs: Vec<Value> = Vec::new();
+    let insts = &func.blocks[blk.index()].insts;
+    for &inst in insts {
         let data = &func.insts[inst.index()];
         if let Some(res) = data.result
-            && !is_add(&data.op)
+            && matches!(data.op, Op::Binary(Binary::Iadd | Binary::Isub, ..))
         {
-            other.push(res);
+            add_mask |= 1_u128 << (res.0 & 127);
+            add_defs.push(res);
         }
     }
-    other.sort_unstable();
-    func.blocks[blk.index()].insts.iter().any(|inst| match func.insts[inst.index()].op {
-        Op::Binary(Binary::Iadd | Binary::Isub, a, b) => {
-            [a, b].into_iter().any(|v| home.get(v.index()).copied().flatten() == Some(blk) && other.binary_search(&v).is_err())
-        }
+    if add_defs.is_empty() {
+        return false;
+    }
+    insts.iter().any(|&inst| match func.insts[inst.index()].op {
+        Op::Binary(Binary::Iadd | Binary::Isub, a, b) => [a, b].into_iter().any(|v| {
+            home.get(v.index()).copied().flatten() == Some(blk)
+                && add_mask & (1_u128 << (v.0 & 127)) != 0
+                && add_defs.contains(&v)
+        }),
         _ => false,
     })
 }

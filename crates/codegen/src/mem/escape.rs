@@ -10,6 +10,7 @@ use super::{MemRoot, TrackRoot};
 struct UseCounts {
     total: Vec<u32>,
     safe: Vec<u32>,
+    unwind_stores: Vec<u32>,
     ro_calls: Vec<u32>,
     returns: Vec<u32>,
 }
@@ -73,10 +74,16 @@ fn finish_slot_escape(
             if spilled || counts.safe[v] != counts.total[v] {
                 esc.unescaped[s.index()] = false;
             }
-            if spilled || counts.safe[v] + counts.ro_calls[v] != counts.total[v] {
+            let uw = counts.unwind_stores.get(v).copied().unwrap_or(0);
+            if spilled || counts.safe[v] + uw != counts.total[v] {
+                esc.addr_unescaped[s.index()] = false;
+            }
+            let ro = counts.ro_calls.get(v).copied().unwrap_or(0);
+            if spilled || counts.safe[v] + ro != counts.total[v] {
                 esc.call_readonly[s.index()] = false;
             }
-            if spilled || counts.safe[v] + counts.returns[v] != counts.total[v] {
+            let ret = counts.returns.get(v).copied().unwrap_or(0);
+            if spilled || counts.safe[v] + ret != counts.total[v] {
                 esc.return_only[s.index()] = false;
             }
         }
@@ -86,13 +93,11 @@ fn finish_slot_escape(
             esc.noalias[usize::from(p)] = true;
         }
     }
-    esc.addr_unescaped = esc.unescaped.clone();
     for u in &func.unwind_drops {
         for s in [u.local, u.flag] {
             esc.unescaped[s.index()] = false;
             esc.call_readonly[s.index()] = false;
             esc.return_only[s.index()] = false;
-            esc.spilled[s.index()] = true;
         }
     }
     esc
@@ -113,14 +118,8 @@ fn is_unknown_mem_op(op: &Op, slots: &[Option<(StackSlot, i32)>], tracked: &[Tra
     match *op {
         Op::Load(addr, _) | Op::Store(_, addr, _) => !known(addr),
         Op::Move(dst, src, _) | Op::Copy(dst, src, _) => !known(dst) || !known(src),
-        Op::Call { .. }
-        | Op::TryCall { .. }
-        | Op::AtomicLoad(..)
-        | Op::AtomicStore(..)
-        | Op::AtomicRmw(..)
-        | Op::AtomicCas(..)
-        | Op::Fence(..) => true,
-        _ => false,
+        Op::Call { .. } | Op::TryCall { .. } => true,
+        _ => super::is_atomic_barrier(op),
     }
 }
 
@@ -225,12 +224,13 @@ fn classify_arith_select(data: &InstData, slots: &[Option<(StackSlot, i32)>], tr
 
 struct EscapeCx<'a> {
     func: &'a Function,
+    cfg: &'a Cfg,
     slots: &'a [Option<(StackSlot, i32)>],
     tracked: &'a [TrackRoot],
     is_const: &'a [bool],
-    in_loop: &'a [bool],
-    danger: &'a [bool],
-    unknown_end: &'a [usize],
+    unwind_write_only: &'a [bool],
+    has_noalias: bool,
+    danger: &'a std::cell::OnceCell<(Vec<bool>, Vec<bool>, Vec<usize>)>,
 }
 
 fn classify_call(
@@ -239,19 +239,27 @@ fn classify_call(
     (b, pos): (Block, usize),
     (params, args): (&[AbiParam], &[Value]),
 ) {
-    let post_safe = post_call_safe(cx.func, b, pos, cx.in_loop, cx.danger, cx.unknown_end);
+    let mut post_safe: Option<bool> = None;
     for (i, &arg) in args.iter().enumerate() {
         if params.get(i).is_some_and(|p| p.readonly) {
+            if counts.ro_calls.is_empty() { counts.ro_calls.resize(counts.total.len(), 0); }
             counts.ro_calls[arg.index()] += 1;
         }
         if params.get(i).is_some_and(|p| p.purpose == ArgumentPurpose::StructReturn) {
+            if counts.returns.is_empty() { counts.returns.resize(counts.total.len(), 0); }
             counts.returns[arg.index()] += 1;
         }
-        if post_safe
+        if cx.has_noalias
             && cx.slots[arg.index()].is_none()
             && matches!(cx.tracked[arg.index()], TrackRoot::Set(MemRoot::NoAliasParam(_)))
         {
-            counts.safe[arg.index()] += 1;
+            let safe = *post_safe.get_or_insert_with(|| {
+                let (in_loop, danger, unknown_end) = cx.danger.get_or_init(|| compute_block_danger(cx.func, cx.cfg, cx.slots, cx.tracked));
+                post_call_safe(cx.func, b, pos, in_loop, danger, unknown_end)
+            });
+            if safe {
+                counts.safe[arg.index()] += 1;
+            }
         }
     }
 }
@@ -261,6 +269,9 @@ fn classify_inst(cx: &EscapeCx<'_>, counts: &mut UseCounts, b: Block, pos: usize
         Op::Load(addr, _) => mark_safe(*addr, cx.slots, cx.tracked, &mut counts.safe),
         Op::Trapz(addr) => mark_param_safe(*addr, cx.slots, cx.tracked, &mut counts.safe),
         Op::Store(val, addr, _) if val != addr => mark_safe(*addr, cx.slots, cx.tracked, &mut counts.safe),
+        Op::StackStore(val, slot, 0) if cx.unwind_write_only.get(slot.index()) == Some(&true) => {
+            mark_safe(*val, cx.slots, cx.tracked, &mut counts.unwind_stores);
+        }
         Op::Move(dst, src, _) | Op::Copy(dst, src, _) => {
             mark_param_safe(*dst, cx.slots, cx.tracked, &mut counts.safe);
             mark_param_safe(*src, cx.slots, cx.tracked, &mut counts.safe);
@@ -286,40 +297,115 @@ pub(super) fn classify_uses(
     cfg: &Cfg,
     slots: &[Option<(StackSlot, i32)>],
     tracked: &[TrackRoot],
-    is_spill: Option<&[bool]>,
+    (is_spill, positions): (Option<&[bool]>, bool),
 ) -> SlotEscapes {
-    if func.slots.is_empty() && !func.signature.params.iter().any(|abi| abi.noalias) {
+    let has_noalias = func.signature.params.iter().any(|abi| abi.noalias);
+    if func.slots.is_empty() && !has_noalias {
         return SlotEscapes::new(func);
     }
+    let any_target = slots.iter().any(Option::is_some)
+        || tracked.iter().any(|t| matches!(t, TrackRoot::Set(MemRoot::Slot(_) | MemRoot::NoAliasParam(_))));
+    if !any_target {
+        let mut esc = SlotEscapes::new(func);
+        for u in &func.unwind_drops {
+            for s in [u.local, u.flag] {
+                esc.unescaped[s.index()] = false;
+                esc.call_readonly[s.index()] = false;
+                esc.return_only[s.index()] = false;
+            }
+        }
+        return esc;
+    }
     let n = func.types.len();
+    let has_indirect_unwind = func.unwind_drops.iter().any(|u| u.indirect);
+    let mut unwind_write_only = if has_indirect_unwind {
+        let mut v = vec![false; func.slots.len()];
+        for u in &func.unwind_drops {
+            if u.indirect {
+                v[u.local.index()] = true;
+            }
+        }
+        v
+    } else {
+        Vec::new()
+    };
     let mut is_const = vec![false; n];
-    for &b in &cfg.rpo {
-        for &inst in &func.blocks[b.index()].insts {
-            let data = &func.insts[inst.index()];
-            if let (&Op::Const(_), Some(res)) = (&data.op, data.result) {
-                is_const[res.index()] = true;
+    if has_indirect_unwind {
+        for &b in &cfg.rpo {
+            for &inst in &func.blocks[b.index()].insts {
+                match func.insts[inst.index()].op {
+                    Op::StackLoad(slot, _) | Op::StackAddr(slot, _) => unwind_write_only[slot.index()] = false,
+                    _ => {}
+                }
             }
         }
     }
-    let (in_loop, danger, unknown_end) = compute_block_danger(func, cfg, slots, tracked);
-    let cx = EscapeCx { func, slots: &slots, tracked: &tracked, is_const: &is_const, in_loop: &in_loop, danger: &danger, unknown_end: &unknown_end };
-    let mut counts = UseCounts { total: vec![0_u32; n], safe: vec![0_u32; n], ro_calls: vec![0_u32; n], returns: vec![0_u32; n] };
+    let mut counts = UseCounts {
+        total: vec![0_u32; n],
+        safe: vec![0_u32; n],
+        unwind_stores: if has_indirect_unwind { vec![0_u32; n] } else { Vec::new() },
+        ro_calls: Vec::new(),
+        returns: Vec::new(),
+    };
+    let danger = std::cell::OnceCell::new();
     let mut points: HashMap<u32, Vec<(u32, u32)>> = HashMap::default();
-    let mut used = Vec::new();
+    let mut used: Vec<(Value, StackSlot, u32)> = Vec::new();
     for &b in &cfg.rpo {
         for (pos, &inst) in func.blocks[b.index()].insts.iter().enumerate() {
             let data = &func.insts[inst.index()];
-            used.clear();
+            match data.op {
+                Op::Const(_) => {
+                    if let Some(res) = data.result { is_const[res.index()] = true; }
+                    continue;
+                }
+                Op::StackLoad(..) | Op::StackAddr(..) | Op::Symbol(_) | Op::SlotAddr(_) | Op::Runtime(_) | Op::Trap => continue,
+                Op::Load(addr, _) => {
+                    if is_rooted(addr, slots, tracked) {
+                        counts.total[addr.index()] += 1;
+                        counts.safe[addr.index()] += 1;
+                    }
+                    continue;
+                }
+                Op::Store(val, addr, _) if !is_rooted(val, slots, tracked) => {
+                    if is_rooted(addr, slots, tracked) {
+                        counts.total[addr.index()] += 1;
+                        counts.safe[addr.index()] += 1;
+                    }
+                    continue;
+                }
+                Op::StackStore(val, ..) if !is_rooted(val, slots, tracked) => continue,
+                _ => {}
+            }
+            if positions {
+                used.clear();
+            }
+            let mut has_tracked = false;
             data.op.for_operands(|v| {
-                counts.total[v.index()] += 1;
-                used.push((v, counts.safe[v.index()]));
+                let vi = v.index();
+                if slots[vi].is_some() || matches!(tracked[vi], TrackRoot::Set(_)) {
+                    has_tracked = true;
+                    counts.total[vi] += 1;
+                    if positions && let Some(s) = slot_root(v, slots, tracked) {
+                        let uw = if has_indirect_unwind { counts.unwind_stores[vi] } else { 0 };
+                        used.push((v, s, counts.safe[vi] + uw));
+                    }
+                }
             });
+            if !has_tracked {
+                continue;
+            }
+            let cx = EscapeCx { func, cfg, slots, tracked, is_const: &is_const, unwind_write_only: &unwind_write_only, has_noalias, danger: &danger };
             classify_inst(&cx, &mut counts, b, pos, data);
-            for (i, &(v, before)) in used.iter().enumerate() {
-                let Some(s) = slot_root(v, slots, tracked) else { continue };
-                let uses = used.iter().filter(|&&(u, _)| u == v).count() as u32;
-                if !used[..i].iter().any(|&(u, _)| u == v) && counts.safe[v.index()] - before < uses {
-                    points.entry(s.0).or_default().push((b.index() as u32, pos as u32));
+            if positions && !used.is_empty() {
+                for (i, &(v, s, before)) in used.iter().enumerate() {
+                    if used[..i].iter().any(|&(u, _, _)| u == v) {
+                        continue;
+                    }
+                    let uses = used[i..].iter().filter(|&&(u, _, _)| u == v).count() as u32;
+                    let after = counts.safe[v.index()] + if has_indirect_unwind { counts.unwind_stores[v.index()] } else { 0 };
+                    if after - before < uses {
+                        points.entry(s.0).or_default().push((b.index() as u32, pos as u32));
+                    }
                 }
             }
         }
@@ -361,4 +447,73 @@ pub(super) fn frontiers(func: &Function, esc: &SlotEscapes) -> HashMap<u32, Fron
         out.insert(s, Frontier { seen, points: pts.clone() });
     }
     out
+}
+
+pub(super) fn finish_fresh_owners(
+    func: &Function,
+    cfg: &Cfg,
+    entry: &[Value],
+    affine: &[(Value, i64)],
+    (frees, called): (&[Value], &[(Value, bool, Block, usize)]),
+    tracked: &mut [TrackRoot],
+) -> bool {
+    let mut freed_in_non_ret: Vec<Value> = Vec::new();
+    if !frees.is_empty() {
+        for &b in &cfg.rpo {
+            let insts = &func.blocks[b.index()].insts;
+            if insts.last().is_some_and(|&i| matches!(func.insts[i.index()].op, Op::Return(_))) { continue; }
+            for &inst in insts {
+                if let Op::Call { callee, args, .. } = &func.insts[inst.index()].op
+                    && frees.contains(callee) && let Some(&ptr) = args.first() && !freed_in_non_ret.contains(&ptr)
+                {
+                    freed_in_non_ret.push(ptr);
+                }
+            }
+        }
+    }
+    let mut updated = false;
+    for &b in &cfg.rpo {
+        let insts = &func.blocks[b.index()].insts;
+        for (spos, &inst) in insts.iter().enumerate() {
+            if let Op::Store(value, addr, _) = func.insts[inst.index()].op
+                && let Some(&(_, is_m, cb, cpos)) = called.iter().find(|&&(v, ..)| v == value)
+                && let Some(&(owner, _)) = affine.get(addr.index())
+                && owner != value
+                && (entry.contains(&owner) || (is_m && !freed_in_non_ret.contains(&owner) && (func.is_frame_ptr(owner) || (cb == b && spos > cpos && !insts[cpos..spos].iter().any(|&i| crate::live::results(&func.insts[i.index()]).any(|r| r == owner))))))
+            {
+                let next = TrackRoot::Set(MemRoot::UniqueHeap(Some(owner)));
+                if tracked[value.index()] != next {
+                    tracked[value.index()] = next;
+                    updated = true;
+                }
+            }
+        }
+    }
+    updated
+}
+
+#[inline]
+pub(super) fn inst_escapes_caller_loc(op: &Op, tracked: &[TrackRoot]) -> bool {
+    let is_cl = |v: Value| tracked[v.index()] == TrackRoot::Set(MemRoot::CallerLoc);
+    match *op {
+        Op::Load(addr, 0) if is_cl(addr) => false,
+        Op::Store(val, addr, 0) if is_cl(addr) && !is_cl(val) => false,
+        Op::Convert(crate::ir::Convert::Bitcast, _) | Op::Jump(..) | Op::Brif(..) => false,
+        _ => {
+            let mut bad = false;
+            op.for_operands(|v| bad |= is_cl(v));
+            bad
+        }
+    }
+}
+
+pub(super) fn caller_loc_escaped(func: &Function, cfg: &Cfg, tracked: &[TrackRoot]) -> bool {
+    for &b in &cfg.rpo {
+        for &inst in &func.blocks[b.index()].insts {
+            if inst_escapes_caller_loc(&func.insts[inst.index()].op, tracked) {
+                return true;
+            }
+        }
+    }
+    false
 }

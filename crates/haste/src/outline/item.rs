@@ -91,7 +91,7 @@ pub struct Import {
 }
 
 /// The attributes that `Items::marks` records per item, so that asking an item for one it does not name scans none of its attributes.
-pub const MARKED: [&str; 7] = ["lang", "panic_handler", "inline", "thread_local", "link_name", "linkage", "define_opaque"];
+pub const MARKED: [&str; 8] = ["lang", "panic_handler", "inline", "thread_local", "link_name", "linkage", "define_opaque", "global_allocator"];
 
 /// The bit that `Items::marks` sets for attribute `key`, or 0 when `key` is not one of `MARKED`.
 pub fn mark(key: &str) -> u8 {

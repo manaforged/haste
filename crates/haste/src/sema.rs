@@ -248,6 +248,13 @@ impl<'a> Context<'a> {
         kids.get(&parent).cloned().unwrap_or_else(|| Arc::from([]))
     }
 
+    pub(super) fn is_extern_fn(&self, item: ItemRef) -> bool {
+        let (_, entry) = self.item(item);
+        entry.kind == ItemKind::Fn
+            && entry.body.is_none()
+            && self.parent_item(item).is_some_and(|parent| self.item(parent).1.kind == ItemKind::ExternBlock)
+    }
+
     /// Whether `item` is a function, static or type declared in an `extern` block, or a bodyless float intrinsic with a host function, which the host links by name.
     pub fn foreign(&self, item: ItemRef) -> bool {
         let (src, entry) = self.item(item);
@@ -255,6 +262,9 @@ impl<'a> Context<'a> {
             return false;
         }
         let external = self.parent_item(item).is_some_and(|parent| self.item(parent).1.kind == ItemKind::ExternBlock);
+        if external && entry.kind == ItemKind::Fn && self.global_alloc_shim(item).is_some() {
+            return false;
+        }
         external || (self.rustc_intrinsic(item) && entry.name.is_some_and(|at| crate::host::intrinsic(src.text(at)).is_some()))
     }
 

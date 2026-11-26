@@ -272,6 +272,7 @@ pub(in crate::sema) fn shape_calls(shape: &Shape) -> Box<dyn Iterator<Item = &Re
         Shape::Glue(glue) => Box::new(glue.drop.iter().chain(&glue.parts).chain(&glue.resume)),
         Shape::Untuple(res) => Box::new(std::iter::once(res)),
         Shape::Clone(calls) | Shape::Asm(calls) => Box::new(calls.iter()),
+        Shape::GlobalAlloc(shim) => Box::new([&shim.allocator, &shim.method].into_iter()),
         _ => Box::new(std::iter::empty()),
     }
 }

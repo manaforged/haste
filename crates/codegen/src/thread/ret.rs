@@ -28,7 +28,7 @@ pub(super) fn open_returns(func: &mut Function, pinned: &[bool]) -> Vec<Opened> 
             }
         }
         let fed = outside.iter().any(|value| owner[value.index()].is_some_and(|block| super::dispatches(func, pinned, block)));
-        let mut preds = cfg.preds[index].clone();
+        let mut preds = cfg.preds_of(ret).to_vec();
         preds.sort_unstable();
         preds.dedup();
         if pinned[index] || !fed || preds.is_empty() || preds.iter().any(|&pred| !matches!(func.last(pred), Some(Op::Jump(..) | Op::Brif(..)))) {
@@ -73,7 +73,7 @@ pub(super) fn close_returns(func: &mut Function, opened: &[Opened]) -> bool {
     for open in opened {
         let index = open.block.index();
         let [inst] = func.blocks[index].insts[..] else { continue };
-        let mut preds = cfg.preds[index].clone();
+        let mut preds = cfg.preds_of(open.block).to_vec();
         preds.sort_unstable();
         preds.dedup();
         let base = func.blocks[index].params.len() - open.fresh.len();

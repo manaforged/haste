@@ -23,14 +23,19 @@ struct Run {
 }
 
 /// Regroups field copies into moves when some block stores enough loaded values to be worth it.
-pub(super) fn run(func: &mut Function) -> bool {
+pub(super) fn run(func: &mut Function, prov: Option<&Provenance>) -> bool {
+    if !func.blocks.iter().any(|b| b.insts.iter().filter(|&&i| matches!(func.insts[i.index()].op, Op::Store(..))).count() >= MIN_PIECES) {
+        return false;
+    }
     let defs = defs(func);
     if !worth(func, &defs) {
         return false;
     }
     let cfg = func.cfg();
-    let prov = Provenance::new(func, &cfg);
-    regroup(func, &prov, &cfg, &defs)
+    match prov {
+        Some(existing) => regroup(func, existing, &cfg, &defs),
+        None => regroup(func, &Provenance::new(func, &cfg), &cfg, &defs),
+    }
 }
 
 fn worth(func: &Function, defs: &[Option<Inst>]) -> bool {
@@ -38,10 +43,17 @@ fn worth(func: &Function, defs: &[Option<Inst>]) -> bool {
 }
 
 fn defs(func: &Function) -> Vec<Option<Inst>> {
-    let uses = func.use_counts();
-    let mut defs = crate::fold::defs(func);
+    let n = func.types.len();
+    let (mut uses, mut defs) = (vec![0_u32; n], vec![None; n]);
+    for &inst in func.blocks.iter().flat_map(|b| &b.insts) {
+        let data = &func.insts[inst.index()];
+        data.op.for_operands(|v| uses[v.index()] += 1);
+        if let Some(res) = data.result {
+            defs[res.index()] = Some(inst);
+        }
+    }
     for (value, def) in defs.iter_mut().enumerate() {
-        if uses.get(value) != Some(&1) {
+        if uses[value] != 1 {
             *def = None;
         }
     }

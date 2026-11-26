@@ -3,6 +3,7 @@ mod atomic;
 mod call;
 mod float;
 mod frame;
+mod frames;
 mod fuse;
 pub(crate) mod int;
 mod location;
@@ -14,7 +15,7 @@ mod wide;
 use asm::{Alu, Asm, Cond, FP, LR, Label, Mem, Reg, SP, Size, Vreg, ZR};
 use frame::{Abi, Loc, Packing, SAVED, SAVED_FLOAT, classify};
 use crate::alloc::{CallTarget, Location, Plan, Regs};
-use crate::emit::{Backend, Tails, emit_brif, emit_call, emit_goto, emit_slow_prologue, emit_stubs, emit_try_call, intake_params};
+use crate::emit::{Backend, Tails, emit_brif, emit_call, emit_goto, emit_stubs, emit_try_call, intake_params};
 use crate::frame::{ArgStep, EdgeScratch, Emitter, Ext, Frame, INCOMING, PAGE, Prepared, ShrinkWrap, Step, arg_steps, drive, edge_steps, emit_body, prepare_split, reg_steps, save_offset, shrink_wrap};
 use crate::ir::{ArgumentPurpose, Binary, Block, Convert, Function, Inst, IntCC, Op, SigRef, Type, Value};
 use crate::park::ParkReg;
@@ -100,7 +101,6 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
     let shrink = shrink_wrap(func, framed, &plan, &frame, &abi.params, &[FP, LR, IP]);
     let mut asm = Asm::default();
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
-    let slow_thunk = asm.label();
     let emit = Emit {
         func,
         frame,
@@ -121,14 +121,14 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         next: None,
         copied,
         direct_calls: target.direct_calls,
+        tlv_cells: target.direct_calls && target.os == Os::Darwin,
         lse: target.os == Os::Darwin,
         sp_bias: 0,
         shrink,
-        slow_thunk,
         trap_label: None,
+        cold_calls: Vec::new(),
         lines: Vec::new(),
-        in_shrink_entry: false,
-        in_fast_ret: false,
+        in_fast: false,
         tails: Tails::new(),
     };
     drive(emit, &order)
@@ -182,14 +182,14 @@ pub(super) struct Emit<'a> {
     next: Option<Block>,
     copied: Vec<bool>,
     direct_calls: bool,
+    tlv_cells: bool,
     lse: bool,
     sp_bias: i32,
     shrink: Option<ShrinkWrap>,
-    slow_thunk: Label,
     trap_label: Option<Label>,
+    cold_calls: Vec<frames::ColdCall>,
     lines: Vec<(u32, u64)>,
-    in_shrink_entry: bool,
-    in_fast_ret: bool,
+    in_fast: bool,
     tails: Tails<'a, Label>,
 }
 
@@ -241,31 +241,13 @@ impl<'a> Emitter<'a> for Emit<'a> {
         self.shrink.is_some()
     }
 
-    fn blocks_fallthrough_to(&self, block: Block) -> bool {
-        self.shrink.is_some_and(|s| s.use_slow_thunk && s.slow_entry == block)
-    }
-
-    fn before_block_bind(&mut self, block: Block) -> Result<(), String> {
+    fn before_block_bind(&mut self, _block: Block) -> Result<(), String> {
         self.asm.maybe_island()?;
-        if let Some(shrink) = self.shrink
-            && shrink.use_slow_thunk
-            && block == shrink.slow_entry
-        {
-            self.asm.bind(self.slow_thunk);
-            emit_slow_prologue(self, shrink.slow_entry)?;
-        }
         Ok(())
     }
 
     fn on_block_bound(&mut self, block: Block) -> Result<(), String> {
-        self.in_shrink_entry = self.shrink.is_some() && self.func.entry == Some(block);
-        self.in_fast_ret = self.shrink.is_some_and(|s| s.fast_ret == block);
-        if let Some(shrink) = self.shrink
-            && !shrink.use_slow_thunk
-            && block == shrink.slow_entry
-        {
-            emit_slow_prologue(self, shrink.slow_entry)?;
-        }
+        self.in_fast = self.shrink.as_ref().is_some_and(|s| s.fast[block.index()]);
         Ok(())
     }
 
@@ -277,11 +259,7 @@ impl<'a> Emitter<'a> for Emit<'a> {
     fn inst(&mut self, inst: Inst) -> Result<(), String> {
         let func = self.func;
         let data = &func.insts[inst.index()];
-        let keep_flags = matches!(
-            data.op,
-            Op::Brif(..) | Op::Trapz(..) | Op::Load(..) | Op::Store(..) | Op::StackAddr(..) | Op::StackLoad(..) | Op::StackStore(..)
-                | Op::Const(_) | Op::SlotAddr(_) | Op::Symbol(_) | Op::Runtime(_) | Op::FramePointer
-        ) || matches!(data.op, Op::Select(cond, ..) if self.flags.is_some_and(|(v, _)| v == cond));
+        let keep_flags = self.preserves_flags(&data.op, data.result);
         if !keep_flags {
             self.flags = None;
             if !matches!(data.op, Op::Icmp(_, x, _) if !self.ty(x).is_vector())
@@ -301,7 +279,6 @@ impl<'a> Emitter<'a> for Emit<'a> {
                 if self.bracket {
                     self.asm.ldp_post(FP, LR, SP, 16);
                 }
-                self.invalidate_spills();
                 res
             }
             Op::TryCall { sig, callee, args, normal, handler } => {
@@ -310,6 +287,14 @@ impl<'a> Emitter<'a> for Emit<'a> {
                 res
             }
             Op::Jump(block, args) => {
+                if self.is_split_ret(*block) {
+                    self.edge(*block, args)?;
+                    return self.fast_ret(*block);
+                }
+                if self.exits_fast(*block) {
+                    self.prologue();
+                    self.in_fast = false;
+                }
                 self.edge(*block, args)?;
                 if self.copied[inst.index()] {
                     return emit_body(self, *block);
@@ -370,6 +355,7 @@ impl<'a> Emitter<'a> for Emit<'a> {
     fn lines(&mut self) -> &mut Vec<(u32, u64)> { &mut self.lines }
 
     fn finish(mut self, _starts: &mut [u32]) -> Result<Code, String> {
+        self.emit_cold_calls();
         self.asm.maybe_island()?;
         if let Some(label) = self.trap_label.take() {
             self.asm.bind(label);
@@ -546,7 +532,7 @@ impl Emit<'_> {
     fn ret(&mut self, values: &[Value]) -> Result<(), String> {
         let returns = self.abi.returns.clone();
         self.move_locs(values, &returns, None);
-        if self.in_fast_ret {
+        if self.in_fast {
             self.asm.ret();
         } else {
             self.epilogue();
@@ -601,7 +587,6 @@ impl Emit<'_> {
                 self.high(high, val);
             }
         }
-        self.invalidate_spills();
     }
 
     fn store_locs(&mut self, values: &[Value], locs: &[Loc]) {
@@ -686,7 +671,14 @@ impl Emit<'_> {
         self.move_to(to, value);
     }
 
-    fn arguments(&mut self, sig: SigRef, callee: Value, args: &[Value]) -> Result<Abi, String> {
+    fn clobber_call_spills(&mut self) {
+        for r in 0..19 { self.last_spill.clobber(Reg(r)); }
+        self.last_spill.clobber(LR);
+        self.last_fspill = None;
+        self.asm.clear_anchor();
+    }
+
+    fn arguments(&mut self, sig: SigRef, callee: Value, args: &[Value], is_try: bool) -> Result<Abi, String> {
         let sig_data = &self.func.sigs[sig.index()];
         let abi = classify(sig_data, self.packing)?;
         for ((arg, loc), param) in args.iter().zip(&abi.params).zip(&sig_data.params) {
@@ -695,6 +687,17 @@ impl Emit<'_> {
             }
         }
         let direct = self.plan.through[callee.index()];
+        if !is_try {
+            let inlined = match direct {
+                Some(CallTarget::Symbol(lookup)) if self.func.is_thread_cell(callee) => self.thread_cell_cold(lookup, args),
+                Some(CallTarget::Runtime(rt)) => self.cached_frame_cold(rt, args),
+                _ => false,
+            };
+            if inlined {
+                self.clobber_call_spills();
+                return Ok(abi);
+            }
+        }
         let (target, extra) = if direct.is_none() {
             match self.plan.reg_of(callee).filter(|&reg| !matches!(reg, A | C | IP | FP | LR | SP) && !abi.clobbers(reg)) {
                 Some(reg) => (reg, None),
@@ -717,6 +720,7 @@ impl Emit<'_> {
             Some(CallTarget::Symbol(sym)) => self.relocs.push(self.asm.call_direct_symbol(sym, self.direct_calls, T)),
             None => self.asm.blr(target),
         }
+        self.clobber_call_spills();
         Ok(abi)
     }
 }
@@ -726,9 +730,12 @@ impl<'a> Backend<'a, Reg, Label> for Emit<'a> {
     fn plan_mut(&mut self) -> &mut Plan<Reg> { &mut self.plan }
     fn frame(&self) -> &Frame<Reg> { &self.frame }
     fn abi(&self) -> &Abi { &self.abi }
-    fn shrink(&self) -> Option<ShrinkWrap> { self.shrink }
-    fn slow_thunk(&self) -> Label { self.slow_thunk }
-    fn in_shrink_entry(&self) -> bool { self.in_shrink_entry }
+    fn shrink(&self) -> Option<&ShrinkWrap> { self.shrink.as_ref() }
+    fn in_fast(&self) -> bool { self.in_fast }
+    fn ret_fast(&mut self, values: &[Value]) -> Result<(), String> {
+        self.in_fast = true;
+        self.ret(values)
+    }
     fn next_block(&self) -> Option<Block> { self.next }
     fn block_label(&self, block: Block) -> Label { self.blocks[block.index()] }
     fn new_label(&mut self) -> Label { self.asm.label() }
@@ -745,14 +752,8 @@ impl<'a> Backend<'a, Reg, Label> for Emit<'a> {
     }
     fn branch_cond(&mut self, condition: Value, invert: bool, label: Label) { self.branch_cond(condition, invert, label); }
     fn edge(&mut self, block: Block, args: &[Value]) -> Result<(), String> { self.edge(block, args) }
-    fn arguments(&mut self, sig: SigRef, callee: Value, args: &[Value]) -> Result<Abi, String> {
-        self.invalidate_spills();
-        self.arguments(sig, callee, args)
-    }
-    fn store_locs(&mut self, values: &[Value], locs: &[Loc]) {
-        self.invalidate_spills();
-        self.store_locs(values, locs);
-    }
+    fn arguments(&mut self, sig: SigRef, callee: Value, args: &[Value], is_try: bool) -> Result<Abi, String> { self.arguments(sig, callee, args, is_try) }
+    fn store_locs(&mut self, values: &[Value], locs: &[Loc]) { self.store_locs(values, locs); }
     fn store_loc(&mut self, value: Value, loc: Loc) { self.store_loc(value, loc); }
     fn load_incoming(&mut self, value: Value, offset: u32) { self.load_home(value, Mem::new(FP, INCOMING + offset as i32)); }
     fn intake_struct(&mut self, _value: Value, _offset: u32) {}

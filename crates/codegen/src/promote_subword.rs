@@ -21,32 +21,32 @@ fn is_splittable(ty: Type) -> bool {
 
 pub(super) fn eval_consts(func: &Function) -> Vec<Option<i64>> {
     let mut consts = vec![None; func.types.len()];
+    let mut pending: Vec<(Value, Convert, Value)> = Vec::new();
     for inst in func.blocks.iter().flat_map(|b| &b.insts) {
         let data = &func.insts[inst.index()];
-        if let (&Op::Const(imm), Some(res)) = (&data.op, data.result) {
-            consts[res.index()] = Some(imm);
+        let Some(res) = data.result else { continue };
+        match data.op {
+            Op::Const(imm) => consts[res.index()] = Some(imm),
+            Op::Convert(kind @ (Convert::Uextend | Convert::Sextend | Convert::Ireduce), x) => pending.push((res, kind, x)),
+            _ => {}
         }
     }
     for _ in 0..4 {
-        let mut changed = false;
-        for inst in func.blocks.iter().flat_map(|b| &b.insts) {
-            let data = &func.insts[inst.index()];
-            let Some(res) = data.result else { continue };
-            if consts[res.index()].is_some() {
-                continue;
-            }
-            let val = match data.op {
-                Op::Convert(Convert::Uextend, x) => consts[x.index()].map(|imm| crate::fold::extend(imm, func.ty(x), false)),
-                Op::Convert(Convert::Sextend, x) => consts[x.index()].map(|imm| crate::fold::extend(imm, func.ty(x), true)),
-                Op::Convert(Convert::Ireduce, x) => consts[x.index()].map(|imm| crate::fold::extend(imm, func.ty(res), false)),
-                _ => None,
-            };
-            if val.is_some() {
-                consts[res.index()] = val;
-                changed = true;
-            }
+        if pending.is_empty() {
+            break;
         }
-        if !changed {
+        let before = pending.len();
+        pending.retain(|&(res, kind, x)| {
+            let Some(imm) = consts[x.index()] else { return true };
+            consts[res.index()] = Some(match kind {
+                Convert::Uextend => crate::fold::extend(imm, func.ty(x), false),
+                Convert::Sextend => crate::fold::extend(imm, func.ty(x), true),
+                Convert::Ireduce => crate::fold::extend(imm, func.ty(res), false),
+                _ => return true,
+            });
+            false
+        });
+        if pending.len() == before {
             break;
         }
     }

@@ -79,6 +79,11 @@ impl HostSymbol {
         Self::resolve_for(name, false)
     }
 
+    /// Whether this host symbol allocates fresh unaliased heap memory (`__rust_alloc` / `__rust_alloc_zeroed`).
+    pub fn is_fresh_alloc(&self) -> bool {
+        matches!(self, Self::Alloc | Self::AllocZeroed)
+    }
+
     /// The external linker symbol name for this host helper.
     pub fn link_name(&self) -> &str {
         match self {

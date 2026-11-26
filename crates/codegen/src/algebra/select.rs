@@ -164,12 +164,28 @@ fn refuted_arm(cx: &RewriteCx, cond: Value, arm: Value, taken: bool) -> Option<V
 }
 
 pub(super) fn tested_select(cx: &RewriteCx, cond: Value) -> Option<(Value, bool)> {
-    let &Op::Select(test, t, f) = cx.op(cx.unwrap_uextend(cond))? else { return None };
-    let ty = cx.func.ty(t);
-    if !ty.is_small_int() || !cx.func.ty(test).is_small_int() { return None; }
-    if cx.uconst(f, ty) == Some(0) && is_non_zero_under(cx, t, unwrap_cond_cmp(cx, test, true), 0) { Some((test, true)) }
-    else if cx.uconst(t, ty) == Some(0) && is_non_zero_under(cx, f, unwrap_cond_cmp(cx, test, false), 0) { Some((test, false)) }
-    else { None }
+    match *cx.op(cx.unwrap_uextend(cond))? {
+        Op::Select(test, t, f) => {
+            let ty = cx.func.ty(t);
+            if !ty.is_small_int() || !cx.func.ty(test).is_small_int() { return None; }
+            if cx.uconst(f, ty) == Some(0) && is_non_zero_under(cx, t, unwrap_cond_cmp(cx, test, true), 0) { Some((test, true)) }
+            else if cx.uconst(t, ty) == Some(0) && is_non_zero_under(cx, f, unwrap_cond_cmp(cx, test, false), 0) { Some((test, false)) }
+            else { None }
+        }
+        Op::Binary(Binary::Isub | Binary::Bxor, a, b) => {
+            let ty = cx.func.ty(a);
+            if !ty.is_small_int() { return None; }
+            for (sel_v, k_v) in [(a, b), (b, a)] {
+                let (Some(k), Some(&Op::Select(test, t, f))) = (cx.uconst(k_v, ty), cx.op(sel_v)) else { continue };
+                if !cx.func.ty(test).is_small_int() { continue; }
+                let (ct, cf) = (cx.uconst(t, ty), cx.uconst(f, ty));
+                if cf == Some(k) && ct.is_some_and(|v| v != k) { return Some((test, true)); }
+                if ct == Some(k) && cf.is_some_and(|v| v != k) { return Some((test, false)); }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 fn unwrap_cond_cmp(cx: &RewriteCx, mut raw: Value, mut taken: bool) -> Option<(IntCC, Value, Value)> {

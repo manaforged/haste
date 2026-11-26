@@ -126,6 +126,9 @@ impl Checker<'_, '_> {
                 out
             }
             Expr::Block { kind, tail, .. } => {
+                if kind == BlockKind::Const {
+                    return Vec::new();
+                }
                 if let Some(cached) = self.temp_sources.get(&expr) {
                     return cached.clone();
                 }
@@ -452,8 +455,13 @@ impl Checker<'_, '_> {
             }
             _ => {
                 let mut out = self.expr_borrow_sources_inner(callee, state, true, None);
+                let ret_has_borrow = self.ty_holds_borrow(self.expr_ty(expr));
+                let hrtb_non_ret = self.callee_hrtb_non_ret_params(callee, ret_has_borrow);
                 let arg_ids: Vec<u32> = self.body.list(args).to_vec();
-                for id in arg_ids {
+                for (idx, id) in arg_ids.into_iter().enumerate() {
+                    if hrtb_non_ret.contains(&idx) {
+                        continue;
+                    }
                     out.extend(self.expr_borrow_sources_inner(ExprId(id), state, true, None));
                 }
                 self.finish_sig_sources(expr, out, false)
@@ -509,10 +517,16 @@ impl Checker<'_, '_> {
         let fn_name = self.cx.name(fn_item);
         let is_iter_fn = self.is_iter_mod(fn_item);
         let is_opt_fn = self.item_in_std_mod(fn_item, "option");
+        let is_res_fn = self.item_in_std_mod(fn_item, "result");
+        let is_clone_fn = fn_name == "clone"
+            && recv_is_by_ref(&sig)
+            && self.cx.owner_trait(fn_item)
+                .or_else(|| self.cx.owner_impl(fn_item).and_then(|b| self.cx.impl_trait(b)))
+                .is_some_and(|tr| self.item_in_std_mod(tr, "clone"));
         let is_by_ref = is_iter_fn && fn_name == "by_ref";
         let mut out = Vec::new();
         if !ret_lts.has_elided && ret_lts.named.is_empty() {
-            if ret_lts.saw_static {
+            if super::checks::closure::sig_returns_only_static(&sig, sig_src, ret_ast, &ret_lts) {
                 return Vec::new();
             }
             let mut param_matched_own_generic = false;
@@ -537,11 +551,14 @@ impl Checker<'_, '_> {
                 && (!param_matched_own_generic || ret_lts.names.contains(&"Self"))
             {
                 let mut recv_sources = self.expr_borrow_sources_inner(recv, state, !recv_is_by_ref(&sig), None);
-                if (is_iter_fn || is_opt_fn) && matches!(fn_name, "copied" | "cloned") {
-                    recv_sources = self.copied_recv_sources(recv, recv_sources, state, is_opt_fn);
-                } else if is_iter_fn
+                if ((is_iter_fn || is_opt_fn) && matches!(fn_name, "copied" | "cloned")) || is_clone_fn {
+                    recv_sources = self.copied_recv_sources(recv, recv_sources, state, is_opt_fn || is_clone_fn);
+                } else if (is_iter_fn
                     && matches!(fn_name, "map" | "filter_map" | "flat_map")
-                    && arg_ids.first().is_some_and(|&a| self.iter_closure_ignores_param(ExprId(a), state))
+                    && arg_ids.first().is_some_and(|&a| self.iter_closure_ignores_param(ExprId(a), state)))
+                    || ((is_opt_fn || is_res_fn)
+                        && matches!(fn_name, "map" | "and_then")
+                        && arg_ids.first().is_some_and(|&a| self.fn_arg_returns_static(ExprId(a))))
                 {
                     for s in &mut recv_sources {
                         s.env_only = true;
@@ -636,7 +653,7 @@ impl Checker<'_, '_> {
                 _ => break,
             }
         }
-        let root = self.root_place(cur).map(|p| p.local);
+        let root = (!matches!(*self.body.expr(cur), Expr::Ref { .. })).then(|| self.root_place(cur).map(|p| p.local)).flatten();
         let indirect = root.is_some_and(|r| {
             let r_ty = self.local_ty(r);
             cur == recv || self.is_ref_ty(r_ty) || self.ty_holds_closure(r_ty)
@@ -703,10 +720,8 @@ impl Checker<'_, '_> {
     }
 
     fn iter_closure_ignores_param(&mut self, arg: ExprId, state: &State) -> bool {
-        let mut cur = arg;
-        while let Expr::Paren(inner) = *self.body.expr(cur) {
-            cur = inner;
-        }
+        if self.fn_arg_returns_static(arg) { return true; }
+        let cur = self.unwrap_parens(arg);
         let Some(closure) = self.typed.closures.get(&cur).cloned() else {
             return false;
         };

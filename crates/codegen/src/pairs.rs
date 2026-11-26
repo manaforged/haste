@@ -38,8 +38,15 @@ pub(crate) fn split(func: &mut Function) -> bool {
 
 /// Which 128-bit values feed only one 128-bit add or subtract in their own block, so a constant they carry can wait for it.
 fn chained(func: &Function) -> Vec<bool> {
-    let uses = func.use_counts();
     let mut ok = vec![false; func.types.len()];
+    let has_add = func.blocks.iter().flat_map(|b| &b.insts).any(|&inst| {
+        let data = &func.insts[inst.index()];
+        matches!(data.op, Op::Binary(Binary::Iadd | Binary::Isub, ..)) && data.result.is_some_and(|r| func.ty(r) == Type::I128)
+    });
+    if !has_add {
+        return ok;
+    }
+    let uses = func.use_counts();
     for block in &func.blocks {
         let local: Vec<Value> = block.insts.iter().filter_map(|&inst| func.insts[inst.index()].result).collect();
         for &inst in &block.insts {

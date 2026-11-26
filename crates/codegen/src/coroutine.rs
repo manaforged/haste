@@ -8,6 +8,7 @@ use crate::ir::{AbiParam, Binary, Block, CallConv, Function, Inst, InstData, Int
 use crate::live::{BitMatrix, results};
 use crate::reloc::RuntimeSymbol;
 
+mod fold_flags;
 mod lazy;
 mod slots;
 
@@ -167,10 +168,10 @@ pub(crate) fn split(func: &mut Function) {
     let old_entry = func.entry.expect("a coroutine has an entry");
     if spec.resumes.is_empty() {
         ready_entry(func, &spec, old_entry);
-        func.zero_init_unwind_flags();
         func.bump_cfg();
         return;
     }
+    fold_flags::run(func, &spec, old_entry);
     let defs = func.def_blocks();
     let cfg = func.cfg();
     let spills = live_across_suspend(func, &cfg, &spec.resumes, &defs);
@@ -215,7 +216,6 @@ pub(crate) fn split(func: &mut Function) {
     if let Some(lazy) = lazy {
         lazy::settle(func, &spec, anchor, lazy, orig_blocks);
     }
-    func.zero_init_unwind_flags();
     func.bump_cfg();
 }
 

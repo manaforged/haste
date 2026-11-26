@@ -502,11 +502,7 @@ fn try_phi_addr_join(
     let mut cur = block;
     for hop in 0..=MAX_JOIN_ANCESTOR_HOPS {
         if hop > 0 {
-            let parent = join.cfg.single_pred(cur)?;
-            if join.bw.has_writes(parent) {
-                break;
-            }
-            cur = parent;
+            cur = join.bw.write_free_idom(cur)?;
         }
         let Some(preds) = (if cur == block { join.preds.clone() } else { eligible_join_preds(func, join.cfg, join.visited, cur) }) else {
             continue;

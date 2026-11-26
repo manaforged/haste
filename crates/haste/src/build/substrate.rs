@@ -11,7 +11,7 @@ use crate::substrate::{Substrate, SubstrateBuilder, deps_key, enabled, target_ha
 
 use super::BatchKind;
 
-pub(super) struct SubstrateSlot {
+pub(crate) struct SubstrateSlot {
     toolchain_key: u64,
     deps_key: Option<u64>,
     workspace_key: Option<u64>,
@@ -19,6 +19,12 @@ pub(super) struct SubstrateSlot {
     pub(super) toolchain: Option<Arc<Substrate>>,
     pub(super) deps: Option<Arc<Substrate>>,
     pub(super) workspace: Option<Arc<Substrate>>,
+}
+
+impl SubstrateSlot {
+    pub(crate) fn top(&self) -> Option<Arc<Substrate>> {
+        self.workspace.as_ref().or(self.deps.as_ref()).or(self.toolchain.as_ref()).cloned()
+    }
 }
 
 pub(super) struct PreBuilders {
@@ -39,7 +45,7 @@ impl PreBuilders {
     }
 }
 
-pub(super) fn open_batch_substrate(workspace: &graph::Workspace) -> Option<SubstrateSlot> {
+pub(crate) fn open_batch_substrate(workspace: &graph::Workspace) -> Option<SubstrateSlot> {
     if !enabled() {
         return None;
     }
@@ -127,6 +133,27 @@ fn export_and_save_layers((outline, store): (&outline::Outline, &mut Cache), ima
         save_substrate_layer(deps_builder, (workspace, kind), slot.deps.take(), SubstrateBuilder::save_deps)?;
     }
     save_substrate_layer(builders.toolchain, (workspace, kind), slot.toolchain.take(), SubstrateBuilder::save_toolchain)
+}
+
+pub(crate) fn save_macro_summaries(outline: &outline::Outline, store: &Cache, mut slot: SubstrateSlot) {
+    if !store.has_new_sysroot_summaries() {
+        return;
+    }
+    let mut builders = make_builders(&slot);
+    if let Err(error) = store.export_sysroot_summaries(outline, Some(&mut builders.toolchain), builders.deps.as_mut()) {
+        eprintln!("haste: cannot export macro summaries: {error:#}");
+        return;
+    }
+    let workspace = slot.workspace_key.or(slot.deps_key).unwrap_or(slot.toolchain_key);
+    let save = || -> Result<()> {
+        if let Some(deps_builder) = builders.deps {
+            save_substrate_layer(deps_builder, (workspace, BatchKind::MainAot), slot.deps.take(), SubstrateBuilder::save_deps)?;
+        }
+        save_substrate_layer(builders.toolchain, (workspace, BatchKind::MainAot), slot.toolchain.take(), SubstrateBuilder::save_toolchain)
+    };
+    if let Err(error) = save() {
+        eprintln!("haste: cannot save macro substrate: {error:#}");
+    }
 }
 
 pub(super) fn save_batch_substrate(

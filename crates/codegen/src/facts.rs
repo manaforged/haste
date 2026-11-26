@@ -10,6 +10,7 @@ use crate::fold::{extend, holds};
 use crate::ir::{Binary, Block, Function, Inst, IntCC, Op, Type, Value};
 use loops::{Env, ExtraPath};
 use rel::{Path, RelKind, cond_truth, fits_truth, rel_of};
+pub(crate) use transfer::deref_ptr;
 
 /// The most facts a path keeps; past it the oldest goes.
 pub(super) const MAX_FACTS: usize = 64;
@@ -39,12 +40,6 @@ impl Fact {
         Self { lo: 0, hi: ty.unsigned_max(), not: Vec::new() }
     }
 
-    /// Exactly the constant `imm` of type `ty`.
-    fn constant(ty: Type, imm: i64) -> Self {
-        let value = unsigned(imm, ty);
-        Self::range(value, value)
-    }
-
     pub(super) fn range(lo: u64, hi: u64) -> Self {
         Self { lo, hi, not: Vec::new() }
     }
@@ -52,6 +47,12 @@ impl Fact {
     /// The single value the fact allows, when it allows one.
     pub(crate) fn exact(&self) -> Option<u64> {
         (self.lo == self.hi).then_some(self.lo)
+    }
+
+    /// Whether `self` already implies every constraint in `other`.
+    #[inline]
+    pub(super) fn subsumes(&self, other: &Fact) -> bool {
+        self.lo >= other.lo && self.hi <= other.hi && (other.not.is_empty() || other.not.iter().all(|&v| !self.admits(v)))
     }
 
     /// What both facts say.
@@ -178,18 +179,22 @@ struct CfgInfo<'a> {
     consts: &'a [Option<i64>],
     incoming: &'a [Vec<(Block, &'a [Value])>],
     complete: &'a [bool],
+    edge_args: &'a [bool],
     single: &'a [Option<Block>],
     idom: &'a [Option<Block>],
 }
 
-fn collect_incoming(func: &Function) -> (Vec<Vec<(Block, &[Value])>>, Vec<bool>) {
-    let mut incoming: Vec<Vec<(Block, &[Value])>> = vec![Vec::new(); func.blocks.len()];
+fn collect_incoming<'a>(func: &'a Function) -> (Vec<Vec<(Block, &'a [Value])>>, Vec<bool>, Vec<bool>) {
+    if !func.blocks.iter().any(|b| !b.params.is_empty()) { return (Vec::new(), Vec::new(), Vec::new()); }
+    let mut incoming: Vec<Vec<(Block, &'a [Value])>> = vec![Vec::new(); func.blocks.len()];
     let mut complete = vec![true; func.blocks.len()];
+    let mut edge_args = vec![false; func.types.len()];
     for pred_idx in 0..func.blocks.len() {
         let pred = Block(pred_idx as u32);
-        let mut edge = |target: Block, args| {
+        let mut edge = |target: Block, args: &'a [Value]| {
             if !func.blocks[target.index()].params.is_empty() {
                 incoming[target.index()].push((pred, args));
+                for &a in args { edge_args[a.index()] = true; }
             }
         };
         match func.last(pred) {
@@ -198,24 +203,20 @@ fn collect_incoming(func: &Function) -> (Vec<Vec<(Block, &[Value])>>, Vec<bool>)
                 edge(*then, then_args.as_slice());
                 edge(*otherwise, else_args.as_slice());
             }
-            _ => {
-                for target in func.successors(pred) {
-                    complete[target.index()] = false;
-                }
-            }
+            _ => { for target in func.successors(pred) { complete[target.index()] = false; } }
         }
     }
-    (incoming, complete)
+    (incoming, complete, edge_args)
 }
 
 impl<'a> Ranges<'a> {
     /// The ranges of `func`'s values over the blocks of `order`, with the constants `consts` an earlier fold found.
     pub(crate) fn new(func: &Function, parts: (&'a [Option<Inst>], &[Option<i64>]), blocks: (&[Block], &[Option<Block>], &[Option<Block>])) -> Self {
-        let (incoming, complete) = collect_incoming(func);
-        Self::over(func, parts, blocks, (&incoming, &complete))
+        let (incoming, complete, edge_args) = collect_incoming(func);
+        Self::over(func, parts, blocks, (&incoming, &complete, &edge_args))
     }
 
-    fn over(func: &Function, (defs, consts): (&'a [Option<Inst>], &[Option<i64>]), (order, single, idom): (&[Block], &[Option<Block>], &[Option<Block>]), (incoming, complete): (&[Vec<(Block, &[Value])>], &[bool])) -> Self {
+    fn over(func: &Function, (defs, consts): (&'a [Option<Inst>], &[Option<i64>]), (order, single, idom): (&[Block], &[Option<Block>], &[Option<Block>]), (incoming, complete, edge_args): (&[Vec<(Block, &[Value])>], &[bool], &[bool])) -> Self {
         let mut table: Vec<(u64, u64)> = func.types.iter().map(|ty| (0, ty.unsigned_max())).collect();
         if let Some(entry) = func.entry {
             for (&param, abi) in func.blocks[entry.index()].params.iter().zip(&func.signature.params) {
@@ -225,49 +226,79 @@ impl<'a> Ranges<'a> {
             }
         }
         let mut ranges = Self { defs, table, raised: Vec::new() };
-        let info = CfgInfo { consts, incoming, complete, single, idom };
-        if ranges.propagate(func, &info, order) {
-            ranges.propagate(func, &info, order);
+        let info = CfgInfo { consts, incoming, complete, edge_args, single, idom };
+        let mut falls_through = vec![0_u32; func.types.len()];
+        let mut epoch = 0_u32;
+        if ranges.propagate(func, &info, order, &mut falls_through, &mut epoch) {
+            ranges.propagate(func, &info, order, &mut falls_through, &mut epoch);
         }
         ranges
     }
 
-    fn propagate(&mut self, func: &Function, info: &CfgInfo, order: &[Block]) -> bool {
+    fn propagate(&mut self, func: &Function, info: &CfgInfo, order: &[Block], falls_through: &mut [u32], epoch: &mut u32) -> bool {
         let mut narrowed = false;
-        let mut falls_through = Vec::new();
+        let bump = |epoch: &mut u32, ft: &mut [u32]| { *epoch = epoch.wrapping_add(1); if *epoch == 0 { ft.fill(0); *epoch = 1; } };
         for &block in order {
             narrowed |= self.refine_params(func, info, block);
-            falls_through.clear();
-            for inst in &func.blocks[block.index()].insts {
+            bump(epoch, falls_through);
+            for &p in &func.blocks[block.index()].params { if func.ty(p).is_small_int() { falls_through[p.index()] = *epoch; } }
+            let mut prev_res = None;
+            for (pos, inst) in func.blocks[block.index()].insts.iter().enumerate() {
                 let data = &func.insts[inst.index()];
                 match data.op {
+                    Op::Const(imm) => {
+                        prev_res = data.result;
+                        if let Some(r) = data.result && func.ty(r).is_small_int() { falls_through[r.index()] = *epoch; let u = unsigned(imm, func.ty(r)); self.table[r.index()] = (u, u); }
+                        continue;
+                    }
+                    Op::StackStore(..) => { prev_res = None; bump(epoch, falls_through); continue; }
+                    Op::Store(_, addr, off) => {
+                        if (0..4096).contains(&off) && transfer::note_deref_addr(func, addr, falls_through, *epoch, &mut self.table) && (info.edge_args.get(addr.index()).copied().unwrap_or(false) || (pos > 0 && prev_res != Some(addr))) { narrowed = true; }
+                        prev_res = None; bump(epoch, falls_through); continue;
+                    }
+                    Op::StackLoad(..) | Op::Load(..) => {
+                        if let Op::Load(addr, off) = data.op && (0..4096).contains(&off) && transfer::note_deref_addr(func, addr, falls_through, *epoch, &mut self.table) && (info.edge_args.get(addr.index()).copied().unwrap_or(false) || (pos > 0 && prev_res != Some(addr))) { narrowed = true; }
+                        prev_res = data.result; bump(epoch, falls_through);
+                        if let Some(r) = data.result && func.ty(r).is_small_int() { falls_through[r.index()] = *epoch; if let Some(imm) = info.consts.get(r.index()).copied().flatten() { let u = unsigned(imm, func.ty(r)); self.table[r.index()] = (u, u); } }
+                        continue;
+                    }
+                    Op::Icmp(..) | Op::Fcmp(..) | Op::Fits(..) | Op::StackAddr(..) | Op::Symbol(_) | Op::SlotAddr(_) => {
+                        prev_res = data.result;
+                        if let Some(r) = data.result && func.ty(r).is_small_int() { falls_through[r.index()] = *epoch; let ty = func.ty(r); self.table[r.index()] = info.consts.get(r.index()).copied().flatten().map_or_else(|| transfer::known_range(&data.op, ty).unwrap_or((0, ty.unsigned_max())), |imm| { let u = unsigned(imm, ty); (u, u) }); }
+                        continue;
+                    }
+                    Op::Jump(..) | Op::Brif(..) | Op::Return(..) | Op::BrTable(..) | Op::Trap => { prev_res = None; continue; }
                     Op::Assume(value) => {
+                        prev_res = None;
                         let (lo, hi) = &mut self.table[value.index()];
-                        if *lo == 0 && *hi != 0 && func.ty(value) != Type::I8 && falls_through.contains(&value) {
+                        if *lo == 0 && *hi != 0 && func.ty(value) != Type::I8 && falls_through[value.index()] == *epoch {
                             *lo = 1;
-                            if !self.raised.contains(&value) {
-                                self.raised.push(value);
-                            }
+                            if !self.raised.contains(&value) { self.raised.push(value); }
                         }
                         continue;
                     }
-                    ref op if !op.is_speculable() => falls_through.clear(),
+                    Op::Call { ref results, .. } => {
+                        prev_res = None;
+                        bump(epoch, falls_through);
+                        for &r in results { if func.ty(r).is_small_int() { falls_through[r.index()] = *epoch; } }
+                        continue;
+                    }
                     _ => {}
                 }
+                if let Some(addr) = transfer::note_deref(func, &data.op, falls_through, *epoch, &mut self.table) && (info.edge_args.get(addr.index()).copied().unwrap_or(false) || (pos > 0 && prev_res != Some(addr))) { narrowed = true; }
+                prev_res = data.result;
+                if !data.op.is_speculable() { bump(epoch, falls_through); }
                 let Some(result) = data.result.filter(|result| func.ty(*result).is_small_int()) else { continue };
-                falls_through.push(result);
-                let fact = match info.consts.get(result.index()).copied().flatten() {
-                    Some(imm) => Fact::constant(func.ty(result), imm),
-                    None => transfer::transfer(func, self, &data.op, func.ty(result), &|value| self.of(value)),
-                };
-                self.table[result.index()] = (fact.lo, fact.hi);
+                falls_through[result.index()] = *epoch;
+                let ty = func.ty(result);
+                if let Some(imm) = info.consts.get(result.index()).copied().flatten() { let u = unsigned(imm, ty); self.table[result.index()] = (u, u); } else if let Some(pair) = transfer::fast_range(func, self, &data.op, ty) { self.table[result.index()] = pair; }
             }
         }
         narrowed
     }
 
     fn refine_params(&mut self, func: &Function, info: &CfgInfo, block: Block) -> bool {
-        if !info.complete[block.index()] || info.incoming[block.index()].is_empty() {
+        if info.incoming.is_empty() || !info.complete[block.index()] || info.incoming[block.index()].is_empty() {
             return false;
         }
         let mut narrowed = false;
@@ -523,9 +554,14 @@ fn join_incoming_rels(
     block: Block,
     path: &mut Path,
 ) {
+    if incoming.is_empty() || !complete[block.index()] || func.blocks[block.index()].params.is_empty() { return; }
     let edges = &incoming[block.index()];
-    if !complete[block.index()] || edges.len() < 2 || edges.len() > 16 || func.blocks[block.index()].params.is_empty() { return; }
+    if edges.len() < 2 || edges.len() > 16 { return; }
     if !edges.iter().all(|&(pred, _)| exits.get(pred.index()).and_then(Option::as_ref).is_some()) { return; }
+    if !edges.iter().any(|&(pred, _)| {
+        exits[pred.index()].as_ref().is_some_and(|p| !p.rels().is_empty())
+            || matches!(func.last(pred), Some(&Op::Brif(_, then, _, otherwise, _)) if then != otherwise)
+    }) { return; }
     let edge_paths: Vec<Path> = edges.iter().map(|&(pred, _)| {
         let mut p = exits[pred.index()].clone().unwrap_or_default();
         if matches!(func.last(pred), Some(&Op::Brif(_, then, _, otherwise, _)) if then != otherwise) {
@@ -577,16 +613,16 @@ pub(crate) fn settle(func: &mut Function, defs: &[Option<Inst>], consts: &mut [O
     let single: Vec<Option<Block>> = (0..func.blocks.len()).map(|b| cfg.single_pred(Block(b as u32))).collect();
     let (mut decided, mut compares, mut rewrites) = (Vec::new(), Vec::new(), Vec::new());
     {
-        let (incoming, complete) = collect_incoming(func);
-        let ranges = Ranges::over(func, (defs, consts), (&cfg.rpo, &single, &cfg.idom), (&incoming, &complete));
+        let (incoming, complete, edge_args) = collect_incoming(func);
+        let ranges = Ranges::over(func, (defs, consts), (&cfg.rpo, &single, &cfg.idom), (&incoming, &complete, &edge_args));
         let def_blocks = std::cell::OnceCell::new();
         let mut live = live::Live::default();
         let loops = cfg.loops();
         let mut env = Env::default();
         let mut exits = exits::Exits::new(func, &cfg, (&single, entry), (loops, &incoming));
-        let mut seen = vec![false; func.types.len()];
+        let mut seen = if selects.is_empty() { Vec::new() } else { vec![false; func.types.len()] };
         for &block in &cfg.rpo {
-            for &param in &func.blocks[block.index()].params { seen[param.index()] = true; }
+            if !seen.is_empty() { for &param in &func.blocks[block.index()].params { seen[param.index()] = true; } }
             live.enter(&cfg, &selects, block);
             for each in &loops.list {
                 if each.head == block {
@@ -595,7 +631,7 @@ pub(crate) fn settle(func: &mut Function, defs: &[Option<Inst>], consts: &mut [O
             }
             let (follow, mut path, mut extra, mut dom) = exits.start(&cfg, block, entry);
             if let Some(pred) = follow {
-                if single[block.index()] == Some(pred) && let [(_, args)] = incoming[block.index()][..] {
+                if single[block.index()] == Some(pred) && let Some(&[(_, args)]) = incoming.get(block.index()).map(Vec::as_slice) {
                     for (&param, &arg) in func.blocks[block.index()].params.iter().zip(args) {
                         if func.ty(param).is_small_int() && param != arg { path.push_rel_kind(RelKind::Eq, param, arg, func.ty(param)); }
                     }
@@ -613,10 +649,10 @@ pub(crate) fn settle(func: &mut Function, defs: &[Option<Inst>], consts: &mut [O
             }
             for &inst in &func.blocks[block.index()].insts {
                 settle_one(func, (&cfg, &ranges, &env, &mut path, &mut extra, &mut dom, &live.recs, block, &seen), inst, (&mut decided, &mut compares, &mut rewrites));
-                let data = &func.insts[inst.index()];
-                if let Some(res) = data.result { seen[res.index()] = true; }
-                if let Op::Call { results, .. } = &data.op {
-                    for &res in results { seen[res.index()] = true; }
+                if !seen.is_empty() {
+                    let data = &func.insts[inst.index()];
+                    if let Some(res) = data.result { seen[res.index()] = true; }
+                    if let Op::Call { results, .. } = &data.op { for &res in results { seen[res.index()] = true; } }
                 }
             }
             exits.store(block, (path, extra, dom));
@@ -666,43 +702,21 @@ fn sub_cond_truth(func: &Function, ctx: (&Cfg, &Ranges, &Env, &Path, &ExtraPath,
 }
 
 /// Settles `inst` under `path` and moves the path past it.
-fn settle_one(
-    func: &Function,
-    (cfg, ranges, env, path, extra, dom, selects, block, seen): (&Cfg, &Ranges, &Env, &mut Path, &mut ExtraPath, &mut DomState, &[SelectRec], Block, &[bool]),
-    inst: Inst,
-    out: (&mut Vec<(Inst, Option<bool>)>, &mut Vec<(Value, bool)>, &mut Vec<(Inst, Value, Value)>),
-) {
+fn settle_one(func: &Function, (cfg, ranges, env, path, extra, dom, selects, block, seen): (&Cfg, &Ranges, &Env, &mut Path, &mut ExtraPath, &mut DomState, &[SelectRec], Block, &[bool]), inst: Inst, out: (&mut Vec<(Inst, Option<bool>)>, &mut Vec<(Value, bool)>, &mut Vec<(Inst, Value, Value)>)) {
     let data = &func.insts[inst.index()];
-    if !dom.aliases.is_empty() {
-        data.op.for_operands(|v| {
-            let mapped = dom.resolve(v);
-            if mapped != v { out.2.push((inst, v, mapped)); }
-        });
-    }
-    if !settle_value(func, (cfg, ranges, env, path, extra, dom, block), data, out.1) {
-        settle_ctrl(func, (cfg, ranges, env, path, extra, dom, selects, block, seen), inst, data, out.0);
-    }
+    if !dom.aliases.is_empty() { data.op.for_operands(|v| { let mapped = dom.resolve(v); if mapped != v { out.2.push((inst, v, mapped)); } }); }
+    if !settle_value(func, (cfg, ranges, env, path, extra, dom, block), data, out.1) { settle_ctrl(func, (cfg, ranges, env, path, extra, dom, selects, block, seen), inst, data, out.0); }
 }
 
-fn settle_value(
-    func: &Function,
-    (cfg, ranges, env, path, extra, dom, block): (&Cfg, &Ranges, &Env, &Path, &ExtraPath, &DomState, Block),
-    data: &crate::ir::InstData,
-    compares: &mut Vec<(Value, bool)>,
-) -> bool {
+fn settle_value(func: &Function, (cfg, ranges, env, path, extra, dom, block): (&Cfg, &Ranges, &Env, &Path, &ExtraPath, &DomState, Block), data: &crate::ir::InstData, compares: &mut Vec<(Value, bool)>) -> bool {
     let known = match (&data.op, data.result) {
         (&Op::Icmp(cc, raw_x, raw_y), Some(result)) if ranges.constant(result).is_none() && func.ty(raw_x).is_small_int() => {
             let (x, y) = (dom.resolve(raw_x), dom.resolve(raw_y));
             let ty = func.ty(x);
             let ctx = (cfg, ranges, env, path, extra, block);
-            decide(cc, ty, &sub_fact(func, ctx, x), &sub_fact(func, ctx, y))
-                .or_else(|| path.decide_rel(func, ranges, cc, ty, x, y))
-                .or_else(|| extra.decide(func, (cfg, ranges, env, path, block), cc, x, y))
-                .map(|b| (result, b))
+            decide(cc, ty, &sub_fact(func, ctx, x), &sub_fact(func, ctx, y)).or_else(|| path.decide_rel(func, ranges, cc, ty, x, y)).or_else(|| extra.decide(func, (cfg, ranges, env, path, block), cc, x, y)).map(|b| (result, b))
         }
-        (&Op::Fits(op, signed, raw_x, raw_y), Some(result)) if ranges.constant(result).is_none() && func.ty(raw_x).is_small_int() => {
-            fits_truth(func, ranges, path, op, signed, dom.resolve(raw_x), dom.resolve(raw_y)).map(|b| (result, b))
-        }
+        (&Op::Fits(op, signed, raw_x, raw_y), Some(result)) if ranges.constant(result).is_none() && func.ty(raw_x).is_small_int() => fits_truth(func, ranges, path, op, signed, dom.resolve(raw_x), dom.resolve(raw_y)).map(|b| (result, b)),
         _ => return false,
     };
     if let Some((result, b)) = known { compares.push((result, b)); }
@@ -736,33 +750,21 @@ fn settle_ctrl(
             dom.propagate_selects(func, (cfg, ranges, env, path, extra), selects, block, seen);
         }
         (&Op::Brif(raw_cond, then, _, otherwise, _), _) if ranges.constant(raw_cond).is_none() => {
-            if let Some(taken) = truth_of(dom.resolve(raw_cond), path).or_else(|| avoided(func, ranges, then, otherwise)) {
+            if let Some(taken) = truth_of(dom.resolve(raw_cond), path).or_else(|| transfer::avoided(func, ranges, then, otherwise)) {
                 decided.push((inst, Some(taken)));
             }
         }
-        _ => {}
-    }
-}
-
-/// The way a branch goes when exactly one of its targets assumes a constant zero before any call or trap: control that enters that target breaks the assumption, so it never does.
-fn avoided(func: &Function, ranges: &Ranges, then: Block, otherwise: Block) -> Option<bool> {
-    let barred = |block: Block| {
-        func.blocks[block.index()]
-            .insts
-            .iter()
-            .map(|inst| &func.insts[inst.index()].op)
-            .take_while(|op| !matches!(op, Op::Call { .. } | Op::Trapz(_)))
-            .any(|op| matches!(op, Op::Assume(value) if ranges.constant(*value) == Some(0)))
-    };
-    match (barred(then), barred(otherwise)) {
-        (true, false) => Some(false),
-        (false, true) => Some(true),
-        _ => None,
+        _ => {
+            if let Some(addr) = transfer::deref_ptr(&data.op) && func.ty(addr) == Type::I64 {
+                let resolved = dom.resolve(addr);
+                if path.fact(ranges, resolved).lo == 0 { path.add(ranges, resolved, Fact::range(1, u64::MAX)); }
+            }
+        }
     }
 }
 
 /// Whether a value with `fact` is nonzero, when the fact settles it.
-pub(super) fn truth(fact: &Fact) -> Option<bool> {
+pub(crate) fn truth(fact: &Fact) -> Option<bool> {
     match fact.exact() {
         Some(known) => Some(known != 0),
         None => (!fact.admits(0)).then_some(true),

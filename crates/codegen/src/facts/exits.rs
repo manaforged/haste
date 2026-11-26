@@ -42,7 +42,7 @@ impl Exits {
             if let Some(dom) = cfg.idom[each.head.index()] {
                 pinned[dom.index()] = true;
             }
-            for &(pred, _) in &incoming[each.head.index()] {
+            for &(pred, _) in incoming.get(each.head.index()).map_or(&[][..], Vec::as_slice) {
                 pinned[pred.index()] = true;
             }
         }

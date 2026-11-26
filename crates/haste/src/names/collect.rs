@@ -4,6 +4,15 @@ use crate::outline::tree::{Crate as Tree, Env};
 use super::path::variant_names;
 use super::{Binding, Crate, Def, ItemRef, ModRef, Ns, Origin, SELF, Scope, Sym, Symbols, UNDERSCORE, plain};
 
+/// When a resolved import's prefix cannot change on later passes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ImportGuard {
+    #[default]
+    None,
+    Solid,
+    Extern(u32, u32),
+}
+
 /// One `use` waiting to resolve: where it is, its interned path, the name it binds (none for a glob) and the source it last read.
 #[derive(Clone, Debug)]
 pub struct Pending {
@@ -16,6 +25,7 @@ pub struct Pending {
     pub name: Option<Sym>,
     pub vis: Vis,
     pub stamp: Option<(Def, u32)>,
+    pub guard: ImportGuard,
     pub active: bool,
 }
 
@@ -141,7 +151,7 @@ pub fn import_parts(file: &crate::outline::tree::File, import: u32, symbols: &Sy
 fn pending_import(file: &crate::outline::tree::File, (index, import): (u32, u32), module: usize, symbols: &Symbols) -> Pending {
     let (segments, absolute, dollar, name) = import_parts(file, import, symbols);
     let vis = file.items.items[file.items.imports[import as usize].item as usize].vis;
-    Pending { module: module as u32, file: index, import, segments, absolute, dollar, name, vis, stamp: None, active: false }
+    Pending { module: module as u32, file: index, import, segments, absolute, dollar, name, vis, stamp: None, guard: ImportGuard::None, active: false }
 }
 
 fn items_in(tree: &Tree, files: &[(u32, Option<u32>)]) -> Vec<(u32, u32)> {

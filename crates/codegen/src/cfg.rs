@@ -26,7 +26,7 @@ pub(crate) struct Cfg {
     pub entry: Option<Block>,
     pub reachable: Vec<bool>,
     pub rpo: Vec<Block>,
-    pub preds: Vec<Vec<Block>>,
+    preds: Edges,
     pub idom: Vec<Option<Block>>,
     edges: Edges,
     loops: OnceLock<Loops>,
@@ -61,6 +61,13 @@ impl Edges {
         &self.targets[start..self.ends[at] as usize]
     }
 
+    fn of_mut(&mut self, block: Block) -> Option<&mut [Block]> {
+        let at = block.index();
+        let end = *self.ends.get(at)? as usize;
+        let start = at.checked_sub(1).map_or(0, |prev| self.ends[prev] as usize);
+        Some(&mut self.targets[start..end])
+    }
+
     fn matches(&self, func: &Function) -> bool {
         self.ends.len() == func.blocks.len()
             && (0..self.ends.len()).all(|b| {
@@ -69,13 +76,30 @@ impl Edges {
             })
     }
 
-    fn preds(&self) -> Vec<Vec<Block>> {
-        let mut preds = vec![Vec::new(); self.ends.len()];
-        for b in 0..self.ends.len() {
-            let block = Block(b as u32);
-            self.of(block).iter().for_each(|target| preds[target.index()].push(block));
+    fn invert(&self) -> Self {
+        let n = self.ends.len();
+        let mut cursor = vec![0_u32; n];
+        for &target in &self.targets {
+            cursor[target.index()] += 1;
         }
-        preds
+        let mut ends = Vec::with_capacity(n);
+        let mut total = 0_u32;
+        for c in &mut cursor {
+            let deg = *c;
+            *c = total;
+            total += deg;
+            ends.push(total);
+        }
+        let mut targets = vec![Block(0); total as usize];
+        for b in 0..n {
+            let block = Block(b as u32);
+            for &target in self.of(block) {
+                let at = &mut cursor[target.index()];
+                targets[*at as usize] = block;
+                *at += 1;
+            }
+        }
+        Self { targets, ends }
     }
 }
 
@@ -120,7 +144,7 @@ fn intersect(idom: &[Option<Block>], rank: &[usize], mut a: Block, mut b: Block)
     a
 }
 
-fn immediate(order: &[Block], rank: &[usize], preds: &[Vec<Block>], blocks: usize) -> Vec<Option<Block>> {
+fn immediate(order: &[Block], rank: &[usize], preds: &Edges, blocks: usize) -> Vec<Option<Block>> {
     let mut idom = vec![None; blocks];
     let Some(&entry) = order.first() else { return idom };
     idom[entry.index()] = Some(entry);
@@ -128,7 +152,7 @@ fn immediate(order: &[Block], rank: &[usize], preds: &[Vec<Block>], blocks: usiz
     while changed {
         changed = false;
         for &block in &order[1..] {
-            let mut done = preds[block.index()].iter().copied().filter(|pred| idom[pred.index()].is_some());
+            let mut done = preds.of(block).iter().copied().filter(|pred| idom[pred.index()].is_some());
             let Some(first) = done.next() else { continue };
             let new = done.fold(first, |acc, pred| intersect(&idom, rank, pred, acc));
             if idom[block.index()] != Some(new) {
@@ -153,13 +177,13 @@ pub(crate) fn dominates(idom: &[Option<Block>], ancestor: Block, mut block: Bloc
 }
 
 pub(crate) fn natural_loop(cfg: &Cfg, head: Block, latches: Vec<Block>) -> Loop {
-    let mut body = vec![false; cfg.preds.len()];
+    let mut body = vec![false; cfg.reachable.len()];
     body[head.index()] = true;
     let mut todo = latches.clone();
     while let Some(block) = todo.pop() {
         let idx = block.index();
         if cfg.reachable[idx] && !std::mem::replace(&mut body[idx], true) {
-            todo.extend(cfg.preds[idx].iter().copied().filter(|p| cfg.reachable[p.index()]));
+            todo.extend(cfg.preds_of(block).iter().copied().filter(|p| cfg.reachable[p.index()]));
         }
     }
     let size = body.iter().filter(|inside| **inside).count();
@@ -169,8 +193,21 @@ pub(crate) fn natural_loop(cfg: &Cfg, head: Block, latches: Vec<Block>) -> Loop 
 impl Cfg {
     pub(crate) fn new(func: &Function) -> Self {
         let blocks = func.blocks.len();
+        if blocks == 0 {
+            let empty = Edges { targets: Vec::new(), ends: Vec::new() };
+            return Self { entry: func.entry, reachable: Vec::new(), rpo: Vec::new(), preds: empty.clone(), idom: Vec::new(), edges: empty, loops: OnceLock::new() };
+        }
+        if blocks == 1 {
+            let edges = Edges::new(func);
+            let preds = edges.clone();
+            let (rpo, reachable, idom) = match func.entry {
+                Some(entry) if entry.index() == 0 => (vec![entry], vec![true], vec![Some(entry)]),
+                _ => (Vec::new(), vec![false], vec![None]),
+            };
+            return Self { entry: func.entry, reachable, rpo, preds, idom, edges, loops: OnceLock::new() };
+        }
         let edges = Edges::new(func);
-        let preds = edges.preds();
+        let preds = edges.invert();
         let (rpo, reachable) = match func.entry {
             Some(entry) => order(blocks, entry, |block| edges.of(block).iter().copied()),
             None => (Vec::new(), vec![false; blocks]),
@@ -192,19 +229,51 @@ impl Cfg {
     }
 
     pub(crate) fn pred_count(&self, block: Block) -> u32 {
-        self.preds[block.index()].len() as u32
+        self.preds.of(block).len() as u32
     }
 
     pub(crate) fn preds_of(&self, block: Block) -> &[Block] {
-        &self.preds[block.index()]
+        self.preds.of(block)
+    }
+
+    pub(crate) fn replace_pred_and_add(&mut self, target: Block, old: Block, pad: Block) {
+        if let Some(ps) = self.preds.of_mut(target)
+            && let Some(slot) = ps.iter_mut().find(|p| **p == old)
+        {
+            *slot = pad;
+        }
+        self.preds.targets.push(old);
+        self.preds.ends.push(self.preds.targets.len() as u32);
+    }
+
+    pub(crate) fn split_preds_for_preheader(&mut self, head: Block, pre: Block, inside: impl Fn(Block) -> bool) {
+        let hi = head.index();
+        let start = hi.checked_sub(1).map_or(0, |prev| self.preds.ends[prev] as usize);
+        let end = self.preds.ends[hi] as usize;
+        let (mut kept, mut outside) = (Vec::new(), Vec::new());
+        for &p in &self.preds.targets[start..end] {
+            if inside(p) { kept.push(p); } else { outside.push(p); }
+        }
+        kept.push(pre);
+        let delta = kept.len() as isize - (end - start) as isize;
+        if delta == 0 {
+            self.preds.targets[start..end].copy_from_slice(&kept);
+        } else {
+            self.preds.targets.splice(start..end, kept);
+            for e in &mut self.preds.ends[hi..] {
+                *e = (*e as isize + delta) as u32;
+            }
+        }
+        self.preds.targets.extend(outside);
+        self.preds.ends.push(self.preds.targets.len() as u32);
     }
 
     pub(crate) fn single_pred(&self, block: Block) -> Option<Block> {
         if Some(block) == self.entry {
             return None;
         }
-        match self.preds[block.index()][..] {
-            [pred] => Some(pred),
+        match self.preds.of(block) {
+            [pred] => Some(*pred),
             _ => None,
         }
     }
@@ -214,7 +283,7 @@ impl Cfg {
     }
 
     pub(crate) fn children(&self) -> Vec<Vec<Block>> {
-        let mut children = vec![Vec::new(); self.preds.len()];
+        let mut children = vec![Vec::new(); self.reachable.len()];
         if let Some((_, rest)) = self.rpo.split_first() {
             for &block in rest {
                 if let Some(parent) = self.idom[block.index()] {
@@ -230,13 +299,13 @@ impl Cfg {
     }
 
     fn find_loops(&self) -> Loops {
-        let mut earlier = vec![false; self.preds.len()];
+        let mut earlier = vec![false; self.reachable.len()];
         let mut list: Vec<Loop> = self
             .rpo
             .iter()
             .filter_map(|&head| {
                 let mut latches = Vec::new();
-                for &pred in &self.preds[head.index()] {
+                for &pred in self.preds_of(head) {
                     if self.reachable[pred.index()] && !earlier[pred.index()] && self.dominates(head, pred) && !latches.contains(&pred) {
                         latches.push(pred);
                     }
@@ -246,7 +315,7 @@ impl Cfg {
             })
             .collect();
         list.sort_by_key(|each| each.size);
-        let mut depths = vec![0_u32; self.preds.len()];
+        let mut depths = vec![0_u32; self.reachable.len()];
         for each in &list {
             depths.iter_mut().zip(&each.body).filter(|(_, inside)| **inside).for_each(|(d, _)| *d += 1);
         }

@@ -1,6 +1,6 @@
 use crate::cfg::Cfg;
 use crate::ir::{Block, Function, Inst, Op, Type, Value};
-use crate::mem::{KnownLoads, MemBase, MemLoc, MemRoot, Provenance, clobbers_op, is_atomic_barrier, is_rodata, may_alias};
+use crate::mem::{KnownLoads, MemBase, MemLoc, MemRoot, Provenance, clobbers_load, is_atomic_barrier, is_rodata, may_alias, may_alias_at};
 use crate::merge::find;
 
 const MAX_MERGE_WALK: usize = 32;
@@ -48,7 +48,7 @@ pub(super) fn loc_immutable(func: &Function, loc: MemLoc) -> bool {
     }
 }
 
-/// Whether `op` may overwrite `loc`, treating immutable `.rodata` and non-atomic `ReadonlyParam` accesses as un-clobbered by calls or alien stores.
+/// Whether `op` may overwrite `loc`, treating immutable `.rodata` and `Freeze` `ReadonlyParam` accesses as un-clobbered by calls, alien stores, or non-aliasing atomics.
 pub(super) fn clobbers_loc(func: &Function, (op, at): (&Op, Option<Inst>), loc: MemLoc, prov: &Provenance) -> bool {
     if is_rodata(func, loc) {
         return false;
@@ -59,15 +59,19 @@ pub(super) fn clobbers_loc(func: &Function, (op, at): (&Op, Option<Inst>), loc: 
                 let w = prov.loc(addr, i64::from(off), func.ty(val).bytes());
                 w.root == loc.root && may_alias(w, loc, prov)
             }
+            Op::AtomicStore(val, addr, _) | Op::AtomicRmw(_, _, addr, val) | Op::AtomicCas(_, addr, _, val) => {
+                let w = prov.loc(addr, 0, func.ty(val).bytes());
+                w.root == loc.root && may_alias(w, loc, prov)
+            }
             Op::Move(dst, _, bytes) => {
                 let w = prov.loc(dst, 0, bytes);
                 w.root == loc.root && may_alias(w, loc, prov)
             }
             Op::Copy(dst, ..) => prov.loc(dst, 0, u32::MAX).root == loc.root,
-            _ => is_atomic_barrier(op),
+            _ => false,
         };
     }
-    clobbers_op(func, (op, at), loc, prov)
+    clobbers_load(func, (op, at), loc, prov)
 }
 
 fn save_immutable_entries(
@@ -107,11 +111,12 @@ pub(super) fn write_preserving(
     ty: Type,
     value: Value,
     prov: &Provenance,
+    at: Option<Inst>,
 ) {
     let saved = save_immutable_entries(func, known, bases, |loc| {
-        matches!(loc.root, MemRoot::Global(_)) || wloc.root != loc.root || !may_alias(wloc, loc, prov)
+        matches!(loc.root, MemRoot::Global(_)) || wloc.root != loc.root || !may_alias_at(wloc, loc, prov, at)
     });
-    known.write(wloc, ty, value, prov);
+    known.write_at(wloc, ty, value, prov, at);
     for (loc, ety, eval) in saved {
         known.remember(loc, ety, eval);
     }
@@ -123,20 +128,10 @@ impl<'a> BlockWrites<'a> {
         let mut writes = vec![Vec::new(); func.blocks.len()];
         for (b_idx, block) in func.blocks.iter().enumerate() {
             for &inst in &block.insts {
-                if matches!(
-                    func.insts[inst.index()].op,
-                    Op::Store(..)
-                        | Op::StackStore(..)
-                        | Op::Copy(..)
-                        | Op::Move(..)
-                        | Op::AtomicLoad(..)
-                        | Op::AtomicStore(..)
-                        | Op::AtomicRmw(..)
-                        | Op::AtomicCas(..)
-                        | Op::Fence(..)
-                        | Op::Call { .. }
-                        | Op::TryCall { .. }
-                ) {
+                let op = &func.insts[inst.index()].op;
+                if is_atomic_barrier(op)
+                    || matches!(op, Op::Store(..) | Op::StackStore(..) | Op::Copy(..) | Op::Move(..) | Op::Call { .. } | Op::TryCall { .. })
+                {
                     writes[b_idx].push(inst);
                 }
             }
@@ -154,6 +149,40 @@ impl<'a> BlockWrites<'a> {
     /// Whether `block` contains any potentially clobbering memory operation.
     pub(super) fn has_writes(&self, block: Block) -> bool {
         !self.writes[block.index()].is_empty()
+    }
+
+    /// Immediate dominator of `cur` when neither it nor any block on a path from it to `cur` has writes.
+    pub(super) fn write_free_idom(&self, cur: Block) -> Option<Block> {
+        let dom = self.cfg.idom[cur.index()]?;
+        if self.has_writes(dom) {
+            return None;
+        }
+        if self.cfg.single_pred(cur) == Some(dom) {
+            return Some(dom);
+        }
+        let mut seen = Vec::new();
+        let mut work = Vec::new();
+        for &pred in self.cfg.preds_of(cur) {
+            if self.cfg.reachable[pred.index()] && pred != dom && !seen.contains(&pred) {
+                if self.has_writes(pred) || seen.len() >= MAX_MERGE_WALK {
+                    return None;
+                }
+                seen.push(pred);
+                work.push(pred);
+            }
+        }
+        while let Some(m) = work.pop() {
+            for &pred in self.cfg.preds_of(m) {
+                if self.cfg.reachable[pred.index()] && pred != dom && !seen.contains(&pred) {
+                    if self.has_writes(pred) || seen.len() >= MAX_MERGE_WALK {
+                        return None;
+                    }
+                    seen.push(pred);
+                    work.push(pred);
+                }
+            }
+        }
+        Some(dom)
     }
 
     /// Computes surviving `KnownLoads` and live `(base, root)` keys at entry to `block`.

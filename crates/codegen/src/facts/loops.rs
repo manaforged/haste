@@ -404,7 +404,7 @@ fn ptr_end_parts(func: &Function, ranges: &Ranges, end: Value, base: Value) -> O
 
 impl Env {
     pub(super) fn collect_loop(&mut self, func: &Function, (cfg, ranges, incoming, complete, exits, def_blocks): (&Cfg, &Ranges, &[Vec<(Block, &[Value])>], &[bool], &[Option<Path>], &std::cell::OnceCell<Vec<Option<Block>>>), each: &Loop) {
-        if !complete[each.head.index()] || func.blocks[each.head.index()].params.is_empty() { return; }
+        if incoming.is_empty() || !complete[each.head.index()] || !func.blocks[each.head.index()].params.iter().any(|&p| func.ty(p).is_small_int()) { return; }
         let dom_exit = cfg.idom.get(each.head.index()).copied().flatten().filter(|&d| d != each.head).and_then(|d| exits.get(d.index()).and_then(Option::as_ref));
         let (mut outside, mut inside): (Vec<(Path, &[Value])>, Vec<(Block, Path, ExtraPath, &[Value])>) = (Vec::new(), Vec::new());
         for &(pred, args) in &incoming[each.head.index()] {
@@ -473,62 +473,66 @@ impl Env {
         for &b in &bounds { if !rel_bounds.contains(&b) { rel_bounds.push(b); } }
         rel_bounds.truncate(16);
         let mut arms = Vec::new();
-        for (k1, &p) in params.iter().enumerate() {
-            let ty = func.ty(p);
-            if !ty.is_small_int() { continue; }
-            for (k2, &q) in params.iter().enumerate().skip(k1 + 1) {
-                if func.ty(q) != ty { continue; }
-                let mut ordered = [None; 2];
-                for &bound in &bounds {
-                    if func.ty(bound) != ty { continue; }
-                    let sum_base = outside.iter().all(|(path, args)| outside_sum_le(func, ranges, path, ty, args[k1], args[k2], bound));
-                    if sum_base && inside.iter().all(|&(latch, ref gp, _, args)| {
-                        arms.clear();
-                        expand_arms(func, ranges, args[k1], args[k2], 0, &mut arms);
-                        arms.iter().all(|&pair| sum_pair_preserves(func, ranges, self, cfg, gp, latch, ty, pair, (p, q)))
-                    }) {
-                        self.sums.push(SumInv { head: each.head, p, q, bound, ty });
-                    }
-                    for (dir, (kl, kh, lo, hi)) in [(k1, k2, p, q), (k2, k1, q, p)].into_iter().enumerate() {
-                        let ord_base = *ordered[dir].get_or_insert_with(|| outside.iter().all(|(path, args)| edge_ule(func, ranges, path, ty, args[kl], args[kh])))
-                            && outside.iter().all(|(path, args)| edge_ule(func, ranges, path, ty, args[kh], bound));
-                        if ord_base && inside.iter().all(|&(_, ref gp, _, args)| {
+        if !bounds.is_empty() {
+            for (k1, &p) in params.iter().enumerate() {
+                let ty = func.ty(p);
+                if !ty.is_small_int() { continue; }
+                for (k2, &q) in params.iter().enumerate().skip(k1 + 1) {
+                    if func.ty(q) != ty { continue; }
+                    let mut ordered = [None; 2];
+                    for &bound in &bounds {
+                        if func.ty(bound) != ty { continue; }
+                        let sum_base = outside.iter().all(|(path, args)| outside_sum_le(func, ranges, path, ty, args[k1], args[k2], bound));
+                        if sum_base && inside.iter().all(|&(latch, ref gp, _, args)| {
                             arms.clear();
-                            expand_arms(func, ranges, args[kl], args[kh], 0, &mut arms);
-                            arms.iter().all(|&pair| order_pair_preserves(func, ranges, gp, ty, pair, (lo, hi)))
+                            expand_arms(func, ranges, args[k1], args[k2], 0, &mut arms);
+                            arms.iter().all(|&pair| sum_pair_preserves(func, ranges, self, cfg, gp, latch, ty, pair, (p, q)))
                         }) {
-                            self.orders.push(OrderInv { head: each.head, lo, hi, bound, ty });
+                            self.sums.push(SumInv { head: each.head, p, q, bound, ty });
+                        }
+                        for (dir, (kl, kh, lo, hi)) in [(k1, k2, p, q), (k2, k1, q, p)].into_iter().enumerate() {
+                            let ord_base = *ordered[dir].get_or_insert_with(|| outside.iter().all(|(path, args)| edge_ule(func, ranges, path, ty, args[kl], args[kh])))
+                                && outside.iter().all(|(path, args)| edge_ule(func, ranges, path, ty, args[kh], bound));
+                            if ord_base && inside.iter().all(|&(_, ref gp, _, args)| {
+                                arms.clear();
+                                expand_arms(func, ranges, args[kl], args[kh], 0, &mut arms);
+                                arms.iter().all(|&pair| order_pair_preserves(func, ranges, gp, ty, pair, (lo, hi)))
+                            }) {
+                                self.orders.push(OrderInv { head: each.head, lo, hi, bound, ty });
+                            }
                         }
                     }
                 }
             }
         }
-        for (k, &p) in params.iter().enumerate() {
-            let ty = func.ty(p);
-            if !ty.is_small_int() { continue; }
-            for &bound in &rel_bounds {
-                if func.ty(bound) != ty || bound == p { continue; }
-                let out_b = inv_params.iter().find(|&&(q, _)| q == bound).map_or(bound, |&(_, init_q)| init_q);
-                let in_alt = inv_params.iter().find(|&&(_, init_q)| init_q == bound).map(|&(q, _)| q);
-                for (kind, cc) in [(RelKind::Ult, IntCC::UnsignedLessThan), (RelKind::Ule, IntCC::UnsignedLessThanOrEqual)] {
-                    let base_ok = outside.iter().all(|(path, args)| {
-                        path.decide_rel(func, ranges, cc, ty, args[k], out_b) == Some(true)
-                            || super::decide(cc, ty, &path.fact(ranges, args[k]), &path.fact(ranges, out_b)) == Some(true)
-                    });
-                    if base_ok && inside.iter().all(|&(latch, ref gp, _, args)| {
-                        let check_bnd = |b| gp.decide_rel(func, ranges, cc, ty, args[k], b) == Some(true)
-                            || super::decide(cc, ty, &gp.fact(ranges, args[k]), &gp.fact(ranges, b)) == Some(true)
-                            || jump_latch_proves(func, cfg, ranges, each, (latch, args[k], cc, b, 0));
-                        check_bnd(bound) || in_alt.is_some_and(check_bnd) || {
-                            arms.clear();
-                            expand_arms(func, ranges, args[k], bound, 0, &mut arms);
-                            arms.iter().all(|&(arm, bnd)| gp.decide_rel(func, ranges, cc, ty, arm, bnd) == Some(true)
-                                || super::decide(cc, ty, &gp.fact(ranges, arm), &gp.fact(ranges, bnd)) == Some(true)
-                                || is_shrunk(func, ranges, gp, ty, arm, p))
+        if !rel_bounds.is_empty() {
+            for (k, &p) in params.iter().enumerate() {
+                let ty = func.ty(p);
+                if !ty.is_small_int() { continue; }
+                for &bound in &rel_bounds {
+                    if func.ty(bound) != ty || bound == p { continue; }
+                    let out_b = inv_params.iter().find(|&&(q, _)| q == bound).map_or(bound, |&(_, init_q)| init_q);
+                    let in_alt = inv_params.iter().find(|&&(_, init_q)| init_q == bound).map(|&(q, _)| q);
+                    for (kind, cc) in [(RelKind::Ult, IntCC::UnsignedLessThan), (RelKind::Ule, IntCC::UnsignedLessThanOrEqual)] {
+                        let base_ok = outside.iter().all(|(path, args)| {
+                            path.decide_rel(func, ranges, cc, ty, args[k], out_b) == Some(true)
+                                || super::decide(cc, ty, &path.fact(ranges, args[k]), &path.fact(ranges, out_b)) == Some(true)
+                        });
+                        if base_ok && inside.iter().all(|&(latch, ref gp, _, args)| {
+                            let check_bnd = |b| gp.decide_rel(func, ranges, cc, ty, args[k], b) == Some(true)
+                                || super::decide(cc, ty, &gp.fact(ranges, args[k]), &gp.fact(ranges, b)) == Some(true)
+                                || jump_latch_proves(func, cfg, ranges, each, (latch, args[k], cc, b, 0));
+                            check_bnd(bound) || in_alt.is_some_and(check_bnd) || {
+                                arms.clear();
+                                expand_arms(func, ranges, args[k], bound, 0, &mut arms);
+                                arms.iter().all(|&(arm, bnd)| gp.decide_rel(func, ranges, cc, ty, arm, bnd) == Some(true)
+                                    || super::decide(cc, ty, &gp.fact(ranges, arm), &gp.fact(ranges, bnd)) == Some(true)
+                                    || is_shrunk(func, ranges, gp, ty, arm, p))
+                            }
+                        }) {
+                            self.rel_invs.push(RelInv { head: each.head, param: p, bound, ty, kind });
+                            break;
                         }
-                    }) {
-                        self.rel_invs.push(RelInv { head: each.head, param: p, bound, ty, kind });
-                        break;
                     }
                 }
             }
@@ -552,16 +556,23 @@ impl Env {
                 }
             }
             let Some(step) = step.filter(|_| step_ok) else { continue };
-            for (end_idx, db) in def_blocks.iter().enumerate() {
-                let end = Value(end_idx as u32);
-                let Some((len, shift, stride)) = ptr_end_parts(func, ranges, end, base) else { continue };
-                if db.is_none_or(|b| each.body[b.index()] || !cfg.dominates(b, each.head)) { continue; }
+            let mut try_end = |end: Value| {
+                let Some((len, shift, stride)) = ptr_end_parts(func, ranges, end, base) else { return };
+                if def_blocks.get(end.index()).copied().flatten().is_none_or(|b| each.body[b.index()] || !cfg.dominates(b, each.head)) { return; }
                 if inside.iter().all(|&(_, ref gp, ref ge, _)| {
                     ge.diffs.iter().any(|&(de, dp, md)| de == end && dp == ptr && md >= step)
                         || (step == 1 && gp.decide_rel(func, ranges, IntCC::NotEqual, Type::I64, end, ptr) == Some(true))
                 }) {
                     self.ptrs.push(PtrInv { head: each.head, ptr, base, end, len, shift, stride });
                 }
+            };
+            if step > 1 {
+                let mut seen_ends = Vec::new();
+                for &(de, dp, md) in &inside[0].2.diffs {
+                    if dp == ptr && md >= step && !seen_ends.contains(&de) { seen_ends.push(de); try_end(de); }
+                }
+            } else if !inside[0].2.diffs.is_empty() || inside[0].1.has_rels() {
+                for end_idx in 0..def_blocks.len() { try_end(Value(end_idx as u32)); }
             }
         }
     }

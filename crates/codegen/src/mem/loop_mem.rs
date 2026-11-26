@@ -1,7 +1,7 @@
 use crate::cfg::{Cfg, Loop};
 use crate::ir::{Binary, Block, Convert, Function, Inst, Op, SigRef, StackSlot, Type, Value};
 
-use super::{MemBase, MemLoc, MemRoot, Provenance, in_range, is_atomic_barrier, may_alias};
+use super::{MemBase, MemLoc, MemRoot, Provenance, in_range, is_atomic_barrier, is_rodata, may_alias};
 
 pub(super) const SPAN_LIMIT: i64 = 1_i64 << 60;
 
@@ -171,7 +171,7 @@ fn ptr_base(
     if let Some((slot, off)) = slots[v.index()] {
         return (MemBase::Slot(slot), i64::from(off), i64::from(off));
     }
-    if let Some(sym) = symbols[v.index()] {
+    if let Some(sym) = symbols.get(v.index()).copied().flatten() {
         return (MemBase::Global(sym), 0, 0);
     }
     (MemBase::Addr(v), 0, 0)
@@ -529,14 +529,15 @@ impl LoopMem {
             return self.slot_load_ok(func, prov, slot, (lo, hi), unknown);
         }
         let deref_ok = in_range(i64::from(offset), width, prov.ro_bytes.get(addr.index()).copied().unwrap_or(0));
-        if self.atomics {
-            return false;
-        }
+        let ro_global = is_rodata(func, loc);
         let (root_ok, trap_ok, readonly_ok, call_safe) = self.root_load_ok(func, prov, loc, (base, lo, hi), unknown);
-        if !(head_prefix || deref_ok || trap_ok) {
+        if self.atomics && !readonly_ok && !ro_global {
             return false;
         }
-        readonly_ok || call_safe || (!self.calls && (!self.writes || root_ok))
+        if !(head_prefix || deref_ok || trap_ok || ro_global) {
+            return false;
+        }
+        ro_global || readonly_ok || call_safe || (!self.calls && (!self.writes || root_ok))
     }
 
     fn slot_root_ok(&self, func: &Function, prov: &Provenance, slot: StackSlot, loc: MemLoc, unknown: bool) -> (bool, bool, bool, bool) {

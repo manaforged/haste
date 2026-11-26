@@ -49,7 +49,7 @@ fn evaluate(func: &Function, cx: &ThreadCx<'_>, disp: Block, found: &[(Inst, Val
     }
     bind(cx, &mut state, &func.blocks[disp.index()].params, args);
     for &(inst, _) in found {
-        let _ = step_inst(func, cx, inst, &mut state);
+        let _ = step_inst(func, cx, None, inst, &mut state);
     }
     state
 }
@@ -69,7 +69,7 @@ fn settles(edge: &Edge, local: &[usize], value: Value, plain: bool) -> bool {
 
 fn incoming(func: &Function, cx: &ThreadCx<'_>, (cfg, single): (&Cfg, &[Option<Block>]), disp: Block, found: &[(Inst, Value)]) -> Option<Vec<Edge>> {
     let params = func.blocks[disp.index()].params.len();
-    let mut preds = cfg.preds[disp.index()].clone();
+    let mut preds = cfg.preds_of(disp).to_vec();
     preds.sort_unstable();
     preds.dedup();
     let mut edges = Vec::new();
@@ -249,9 +249,23 @@ fn add_jump_block(func: &mut Function, target: Block, args: Vec<Value>) -> Block
 }
 
 fn split_cold_loop_exits(func: &mut Function) -> bool {
+    let orig_len = func.blocks.len();
+    let has_cand = {
+        let cfg = func.cfg();
+        !cfg.loops().list.is_empty()
+            && (0..orig_len).any(|bi| {
+                let block = Block(bi as u32);
+                let depth = cfg.loops().depth_of(block);
+                cfg.reachable[bi]
+                    && depth > 0
+                    && matches!(func.last(block), Some(Op::Brif(_, t_b, t_a, e_b, e_a)) if t_b != e_b && ((!t_a.is_empty() && cfg.loops().depth_of(*t_b) < depth) || (!e_a.is_empty() && cfg.loops().depth_of(*e_b) < depth)))
+            })
+    };
+    if !has_cand {
+        return false;
+    }
     let uses = func.use_counts();
     let cfg = func.cfg().clone();
-    let orig_len = func.blocks.len();
     let mut split_any = false;
     for bi in 0..orig_len {
         let block = Block(bi as u32);
@@ -297,12 +311,27 @@ fn diamond_safe(func: &Function, cfg: &Cfg, (block, target): (Block, Block), (op
     {
         return true;
     }
-    let base = body(func, target).iter().filter(|&&i| non_trivial_op(&func.insts[i.index()].op)).count();
-    let extra = queued.iter().filter(|&&i| non_trivial_op(&func.insts[i.index()].op)).count();
-    base + extra < 6
+    let insts = body(func, target);
+    if insts.iter().any(|&i| {
+        let op = &func.insts[i.index()].op;
+        !op.is_speculable() && !matches!(op, Op::Load(..) | Op::StackLoad(..))
+    }) {
+        return true;
+    }
+    let base = insts.iter().filter(|&&i| non_trivial_op(&func.insts[i.index()].op)).count();
+    base >= 6 || base + queued.iter().filter(|&&i| non_trivial_op(&func.insts[i.index()].op)).count() < 6
 }
 
-fn pick_sink_target(func: &Function, cfg: &Cfg, block: Block, sites: &[(Inst, Block)], (op, moves): (&Op, &[Vec<Inst>])) -> Option<Block> {
+fn cheap_call_addr(func: &Function, defs: &[Option<Inst>], op: &Op) -> bool {
+    let is_const = |v: Value| defs.get(v.index()).copied().flatten().is_some_and(|i| matches!(func.insts[i.index()].op, Op::Const(_)));
+    match *op {
+        Op::StackAddr(..) => true,
+        Op::Binary(crate::ir::Binary::Iadd | crate::ir::Binary::Isub, a, b) => is_const(a) || is_const(b),
+        _ => false,
+    }
+}
+
+fn pick_sink_target(func: &Function, cfg: &Cfg, defs: Option<&[Option<Inst>]>, block: Block, sites: &[(Inst, Block)], (op, moves): (&Op, &[Vec<Inst>])) -> Option<Block> {
     let mut lca = sites.first()?.1;
     for &(_, site) in sites {
         if !cfg.reachable[site.index()] {
@@ -313,8 +342,14 @@ fn pick_sink_target(func: &Function, cfg: &Cfg, block: Block, sites: &[(Inst, Bl
         }
     }
     let mut target = lca;
-    while target != block && !loops_subset(cfg.loops(), target, block) {
-        target = cfg.idom[target.index()]?;
+    if !(target != block
+        && !loops_subset(cfg.loops(), target, block)
+        && defs.is_some_and(|d| cheap_call_addr(func, d, op))
+        && crate::live::has_regular_call(func, target))
+    {
+        while target != block && !loops_subset(cfg.loops(), target, block) {
+            target = cfg.idom[target.index()]?;
+        }
     }
     if target == block || !cfg.dominates(block, target) {
         return None;
@@ -322,12 +357,16 @@ fn pick_sink_target(func: &Function, cfg: &Cfg, block: Block, sites: &[(Inst, Bl
     diamond_safe(func, cfg, (block, target), (op, &moves[target.index()])).then_some(target)
 }
 
-fn build_users(func: &Function) -> Vec<Vec<(Inst, Block)>> {
+fn build_users(func: &Function, spec_def: &[bool]) -> Vec<Vec<(Inst, Block)>> {
     let mut users = vec![Vec::new(); func.types.len()];
     for (bi, data) in func.blocks.iter().enumerate() {
         let blk = Block(bi as u32);
         for &inst in &data.insts {
-            func.insts[inst.index()].op.for_operands(|v| users[v.index()].push((inst, blk)));
+            func.insts[inst.index()].op.for_operands(|v| {
+                if spec_def[v.index()] {
+                    users[v.index()].push((inst, blk));
+                }
+            });
         }
     }
     users
@@ -342,25 +381,31 @@ fn flush_moves(func: &mut Function, block: Block, moves: &mut Vec<Inst>) {
     func.blocks[block.index()].insts = next;
 }
 
-fn sink_block(func: &mut Function, cfg: &Cfg, block: Block, users: &mut [Vec<(Inst, Block)>], moves: &mut [Vec<Inst>]) -> bool {
+fn sink_block(func: &mut Function, cfg: &Cfg, defs: Option<&[Option<Inst>]>, block: Block, has_child: bool, users: &mut [Vec<(Inst, Block)>], moves: &mut [Vec<Inst>]) -> bool {
     flush_moves(func, block, &mut moves[block.index()]);
-    let insts = func.blocks[block.index()].insts.clone();
-    let body_len = insts.len().saturating_sub(1);
+    if !has_child {
+        return false;
+    }
+    let bi = block.index();
+    let len = func.blocks[bi].insts.len();
+    let body_len = len.saturating_sub(1);
     if body_len == 0 {
         return false;
     }
-    let mut kept = vec![true; insts.len()];
-    let mut changed = false;
+    let mut kept: Vec<bool> = Vec::new();
     for pos in (0..body_len).rev() {
-        let inst = insts[pos];
+        let inst = func.blocks[bi].insts[pos];
         let data = &func.insts[inst.index()];
         let Some(res) = data.result else { continue };
         if !data.op.is_speculable() {
             continue;
         }
-        let Some(target) = pick_sink_target(func, cfg, block, &users[res.index()], (&data.op, moves)) else {
+        let Some(target) = pick_sink_target(func, cfg, defs, block, &users[res.index()], (&data.op, moves)) else {
             continue;
         };
+        if kept.is_empty() {
+            kept.resize(len, true);
+        }
         kept[pos] = false;
         moves[target.index()].push(inst);
         data.op.for_operands(|v| {
@@ -370,26 +415,63 @@ fn sink_block(func: &mut Function, cfg: &Cfg, block: Block, users: &mut [Vec<(In
                 }
             }
         });
-        changed = true;
     }
-    if changed {
+    if !kept.is_empty() {
         let mut idx = 0;
-        func.blocks[block.index()].insts.retain(|_| {
+        func.blocks[bi].insts.retain(|_| {
             let keep = kept[idx];
             idx += 1;
             keep
         });
+        return true;
     }
-    changed
+    false
 }
 
 fn sink_dominated(func: &mut Function) -> bool {
+    if func.blocks.len() <= 1 {
+        return false;
+    }
     let cfg = func.cfg().clone();
-    let mut users = build_users(func);
+    let mut has_child = vec![false; func.blocks.len()];
+    let mut any_child = false;
+    for &b in &cfg.rpo {
+        if let Some(p) = cfg.idom[b.index()]
+            && p != b
+        {
+            has_child[p.index()] = true;
+            any_child = true;
+        }
+    }
+    if !any_child {
+        return false;
+    }
+    let mut spec_def = vec![false; func.types.len()];
+    let mut any_spec = false;
+    for &b in &cfg.rpo {
+        if !has_child[b.index()] {
+            continue;
+        }
+        let insts = &func.blocks[b.index()].insts;
+        for &inst in &insts[..insts.len().saturating_sub(1)] {
+            let data = &func.insts[inst.index()];
+            if let Some(res) = data.result
+                && data.op.is_speculable()
+            {
+                spec_def[res.index()] = true;
+                any_spec = true;
+            }
+        }
+    }
+    if !any_spec {
+        return false;
+    }
+    let defs = (!cfg.loops().list.is_empty()).then(|| crate::fold::defs(func));
+    let mut users = build_users(func, &spec_def);
     let mut moves = vec![Vec::new(); func.blocks.len()];
     let mut changed = false;
     for &block in &cfg.rpo {
-        changed |= sink_block(func, &cfg, block, &mut users, &mut moves);
+        changed |= sink_block(func, &cfg, defs.as_deref(), block, has_child[block.index()], &mut users, &mut moves);
     }
     changed
 }

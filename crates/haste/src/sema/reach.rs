@@ -65,6 +65,7 @@ pub struct Reached {
     catch_unwind_state: AtomicUsize,
     catch_unwind_cache: Mutex<CatchUnwindCache>,
     may_unwind_cache: RwLock<Option<(usize, Vec<bool>)>>,
+    incremental: bool,
 }
 
 fn is_thread_spawn_name(name: &str, src: &crate::outline::source::Source) -> bool {
@@ -136,8 +137,21 @@ impl Reached {
         false
     }
 
+    /// Marks this reach graph as incrementally grown (lazy JIT), skipping whole-graph unwind fixed-point scans.
+    pub fn set_incremental(&mut self, incremental: bool) {
+        self.incremental = incremental;
+    }
+
+    /// Whether this reach graph grows incrementally during lazy JIT execution.
+    pub fn is_incremental(&self) -> bool {
+        self.incremental
+    }
+
     /// Whether reached function `index` may unwind directly or transitively through any reachable call.
     pub fn may_unwind(&self, cx: &mut Context<'_>, index: usize) -> bool {
+        if self.incremental {
+            return true;
+        }
         let len = self.list.len();
         if index >= len {
             return true;
@@ -651,15 +665,22 @@ pub(super) fn is_inferring(instance: Instance) -> bool {
 
 /// The inferred body of `instance`: the one an earlier pass kept, or a fresh inference that is kept when it type-checked, laid out, and asked for nothing.
 pub(crate) fn typed_once(cx: &mut Context<'_>, instance: &Instance, unlaid: &mut Vec<String>) -> Result<Arc<Typed>, String> {
-    if let Some(typed) = cx.store.finals.get(instance).filter(|t| cx.store.lookups.skip_warm_sysroot_bodies || !matches!(&t.tables, super::infer::LazyTables::CheckOnly(_))) {
+    let is_alloc_shim = cx.global_alloc_shim(instance.0).is_some();
+    if !is_alloc_shim
+        && let Some(typed) = cx.store.finals.get(instance).filter(|t| cx.store.lookups.skip_warm_sysroot_bodies || !matches!(&t.tables, super::infer::LazyTables::CheckOnly(_)))
+    {
         register(cx, *instance, &typed);
         return Ok(typed);
     }
-    if let Some(result) = thaw::thawed(cx, instance, unlaid) {
+    if !is_alloc_shim
+        && let Some(result) = thaw::thawed(cx, instance, unlaid)
+    {
         return result;
     }
     let typed = typed_fresh(cx, instance, unlaid)?;
-    thaw::note_fresh(cx, *instance, &typed);
+    if !is_alloc_shim {
+        thaw::note_fresh(cx, *instance, &typed);
+    }
     Ok(typed)
 }
 

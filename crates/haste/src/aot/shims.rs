@@ -32,7 +32,7 @@ pub(in crate::aot) enum Shim {
 const PTHREAD_DEPS: &[&str] = &["pthread_key_create", "pthread_getspecific", "pthread_setspecific", "calloc", "sched_yield"];
 const WIN_TLS_DEPS: &[&str] = &["TlsAlloc", "TlsGetValue", "TlsSetValue", "calloc", "SwitchToThread"];
 
-fn collect_deps(shim: Shim, tls: &[&'static str], mem: (&'static str, &'static str, &'static str), jmp: (&'static str, &'static str)) -> Vec<&'static str> {
+fn collect_deps(shim: Shim, tls: &[&'static str], mem: (&'static str, &'static str, &'static str), jmp: Option<(&'static str, &'static str)>) -> Vec<&'static str> {
     let (alloc_aligned, yield_fn, free_fn) = mem;
     match shim {
         Shim::Alloc => vec!["malloc", alloc_aligned],
@@ -42,15 +42,15 @@ fn collect_deps(shim: Shim, tls: &[&'static str], mem: (&'static str, &'static s
         Shim::Realloc => vec!["realloc", "malloc", alloc_aligned, "memcpy", free_fn],
         Shim::FillOnce => vec![yield_fn],
         Shim::ThreadCell => tls.iter().copied().chain(["memcpy", "free", alloc_aligned, "memset"]).collect(),
-        Shim::CatchUnwind => tls.iter().copied().chain([jmp.0]).collect(),
-        Shim::StartPanic => tls.iter().copied().chain([jmp.1, "abort"]).collect(),
+        Shim::CatchUnwind => tls.iter().copied().chain(jmp.map(|j| j.0)).collect(),
+        Shim::StartPanic => tls.iter().copied().chain(jmp.map(|j| j.1)).chain(["abort"]).collect(),
         Shim::DropPush | Shim::DropPop => tls.to_vec(),
         _ => Vec::new(),
     }
 }
 
 pub(super) fn deps(shim: Shim) -> Vec<&'static str> {
-    collect_deps(shim, PTHREAD_DEPS, ("posix_memalign", "sched_yield", "free"), ("_setjmp", "_longjmp"))
+    collect_deps(shim, PTHREAD_DEPS, ("posix_memalign", "sched_yield", "free"), None)
 }
 
 pub(super) fn windows_deps(shim: Shim) -> Vec<&'static str> {
@@ -61,7 +61,7 @@ pub(super) fn windows_deps(shim: Shim) -> Vec<&'static str> {
         Shim::Realloc => vec!["_aligned_realloc"],
         Shim::FrameAlloc => vec!["malloc"],
         Shim::FrameFree => vec!["free"],
-        _ => collect_deps(shim, WIN_TLS_DEPS, ("_aligned_malloc", "SwitchToThread", "free"), ("_setjmp", "longjmp")),
+        _ => collect_deps(shim, WIN_TLS_DEPS, ("_aligned_malloc", "SwitchToThread", "free"), Some(("_setjmp", "longjmp"))),
     }
 }
 
@@ -176,17 +176,17 @@ fn x64_fwd(op: u8, out: &mut Buf) -> usize {
     out.pos()
 }
 
-fn x64_patch8(after: usize, out: &mut Buf) {
+pub(super) fn x64_patch8(after: usize, out: &mut Buf) {
     out.0[after - 1] = ((out.pos() as isize - after as isize) as i8) as u8;
 }
 
-fn x64_fwd32(prefix: &[u8], out: &mut Buf) -> usize {
+pub(super) fn x64_fwd32(prefix: &[u8], out: &mut Buf) -> usize {
     out.bytes(prefix);
     out.u32(0);
     out.pos()
 }
 
-fn x64_patch32(after: usize, out: &mut Buf) {
+pub(super) fn x64_patch32(after: usize, out: &mut Buf) {
     out.patch_u32(after - 4, ((out.pos() as i64 - after as i64) as i32) as u32);
 }
 
@@ -212,12 +212,12 @@ fn x64_here(labels: &[usize], out: &mut Buf) {
     labels.iter().for_each(|&after| x64_patch8(after, out));
 }
 
-fn x64_jcc(bytes: &[u8], op: u8, out: &mut Buf) -> usize {
+pub(super) fn x64_jcc(bytes: &[u8], op: u8, out: &mut Buf) -> usize {
     out.bytes(bytes);
     x64_fwd(op, out)
 }
 
-fn arm64_jcc(words: &[u32], word: u32, out: &mut Buf) -> usize {
+pub(super) fn arm64_jcc(words: &[u32], word: u32, out: &mut Buf) -> usize {
     out.words(words);
     arm64_fwd(word, out)
 }
@@ -236,9 +236,9 @@ impl<'a> Emit<'a> {
         emit_rel_branch(self.arch, link, self.at(out), (self.stub_va)(name)?, out);
         Ok(())
     }
-    fn call(&self, name: &str, out: &mut Buf) -> Result<()> { self.branch(true, name, out) }
+    pub(super) fn call(&self, name: &str, out: &mut Buf) -> Result<()> { self.branch(true, name, out) }
     pub(super) fn tail(&self, name: &str, out: &mut Buf) -> Result<()> { self.branch(false, name, out) }
-    fn bytes_call(&self, b: &[u8], name: &str, out: &mut Buf) -> Result<()> { out.bytes(b); self.call(name, out) }
+    pub(super) fn bytes_call(&self, b: &[u8], name: &str, out: &mut Buf) -> Result<()> { out.bytes(b); self.call(name, out) }
     fn bytes_tail(&self, b: &[u8], name: &str, out: &mut Buf) -> Result<()> { out.bytes(b); self.tail(name, out) }
     pub(super) fn words_call(&self, w: &[u32], name: &str, out: &mut Buf) -> Result<()> { out.words(w); self.call(name, out) }
     fn words_tail(&self, w: &[u32], name: &str, out: &mut Buf) -> Result<()> { out.words(w); self.tail(name, out) }
@@ -267,7 +267,7 @@ fn emit_x64_tls_get(c: &Emit<'_>, key_va: u64, out: &mut Buf) -> Result<()> {
     c.bytes_call(reg, c.pick("TlsGetValue", "pthread_getspecific"), out)
 }
 
-fn emit_x64_unwind_state(c: &Emit<'_>, addrs: SectionAddrs, out: &mut Buf) -> Result<()> {
+pub(super) fn emit_x64_unwind_state(c: &Emit<'_>, addrs: SectionAddrs, out: &mut Buf) -> Result<()> {
     if addrs.unwind_tls != 0 {
         super::tls::emit_x64_tls_unwind_state(addrs.unwind_tls, out);
         return Ok(());
@@ -317,60 +317,6 @@ fn emit_x64_drop_op(c: &Emit<'_>, push: bool, addrs: SectionAddrs, out: &mut Buf
     x64_patch8(no_state, out);
     if c.win { out.bytes(&[0x48, 0x83, 0xC4, 0x20]); }
     out.bytes(&[0x41, 0x5D, 0x41, 0x5C, 0x5B, 0xC3]);
-    Ok(())
-}
-
-fn emit_x64_catch_unwind(c: &Emit<'_>, addrs: SectionAddrs, out: &mut Buf) -> Result<()> {
-    let d: u8 = if c.win { 0x20 } else { 0 };
-    out.bytes(&[0x55, 0x48, 0x89, 0xE5, 0x53, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x81, 0xEC]);
-    out.u32(0x238 + u32::from(d));
-    out.bytes(if c.win { &[0x49, 0x89, 0xCC, 0x49, 0x89, 0xD6, 0x4D, 0x89, 0xC7] } else { &[0x49, 0x89, 0xFC, 0x49, 0x89, 0xF6, 0x49, 0x89, 0xD7] });
-    emit_x64_unwind_state(c, addrs, out)?;
-    let no_state = x64_jcc(&[0x48, 0x85, 0xC0], 0x74, out);
-    out.bytes(&[
-        0x48, 0x89, 0xC3, 0x48, 0x8B, 0x03, 0x48, 0x89, 0x44, 0x24, d, 0x48, 0x8B, 0x43, 0x08, 0x48, 0x89, 0x44, 0x24, d + 8,
-        0x48, 0xC7, 0x44, 0x24, d + 0x10, 0, 0, 0, 0, 0x48, 0xC7, 0x44, 0x24, d + 0x18, 0, 0, 0, 0, 0x48, 0x89, 0xAC, 0x24,
-    ]);
-    out.u32(super::unwind::STOP_FP_OFFSET + u32::from(d));
-    out.bytes(&[0x48, 0x8D, 0x44, 0x24, d, 0x48, 0x89, 0x03]);
-    let jmp_args = if c.win { &[0x48, 0x8D, 0x4C, 0x24, d + 0x20, 0x31, 0xD2][..] } else { &[0x48, 0x8D, 0x7C, 0x24, d + 0x20] };
-    c.bytes_call(jmp_args, "_setjmp", out)?;
-    let caught = x64_jcc(&[0x85, 0xC0], 0x75, out);
-    let call_try: &[u8] = if c.win { &[0x4C, 0x89, 0xF1, 0x41, 0xFF, 0xD4] } else { &[0x4C, 0x89, 0xF7, 0x41, 0xFF, 0xD4] };
-    out.bytes(call_try);
-    let ok_zero = x64_jcc(&[0x48, 0x8B, 0x44, 0x24, d, 0x48, 0x89, 0x03], 0xEB, out);
-    x64_patch8(no_state, out);
-    out.bytes(call_try);
-    x64_patch8(ok_zero, out);
-    let done = x64_jcc(&[0x31, 0xC0], 0xEB, out);
-    x64_patch8(caught, out);
-    let seq = if c.win { [0x4C, 0x89, 0xF1, 0x48, 0x8D, 0x54, 0x24, d + 0x10] } else { [0x4C, 0x89, 0xF7, 0x48, 0x8D, 0x74, 0x24, d + 0x10] };
-    out.bytes(&seq);
-    out.bytes(&[0x41, 0xFF, 0xD7, 0xB8, 1, 0, 0, 0]);
-    x64_patch8(done, out);
-    out.bytes(&[0x48, 0x81, 0xC4]);
-    out.u32(0x238 + u32::from(d));
-    out.bytes(&[0x41, 0x5F, 0x41, 0x5E, 0x41, 0x5D, 0x41, 0x5C, 0x5B, 0x5D, 0xC3]);
-    Ok(())
-}
-
-fn emit_x64_start_panic(c: &Emit<'_>, addrs: SectionAddrs, out: &mut Buf) -> Result<()> {
-    out.bytes(&[0x55, 0x48, 0x89, 0xE5, 0x53, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57]);
-    out.bytes(if c.win { &[0x48, 0x83, 0xEC, 0x28, 0x49, 0x89, 0xCC, 0x49, 0x89, 0xD6] } else { &[0x48, 0x83, 0xEC, 0x08, 0x49, 0x89, 0xFC, 0x49, 0x89, 0xF6] });
-    emit_x64_unwind_state(c, addrs, out)?;
-    out.bytes(&[0x48, 0x85, 0xC0]);
-    let no_state = x64_fwd32(&[0x0F, 0x84], out);
-    out.bytes(&[0x48, 0x89, 0xC3, 0x4C, 0x8B, 0x3B, 0x4D, 0x85, 0xFF]);
-    let no_frame = x64_fwd32(&[0x0F, 0x84], out);
-    out.bytes(&[0x49, 0x8B, 0x07, 0x48, 0x89, 0x03, 0x49, 0x8B, 0x46, 0x18]);
-    out.bytes(if c.win { &[0x4C, 0x89, 0xE1] } else { &[0x4C, 0x89, 0xE7] });
-    out.bytes(&[0xFF, 0xD0, 0x49, 0x89, 0x47, 0x10, 0x49, 0x89, 0x57, 0x18, 0x49, 0x89, 0x1F]);
-    super::unwind::emit_x64_walk_call(c, addrs, out);
-    let longjmp_args = if c.win { &[0x49, 0x8D, 0x4F, 0x20, 0xBA, 1, 0, 0, 0][..] } else { &[0x49, 0x8D, 0x7F, 0x20, 0xBE, 1, 0, 0, 0] };
-    c.bytes_call(longjmp_args, c.pick("longjmp", "_longjmp"), out)?;
-    [no_state, no_frame].into_iter().for_each(|l| x64_patch32(l, out));
-    c.call("abort", out)?;
-    out.bytes(&[0x0F, 0x0B]);
     Ok(())
 }
 
@@ -495,7 +441,7 @@ fn emit_arm64_tls_get(c: &Emit<'_>, key_va: u64, out: &mut Buf) -> Result<()> {
     c.words_call(&[if c.win { 0xB940_0AA0 } else { 0xF940_06A0 }], c.pick("TlsGetValue", "pthread_getspecific"), out)
 }
 
-fn emit_arm64_unwind_state(c: &Emit<'_>, addrs: SectionAddrs, out: &mut Buf) -> Result<()> {
+pub(super) fn emit_arm64_unwind_state(c: &Emit<'_>, addrs: SectionAddrs, out: &mut Buf) -> Result<()> {
     if addrs.tlv_desc != 0 {
         super::tls::emit_arm64_tlv_unwind_state(c, addrs.tlv_desc, addrs.unwind_tls, out);
         return Ok(());
@@ -545,40 +491,6 @@ fn emit_arm64_drop_op(c: &Emit<'_>, push: bool, addrs: SectionAddrs, out: &mut B
     arm64_here(&[ret_null], out);
     if let Some(lbl) = ret_unlinked { arm64_here(&[lbl], out); }
     out.u32(0xD65F_03C0);
-    Ok(())
-}
-
-fn emit_arm64_catch_unwind(c: &Emit<'_>, addrs: SectionAddrs, out: &mut Buf) -> Result<()> {
-    out.words(&[0xA9BC_7BFD, 0x9100_03FD, 0xA901_53F3, 0xA902_5BF5, 0xA903_63F7, 0xD108_C3FF, 0xAA00_03F4, 0xAA01_03F6, 0xAA02_03F7]);
-    emit_arm64_unwind_state(c, addrs, out)?;
-    let no_state = arm64_fwd(0xB400_0000, out);
-    out.words(&[0xAA00_03F3, 0xA940_2668, 0xA900_27E8, 0xA901_7FFF, 0xF900_03FD | ((super::unwind::STOP_FP_OFFSET / 8) << 10), 0x9100_03E8, 0xF900_0268, 0x9100_83E0]);
-    if c.win { out.u32(0xAA1F_03E1); }
-    c.call("_setjmp", out)?;
-    let caught = arm64_fwd(0x3500_0000, out);
-    let ok_zero = arm64_jcc(&[0xAA16_03E0, 0xD63F_0280, 0xF940_03E8, 0xF900_0268], 0x1400_0000, out);
-    arm64_here(&[no_state], out);
-    out.words(&[0xAA16_03E0, 0xD63F_0280]);
-    arm64_here(&[ok_zero], out);
-    let done = arm64_jcc(&[0x5280_0000], 0x1400_0000, out);
-    arm64_here(&[caught], out);
-    out.words(&[0xAA16_03E0, 0x9100_43E1, 0xD63F_02E0, 0x5280_0020]);
-    arm64_here(&[done], out);
-    out.words(&[0x9108_C3FF, 0xA943_63F7, 0xA942_5BF5, 0xA941_53F3, 0xA8C4_7BFD, 0xD65F_03C0]);
-    Ok(())
-}
-
-fn emit_arm64_start_panic(c: &Emit<'_>, addrs: SectionAddrs, out: &mut Buf) -> Result<()> {
-    out.words(&[0xA9BC_7BFD, 0x9100_03FD, 0xA901_53F3, 0xA902_5BF5, 0xA903_63F7, 0xAA00_03F4, 0xAA01_03F6]);
-    emit_arm64_unwind_state(c, addrs, out)?;
-    let no_state = arm64_fwd(0xB400_0000, out);
-    let no_frame = arm64_jcc(&[0xAA00_03F3, 0xF940_0277], 0xB400_0017, out);
-    out.words(&[0xF940_02E8, 0xF900_0268, 0xF940_0EC8, 0xAA14_03E0, 0xD63F_0100, 0xA901_06E0, 0xF900_02F3]);
-    super::unwind::emit_arm64_walk_call(c, addrs, out);
-    c.words_call(&[0x9100_82E0, 0x5280_0021], c.pick("longjmp", "_longjmp"), out)?;
-    arm64_here(&[no_state, no_frame], out);
-    c.call("abort", out)?;
-    out.u32(0xD420_0020);
     Ok(())
 }
 
@@ -699,8 +611,8 @@ fn emit_shim_x64(os: Os, shim: Shim, va: u64, addrs: SectionAddrs, stub_va: &dyn
         Shim::ThreadCell => emit_x64_thread_cell(&c, addrs.thread_key, out)?,
         Shim::FrameAlloc | Shim::FrameFree if os == Os::Linux => emit_x64_frame_cache(&c, shim == Shim::FrameAlloc, addrs.frame_tls, out)?,
         Shim::FrameAlloc | Shim::FrameFree => c.tail(if shim == Shim::FrameAlloc { "malloc" } else { "free" }, out)?,
-        Shim::CatchUnwind => emit_x64_catch_unwind(&c, addrs, out)?,
-        Shim::StartPanic => emit_x64_start_panic(&c, addrs, out)?,
+        Shim::CatchUnwind => super::unwind::emit_x64_catch_unwind(&c, addrs, out)?,
+        Shim::StartPanic => super::unwind::emit_x64_start_panic(&c, addrs, out)?,
         Shim::PanicCleanup => out.bytes(if c.win { &[0x48, 0x8B, 0x01, 0x48, 0x8B, 0x51, 0x08, 0xC3] } else { &[0x48, 0x8B, 0x07, 0x48, 0x8B, 0x57, 0x08, 0xC3] }),
         Shim::DropPush | Shim::DropPop => emit_x64_drop_op(&c, shim == Shim::DropPush, addrs, out)?,
         Shim::UnwindWalk => super::unwind::emit_walk(Arch::X64, os, out)?,
@@ -756,8 +668,8 @@ fn emit_shim_arm64(os: Os, shim: Shim, va: u64, addrs: SectionAddrs, stub_va: &d
         }
         Shim::ThreadCell if addrs.tlv_desc != 0 => super::tls::emit_arm64_tlv_thread_cell(&c, addrs.tlv_desc, addrs.thread_tls, out)?,
         Shim::ThreadCell => emit_arm64_thread_cell(&c, addrs.thread_key, out)?,
-        Shim::CatchUnwind => emit_arm64_catch_unwind(&c, addrs, out)?,
-        Shim::StartPanic => emit_arm64_start_panic(&c, addrs, out)?,
+        Shim::CatchUnwind => super::unwind::emit_arm64_catch_unwind(&c, addrs, out)?,
+        Shim::StartPanic => super::unwind::emit_arm64_start_panic(&c, addrs, out)?,
         Shim::PanicCleanup => out.words(&[0xA940_0400, 0xD65F_03C0]),
         Shim::DropPush | Shim::DropPop => emit_arm64_drop_op(&c, shim == Shim::DropPush, addrs, out)?,
         Shim::UnwindWalk => super::unwind::emit_walk(Arch::Arm64, os, out)?,

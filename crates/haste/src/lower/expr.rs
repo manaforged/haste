@@ -316,7 +316,7 @@ impl Lower<'_, '_> {
     }
 
     fn try_box_new_zeroed(&mut self, expr: ExprId, item: ItemRef, args: List) -> Result<Option<Value>> {
-        if !self.open || self.cx.name(item) != "new" || self.cx.outline.roots[item.krate as usize].name != "alloc" {
+        if !self.open || self.cx.global_allocator().is_some() || self.cx.name(item) != "new" || self.cx.outline.roots[item.krate as usize].name != "alloc" {
             return Ok(None);
         }
         let &[arg] = self.body.list(args) else { return Ok(None) };
@@ -424,17 +424,24 @@ impl Lower<'_, '_> {
             return Ok(None);
         }
         if let Some(which) = self.cx.intrinsic(item) {
-            let slice = self.cx.types.substs(substs).to_vec();
-            return self.intrinsic(&origin, which, &slice, &values);
+            return self.intrinsic(&origin, which, &self.cx.types.substs(substs).to_vec(), &values);
         }
         let index = self.reached_index(item, substs)?;
         let callee = self.reached.typed(index, self.cx.name(item))?;
         let params = callee.params.iter().map(|&local| callee.locals[local as usize].ty).collect();
         if self.cx.foreign(item) {
-            if callee.ret.map_or(Ok(true), |ret| repr(self.cx, ret).map(|r| r == Repr::Zst))? && self.cx.symbol_name(item).as_deref().and_then(crate::host::HostSymbol::resolve) == Some(crate::host::HostSymbol::Noop) {
-                return Ok(None);
+            if callee.ret.map_or(Ok(true), |ret| repr(self.cx, ret).map(|r| r == Repr::Zst))? {
+                match self.cx.symbol_name(item).as_deref() {
+                    Some(n) if crate::host::HostSymbol::resolve(n) == Some(crate::host::HostSymbol::Noop) => return Ok(None),
+                    Some("llvm.aarch64.isb") => { self.ins().fence(haste_codegen::AtomicOrd::Isb); return Ok(None); }
+                    Some("llvm.aarch64.dmb") => { self.ins().fence(haste_codegen::AtomicOrd::SeqCst); return Ok(None); }
+                    _ => {}
+                }
             }
             let code = self.code_of(index, origin);
+            if let Some(host) = self.cx.symbol_name(item).as_deref().and_then(crate::host::HostSymbol::resolve) {
+                self.mark_if_fresh_alloc(&host, code);
+            }
             return self.native_call(code, (params, callee.ret), values);
         }
         self.call_with(Callee::Reached(index, origin), (params, callee.ret), values)
@@ -447,12 +454,7 @@ impl Lower<'_, '_> {
         };
         let (callee, cycle) = resolve_inline(self.cx, (self.reached, self.slots), self.inline, index, (limit, false))?;
         self.cycle_root = self.cycle_root.min(cycle);
-        let Some(found) = callee.filter(|found| {
-            self.inline.host.takes(self.cx, self.reached, index, found)
-                && (self.mode != LowerMode::Dict || found.body.unwind_drops().is_empty())
-        }) else {
-            return Ok(None);
-        };
+        let Some(found) = callee.filter(|found| self.inline.host.takes(self.cx, self.reached, index, found) && (self.mode != LowerMode::Dict || found.body.unwind_drops().is_empty())) else { return Ok(None) };
         if !self.inline.host.compact || found.form != Form::Dense {
             return Ok(Some(found));
         }
@@ -488,10 +490,13 @@ impl Lower<'_, '_> {
                 let callee_tracked = self.cx.track_caller(self.reached.list[index].0.0);
                 let wants_track = !caller_tracked && callee_tracked;
                 if let Some(inlined) = self.slots.allow_inline().then(|| self.inline_callee(index)).transpose()?.flatten() {
-                    let (was_open, from_blk) = (self.open, self.b.block_count());
+                    if caller_tracked && !callee_tracked && inlined.body.has_calls() {
+                        return self.with_caller_loc(Some(false), |this| this.emit_inlined(&inlined, origin, values));
+                    }
+                    let (was_open, caller_blk, from_blk) = (self.open, self.b.current_block(), self.b.block_count());
                     let res = self.emit_inlined(&inlined, origin, values)?;
                     if wants_track && was_open {
-                        self.wrap_inlined_caller_loc(from_blk, self.b.block_count().saturating_sub(1))?;
+                        self.wrap_inlined_caller_loc(caller_blk, from_blk, self.b.block_count().saturating_sub(1))?;
                     }
                     return Ok(res);
                 }

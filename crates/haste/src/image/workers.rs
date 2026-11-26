@@ -14,7 +14,7 @@ use crate::substrate::tally::{Tally, clock, tally};
 use crate::sync::lock;
 use haste_codegen::{Code, Memory};
 
-use super::aot::{self, AotCode, AotFn, AotQueue, CachedAotTemplate, bucket_by_item, lpt_chunks};
+use super::aot::{self, AotCode, AotFn, AotQueue, AotWork, CachedAotTemplate, bucket_by_item, collect_warm_callees, lpt_chunks};
 use super::stencil::{DictConfig, DistinctInst, GroupWork, aot_relocs_valid, item_err, mode_dict_key, mode_stencil_key};
 use super::global_asm::Foreign;
 use super::{Image, ImageMode, Pass, resolve_host_symbol, weak};
@@ -146,13 +146,13 @@ impl Image {
             let mut eval_requests = Vec::new();
             for (shard, output) in current_shards.iter().zip(outputs) {
                 match output {
-                    Some((pass, failed, later, reqs)) => {
+                    Ok((pass, failed, later, reqs)) => {
                         self.pass.merge(pass);
                         errors.extend(failed);
                         deferred.extend(later);
                         eval_requests.extend(reqs);
                     }
-                    None => errors.extend(self.lost(cx, reached, shard)),
+                    Err(reason) => errors.extend(self.lost(cx, reached, shard, &reason)),
                 }
             }
             if deferred.is_empty() || eval_requests.is_empty() || wave + 1 == MAX_PARALLEL_WAVES || deferred.len() < min_parallel {
@@ -175,23 +175,33 @@ impl Image {
         errors
     }
 
-    /// Clears the slots of a worker that panicked, whose code chunks unmapped as it unwound, and gives each of its functions an error.
-    fn lost(&self, cx: &Context<'_>, reached: &Reached, shard: &[Vec<usize>]) -> Vec<(usize, String)> {
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_owned()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_owned()
+    }
+}
+
+/// Clears the slots of a worker that panicked, whose code chunks unmapped as it unwound, and gives each of its functions an error.
+    fn lost(&self, cx: &Context<'_>, reached: &Reached, shard: &[Vec<usize>], reason: &str) -> Vec<(usize, String)> {
         let lost = shard.iter().flatten().map(|&index| {
             if self.backend.is_jit() {
                 self.slot(index).store(0, Ordering::Release);
             }
-            (index, format!("{}: compile worker panicked", cx.name(reached.list[index].0.0)))
+            (index, format!("{}: compile worker panicked: {reason}", cx.name(reached.list[index].0.0)))
         });
         lost.collect()
     }
 
-    /// Runs `work` on each shard in a scoped thread of its own with one of `forks`, and gives what each thread returned, or `None` for one that panicked.
-    pub(super) fn run_shards<'a, T: Send>(&self, forks: Vec<Context<'a>>, shards: &[Vec<Vec<usize>>], work: impl Fn(Context<'a>, &[Vec<usize>]) -> T + Sync) -> Vec<Option<T>> {
+    /// Runs `work` on each shard in a scoped thread of its own with one of `forks`, returning each thread's value or its panic payload message.
+    pub(super) fn run_shards<'a, T: Send>(&self, forks: Vec<Context<'a>>, shards: &[Vec<Vec<usize>>], work: impl Fn(Context<'a>, &[Vec<usize>]) -> T + Sync) -> Vec<Result<T, String>> {
         let work = &work;
         std::thread::scope(|scope| {
             let handles: Vec<_> = forks.into_iter().zip(shards).map(|(fork, shard)| scope.spawn(move || work(fork, shard))).collect();
-            handles.into_iter().map(|handle| handle.join().map_or(None, Some)).collect()
+            handles.into_iter().map(|handle| handle.join().map_err(Self::panic_message)).collect()
         })
     }
 
@@ -323,12 +333,24 @@ impl Image {
         let mut pass = Pass::default();
         pass.stencils.cfg = cfg;
         let (mut errors, mut deferred, mut eval_requests) = (Vec::new(), Vec::new(), Vec::new());
-        while let Some((batch, _guard)) = queue.pop() {
-            let mut batch_errors = Vec::new();
-            let work = self.prepare_work(&mut cx, reached, &batch, (&mut batch_errors, None));
-            errors.extend(batch_errors);
-            if !work.is_empty() {
-                self.compile_worker_bucket(&mut cx, reached, &work, (cfg, allow_singleton), &mut pass, (&mut errors, &mut deferred, &mut eval_requests));
+        while let Some(item) = queue.pop() {
+            match item {
+                AotWork::Compile(batch, _guard) => {
+                    if self.allow_inline() && queue.want_warm() {
+                        queue.push_warm(collect_warm_callees(&cx, reached, queue, &batch));
+                    }
+                    let mut batch_errors = Vec::new();
+                    let work = self.prepare_work(&mut cx, reached, &batch, (&mut batch_errors, None));
+                    errors.extend(batch_errors);
+                    if !work.is_empty() {
+                        self.compile_worker_bucket(&mut cx, reached, &work, (cfg, allow_singleton), &mut pass, (&mut errors, &mut deferred, &mut eval_requests));
+                    }
+                }
+                AotWork::Warm(idx) => {
+                    lower::warm_inline(&mut cx, reached, self, idx);
+                    let _ = cx.take_deferred_evals();
+                    self.bodies.trim_transient();
+                }
             }
         }
         (pass, errors, deferred, eval_requests)
