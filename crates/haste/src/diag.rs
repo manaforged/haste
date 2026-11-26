@@ -85,6 +85,7 @@ impl Span {
     }
 
     /// Resolves a byte range `(start_byte..end_byte)` in `text` into a displayable `Span`.
+    #[cfg(test)]
     pub(crate) fn from_bytes(
         file: PathBuf,
         text: &str,
@@ -92,16 +93,43 @@ impl Span {
         end_byte: u32,
         from_macro: bool,
     ) -> Self {
+        Self::from_bytes_indexed(file, text, None, start_byte, end_byte, from_macro)
+    }
+
+    fn from_bytes_indexed(
+        file: PathBuf,
+        text: &str,
+        newlines: Option<&[u32]>,
+        start_byte: u32,
+        end_byte: u32,
+        from_macro: bool,
+    ) -> Self {
         let len = text.len();
         let sb = clamp_char_boundary(text, (start_byte as usize).min(len));
         let eb = clamp_char_boundary(text, (end_byte as usize).max(sb).min(len));
-        let line_start = text[..sb].rfind('\n').map_or(0, |nl| nl + 1);
-        let line_end = text[sb..].find('\n').map_or(len, |rel| sb + rel);
+        let (line_idx, line_start, line_end) = match newlines {
+            Some(nls) => {
+                let idx = nls.partition_point(|&nl| (nl as usize) < sb);
+                let start = if idx == 0 {
+                    0
+                } else {
+                    nls[idx - 1] as usize + 1
+                };
+                let end = nls.get(idx).map_or(len, |&nl| nl as usize);
+                (idx, start, end)
+            }
+            None => {
+                let start = text[..sb].rfind('\n').map_or(0, |nl| nl + 1);
+                let end = text[sb..].find('\n').map_or(len, |rel| sb + rel);
+                let idx = text[..start].matches('\n').count();
+                (idx, start, end)
+            }
+        };
         let line_text = text[line_start..line_end].trim_end_matches('\r');
         let line_limit = line_start + line_text.len();
         let clamped_start = sb.min(line_limit);
         let clamped_end = eb.min(line_limit).max(clamped_start);
-        let line = text[..line_start].matches('\n').count() + 1;
+        let line = line_idx + 1;
         let col = expanded_width(&text[line_start..clamped_start]) + 1;
         let width = expanded_width(&text[clamped_start..clamped_end]).max(1);
         Self {
@@ -116,8 +144,15 @@ impl Span {
 
     /// Resolves a half-open token range `start_tok..end_tok` on `src`.
     pub(crate) fn from_tokens(src: &Source, start_tok: u32, end_tok: u32) -> Option<Self> {
-        let (path, text, sb, eb, from_macro) = src.token_byte_span(start_tok, end_tok)?;
-        Some(Self::from_bytes(path.to_owned(), text, sb, eb, from_macro))
+        let (layer, sb, eb, from_macro) = src.token_byte_span(start_tok, end_tok)?;
+        Some(Self::from_bytes_indexed(
+            layer.path.clone(),
+            &layer.text,
+            Some(layer.line_starts()),
+            sb,
+            eb,
+            from_macro,
+        ))
     }
 
     /// Resolves a single token index `tok` on `src`.

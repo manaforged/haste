@@ -9,7 +9,7 @@ use rustc_hash::FxHashMap;
 use rustc_lexer::{FrontmatterAllowed, TokenKind, tokenize};
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 /// One non-trivia token, with the index of its matching delimiter when it opens or closes a group.
@@ -110,6 +110,7 @@ pub struct Source {
     pub outputs: Outputs,
     /// Where the tokens of this layer lie in the file at `path` as read from disk.
     pub origins: Origins,
+    pub(crate) line_starts: OnceLock<Vec<u32>>,
 }
 
 /// Where the tokens of a source lie in the file at its path as read from disk: every token where it is, or the listed tokens, by index, at the byte offsets of the tokens a macro copied them from.
@@ -253,6 +254,7 @@ impl Tokens {
             offset: 0,
             outputs: Outputs::default(),
             origins: Origins::Copied(self.origins),
+            line_starts: OnceLock::new(),
         })
     }
 
@@ -375,6 +377,7 @@ impl Source {
             offset: 0,
             outputs: Outputs::default(),
             origins: Origins::Copied(Vec::new()),
+            line_starts: OnceLock::new(),
         })
     }
 
@@ -649,28 +652,56 @@ impl Source {
             .map_or(src.text.len() as u32, |(start, _)| start)
     }
 
+    /// Byte offsets of every `\n` in this layer's text, computed once on first lookup.
+    pub(crate) fn line_starts(&self) -> &[u32] {
+        self.line_starts.get_or_init(|| {
+            let mut starts = Vec::new();
+            let bytes = self.text.as_bytes();
+            let mut i = 0;
+            while let Some(rel) = bytes[i..].iter().position(|&b| b == b'\n') {
+                let nl = i + rel;
+                starts.push(nl as u32);
+                i = nl + 1;
+            }
+            starts
+        })
+    }
+
+    /// One-based `(line, column)` of byte offset `byte` in this layer's text.
+    pub(crate) fn line_col_at(&self, byte: usize) -> (usize, usize) {
+        let mut byte = byte.min(self.text.len());
+        while byte > 0 && !self.text.is_char_boundary(byte) {
+            byte -= 1;
+        }
+        let newlines = self.line_starts();
+        let line_idx = newlines.partition_point(|&nl| (nl as usize) < byte);
+        let line_start = if line_idx == 0 {
+            0
+        } else {
+            newlines[line_idx - 1] as usize + 1
+        };
+        let col = self.text[line_start..byte].chars().count() + 1;
+        (line_idx + 1, col)
+    }
+
     /// The line of token `at` in the text of its layer, counting from one.
     pub fn line(&self, at: u32) -> usize {
         let (src, _) = self.layer(at);
-        src.text[..self.byte(at) as usize].matches('\n').count() + 1
+        src.line_col_at(self.byte(at) as usize).0
     }
 
     /// The column of token `at` in its line, counting characters from one.
     pub fn column(&self, at: u32) -> usize {
         let (src, _) = self.layer(at);
-        let before = &src.text[..self.byte(at) as usize];
-        before[before.rfind('\n').map_or(0, |newline| newline + 1)..]
-            .chars()
-            .count()
-            + 1
+        src.line_col_at(self.byte(at) as usize).1
     }
 
-    /// Resolves token range `start_tok..end_tok` (half-open) to `(path, text, start_byte, end_byte, from_macro)`.
+    /// Resolves token range `start_tok..end_tok` (half-open) to `(layer, start_byte, end_byte, from_macro)`.
     pub(crate) fn token_byte_span(
         &self,
         start_tok: u32,
         end_tok: u32,
-    ) -> Option<(&Path, &str, u32, u32, bool)> {
+    ) -> Option<(&Source, u32, u32, bool)> {
         if self.is_empty() || start_tok >= self.len() {
             return None;
         }
@@ -698,7 +729,7 @@ impl Source {
             let end_byte = same_line_end
                 .unwrap_or_else(|| sb.saturating_add(s_len).min(text_len))
                 .max(sb);
-            return Some((&base.source.path, &base.source.text, sb, end_byte, true));
+            return Some((&base.source, sb, end_byte, true));
         }
         if matches!(s_layer.origins, Origins::Copied(_)) {
             return None;
@@ -720,7 +751,7 @@ impl Source {
         }
         .min(text_len);
         let start_byte = s_start.min(end_byte);
-        Some((&s_layer.path, &s_layer.text, start_byte, end_byte, false))
+        Some((s_layer, start_byte, end_byte, false))
     }
 
     /// The number of tokens, those of the base included.

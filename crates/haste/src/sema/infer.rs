@@ -679,6 +679,7 @@ pub(super) fn detached_summary<T>(
         offset: 0,
         outputs: Default::default(),
         origins: crate::outline::source::Origins::Read,
+        line_starts: std::sync::OnceLock::new(),
     });
     let home = cx.module_of(item).unwrap_or(ModRef {
         krate: item.krate,

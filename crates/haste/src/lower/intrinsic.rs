@@ -214,17 +214,8 @@ impl Lower<'_, '_> {
                 }
             }
             loc => {
-                let mut byte = (loc as u32 as usize).min(root.text.len());
-                while byte > 0 && !root.text.is_char_boundary(byte) {
-                    byte -= 1;
-                }
-                let before = &root.text[..byte];
-                let line = before.matches('\n').count() as u32 + 1;
-                let col = before[before.rfind('\n').map_or(0, |n| n + 1)..]
-                    .chars()
-                    .count() as u32
-                    + 1;
-                (line, col)
+                let (line, col) = root.line_col_at(loc as u32 as usize);
+                (line as u32, col as u32)
             }
         };
         let mut file = root.path.display().to_string().into_bytes();
