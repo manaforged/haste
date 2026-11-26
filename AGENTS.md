@@ -4,14 +4,7 @@
 
 ## Install
 
-Do **not** install `haste` from crates.io (that is an unrelated benchmarking crate). Install from git:
-
-```bash
-rustup component add rust-src
-cargo install --git https://github.com/manaforged/haste haste
-```
-
-Prerequisites: Rust 1.88+ with `rust-src`, plus a C compiler and `make` on macOS and Linux x86-64 GNU.
+Follow the canonical install and prerequisites instructions in [README.md#install-and-quickstart](README.md#install-and-quickstart) (do **not** install `haste` from crates.io).
 
 ## Daily commands
 
@@ -23,8 +16,9 @@ Prerequisites: Rust 1.88+ with `rust-src`, plus a C compiler and `make` on macOS
 
 ## Guardrails for agents using haste
 
-- Keep `cargo check` or `rustc` as your final CI/merge gate: `haste` does not yet support nightly `#![feature(...)]`, full Polonius lifetimes, custom `harness = false` test runners, or static C archives (`lib*.a`) in `haste build -o`.
-- Target selection supports `-p <PKG>`, `--bin <NAME>`, `--example <NAME>`, `--workspace`, and feature flags (not `--test <NAME>`, `--lib`, or `--doc`).
+- Keep `cargo check` or `rustc` as your final CI/merge gate: `haste` does not yet support nightly `#![feature(...)]`, full Polonius lifetimes, custom `harness = false` test runners, or cross-target static C archives (`lib*.a`) in `haste build -o`.
+- Target selection supports `-p <PKG>`, `--bin <NAME>`, `--bins`, `--lib`, `--example <NAME>`, `--test <NAME>`, `--workspace`, and feature flags (not `--doc`).
+- `haste test` captures stdout/stderr on a single isolated run per test (`-- --nocapture`, `-- --show-output`, `-- --list`, `-- --exact`, `-- --skip`).
 - Daemons are keyed per workspace path and auto-exit after 120 s idle (`HASTE_SERVE_IDLE_SECS`); stop worktree daemons (`haste serve stop --all`) before removing worktrees, or set `HASTE_NO_DAEMON=1` to bypass an active daemon.
 - `haste clean` removes the global `$HASTE_HOME` cache (including the daemon registry), not a per-project `target/` directory.
 - On Windows, use `haste build -o` (JIT `run`/`test`, `--daemon`, and `--watch` require Unix). On macOS, Hardened Runtime or App Sandbox restrictions can block JIT `mach_vm_remap` pages.

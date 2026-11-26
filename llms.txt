@@ -4,9 +4,7 @@
 
 ## Install
 
-- Requires Rust 1.88+ with `rust-src`, plus a C compiler and `make` on macOS and Linux x86-64 GNU.
-- Do not use `cargo install haste` (unrelated crates.io package).
-- Command: `cargo install --git https://github.com/manaforged/haste haste`
+- Canonical instructions and prerequisites: [README.md#install-and-quickstart](README.md#install-and-quickstart) (do not use `cargo install haste`).
 
 ## Key Capabilities
 

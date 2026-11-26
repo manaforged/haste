@@ -16,9 +16,11 @@ Prerequisites: Rust 1.88 or newer with `rust-src`, plus a C compiler and `make` 
 
 ```bash
 rustup component add rust-src
-cargo install --git https://github.com/manaforged/haste haste
+cargo install --git https://github.com/manaforged/haste --locked haste
 haste --version # prints: haste 0.0.0 (<commit>) when built from a git checkout
 ```
+
+Teams can pin a specific revision (`--rev <SHA>` or `--tag <TAG>`) and roll back by reinstalling a known-good revision.
 
 Try it on a fresh crate from any directory (the first run per profile indexes `rust-src` once and logs progress to stderr):
 
@@ -36,7 +38,7 @@ haste --release build -o ./haste-demo-bin haste-demo
 ./haste-demo-bin
 ```
 
-If a workspace has no `Cargo.lock`, `haste` runs `cargo generate-lockfile` automatically. If locked registry or git crates are missing locally, `haste` runs `cargo fetch --locked` automatically (and honors `cargo vendor` and `.cargo/config.toml` `[source.*.directory]` offline).
+If a workspace has no `Cargo.lock`, `haste` runs `cargo generate-lockfile` automatically. If locked registry or git crates are missing locally, `haste` runs `cargo fetch --locked` automatically unless `CARGO_NET_OFFLINE=true` or `[net] offline = true` is set. Dependency lookup matches `Cargo.lock` `source` URLs against `.cargo/config.toml` `[source.*]` / `replace-with` entries, honors `cargo vendor` offline, and verifies `.cargo-checksum.json` hashes when present.
 
 ### Incremental daemon
 
@@ -125,7 +127,9 @@ Compute benchmarks subtract each compiler's warmed empty-main startup baseline (
 | `clap` (`4.x`, `derive`), `regex` (`1.x`), `winnow` (`0.7`) | Supported (JIT + AOT) | `tests/probes/cd`, `tests/probes/rx`, `tests/probes/wn` |
 | `#[tokio::test]` (`current_thread`, `multi_thread`, `LocalSet`, `start_paused`) | Supported (JIT) | Verified on 9-test Tokio suite; `harness = false` unsupported |
 | Procedural macros (`derive`, attribute, function-like) | Supported (JIT + AOT) | `tests/proc-macro`, `tests/probes/pc` |
-| Crates bundling static C archives (`lib*.a`, e.g. `ring`, `tikv-jemalloc-sys`) | JIT only (`build -o` errors) | See [Limits](#limits) |
+| `rusqlite` (`0.32`, `bundled` C `libsqlite3.a`) | Supported (JIT + native Unix AOT) | Live-verified with `build.rs` static archive |
+| `prost` (`0.13`), `uuid` (`1.x`), `chrono` (`0.4`) | Supported (JIT + AOT) | Live-verified |
+| Crates bundling static C archives (`lib*.a`, e.g. `rusqlite` `bundled`, `tikv-jemalloc-sys`) | JIT + native Unix AOT (`build -o`); cross-target AOT errors | See [Limits](#limits) |
 | `reqwest` / `openssl-sys` | Untested | Not covered in `tests/probes` |
 | Nightly `#![feature(...)]` crates | Unsupported | Stable syntax and stdlib only |
 
@@ -150,7 +154,7 @@ compiler.emit("./my-app", "./out-bin")?;
 
 - **Incomplete borrow-checker and nightly coverage:** Full Polonius borrow checking, some upstream `rust-lang/rust` `tests/ui/borrowck` and higher-ranked (`for<'a>`) lifetime edge cases, and nightly `#![feature(...)]` attributes are not yet supported. Keep `cargo check` or `rustc` in CI as your merge and release gate.
 - **External dependencies stay lazy:** `haste` type-checks and borrow-checks every concrete and generic function in the selected member crate before running or emitting code, while external crates and `std` are checked only along reached paths.
-- **Static C archives in standalone AOT:** `haste build .` checks `haste`'s own 42-package workspace (including `tikv-jemalloc-sys`, 0 failed functions), and JIT loads `build.rs` archives via a generated shared library. Standalone `haste build -o` rejects crates that link static C archives (`lib*.a`) rather than emitting an incomplete binary.
+- **Static C archives in standalone AOT:** `haste build .` checks `haste`'s own 42-package workspace (including `tikv-jemalloc-sys`, 0 failed functions), and both JIT and native Unix `haste build -o` link `build.rs` static C archives (`lib*.a`, such as `rusqlite` `bundled`) via a cached shared bundle. Cross-target `haste build -o --target <TRIPLE>` rejects static C archives rather than emitting an incomplete binary.
 - **Test harnesses and proc-macro edge cases:** `haste test` runs `#[test]` and `#[tokio::test]` functions (`fn()` and `fn() -> Result<(), E>`), not custom `harness = false` runners, and procedural macros relying on rustc-private span or hygiene internals can fail.
 - **Platform support:** Supported hosts and AOT `--target` triples are `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-pc-windows-msvc`, and `aarch64-pc-windows-msvc`. Windows PE32+ emission is experimental; JIT `run`/`test`, `serve`, `--daemon`, and `--watch` require Unix; `prep` / `--prepared` are Linux x86-64 only (using `RUSTC_BOOTSTRAP=1`). On macOS, Hardened Runtime or App Sandbox restrictions can block dual-mapped `mach_vm_remap` JIT pages.
 - **Debug info, unwinding, and traps:** AOT binaries emit symbol tables (`HASTE_SYMBOLS`) and DWARF `.debug_line` (`HASTE_DEBUG_INFO`), not full `.debug_info` variable/type DIEs. In `--release` builds without `catch_unwind` or threads, out-of-bounds indexing and divide-by-zero emit hardware traps instead of unwinding; panicking across `extern "C"` aborts (`extern "C-unwind"` unwinds).

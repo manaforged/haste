@@ -8,7 +8,9 @@
 
 - Like `cargo`, `haste` executes crate `build.rs` scripts and procedural macros unsandboxed as the invoking user. Only build trusted workspaces.
 - `haste serve` listens on a per-user Unix domain socket (abstract namespace on Linux, temp file on macOS) and verifies the peer UID on every connection.
-- When locked registry or git crates are missing locally, `haste` runs `cargo fetch --locked` automatically unless dependencies are vendored via `cargo vendor` / `.cargo/config.toml`.
+- Dependency lookup matches `Cargo.lock` `source` URLs against `.cargo/config.toml` `[source.*]` / `replace-with` entries and verifies `.cargo-checksum.json` package hashes when present.
+- When locked registry or git crates are missing locally, `haste` runs `cargo fetch --locked` automatically unless `CARGO_NET_OFFLINE=true` or `[net] offline = true` is set, or dependencies are vendored via `cargo vendor` / `.cargo/config.toml`.
+- Teams piloting `haste` can pin an exact revision (`cargo install --git https://github.com/manaforged/haste --rev <SHA> --locked haste`), verify it with `haste --version`, and roll back by reinstalling a known-good `--rev` or `--tag`.
 
 ## Reporting a Vulnerability
 
