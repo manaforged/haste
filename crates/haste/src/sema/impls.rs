@@ -224,6 +224,9 @@ impl<'a> Context<'a> {
 
     /// The parsed header of impl `block`.
     pub fn impl_header(&mut self, block: ImplRef) -> Result<Arc<ImplHeader>> {
+        if let Some(found) = self.headers_local.get(&block) {
+            return Ok(Arc::clone(found));
+        }
         Ok(Arc::clone(self.ensure_impl_header(block)?))
     }
 
