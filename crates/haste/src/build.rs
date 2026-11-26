@@ -353,6 +353,7 @@ impl Build {
         let bin = self.binary.as_mut().context("the binary is not compiled")?;
         let failed = bin.print_diagnostics(&self.compilation.outline);
         if failed > 0 {
+            crate::diag::print_build_finished(false);
             bail!("{failed} functions failed to compile");
         }
         bin.write_aot(&self.compilation, path)?;
@@ -365,6 +366,7 @@ impl Build {
                 started.elapsed().as_secs_f64() * 1e3
             );
         }
+        crate::diag::print_build_finished(true);
         Ok(0)
     }
 
@@ -373,6 +375,11 @@ impl Build {
         let Some(cases) = &self.cases else {
             bail!("the cases are not compiled")
         };
+        if crate::with_cfg(|c| c.no_run) {
+            let status = cases.check(&self.compilation.outline, built);
+            crate::diag::print_build_finished(status == 0);
+            return Ok(if status == 0 { 0 } else { 101 });
+        }
         cases.report(&self.compilation.outline, started, built, filters)
     }
 
@@ -381,7 +388,9 @@ impl Build {
         let Some(binary) = &self.binary else {
             bail!("the binary is not compiled")
         };
-        Ok(binary.check(&self.compilation.outline, built))
+        let status = binary.check(&self.compilation.outline, built);
+        crate::diag::print_build_finished(status == 0);
+        Ok(status)
     }
 
     fn batch_diagnostics(&self, batch: Option<&Batch>) -> Option<String> {

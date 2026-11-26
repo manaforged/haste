@@ -30,6 +30,7 @@ pub(super) fn stamps(workspace: &graph::Workspace, outline: &outline::Outline) -
                 .iter()
                 .map(|file| file.source.path.clone())
         })
+        .chain(local_source_paths(workspace))
         .collect();
     sources.sort();
     sources.dedup();
@@ -54,8 +55,8 @@ pub(super) fn paths(stamps: &[Watch]) -> Vec<PathBuf> {
     stamps.iter().map(|watch| watch.path.clone()).collect()
 }
 
-pub(super) fn pre_stamps(workspace: &graph::Workspace) -> HashMap<PathBuf, Stamp> {
-    let mut out = HashMap::default();
+fn local_source_paths(workspace: &graph::Workspace) -> Vec<PathBuf> {
+    let mut out = Vec::new();
     let mut stack = Vec::new();
     for pkg in workspace.packages.iter().filter(|pkg| pkg.local()) {
         for sub in SOURCE_DIRS {
@@ -74,7 +75,7 @@ pub(super) fn pre_stamps(workspace: &graph::Workspace) -> HashMap<PathBuf, Stamp
             .chain(pkg.manifest.benches.iter().map(|(_, p)| p));
         for path in roots {
             if path.is_file() {
-                out.insert(path.clone(), stamp(path));
+                out.push(path.clone());
             }
         }
     }
@@ -87,11 +88,21 @@ pub(super) fn pre_stamps(workspace: &graph::Workspace) -> HashMap<PathBuf, Stamp
             if path.is_dir() {
                 stack.push(path);
             } else if path.extension().is_some_and(|e| e == "rs") {
-                out.insert(path.clone(), stamp(&path));
+                out.push(path);
             }
         }
     }
     out
+}
+
+pub(super) fn pre_stamps(workspace: &graph::Workspace) -> HashMap<PathBuf, Stamp> {
+    local_source_paths(workspace)
+        .into_iter()
+        .map(|path| {
+            let s = stamp(&path);
+            (path, s)
+        })
+        .collect()
 }
 
 fn collect_edits(
@@ -166,10 +177,10 @@ pub(super) fn body_edits(
     }
 }
 
-/// Whether crate `krate` is a procedural macro crate, whose bodies decide the code of the crates that call its macros.
+/// Whether crate `krate` is a procedural macro crate or a dependency of one, whose bodies decide the code of the crates that call those macros.
 fn expands(workspace: &graph::Workspace, outline: &outline::Outline, krate: u32) -> bool {
     outline
-        .package(workspace, krate as usize)
-        .manifest
-        .proc_macro
+        .dependents(krate as usize)
+        .into_iter()
+        .any(|dep| outline.package(workspace, dep).manifest.proc_macro)
 }

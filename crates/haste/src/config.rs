@@ -19,6 +19,7 @@ pub(crate) struct Config {
     pub target: &'static Target,
     pub selection: Selection,
     pub test_mode: bool,
+    pub no_run: bool,
     pub daemon: bool,
     pub prepared: bool,
     pub debug_info: bool,
@@ -47,6 +48,7 @@ impl Config {
             target: Target::host(),
             selection: Selection::default(),
             test_mode: false,
+            no_run: false,
             daemon: false,
             prepared: false,
             debug_info: false,
@@ -79,6 +81,7 @@ impl Config {
         self.target.triple.hash(state);
         self.selection.hash(state);
         self.test_mode.hash(state);
+        self.no_run.hash(state);
         self.prepared.hash(state);
         self.debug_info.hash(state);
         self.symbols.hash(state);
@@ -99,6 +102,7 @@ impl Config {
             target,
             selection: Selection::default(),
             test_mode: false,
+            no_run: false,
             daemon: false,
             prepared: false,
             debug_info: true,

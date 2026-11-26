@@ -263,7 +263,9 @@ extern "C" fn abort() -> ! {
 #[cfg(target_vendor = "apple")]
 pub(crate) mod apple_args {
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering};
+    use std::sync::{Mutex, MutexGuard};
 
+    static LOCK: Mutex<()> = Mutex::new(());
     static ACTIVE: AtomicBool = AtomicBool::new(false);
     static ARGC: AtomicI32 = AtomicI32::new(0);
     static ARGV: AtomicPtr<*mut libc::c_char> = AtomicPtr::new(std::ptr::null_mut());
@@ -293,6 +295,7 @@ pub(crate) mod apple_args {
 
     /// Scoped override of `_NSGetArgc` / `_NSGetArgv` for JIT-executed programs on Apple hosts.
     pub(crate) struct Guard {
+        _lock: MutexGuard<'static, ()>,
         prev_active: bool,
         prev_argc: libc::c_int,
         prev_argv: *mut *mut libc::c_char,
@@ -300,11 +303,13 @@ pub(crate) mod apple_args {
 
     impl Guard {
         pub(crate) fn install(argc: libc::c_int, argv: *mut *mut libc::c_char) -> Self {
+            let lock = crate::sync::lock(&LOCK);
             let prev_active = ACTIVE.load(Ordering::Acquire);
             let prev_argc = ARGC.swap(argc, Ordering::AcqRel);
             let prev_argv = ARGV.swap(argv, Ordering::AcqRel);
             ACTIVE.store(true, Ordering::Release);
             Self {
+                _lock: lock,
                 prev_active,
                 prev_argc,
                 prev_argv,

@@ -31,7 +31,7 @@ pub(super) fn usage() -> String {
         .map(|(_, name)| name)
         .collect();
     format!(
-        "usage: haste [-p PKG] [--workspace] [--bin NAME | --example NAME] [--tests] [--all-targets] [-F FEATURES] [--all-features] [--no-default-features] [--manifest-path PATH] [--locked] [--offline] [--ignored] [--include-ignored] [--target TRIPLE] [-j|--jobs N] [--release | --profile NAME] [--message-format FMT] [-q|--quiet] [--daemon] [--prepared] [--prep-wait MS] [--perf-map] [--watch] [--stats-json PATH] [-o PATH] {} [PATH] [--] [ARGS...]\n       haste serve status [PATH]\n       haste serve stop [PATH | --all]\n       haste clean\n       haste [-j|--jobs N] debug {} PATH [CRATE]\n       haste [--release] debug code PATH DIR\n       haste -V|--version | -h|--help",
+        "usage: haste [-p PKG] [--workspace] [--lib] [--bins] [--bin NAME | --example NAME] [--tests] [--all-targets] [-F FEATURES] [--all-features] [--no-default-features] [--manifest-path PATH] [--locked] [--offline] [--frozen] [--color WHEN] [--no-run] [--ignored] [--include-ignored] [--target TRIPLE] [-j|--jobs N] [--release | --profile NAME] [--message-format FMT] [-q|--quiet] [--daemon] [--prepared] [--prep-wait MS] [--perf-map] [--watch] [--stats-json PATH] [-o PATH] {} [PATH] [--] [ARGS...]\n       haste serve status [PATH]\n       haste serve stop [PATH | --all]\n       haste clean\n       haste [-j|--jobs N] debug {} PATH [CRATE]\n       haste [--release] debug code PATH DIR\n       haste -V|--version | -h|--help",
         modes.join("|"),
         queries.join("|"),
     )
@@ -178,6 +178,7 @@ struct ParsedOpts {
     watch: bool,
     target: Option<&'static haste_codegen::Target>,
     check_alias: bool,
+    no_run: bool,
 }
 
 fn split_flag(flag: &str) -> (&str, Option<&str>) {
@@ -250,6 +251,13 @@ fn parse_message_format(fmt: &str) -> Result<crate::MessageFormat> {
     }
 }
 
+fn parse_color(when: &str) -> Result<()> {
+    match when {
+        "auto" | "always" | "never" => Ok(()),
+        _ => anyhow::bail!("unknown color option `{when}`; expected `auto`, `always`, or `never`"),
+    }
+}
+
 fn manifest_workspace_dir(manifest: &std::path::Path) -> PathBuf {
     match manifest.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
@@ -268,6 +276,11 @@ fn apply_bool_flag(opts: &mut ParsedOpts, flag: &str) -> bool {
         "--no-default-features" => opts.selection.no_default_features = true,
         "--locked" => opts.selection.locked = true,
         "--offline" => opts.selection.offline = true,
+        "--frozen" => {
+            opts.selection.locked = true;
+            opts.selection.offline = true;
+        }
+        "--no-run" => opts.no_run = true,
         "-q" | "--quiet" => opts.selection.quiet = true,
         "--ignored" => opts.selection.ignored_only = true,
         "--include-ignored" => opts.selection.include_ignored = true,
@@ -342,6 +355,10 @@ fn apply_value_flag<I: Iterator<Item = std::ffi::OsString>>(
         "--message-format" => {
             let fmt = take_non_empty(args, eq_val, "--message-format takes a format name")?;
             opts.selection.message_format = parse_message_format(&fmt)?;
+        }
+        "--color" => {
+            let when = take_non_empty(args, eq_val, "--color takes `auto`, `always`, or `never`")?;
+            parse_color(&when)?;
         }
         "--prep-wait" => {
             let raw = take_non_empty(args, eq_val, "--prep-wait takes a number of milliseconds")?;
@@ -461,6 +478,9 @@ fn validate_command_opts(command: Command, opts: &ParsedOpts) -> Result<Command>
     if opts.watch && !matches!(command, Command::Request(Request::Run)) {
         anyhow::bail!("--watch is only supported with `haste run`");
     }
+    if opts.no_run && !matches!(command, Command::Request(Request::Test)) {
+        anyhow::bail!("--no-run is only supported with `haste test`");
+    }
     Ok(command)
 }
 
@@ -481,6 +501,7 @@ fn build_config(command: Command, opts: &ParsedOpts) -> crate::config::Config {
         cfg.target = target;
     }
     cfg.selection = opts.selection.clone();
+    cfg.no_run = opts.no_run;
     cfg.test_mode = matches!(command, Command::Request(Request::Test))
         || opts.selection.tests
         || opts.selection.all_targets
@@ -721,5 +742,22 @@ mod tests {
         assert!(matches!(cmd, Command::Request(Request::Build)));
         assert!(opts.check_alias);
         assert!(out.is_none());
+    }
+
+    #[test]
+    fn parses_cargo_muscle_memory_flags() {
+        let ((_, _, _, _, _, cfg), _) = parse_strs(&["build", "--frozen", "--color=always"])
+            .expect("valid")
+            .expect("not meta");
+        assert!(cfg.selection.locked && cfg.selection.offline);
+        assert!(parse_strs(&["build", "--color", "never"]).is_ok());
+        assert!(parse_strs(&["build", "--color=bogus"]).is_err());
+        let ((_, _, _, _, _, cfg), _) = parse_strs(&["test", "--no-run"])
+            .expect("valid")
+            .expect("not meta");
+        assert!(cfg.no_run);
+        assert!(parse_strs(&["build", "--no-run"]).is_err());
+        let u = usage();
+        assert!(u.contains("--lib") && u.contains("--bins") && u.contains("--frozen"));
     }
 }

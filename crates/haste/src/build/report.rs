@@ -242,15 +242,72 @@ fn push_json_opt_str(out: &mut String, s: Option<&str>) {
     }
 }
 
+fn span_byte_range(text: &str, line: usize, col_start: usize, col_end: usize) -> (usize, usize) {
+    if line == 0 {
+        return (0, 0);
+    }
+    let mut line_start = 0usize;
+    let mut line_text = None;
+    for (idx, slice) in text.split_inclusive('\n').enumerate() {
+        if idx + 1 == line {
+            line_text = Some(slice.trim_end_matches(['\r', '\n']));
+            break;
+        }
+        line_start += slice.len();
+    }
+    let Some(line_text) = line_text else {
+        return (0, 0);
+    };
+    let col_to_byte = |target_col: usize| -> usize {
+        if target_col <= 1 {
+            return line_start;
+        }
+        let mut col = 1usize;
+        for (byte_off, ch) in line_text.char_indices() {
+            if col >= target_col {
+                return line_start + byte_off;
+            }
+            col += if ch == '\t' { 4 } else { 1 };
+        }
+        line_start + line_text.len()
+    };
+    let sb = col_to_byte(col_start);
+    let eb = col_to_byte(col_end).max(sb);
+    (sb, eb)
+}
+
+fn file_span_byte_range(
+    file: &str,
+    line: usize,
+    col_start: usize,
+    col_end: usize,
+) -> (usize, usize) {
+    std::fs::read_to_string(file).map_or((0, 0), |text| {
+        span_byte_range(&text, line, col_start, col_end)
+    })
+}
+
+fn find_manifest_path(file: &str) -> Option<String> {
+    let mut dir = std::path::Path::new(file).parent()?;
+    loop {
+        let candidate = dir.join("Cargo.toml");
+        if candidate.is_file() {
+            return Some(candidate.to_string_lossy().into_owned());
+        }
+        dir = dir.parent()?;
+    }
+}
+
 fn push_json_span(out: &mut String, span: &ParsedSpan<'_>) {
     use std::fmt::Write as _;
     let cs = span.col_start.max(1);
     let ce = span.col_end.max(cs);
+    let (byte_start, byte_end) = file_span_byte_range(span.file, span.line, cs, ce);
     out.push_str("{\"file_name\":");
     push_json_str(out, span.file);
     let _ = write!(
         out,
-        ",\"byte_start\":0,\"byte_end\":0,\"line_start\":{},\"line_end\":{},\"column_start\":{cs},\"column_end\":{ce},\"is_primary\":{},\"text\":[",
+        ",\"byte_start\":{byte_start},\"byte_end\":{byte_end},\"line_start\":{},\"line_end\":{},\"column_start\":{cs},\"column_end\":{ce},\"is_primary\":{},\"text\":[",
         span.line, span.line, span.is_primary
     );
     if let Some(src) = span.source_line {
@@ -277,7 +334,16 @@ fn format_json_diagnostic(diag: &str) -> String {
     let parsed = parse_diagnostic(diag);
     let rendered = format!("{}\n", format_diagnostic(diag));
     let mut out = String::with_capacity(diag.len() + 256);
-    out.push_str("{\"reason\":\"compiler-message\",\"message\":{\"$message_type\":\"diagnostic\",\"level\":\"error\",\"code\":");
+    out.push_str("{\"reason\":\"compiler-message\"");
+    if let Some(manifest) = parsed
+        .spans
+        .first()
+        .and_then(|s| find_manifest_path(s.file))
+    {
+        out.push_str(",\"manifest_path\":");
+        push_json_str(&mut out, &manifest);
+    }
+    out.push_str(",\"message\":{\"$message_type\":\"diagnostic\",\"level\":\"error\",\"code\":");
     match parsed.code {
         Some(code) => {
             out.push_str("{\"code\":");
@@ -535,6 +601,7 @@ impl Batch {
     ) -> Result<i32> {
         if !self.member_errors.is_empty() {
             print_formatted_diagnostics(&self.member_errors);
+            crate::diag::print_build_finished(false);
             return Ok(101);
         }
         let sel = crate::selection();
@@ -592,14 +659,23 @@ impl Batch {
             Vec::with_capacity(raw.len());
         for (name, meta, outcome) in raw {
             let env = outline.crates[meta.item.krate as usize].env.vars.as_slice();
+            let manifest_dir = env
+                .iter()
+                .find(|(k, _)| k == "CARGO_MANIFEST_DIR")
+                .map(|(_, v)| std::path::Path::new(v.as_str()));
             let resolved = match outcome {
                 None => None,
                 Some(Err(idx)) => Some(Err(errs[idx].as_str())),
                 Some(Ok((root, start))) => {
                     let nocapture = args.nocapture && meta.expected.is_none();
-                    let run = self
-                        .image
-                        .run_test_captured(root, start, name, env, nocapture)?;
+                    let run = self.image.run_test_captured(
+                        root,
+                        start,
+                        name,
+                        env,
+                        manifest_dir,
+                        nocapture,
+                    )?;
                     Some(Ok(run))
                 }
             };
@@ -628,4 +704,19 @@ fn item_loc(outline: &outline::Outline, item: ItemRef) -> String {
     };
     let line = file.source.line(entry.start);
     format!("{}:{line} ", file.source.path.display())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn span_byte_range_matches_multiline_and_tabs() {
+        let text = "fn main() {\n    let x: i32 = \"hi\";\n\tbad;\n}\n";
+        let hi = text.find("\"hi\"").expect("literal");
+        assert_eq!(span_byte_range(text, 2, 18, 22), (hi, hi + 4));
+        let bad = text.find("bad").expect("bad");
+        assert_eq!(span_byte_range(text, 3, 5, 8), (bad, bad + 3));
+        assert_eq!(span_byte_range(text, 0, 1, 2), (0, 0));
+    }
 }
