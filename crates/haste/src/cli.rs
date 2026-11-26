@@ -520,7 +520,15 @@ pub fn main() -> Result<()> {
         Err(meta) => return Ok(print_meta(meta)),
     };
     crate::with_config(std::sync::Arc::new(cfg), || {
-        run_parsed(command, path, rest, stats_json, out)
+        match run_parsed(command, path, rest, stats_json, out) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                if crate::build::emit_early_json_error(&err) {
+                    std::process::exit(1);
+                }
+                Err(err)
+            }
+        }
     })
 }
 

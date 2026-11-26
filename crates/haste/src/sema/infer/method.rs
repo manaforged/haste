@@ -435,10 +435,18 @@ impl<'a> Infer<'_, 'a> {
             .res
             .insert(expr, Res::fn_of(&self.cx.types, item, &substs));
         self.out.adjusts.insert(expr, adjust);
-        if let (Some(Mut::Mut), crate::body::Expr::Method { receiver, .. }) =
-            (adjust.autoref, *self.body.expr(expr))
-        {
-            self.note_mut(receiver)?;
+        if let crate::body::Expr::Method { receiver, .. } = *self.body.expr(expr) {
+            if adjust.autoref == Some(Mut::Mut) {
+                self.note_mut(receiver)?;
+            }
+            let recv_ty = self.out.exprs[receiver.0 as usize];
+            let borrows_recv = (adjust.derefs == 0 && adjust.autoref.is_some())
+                || (adjust.derefs > 0
+                    && (self.out.derefs.contains_key(&(expr, 0))
+                        || matches!(self.cx.types.kind(self.resolve(recv_ty)), Kind::Array(..))));
+            if borrows_recv {
+                self.check_packed_ref(receiver, recv_ty)?;
+            }
         }
         let (types, ret) = self.fn_types(item, &substs)?;
         let given = self.body.list(params).to_vec();

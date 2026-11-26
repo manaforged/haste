@@ -140,6 +140,7 @@ struct UnaryCache([AtomicU32Slab<TY_SLAB, TY_SLABS>; 7]);
 pub struct Types {
     inner: Arc<Interner<Kind, TY_SHARDS, TY_SLAB, TY_SLABS>>,
     flags: Arc<AtomicU8Slab<TY_SLAB, TY_SLABS>>,
+    depths: Arc<AtomicU8Slab<TY_SLAB, TY_SLABS>>,
     unary: Arc<UnaryCache>,
     substs: SubstsPool,
     projs: ProjPool,
@@ -152,6 +153,7 @@ impl Default for Types {
         let types = Self {
             inner: Arc::default(),
             flags: Arc::default(),
+            depths: Arc::default(),
             unary: Arc::default(),
             substs: SubstsPool::default(),
             projs: ProjPool::default(),
@@ -337,10 +339,33 @@ impl Types {
         self.intern_slow(kind)
     }
 
+    /// The nesting depth of `ty`, saturated at `u8::MAX`.
+    pub fn ty_depth(&self, ty: Ty) -> usize {
+        if ty == Ty::NONE {
+            0
+        } else {
+            usize::from(self.depths.get(ty.0 as usize).unwrap_or(0))
+        }
+    }
+
+    /// The maximum nesting depth of any type in `substs`.
+    pub fn substs_depth(&self, substs: Substs) -> usize {
+        self.substs(substs)
+            .iter()
+            .fold(0usize, |acc, &ty| acc.max(self.ty_depth(ty)))
+    }
+
+    fn kind_depth(&self, kind: &Kind) -> u8 {
+        kind.children(self)
+            .fold(0u8, |acc, child| acc.max(self.ty_depth(child) as u8))
+            .saturating_add(1)
+    }
+
     fn intern_slow(&self, kind: Kind) -> Ty {
         Ty(self.inner.intern_owned(kind, |kind, id| {
             self.flags
                 .set(id as usize, self.kind_flags(kind) | FLAG_SET);
+            self.depths.set(id as usize, self.kind_depth(kind));
         }))
     }
 

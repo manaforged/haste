@@ -119,6 +119,36 @@ fn check_and_print_member_items(
     Ok(Err(101))
 }
 
+thread_local! {
+    static JSON_FINISHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn mark_json_finished() {
+    JSON_FINISHED.with(|slot| slot.set(true));
+}
+
+/// Emits JSON `compiler-message` and `build-finished` for an early error when JSON output is active; returns `true` when handled.
+pub(crate) fn emit_early_json_error(err: &anyhow::Error) -> bool {
+    let fmt = crate::selection().message_format;
+    if !matches!(
+        fmt,
+        crate::MessageFormat::Json | crate::MessageFormat::JsonRenderDiagnostics
+    ) {
+        return false;
+    }
+    if JSON_FINISHED.with(|slot| slot.replace(false)) {
+        if fmt == crate::MessageFormat::JsonRenderDiagnostics {
+            eprintln!("error: {err:#}");
+        }
+        return true;
+    }
+    let text = format!("{err:#}");
+    let diags = report::split_error_diagnostics(&text);
+    report::print_formatted_diagnostics(&diags);
+    crate::diag::print_build_finished(false);
+    true
+}
+
 impl Build {
     /// Loads every crate of `workspace`, resolves its names and expands its macros, inferring and compiling nothing yet.
     pub fn load(workspace: &graph::Workspace, targets: &Targets) -> Result<Build> {
@@ -354,6 +384,7 @@ impl Build {
         let failed = bin.print_diagnostics(&self.compilation.outline);
         if failed > 0 {
             crate::diag::print_build_finished(false);
+            mark_json_finished();
             bail!("{failed} functions failed to compile");
         }
         bin.write_aot(&self.compilation, path)?;
