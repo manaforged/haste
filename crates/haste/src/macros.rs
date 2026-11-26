@@ -28,6 +28,7 @@ pub struct Compilation {
     pub names: Names,
     expander: Option<Expander>,
     substrate: Option<std::sync::Arc<crate::substrate::Substrate>>,
+    sysroot_heads: Option<std::sync::Arc<HashMap<u32, std::sync::Arc<crate::sema::impls::Index>>>>,
 }
 
 struct Expander {
@@ -71,6 +72,10 @@ fn load_with_sysroot(
     let mut outline = crate::outline::new(workspace, targets, scripts);
     let cached = crate::substrate::sysroot::try_load(workspace, targets, &mut outline);
     let was_miss = cached.is_none();
+    let (cached_names, mut sysroot_heads) = match cached {
+        Some((symbols, names, heads)) => (Some((symbols, names)), Some(std::sync::Arc::new(heads))),
+        None => (None, None),
+    };
     let show_sysroot = was_miss
         && crate::substrate::enabled()
         && crate::scripts::sysroot_scripts_settled(workspace);
@@ -105,7 +110,7 @@ fn load_with_sysroot(
         })
         .collect();
     outline.load_selected(&selected)?;
-    let names = Names::new_with(workspace, &outline, cached);
+    let names = Names::new_with(workspace, &outline, cached_names);
     let has_proc_macro = outline
         .roots
         .iter()
@@ -123,6 +128,7 @@ fn load_with_sysroot(
         names,
         expander: None,
         substrate,
+        sysroot_heads: sysroot_heads.take(),
     };
     for (krate, _) in selected.iter().enumerate().filter(|(_, on)| **on) {
         compilation.names.crates[krate].set_eager();
@@ -139,7 +145,8 @@ fn load_with_sysroot(
         });
     }
     if was_miss && crate::scripts::sysroot_scripts_settled(workspace) {
-        crate::substrate::sysroot::save(workspace, targets, &compilation);
+        compilation.sysroot_heads =
+            crate::substrate::sysroot::save(workspace, targets, &compilation);
         if let Some(started) = sysroot_started {
             eprintln!(
                 "haste: standard library cached in {:.1}s",
@@ -239,6 +246,7 @@ fn answer_passes<R>(
     (mut store, ask): (Cache, impl Fn(&mut Compilation, Requests) -> Result<Answer>),
     mut pass: impl FnMut(Context<'_>, bool) -> Result<Result<R, (Cache, Requests)>>,
 ) -> Result<R> {
+    store.set_sysroot_heads_if_unset(&compilation.sysroot_heads);
     let mut last = false;
     loop {
         let (kept, asks) = match pass(
