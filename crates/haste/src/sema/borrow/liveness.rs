@@ -203,6 +203,9 @@ impl Checker<'_, '_> {
                 if matches!(op, BinOp::And | BinOp::Or) {
                     let mut b_live = live.clone();
                     self.collect_live_expr_with(b, &mut b_live, targets);
+                    if op == BinOp::And {
+                        self.remove_cond_let_locals(b, live);
+                    }
                     live.extend(b_live);
                 } else {
                     self.collect_live_expr_with(b, live, targets);
@@ -308,6 +311,22 @@ impl Checker<'_, '_> {
         }
     }
 
+    fn remove_cond_let_locals(&self, expr: ExprId, live: &mut HashSet<u32>) {
+        match *self.body.expr(expr) {
+            Expr::Paren(inner) => self.remove_cond_let_locals(inner, live),
+            Expr::Let(pat, _) => {
+                let mut bound = HashSet::default();
+                self.collect_pat_locals(pat, &mut bound);
+                live.retain(|l| !bound.contains(l));
+            }
+            Expr::Binary(BinOp::And, a, b) => {
+                self.remove_cond_let_locals(a, live);
+                self.remove_cond_let_locals(b, live);
+            }
+            _ => {}
+        }
+    }
+
     fn collect_live_closure(
         &self,
         expr: ExprId,
@@ -318,17 +337,12 @@ impl Checker<'_, '_> {
         let mut body_live = HashSet::default();
         self.collect_live_expr_with(body, &mut body_live, &[]);
         if let Some(closure) = self.typed.closures.get(&expr) {
-            for &local in &closure.params {
-                body_live.remove(&local);
-            }
+            body_live.retain(|l| !closure.params.contains(l));
         }
         for &p in self.body.list(params) {
-            let param = self.body.params[p as usize];
             let mut bound = HashSet::default();
-            self.collect_pat_locals(param.pat, &mut bound);
-            for local in bound {
-                body_live.remove(&local);
-            }
+            self.collect_pat_locals(self.body.params[p as usize].pat, &mut bound);
+            body_live.retain(|l| !bound.contains(l));
         }
         live.extend(body_live);
     }

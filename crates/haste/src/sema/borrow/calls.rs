@@ -726,7 +726,10 @@ impl Checker<'_, '_> {
                 if state.diverged {
                     break;
                 }
-                let sources = self.expr_borrow_sources(arg, state);
+                let mut sources = self.expr_borrow_sources(arg, state);
+                if shared_reborrow {
+                    sources.iter_mut().for_each(|s| s.mutable = false);
+                }
                 if effective_ref.is_none()
                     && let Some(local) = plain_local
                     && state.moved.get(local as usize).copied().unwrap_or(false)
@@ -741,7 +744,7 @@ impl Checker<'_, '_> {
                     is_deferred_mut,
                     Some(arg),
                     |_| true,
-                    |s| s.mutable && !shared_reborrow,
+                    |s| s.mutable,
                 );
                 arg_sources.push(sources);
                 prune_moved_loans(state);
@@ -758,20 +761,17 @@ impl Checker<'_, '_> {
                         !(l.holder == Some(temp_id) && l.two_phase)
                             && super::loan_conflicts_borrow(l, local, &steps)
                     }) {
+                        let name = self.local_name(local);
                         let (msg, primary, sec) = if loan.mutable {
                             (
-                                format!(
-                                    "cannot use `{}` because it was mutably borrowed",
-                                    self.local_name(local)
-                                ),
+                                format!("cannot use `{name}` because it was mutably borrowed"),
                                 "use of borrowed value occurs here",
                                 "mutable borrow occurs here",
                             )
                         } else {
                             (
                                 format!(
-                                    "cannot borrow `{}` as mutable because it is also borrowed as immutable",
-                                    self.local_name(local)
+                                    "cannot borrow `{name}` as mutable because it is also borrowed as immutable"
                                 ),
                                 "mutable borrow occurs here",
                                 "immutable borrow occurs here",

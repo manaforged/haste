@@ -263,7 +263,10 @@ impl Checker<'_, '_> {
         seen: &mut HashSet<(Ty, bool)>,
         allow_phantom: bool,
     ) -> bool {
-        if ty == Ty::NONE || !seen.insert((ty, allow_phantom)) {
+        if ty == Ty::NONE
+            || !seen.insert((ty, allow_phantom))
+            || (!self.ty_holds_borrow(ty) && !self.ty_has_non_static_param(ty))
+        {
             return false;
         }
         match self.cx.types.kind(ty).clone() {

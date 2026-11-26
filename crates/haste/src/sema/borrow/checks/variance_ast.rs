@@ -135,7 +135,7 @@ fn is_interior_mut_adt(cx: &Context<'_>, item: ItemRef) -> bool {
         || is_interior_mut_name(cx.plain_name(item))
 }
 
-fn resolve_ast_type_path(
+pub(in super::super) fn resolve_ast_type_path(
     cx: &mut Context<'_>,
     scope: Option<ItemRef>,
     body: &Body,

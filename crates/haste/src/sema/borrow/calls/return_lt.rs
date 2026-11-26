@@ -543,12 +543,14 @@ impl super::super::Checker<'_, '_> {
                 && inner.is_some_and(|i| {
                     self.ty_holds_non_dyn_borrow(i) && expr_depth <= self.ty_max_ref_depth(i)
                 });
+            let derefs_past = past_outer || self.closure_param_loan_flags(target_ty, &src.steps).1;
             if let Some(active) = self.active_closures.last_mut() {
-                if !past_outer
-                    && let Some(idx) = active.params.iter().position(|&p| p == src.target)
-                    && !active.ret_params.contains(&idx)
-                {
-                    active.ret_params.push(idx);
+                if let Some(idx) = active.params.iter().position(|&p| p == src.target) {
+                    if let Some(entry) = active.ret_params.iter_mut().find(|(p, _)| *p == idx) {
+                        entry.1 &= derefs_past;
+                    } else {
+                        active.ret_params.push((idx, derefs_past));
+                    }
                 }
                 if src.origin_only {
                     active.ret_orig.insert(src.target);

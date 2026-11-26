@@ -114,6 +114,14 @@ impl Infer<'_, '_> {
             let resolved = self.resolve(ty);
             match *self.cx.types.kind(resolved) {
                 Kind::Ref(_, inner) => ty = inner,
+                Kind::Array(elem, len) => {
+                    let resolved_len = self.resolve(len);
+                    return if resolved_len != len {
+                        self.cx.types.intern(Kind::Array(elem, resolved_len))
+                    } else {
+                        resolved
+                    };
+                }
                 _ => return resolved,
             }
         }
@@ -447,17 +455,25 @@ impl Infer<'_, '_> {
         let Ok((pats, rest)) = rest_split(self.body, list) else {
             return MPat::Opaque;
         };
+        let ty = self.resolve(ty);
         match *self.cx.types.kind(ty) {
             Kind::Array(elem, len) => {
+                let len = self.resolve(len);
+                let all_wild = |this: &mut Self| {
+                    pats.iter().enumerate().all(|(i, &p)| {
+                        Some(i) == rest || matches!(this.lower_match_pat(p, elem), MPat::Wild)
+                    })
+                };
                 let Some(n) = self.cx.types.len(len) else {
-                    return MPat::Opaque;
+                    return if all_wild(self) {
+                        MPat::Wild
+                    } else {
+                        MPat::Opaque
+                    };
                 };
                 if n > MAX_ARRAY_EXPAND {
                     let fixed = pats.len() - usize::from(rest.is_some());
-                    let all_wild = pats.iter().enumerate().all(|(i, &p)| {
-                        Some(i) == rest || matches!(self.lower_match_pat(p, elem), MPat::Wild)
-                    });
-                    return if all_wild
+                    return if all_wild(self)
                         && (fixed as u64 == n || (rest.is_some() && fixed as u64 <= n))
                     {
                         MPat::Wild

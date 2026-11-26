@@ -1,6 +1,15 @@
-use crate::body::{Args, Body, Bound, GenericArg, Ty as AstTy, TyId};
-use crate::outline::source::Source;
+use std::sync::Arc;
 
+use crate::body::sig::{GenericKind, Signature};
+use crate::body::{Args, Body, Bound, Expr, ExprId, GenericArg, PatId, Ty as AstTy, TyId};
+use crate::names::{ItemRef, plain};
+use crate::outline::item::ItemKind;
+use crate::outline::source::Source;
+use crate::sema::Alias;
+use crate::sema::infer::Res;
+
+use super::super::Checker;
+use super::super::checks::resolve_ast_type_path;
 use super::lifetimes::{LT_STATIC, is_owned_container, is_prim_name, lifetime_is_static};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -257,5 +266,147 @@ fn ast_ty_is_provably_static_in_mode(
             false
         }
         _ => false,
+    }
+}
+
+enum StaticAstOwner {
+    Sig(Arc<Signature>),
+    Alias(Arc<Alias>),
+}
+
+impl Checker<'_, '_> {
+    pub(in super::super) fn scrut_variant_field_is_static(
+        &mut self,
+        pat: PatId,
+        scrut: ExprId,
+        field_idx: usize,
+    ) -> bool {
+        let Some(Res::Ctor(adt_item, variant_idx, _)) = self.typed.pat_res.get(&pat).copied()
+        else {
+            return false;
+        };
+        let scrut = self.unwrap_parens(scrut);
+        let fn_item = match *self.body.expr(scrut) {
+            Expr::Method { .. } => match self.typed.res.get(&scrut).copied() {
+                Some(Res::Fn(it, _)) => Some(it),
+                _ => None,
+            },
+            Expr::Call(callee, _) => self.call_sig_fn_item(scrut, callee),
+            _ => None,
+        };
+        let Some(fn_item) = fn_item else {
+            return false;
+        };
+        let Ok(sig) = self.cx.signature(fn_item) else {
+            return false;
+        };
+        let Some(mut cur_ty) = sig.ret else {
+            return false;
+        };
+        let mut cur_scope: ItemRef = fn_item;
+        let mut owner = StaticAstOwner::Sig(sig);
+        for _ in 0..8 {
+            let cur_body = match &owner {
+                StaticAstOwner::Sig(s) => &s.body,
+                StaticAstOwner::Alias(a) => &a.arena,
+            };
+            while let AstTy::Paren(inner) = *cur_body.ty(cur_ty) {
+                cur_ty = inner;
+            }
+            let AstTy::Path(path_id) = *cur_body.ty(cur_ty) else {
+                return false;
+            };
+            let cur_src = self.cx.item(cur_scope).0;
+            let Some(resolved) =
+                resolve_ast_type_path(self.cx, Some(cur_scope), cur_body, cur_src, path_id)
+            else {
+                return false;
+            };
+            if self.cx.item(resolved).1.kind == ItemKind::Type {
+                let Ok(alias) = self.cx.alias_def(resolved) else {
+                    return false;
+                };
+                cur_ty = alias.ty;
+                cur_scope = resolved;
+                owner = StaticAstOwner::Alias(alias);
+                continue;
+            }
+            if resolved != adt_item {
+                return false;
+            }
+            let Ok(def) = self.cx.adt_def(adt_item) else {
+                return false;
+            };
+            let Some(field) = def
+                .variants
+                .get(variant_idx as usize)
+                .and_then(|v| v.fields.get(field_idx))
+            else {
+                return false;
+            };
+            let adt_src = &self.cx.file(adt_item).source;
+            let mut f_ty = field.ty;
+            while let AstTy::Paren(inner) = *def.body.ty(f_ty) {
+                f_ty = inner;
+            }
+            if let AstTy::Path(fp) = *def.body.ty(f_ty)
+                && def.body.path(fp).qself.is_none()
+                && def.body.list(def.body.path(fp).segments).len() == 1
+            {
+                let seg = def.body.segments[def.body.list(def.body.path(fp).segments)[0] as usize];
+                let fname = plain(adt_src.text(seg.name));
+                if seg.args.is_none()
+                    && let Some(param_pos) = def
+                        .generics
+                        .params
+                        .iter()
+                        .filter(|g| g.kind == GenericKind::Type)
+                        .position(|g| plain(adt_src.text(g.name)) == fname)
+                {
+                    let cur_body = match &owner {
+                        StaticAstOwner::Sig(s) => &s.body,
+                        StaticAstOwner::Alias(a) => &a.arena,
+                    };
+                    let cur_src = self.cx.item(cur_scope).0;
+                    let cur_sig = match &owner {
+                        StaticAstOwner::Sig(s) => Some((s.as_ref(), cur_src)),
+                        StaticAstOwner::Alias(_) => None,
+                    };
+                    let Some(&last_seg) = cur_body.list(cur_body.path(path_id).segments).last()
+                    else {
+                        return false;
+                    };
+                    let Some(Args::Angle(angle)) = cur_body.segments[last_seg as usize].args else {
+                        return false;
+                    };
+                    let Some(arg_ty) = cur_body
+                        .list(angle)
+                        .iter()
+                        .filter_map(|&a| match cur_body.args[a as usize] {
+                            GenericArg::Ty(t) => Some(t),
+                            _ => None,
+                        })
+                        .nth(param_pos)
+                    else {
+                        return false;
+                    };
+                    return ast_ty_is_provably_static_in_mode(
+                        cur_body,
+                        cur_src,
+                        cur_sig,
+                        arg_ty,
+                        DynDefault::InSig,
+                    );
+                }
+            }
+            return ast_ty_is_provably_static_in_mode(
+                &def.body,
+                adt_src,
+                None,
+                f_ty,
+                DynDefault::InSig,
+            );
+        }
+        false
     }
 }
