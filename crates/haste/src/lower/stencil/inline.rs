@@ -667,7 +667,13 @@ fn simplify_inline(
     relocs: &[SymbolSource],
     (limit, simplified, elide): (usize, bool, bool),
 ) -> std::result::Result<(Arc<Function>, bool), Miss> {
-    if func.size() > limit.saturating_mul(6).max(1600) {
+    let quick = crate::profile() != crate::outline::tree::Profile::Release;
+    let pre_cap = if quick {
+        limit.saturating_mul(6).max(256)
+    } else {
+        limit.saturating_mul(6).max(1600)
+    };
+    if func.size() > pre_cap {
         return Err(Miss::Shape);
     }
     haste_codegen::split_coroutine(&mut func);
@@ -676,6 +682,7 @@ fn simplify_inline(
     }
     if !func.unwind_drops().is_empty() {
         let elided = elide
+            && (!quick || func.inline_size() <= limit.saturating_mul(2))
             && func.elide_dead_unwind_drops(|sym| {
                 sym_may_unwind(cx, reached, relocs.get(sym as usize))
             });
