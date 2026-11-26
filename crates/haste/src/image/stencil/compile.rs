@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use haste_codegen::Code;
-use rustc_hash::FxHashSet as HashSet;
 
 use super::{CachedTemplate, DictConfig, VerifyRecord, aot_relocs_valid, compile_traced, item_err};
 use crate::image::aot::{AotCode, AotFn};
@@ -51,32 +50,16 @@ impl Image {
         pass: &mut Pass,
     ) -> Vec<(usize, String)> {
         let mut errors = Vec::new();
-        let mut seen: HashSet<(ItemRef, FootprintId)> = HashSet::default();
+        let check_layout = !reached.unlaid.is_empty();
         for &index in indices {
-            let (item, substs) = reached.list[index].0;
-            if cx.outline.is_fixed(item.krate) {
-                pass.record_size(index, 0, 0);
+            if check_layout
+                && let Ok(typed) = &reached.list[index].1
+                && let Err(err) = crate::sema::reach::lay_out(cx, typed)
+            {
+                errors.push((index, item_err(cx, reached.list[index].0.0, &err)));
                 continue;
             }
-            if indices.len() > 1 && !substs.is_empty() {
-                match lower::eval_footprint(cx, reached, self, index) {
-                    Ok(fp) if !seen.insert((item, fp)) => {
-                        pass.record_size(index, 0, 0);
-                        continue;
-                    }
-                    Ok(_) => {}
-                    Err(err) => {
-                        errors.push((index, item_err(cx, item, &err)));
-                        continue;
-                    }
-                }
-            }
-            let started = std::time::Instant::now();
-            if let Err(err) = lower::lower_stencil(cx, reached, self, index) {
-                errors.push((index, item_err(cx, item, &err)));
-            } else {
-                pass.record_size(index, 0, started.elapsed().as_nanos() as u64);
-            }
+            pass.record_size(index, 0, 0);
         }
         errors
     }
