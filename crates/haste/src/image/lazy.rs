@@ -107,6 +107,17 @@ pub fn serve(
     demand: &mut Jit,
     driver: &mut dyn Driver,
 ) -> Result<()> {
+    serve_selected(compilation, ask, demand, driver, None)
+}
+
+pub(super) fn serve_selected(
+    compilation: &mut Compilation,
+    ask: Answerer<'_>,
+    demand: &mut Jit,
+    driver: &mut dyn Driver,
+    selected: Option<&[bool]>,
+) -> Result<()> {
+    crate::host::native::load_selected(&compilation.outline, selected)?;
     let mut store = std::mem::take(&mut demand.store);
     store.forget_lookups();
     let mut cx = Context::new(&compilation.outline, &compilation.names, store);

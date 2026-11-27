@@ -383,6 +383,9 @@ impl Image {
         reached: &Reached,
         indices: &[usize],
     ) {
+        if self.backend.is_check() {
+            return;
+        }
         let jit = self.backend.is_jit();
         let mut cells_batch = Vec::new();
         let mut aot_batch = Vec::new();

@@ -158,7 +158,6 @@ fn load_with_sysroot(
     if !errors.is_empty() {
         anyhow::bail!("{}", errors.join("\n"));
     }
-    crate::host::native::load(&compilation.outline)?;
     Ok(compilation)
 }
 

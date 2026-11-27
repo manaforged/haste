@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 use anyhow::{Result, bail};
 
 use super::Image;
-use super::lazy::{Answerer, Driver, Ended, Jit, serve};
+use super::lazy::{Answerer, Driver, Ended, Jit, serve_selected};
 use crate::macros::Compilation;
 
 /// One macro call: the declared `proc_macro` entry function, the declared macro function it runs, the one or two input texts, and its group: the calls of one macro crate from one crate, which run in order in one child so the macro's statics carry from call to call as in one compiler process.
@@ -26,15 +26,17 @@ pub fn run_macros(
     compilation: &mut Compilation,
     demand: &mut Jit,
     jobs: &[Job<'_>],
+    selected: &[bool],
     ask: Answerer<'_>,
 ) -> Result<Vec<Option<Result<Vec<u8>, String>>>> {
-    crate::with_host_target(|| run_macros_inner(compilation, demand, jobs, ask))
+    crate::with_host_target(|| run_macros_inner(compilation, demand, jobs, selected, ask))
 }
 
 fn run_macros_inner(
     compilation: &mut Compilation,
     demand: &mut Jit,
     jobs: &[Job<'_>],
+    selected: &[bool],
     ask: Answerer<'_>,
 ) -> Result<Vec<Option<Result<Vec<u8>, String>>>> {
     let mut parts: Vec<Vec<usize>> = Vec::new();
@@ -55,7 +57,7 @@ fn run_macros_inner(
     };
     demand.set_fast(true);
     demand.set_ahead(true);
-    serve(compilation, ask, demand, &mut shares)?;
+    serve_selected(compilation, ask, demand, &mut shares, Some(selected))?;
     Ok(shares.results)
 }
 
