@@ -17,11 +17,14 @@ use super::wire::{
 };
 use super::{enabled, prune_stale};
 
-const LOCAL_MAGIC: [u8; 8] = *b"HSTLCHK1";
-const FILES_MAGIC: [u8; 8] = *b"HSTLFIL1";
+const LOCAL_MAGIC: [u8; 8] = *b"HSTLCHK2";
+const FILES_MAGIC: [u8; 8] = *b"HSTLFIL2";
 const CHECK_HEADER_LEN: usize = 24;
 const FILES_HEADER_LEN: usize = 28;
 const MAX_KEPT_ENTRIES: usize = 512;
+
+type WatchEnvs = Vec<(String, Option<u64>)>;
+type WatchData = (Vec<(PathBuf, FileStamp)>, WatchEnvs);
 
 /// Returns whether the per-crate local disk check cache is enabled.
 pub fn active() -> bool {
@@ -34,6 +37,7 @@ pub struct DirtyCrate {
     pub key: u64,
     pub iface_key: Option<u64>,
     pub dirty_files: Option<Vec<usize>>,
+    carried: WatchData,
 }
 
 /// Partition of checked local crates into cache hits and dirty crates.
@@ -84,6 +88,15 @@ fn rel_path<'a>(outline: &'a Outline, krate: usize, file: &'a File) -> &'a Path 
 fn hash_str(s: &str) -> u64 {
     let mut hasher = FxHasher::default();
     s.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn hash_env_val(name: &str, val: &str) -> u64 {
+    let mut hasher = FxHasher::default();
+    LOCAL_MAGIC.hash(&mut hasher);
+    name.hash(&mut hasher);
+    0xffu8.hash(&mut hasher);
+    val.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -165,10 +178,15 @@ fn local_closure(outline: &Outline, start: usize) -> Vec<usize> {
     out
 }
 
-fn collect_included_stamps(outline: &Outline, closure: &[usize]) -> Vec<(PathBuf, FileStamp)> {
+fn collect_included_stamps(
+    outline: &Outline,
+    closure: &[usize],
+    carried: &[(PathBuf, FileStamp)],
+) -> Vec<(PathBuf, FileStamp)> {
     let mut paths: Vec<PathBuf> = closure
         .iter()
         .flat_map(|&k| outline.included(k).into_iter().map(|(path, _)| path))
+        .chain(carried.iter().map(|(path, _)| path.clone()))
         .collect();
     paths.sort();
     paths.dedup();
@@ -181,15 +199,23 @@ fn collect_included_stamps(outline: &Outline, closure: &[usize]) -> Vec<(PathBuf
         .collect()
 }
 
-fn collect_env_reads(outline: &Outline, closure: &[usize]) -> Vec<(String, Option<String>)> {
-    let mut merged: HashMap<String, Option<String>> = HashMap::default();
+fn collect_env_reads(
+    outline: &Outline,
+    closure: &[usize],
+    carried: &[(String, Option<u64>)],
+) -> WatchEnvs {
+    let mut merged: HashMap<String, Option<u64>> = HashMap::default();
+    for (name, val_hash) in carried {
+        merged.insert(name.clone(), *val_hash);
+    }
     for &k in closure {
         let reads = crate::sync::lock(&outline.crates[k].env.env_reads);
         for (name, val) in reads.iter() {
-            merged.entry(name.clone()).or_insert_with(|| val.clone());
+            let hashed = val.as_deref().map(|v| hash_env_val(name, v));
+            merged.insert(name.clone(), hashed);
         }
     }
-    let mut out: Vec<(String, Option<String>)> = merged.into_iter().collect();
+    let mut out: WatchEnvs = merged.into_iter().collect();
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
 }
@@ -197,7 +223,7 @@ fn collect_env_reads(outline: &Outline, closure: &[usize]) -> Vec<(String, Optio
 fn write_watch_data(
     out: &mut Vec<u8>,
     included: &[(PathBuf, FileStamp)],
-    envs: &[(String, Option<String>)],
+    envs: &[(String, Option<u64>)],
 ) -> Option<()> {
     for (path, stamp) in included {
         write_path(out, path)?;
@@ -213,17 +239,15 @@ fn write_watch_data(
     for (name, val) in envs {
         write_len_bytes(out, name.as_bytes())?;
         match val {
-            Some(v) => {
+            Some(hash) => {
                 out.push(1);
-                write_len_bytes(out, v.as_bytes())?;
+                out.extend_from_slice(&hash.to_le_bytes());
             }
             None => out.push(0),
         }
     }
     Some(())
 }
-
-type WatchData = (Vec<(PathBuf, FileStamp)>, Vec<(String, Option<String>)>);
 
 fn read_watch_data(
     data: &[u8],
@@ -251,7 +275,10 @@ fn read_watch_data(
         let present = *read_bytes(data, pos, 1)?.first()?;
         let val = match present {
             0 => None,
-            1 => Some(read_utf8(data, pos)?),
+            1 => {
+                let raw = read_bytes(data, pos, 8)?;
+                Some(read_u64(raw, 0))
+            }
             _ => return None,
         };
         envs.push((name, val));
@@ -259,19 +286,22 @@ fn read_watch_data(
     Some((included, envs))
 }
 
-fn validate_watch(included: &[(PathBuf, FileStamp)], envs: &[(String, Option<String>)]) -> bool {
+fn validate_watch(included: &[(PathBuf, FileStamp)], envs: &[(String, Option<u64>)]) -> bool {
     included
         .iter()
         .all(|(inc, expected)| file_stamp(inc) == *expected)
-        && envs
-            .iter()
-            .all(|(name, expected)| crate::process_env_var(name) == *expected)
+        && envs.iter().all(|(name, expected)| {
+            crate::process_env_var(name)
+                .as_deref()
+                .map(|v| hash_env_val(name, v))
+                == *expected
+        })
 }
 
 fn encode_entry(
     key: u64,
     included: &[(PathBuf, FileStamp)],
-    envs: &[(String, Option<String>)],
+    envs: &[(String, Option<u64>)],
 ) -> Option<Vec<u8>> {
     let inc_count = u32::try_from(included.len()).ok()?;
     let env_count = u32::try_from(envs.len()).ok()?;
@@ -302,7 +332,7 @@ fn encode_files_entry(
     iface_key: u64,
     files: &[(u64, u64)],
     included: &[(PathBuf, FileStamp)],
-    envs: &[(String, Option<String>)],
+    envs: &[(String, Option<u64>)],
 ) -> Option<Vec<u8>> {
     let file_count = u32::try_from(files.len()).ok()?;
     let inc_count = u32::try_from(included.len()).ok()?;
@@ -344,17 +374,13 @@ fn decode_files_entry(data: &[u8], expected_key: u64) -> Option<(HashMap<u64, u6
     (pos == data.len()).then_some((files, watch))
 }
 
-fn try_hit_at(path: &Path, key: u64) -> bool {
-    let Ok(data) = std::fs::read(path) else {
-        return false;
-    };
-    let Some((included, envs)) = decode_entry(&data, key) else {
-        return false;
-    };
-    validate_watch(&included, &envs)
+fn try_hit_at(path: &Path, key: u64) -> Option<WatchData> {
+    let data = std::fs::read(path).ok()?;
+    let (included, envs) = decode_entry(&data, key)?;
+    validate_watch(&included, &envs).then_some((included, envs))
 }
 
-fn try_hit(key: u64) -> bool {
+fn try_hit(key: u64) -> Option<WatchData> {
     try_hit_at(&entry_path(key), key)
 }
 
@@ -363,7 +389,7 @@ fn try_hit_files_at(
     iface_key: u64,
     outline: &Outline,
     krate: usize,
-) -> Option<Vec<usize>> {
+) -> Option<(Vec<usize>, WatchData)> {
     let data = std::fs::read(path).ok()?;
     let (cached, (included, envs)) = decode_files_entry(&data, iface_key)?;
     if !validate_watch(&included, &envs) {
@@ -380,11 +406,16 @@ fn try_hit_files_at(
         })
         .map(|(idx, _)| idx)
         .collect();
-    Some(dirty)
+    Some((dirty, (included, envs)))
 }
 
 fn has_partial_local(outline: &Outline, closure: &[usize]) -> bool {
     closure.iter().any(|&k| outline.crates[k].partial())
+}
+
+fn merge_watch_into(dst: &mut WatchData, src: &WatchData) {
+    dst.0.extend(src.0.iter().cloned());
+    dst.1.extend(src.1.iter().cloned());
 }
 
 /// Splits `crates` into cached-passing crates and dirty crates under `(toolchain_key, target_key)`.
@@ -397,21 +428,20 @@ pub fn partition(
     let hashes = CrateHashes::compute(outline, toolchain_key, target_key);
     let global_key = global_check_key(workspace);
     let mut hits = Vec::new();
-    let mut dirty = Vec::new();
+    let mut is_dirty = vec![false; outline.crates.len()];
+    let mut watches_by_crate: HashMap<usize, WatchData> = HashMap::default();
+    let mut pending_dirty = Vec::new();
     for &krate in crates {
         let key = crate_key(&hashes, krate, global_key);
         let closure = local_closure(outline, krate);
         if has_partial_local(outline, &closure) {
-            dirty.push(DirtyCrate {
-                krate,
-                key,
-                iface_key: None,
-                dirty_files: None,
-            });
+            is_dirty[krate] = true;
+            pending_dirty.push((krate, key, None, None));
             continue;
         }
-        if try_hit(key) {
+        if let Some(watch) = try_hit(key) {
             hits.push(krate);
+            watches_by_crate.insert(krate, watch);
             continue;
         }
         let iface_key = can_file_cache(workspace, outline, krate).then(|| {
@@ -424,25 +454,43 @@ pub fn partition(
             )
         });
         if let Some(ik) = iface_key
-            && let Some(dirty_files) = try_hit_files_at(&files_path(ik), ik, outline, krate)
+            && let Some((dirty_files, watch)) =
+                try_hit_files_at(&files_path(ik), ik, outline, krate)
         {
+            watches_by_crate.insert(krate, watch);
             if dirty_files.is_empty() {
                 hits.push(krate);
             } else {
-                dirty.push(DirtyCrate {
-                    krate,
-                    key,
-                    iface_key: Some(ik),
-                    dirty_files: Some(dirty_files),
-                });
+                is_dirty[krate] = true;
+                pending_dirty.push((krate, key, Some(ik), Some(dirty_files)));
             }
             continue;
+        }
+        is_dirty[krate] = true;
+        pending_dirty.push((krate, key, iface_key, None));
+    }
+    let mut unhit_deps = HashSet::default();
+    let mut dirty = Vec::with_capacity(pending_dirty.len());
+    for (krate, key, iface_key, dirty_files) in pending_dirty {
+        let mut carried = (Vec::new(), Vec::new());
+        for dep in local_closure(outline, krate) {
+            if let Some(watch) = watches_by_crate.get(&dep) {
+                merge_watch_into(&mut carried, watch);
+            } else if !is_dirty[dep] && !unhit_deps.contains(&dep) {
+                if let Some(watch) = try_hit(crate_key(&hashes, dep, global_key)) {
+                    merge_watch_into(&mut carried, &watch);
+                    watches_by_crate.insert(dep, watch);
+                } else {
+                    unhit_deps.insert(dep);
+                }
+            }
         }
         dirty.push(DirtyCrate {
             krate,
             key,
             iface_key,
-            dirty_files: None,
+            dirty_files,
+            carried,
         });
     }
     Partition { hits, dirty }
@@ -490,8 +538,8 @@ pub fn record(outline: &Outline, dirty: &[DirtyCrate], failed_crates: &HashSet<u
         if has_partial_local(outline, &closure) {
             continue;
         }
-        let included = collect_included_stamps(outline, &closure);
-        let envs = collect_env_reads(outline, &closure);
+        let included = collect_included_stamps(outline, &closure, &entry.carried.0);
+        let envs = collect_env_reads(outline, &closure, &entry.carried.1);
         if let Some(bytes) = encode_entry(entry.key, &included, &envs) {
             let path = entry_path(entry.key);
             if write_new_bytes(&path, &bytes).is_ok() {
@@ -522,78 +570,4 @@ pub fn record(outline: &Outline, dirty: &[DirtyCrate], failed_crates: &HashSet<u
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn encode_decode_round_trip_and_key_mismatch() {
-        let included = vec![
-            (PathBuf::from("/tmp/a.txt"), Some((12, 345_678))),
-            (PathBuf::from("/tmp/missing.txt"), None),
-        ];
-        let envs = vec![
-            ("VAR_A".to_owned(), Some("val".to_owned())),
-            ("VAR_B".to_owned(), None),
-        ];
-        let bytes = encode_entry(0xDEAD_BEEF, &included, &envs).expect("encode");
-        assert!(decode_entry(&bytes, 0xCAFE_BABE).is_none());
-        let (dec_inc, dec_env) = decode_entry(&bytes, 0xDEAD_BEEF).expect("decode");
-        assert_eq!(dec_inc, included);
-        assert_eq!(dec_env, envs);
-    }
-
-    #[test]
-    fn files_entry_round_trip_and_key_mismatch() {
-        let files = vec![(11, 22), (33, 44)];
-        let included = vec![(PathBuf::from("/tmp/a.txt"), Some((1, 2)))];
-        let envs = vec![("FOO".to_owned(), Some("bar".to_owned()))];
-        let bytes = encode_files_entry(0xABCD_1234, &files, &included, &envs).expect("encode");
-        assert!(decode_files_entry(&bytes, 0x9999_0000).is_none());
-        let (dec_files, (dec_inc, dec_env)) =
-            decode_files_entry(&bytes, 0xABCD_1234).expect("decode");
-        assert_eq!(dec_files.get(&11), Some(&22));
-        assert_eq!(dec_files.get(&33), Some(&44));
-        assert_eq!(dec_inc, included);
-        assert_eq!(dec_env, envs);
-    }
-
-    #[test]
-    fn try_hit_detects_env_and_included_file_changes() {
-        let tmp = std::env::temp_dir().join(format!("haste-local-test-{}", std::process::id()));
-        drop(std::fs::remove_dir_all(&tmp));
-        std::fs::create_dir_all(&tmp).expect("mkdir");
-        let inc_file = tmp.join("data.txt");
-        std::fs::write(&inc_file, "hello").expect("write");
-        let stamp = file_stamp(&inc_file);
-        let entry_id = 0x1111_2222_3333_4444_u64;
-        let cache_file = tmp.join(format!("{entry_id:016x}.check"));
-        let bytes = encode_entry(
-            entry_id,
-            &[(inc_file.clone(), stamp)],
-            &[("HASTE_TEST_LOCAL_ENV".to_owned(), Some("v1".to_owned()))],
-        )
-        .expect("encode");
-        write_new_bytes(&cache_file, &bytes).expect("write cache");
-        let env_v1 = {
-            let mut m = rustc_hash::FxHashMap::default();
-            m.insert("HASTE_TEST_LOCAL_ENV".to_owned(), "v1".to_owned());
-            std::sync::Arc::new(m)
-        };
-        let env_v2 = {
-            let mut m = rustc_hash::FxHashMap::default();
-            m.insert("HASTE_TEST_LOCAL_ENV".to_owned(), "v2".to_owned());
-            std::sync::Arc::new(m)
-        };
-        assert!(crate::with_client_env(Some(env_v1.clone()), || {
-            try_hit_at(&cache_file, entry_id)
-        }));
-        assert!(!crate::with_client_env(Some(env_v2), || {
-            try_hit_at(&cache_file, entry_id)
-        }));
-        std::fs::write(&inc_file, "hello world!").expect("edit inc");
-        assert!(!crate::with_client_env(Some(env_v1), || {
-            try_hit_at(&cache_file, entry_id)
-        }));
-        drop(std::fs::remove_dir_all(&tmp));
-    }
-}
+mod tests;

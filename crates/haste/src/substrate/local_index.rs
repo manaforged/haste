@@ -430,9 +430,6 @@ mod tests {
     use super::*;
     use crate::outline::Role;
     use crate::sema::summary::codec::Cursor;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn temp_dir(tag: &str) -> PathBuf {
         let seq = std::time::SystemTime::now()
@@ -448,10 +445,10 @@ mod tests {
     }
 
     fn with_local_env<R>(home: &Path, disable_local: bool, f: impl FnOnce() -> R) -> R {
-        let _guard = crate::sync::lock(&ENV_LOCK);
+        let _guard = crate::sync::lock(&crate::substrate::TEST_HOME_LOCK);
         let prev_home = std::env::var_os("HASTE_HOME");
         let prev_no_local = std::env::var_os("HASTE_NO_LOCAL_INDEX");
-        // SAFETY: serialized by `ENV_LOCK` within unit tests.
+        // SAFETY: serialized by `TEST_HOME_LOCK` within unit tests.
         unsafe {
             std::env::set_var("HASTE_HOME", home);
             if disable_local {
@@ -461,7 +458,7 @@ mod tests {
             }
         }
         let out = f();
-        // SAFETY: serialized by `ENV_LOCK` within unit tests.
+        // SAFETY: serialized by `TEST_HOME_LOCK` within unit tests.
         unsafe {
             match prev_home {
                 Some(v) => std::env::set_var("HASTE_HOME", v),
