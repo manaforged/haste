@@ -89,13 +89,8 @@ impl<'a> Checker<'_, 'a> {
         } else {
             self.typed.res.get(&expr).copied()
         };
-        if matches!(ctor_res, Some(Res::Ctor(..))) {
-            let arg_ids: Vec<u32> = self.body.list(args).to_vec();
-            let mut out = Vec::new();
-            for id in arg_ids {
-                out.extend(self.expr_borrow_sources_inner(ExprId(id), state, true, extend_depth));
-            }
-            return dedup_sources(out);
+        if let Some(Res::Ctor(item, variant, _)) = ctor_res {
+            return self.ctor_borrow_sources(item, variant, args, state, extend_depth);
         }
         if let Some(fn_item) = self.call_sig_fn_item(expr, callee) {
             return self.sig_borrow_sources(expr, fn_item, None, args, state);
@@ -386,6 +381,7 @@ impl<'a> Checker<'_, 'a> {
                     .cloned()
             {
                 arg_srcs.retain(|s| ret_real.contains(&s.target) || ret_orig.contains(&s.target));
+                arg_srcs = self.unwrap_closure_ret_origin_containers(arg_srcs, state);
             }
             out.extend(arg_srcs);
         }
@@ -394,7 +390,7 @@ impl<'a> Checker<'_, 'a> {
         {
             out.extend(self.sig_no_lt_recv_sources(
                 (ctx.expr, recv, ret_ty),
-                sig,
+                (sig, ctx.sig_src),
                 arg_ids,
                 &ctx.flags,
                 state,
@@ -406,7 +402,7 @@ impl<'a> Checker<'_, 'a> {
     fn sig_no_lt_recv_sources(
         &mut self,
         (call_expr, recv, ret_ty): (ExprId, ExprId, Ty),
-        sig: &Signature,
+        (sig, sig_src): (&Signature, &Source),
         arg_ids: &[u32],
         flags: &SigFnFlags<'a>,
         state: &State,
@@ -433,6 +429,12 @@ impl<'a> Checker<'_, 'a> {
                 .is_some_and(|a| a.derefs > 0)
         {
             return self.guard_take_recv_sources(call_expr, recv, recv_sources, state);
+        }
+        if let Some((SelfKind::Typed(self_ty), _)) = sig.receiver
+            && !self.is_ref_ty(ret_ty)
+            && super::closure_peel::ast_ty_refs_self(&sig.body, sig_src, self_ty)
+        {
+            return self.unwrap_typed_self_ref_sources(call_expr, recv, recv_sources, state);
         }
         let owns_dyn_only =
             recv_is_by_ref(sig) && ret_ty != Ty::NONE && !self.ty_holds_non_dyn_borrow(ret_ty);

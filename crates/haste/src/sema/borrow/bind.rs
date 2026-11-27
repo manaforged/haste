@@ -44,7 +44,7 @@ impl Checker<'_, '_> {
             return;
         }
         let ty = self.local_ty(local);
-        if ty != Ty::NONE && !self.ty_holds_borrow(ty) {
+        if ty != Ty::NONE && !self.ty_holds_borrow(ty) && !self.ty_has_non_static_param(ty) {
             return;
         }
         let is_shared_target = |target: u32| self.is_shared_ref_or_ptr(self.local_ty(target));

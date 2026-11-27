@@ -1,9 +1,9 @@
-use crate::body::{Args, Body, Expr, ExprId, GenericArg, Ty as AstTy, TyId};
+use crate::body::{Args, Body, Expr, ExprId, GenericArg, List, Ty as AstTy, TyId};
 use crate::lower::is_freeze_ty;
-use crate::names::plain;
+use crate::names::{ItemRef, plain};
 use crate::outline::source::Source;
 use crate::sema::infer::Res;
-use crate::sema::ty::{Kind, Ty};
+use crate::sema::ty::{Kind, Mut, Ty};
 
 use super::super::{Checker, State};
 use super::sig::SigCall;
@@ -455,4 +455,28 @@ fn peel_try_ret_ast(
         }
     }
     Some(first)
+}
+
+impl Checker<'_, '_> {
+    pub(super) fn ctor_borrow_sources(
+        &mut self,
+        item: ItemRef,
+        variant: u32,
+        args: List,
+        state: &State,
+        extend_depth: Option<u32>,
+    ) -> Vec<BorrowSource> {
+        let arg_ids: Vec<u32> = self.body.list(args).to_vec();
+        let mut out = Vec::new();
+        for (idx, id) in arg_ids.into_iter().enumerate() {
+            let reborrow_mut = self.ctor_field_ref_mut(item, variant, idx) != Some(Mut::Not);
+            out.extend(self.expr_borrow_sources_inner(
+                ExprId(id),
+                state,
+                reborrow_mut,
+                extend_depth,
+            ));
+        }
+        dedup_sources(out)
+    }
 }

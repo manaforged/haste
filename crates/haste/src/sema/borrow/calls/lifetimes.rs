@@ -360,11 +360,12 @@ pub(in super::super) fn compute_param_lifetimes(
 }
 
 fn resolve_slot_lts(
-    sig: &crate::body::sig::Signature,
+    sig: &Signature,
     src: &Source,
     lts: &Lifetimes<'_>,
     impl_lts: (bool, bool, &[String]),
     static_names: &[String],
+    allow_self_elided: bool,
 ) -> (bool, Vec<String>) {
     let (impl_has_lt, impl_has_elided, impl_named) = impl_lts;
     let has_self = lts.names.contains(&"Self");
@@ -376,7 +377,7 @@ fn resolve_slot_lts(
             }
         }
     }
-    let self_elided = impl_has_elided && has_self;
+    let self_elided = allow_self_elided && impl_has_elided && has_self;
     let mut has_elided =
         lts.has_elided || self_elided || has_unbounded_type_param(sig, src, lts, static_names);
     if has_elided
@@ -399,12 +400,7 @@ fn resolve_slot_lts(
 
 fn record_param_ty(
     cx: &mut crate::sema::Context<'_>,
-    (item, sig, src, static_names): (
-        crate::names::ItemRef,
-        &crate::body::sig::Signature,
-        &Source,
-        &[String],
-    ),
+    (item, sig, src, static_names): (crate::names::ItemRef, &Signature, &Source, &[String]),
     ty: TyId,
     impl_lts: (bool, bool, &[String]),
     slot: usize,
@@ -417,9 +413,10 @@ fn record_param_ty(
         && lts.named.is_empty()
         && !(impl_lts.0 && lts.names.contains(&"Self"))
         && has_unbounded_type_param(sig, src, &lts, static_names);
-    let (has_elided, named) = resolve_slot_lts(sig, src, &lts, impl_lts, static_names);
-    info.has_elided_lt[slot] = has_elided;
-    info.named_lts[slot] = named;
+    let allow_elided =
+        !super::super::propagate::closure_peel::all_self_behind_named_ref(&sig.body, src, ty);
+    (info.has_elided_lt[slot], info.named_lts[slot]) =
+        resolve_slot_lts(sig, src, &lts, impl_lts, static_names, allow_elided);
     if let AstTy::Ref {
         lifetime,
         ty: inner,
@@ -442,10 +439,8 @@ fn record_param_ty(
         );
         let mut inner_lts = Lifetimes::default();
         collect_ty_lifetimes(&sig.body, src, inner, &mut inner_lts);
-        let (inner_has_elided, inner_named) =
-            resolve_slot_lts(sig, src, &inner_lts, impl_lts, static_names);
-        info.inner_has_elided_lt[slot] = inner_has_elided;
-        info.inner_named_lts[slot] = inner_named;
+        (info.inner_has_elided_lt[slot], info.inner_named_lts[slot]) =
+            resolve_slot_lts(sig, src, &inner_lts, impl_lts, static_names, true);
     }
 }
 

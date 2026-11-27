@@ -1,6 +1,10 @@
 use rustc_hash::FxHashSet as HashSet;
 
-use crate::body::{BlockKind, Expr, ExprId, Pat, PatId, Stmt, UnOp};
+use crate::body::{
+    Args, BlockKind, Body, Bound, Expr, ExprId, GenericArg, Pat, PatId, Stmt, Ty as AstTy, TyId,
+    UnOp,
+};
+use crate::outline::source::Source;
 use crate::sema::infer::Res;
 use crate::sema::ty::{Kind, Mut, Ty};
 
@@ -377,4 +381,157 @@ impl Checker<'_, '_> {
         }
         true
     }
+
+    pub(super) fn unwrap_typed_self_ref_sources(
+        &mut self,
+        call_expr: ExprId,
+        recv: ExprId,
+        recv_sources: Vec<super::BorrowSource>,
+        state: &super::super::State,
+    ) -> Vec<super::BorrowSource> {
+        let mut out = self.copied_recv_sources(call_expr, recv, recv_sources, state, true);
+        if self.closure_depth > 0 {
+            for s in &mut out {
+                if !self.is_ref_ty(self.local_ty(s.target))
+                    && !self.is_closure_param(s.target)
+                    && self
+                        .scope_depth
+                        .get(s.target as usize)
+                        .copied()
+                        .unwrap_or(0)
+                        < self.closure_depth
+                {
+                    s.origin_only = true;
+                }
+            }
+        }
+        out
+    }
+
+    pub(super) fn unwrap_closure_ret_origin_containers(
+        &mut self,
+        sources: Vec<super::BorrowSource>,
+        state: &super::super::State,
+    ) -> Vec<super::BorrowSource> {
+        let targets: Vec<u32> = sources
+            .iter()
+            .filter(|s| {
+                s.origin_only
+                    && !self.is_ref_ty(self.local_ty(s.target))
+                    && !self.is_param_local(s.target)
+                    && !self.is_closure_param(s.target)
+                    && state.loans.iter().any(|l| l.holder == Some(s.target))
+            })
+            .map(|s| s.target)
+            .collect();
+        if targets.is_empty() {
+            return sources;
+        }
+        self.unwrap_container_loans_deep(sources, state, &targets)
+    }
+}
+
+fn self_ref_status(
+    body: &Body,
+    src: &Source,
+    ty: TyId,
+    behind_ref: bool,
+    behind_named: bool,
+) -> (bool, bool) {
+    let merge = |(a0, a1): (bool, bool), (b0, b1): (bool, bool)| (a0 || b0, a1 || b1);
+    let check_args = |args: Option<Args>, in_ref: bool, in_named: bool| -> (bool, bool) {
+        match args {
+            Some(Args::Angle(list)) => body.list(list).iter().fold((false, false), |acc, &arg| {
+                let sub = match body.args[arg as usize] {
+                    GenericArg::Ty(t) | GenericArg::Binding { ty: t, .. } => {
+                        self_ref_status(body, src, t, in_ref, in_named)
+                    }
+                    _ => (false, false),
+                };
+                (acc.0 || sub.0, acc.1 || sub.1)
+            }),
+            Some(Args::Paren { inputs, output }) => {
+                let mut acc = body.list(inputs).iter().fold((false, false), |acc, &t| {
+                    let sub = self_ref_status(body, src, TyId(t), false, false);
+                    (acc.0 || sub.0, acc.1 || sub.1)
+                });
+                if let Some(o) = output {
+                    let sub = self_ref_status(body, src, o, false, false);
+                    acc = (acc.0 || sub.0, acc.1 || sub.1);
+                }
+                acc
+            }
+            _ => (false, false),
+        }
+    };
+    match *body.ty(ty) {
+        AstTy::Ref {
+            lifetime,
+            ty: inner,
+            ..
+        } => {
+            let next_named = behind_named
+                || lifetime
+                    .is_some_and(|lt| super::super::calls::lifetimes::is_named_lt(src.text(lt)));
+            self_ref_status(body, src, inner, true, next_named)
+        }
+        AstTy::Path(path) => {
+            let segs = body.list(body.path(path).segments);
+            let mut acc = if segs
+                .first()
+                .is_some_and(|&s| src.text(body.segments[s as usize].name) == "Self")
+            {
+                (behind_ref, !behind_named)
+            } else {
+                (false, false)
+            };
+            for &s in segs {
+                acc = merge(
+                    acc,
+                    check_args(body.segments[s as usize].args, behind_ref, behind_named),
+                );
+            }
+            acc
+        }
+        AstTy::Tuple(list) => body.list(list).iter().fold((false, false), |acc, &t| {
+            let sub = self_ref_status(body, src, TyId(t), behind_ref, behind_named);
+            (acc.0 || sub.0, acc.1 || sub.1)
+        }),
+        AstTy::Slice(t) | AstTy::Array(t, _) | AstTy::Paren(t) | AstTy::Pat(t, _) => {
+            self_ref_status(body, src, t, behind_ref, behind_named)
+        }
+        AstTy::Ptr { ty: t, .. } => self_ref_status(body, src, t, false, false),
+        AstTy::Fn { params, ret, .. } => {
+            let mut acc = body.list(params).iter().fold((false, false), |acc, &t| {
+                let sub = self_ref_status(body, src, TyId(t), false, false);
+                (acc.0 || sub.0, acc.1 || sub.1)
+            });
+            if let Some(r) = ret {
+                acc = merge(acc, self_ref_status(body, src, r, false, false));
+            }
+            acc
+        }
+        AstTy::ImplTrait(_, list) | AstTy::DynTrait(list) => {
+            body.list(list).iter().fold((false, false), |mut acc, &b| {
+                if let Bound::Trait { path, .. } = body.bounds[b as usize] {
+                    for &s in body.list(body.path(path).segments) {
+                        acc = merge(
+                            acc,
+                            check_args(body.segments[s as usize].args, false, false),
+                        );
+                    }
+                }
+                acc
+            })
+        }
+        _ => (false, false),
+    }
+}
+
+pub(in super::super) fn all_self_behind_named_ref(body: &Body, src: &Source, ty: TyId) -> bool {
+    !self_ref_status(body, src, ty, false, false).1
+}
+
+pub(in super::super) fn ast_ty_refs_self(body: &Body, src: &Source, ty: TyId) -> bool {
+    self_ref_status(body, src, ty, false, false).0
 }

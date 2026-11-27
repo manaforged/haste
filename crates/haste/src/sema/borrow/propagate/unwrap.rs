@@ -454,11 +454,12 @@ impl Checker<'_, '_> {
         for _ in 0..8 {
             let mut grew = false;
             cur = super::unwrap_container_loans(cur, state, |s| {
+                let s_ty = self.local_ty(s.target);
                 let should = !self.from_caller(s.target, s.through_ref)
                     && !self.is_param_local(s.target)
                     && !self.is_closure_param(s.target)
                     && checks::is_temp_target(s.target).is_none()
-                    && self.ty_holds_borrow(self.local_ty(s.target))
+                    && (self.ty_holds_borrow(s_ty) || self.ty_has_non_static_param(s_ty))
                     && state.loans.iter().any(|l| l.holder == Some(s.target))
                     && seen.insert(s.target);
                 grew |= should;

@@ -1,4 +1,4 @@
-mod closure_peel;
+pub(super) mod closure_peel;
 mod sig;
 mod tuple;
 mod unwrap;
@@ -707,6 +707,13 @@ impl Checker<'_, '_> {
                 });
             }
             return dedup_sources(out);
+        }
+        if p.through_ref
+            && !self.is_ref_ty(self.local_ty(local))
+            && !self.is_param_local(local)
+            && !self.is_closure_param(local)
+        {
+            return Vec::new();
         }
         vec![BorrowSource {
             target: local,

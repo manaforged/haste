@@ -491,7 +491,7 @@ impl super::super::Checker<'_, '_> {
         self.ast_ptr_or_ref_mut_local(&def.body, &self.cx.file(item).source, f_ty)
     }
 
-    pub(super) fn ctor_field_ref_mut(
+    pub(in super::super) fn ctor_field_ref_mut(
         &mut self,
         item: ItemRef,
         variant: u32,
