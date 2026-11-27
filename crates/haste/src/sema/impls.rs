@@ -79,6 +79,8 @@ pub fn head(kind: &Kind) -> Option<Head> {
 }
 
 mod index;
+#[cfg(test)]
+pub(crate) mod tests;
 
 use index::Asked;
 pub use index::Index;
@@ -459,6 +461,7 @@ impl<'a> Context<'a> {
             return known;
         }
         let before = self.quiet_mark();
+        let asks_before = self.asks.count();
         let found = header.trait_ref.and_then(|trait_ref| {
             let syntax::Ty::Path(path) = *header.body.ty(trait_ref) else {
                 return None;
@@ -478,7 +481,7 @@ impl<'a> Context<'a> {
                 _ => None,
             }
         });
-        if self.quiet_mark() == before {
+        if self.quiet_mark() == before && self.asks.count() == asks_before {
             self.store.lookups.impl_traits.insert(block, found);
         }
         found
@@ -584,7 +587,8 @@ impl<'a> Context<'a> {
                     this.asks.crates.borrow_mut().push(krate);
                 }
                 let mut index = (*cached).clone();
-                let blocks = this.crate_body_impls(krate);
+                let (blocks, incomplete) = this.crate_body_impls(krate);
+                index.incomplete |= incomplete;
                 this.index_blocks(&mut index, blocks);
                 index
             });
@@ -604,11 +608,14 @@ impl<'a> Context<'a> {
             {
                 this.asks.crates.borrow_mut().push(krate);
             }
-            let blocks = match holder {
+            let (blocks, incomplete) = match holder {
                 Holder::Crate(krate) => this.crate_impls(krate),
-                Holder::Body(root) => this.body_impls(root),
+                Holder::Body(root) => (this.body_impls(root), false),
             };
-            let mut index = Index::default();
+            let mut index = Index {
+                incomplete,
+                ..Index::default()
+            };
             this.index_blocks(&mut index, blocks);
             index
         });
@@ -645,19 +652,21 @@ impl<'a> Context<'a> {
         }
     }
 
-    /// The impls of crate `krate`: those of its modules, then those in the bodies of its module-level `const _` items and functions.
-    fn crate_impls(&mut self, krate: u32) -> Vec<ImplRef> {
+    /// The impls of crate `krate`: those of its modules, then those in the bodies of its module-level `const _` items and functions, and whether any body failed to parse yet.
+    fn crate_impls(&mut self, krate: u32) -> (Vec<ImplRef>, bool) {
         let count = self.outline.crates[krate as usize].impls.len() as u32;
         let mut blocks: Vec<ImplRef> = (0..count)
             .map(|index| ImplRef::Module { krate, index })
             .collect();
-        blocks.extend(self.crate_body_impls(krate));
-        blocks
+        let (body_blocks, incomplete) = self.crate_body_impls(krate);
+        blocks.extend(body_blocks);
+        (blocks, incomplete)
     }
 
-    fn crate_body_impls(&mut self, krate: u32) -> Vec<ImplRef> {
+    fn crate_body_impls(&mut self, krate: u32) -> (Vec<ImplRef>, bool) {
         let bodies = self.outline.crates[krate as usize].impl_bodies.clone();
         let mut blocks = Vec::new();
+        let mut incomplete = false;
         for (file, item) in bodies {
             let root = ItemRef {
                 krate,
@@ -666,9 +675,11 @@ impl<'a> Context<'a> {
             };
             if self.file(root).body_read(krate, item) || self.parse_body(root).is_ok() {
                 blocks.extend(self.body_impls(root));
+            } else {
+                incomplete = true;
             }
         }
-        blocks
+        (blocks, incomplete)
     }
 
     fn body_impls(&self, root: ItemRef) -> Vec<ImplRef> {

@@ -627,3 +627,125 @@ impl Specialty {
         other.direct.iter().all(|of| self.implied.contains(of))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use rustc_hash::FxHashMap as HashMap;
+
+    use crate::names::{Crate as NamesCrate, ItemRef, Names, Symbols};
+    use crate::outline::tree::Files;
+    use crate::outline::{Outline, Role, Root};
+    use crate::sema::impls::tests::declared_crate;
+    use crate::sema::{Cache, Context};
+
+    #[test]
+    fn body_local_struct_impl_satisfies_trait() {
+        let dir =
+            std::env::temp_dir().join(format!("haste_body_local_impl_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let dep_path = dir.join("dep.rs");
+        let app_path = dir.join("app.rs");
+        std::fs::write(
+            &dep_path,
+            concat!(
+                "pub mod collector {\n",
+                "    pub trait Collector {\n",
+                "        fn ping(&self) -> u32;\n",
+                "    }\n",
+                "}\n",
+                "pub struct Report;\n",
+                "impl Report {\n",
+                "    pub fn info<C: collector::Collector>(_r: Report, _c: C) -> u32 {\n",
+                "        7\n",
+                "    }\n",
+                "}\n",
+            ),
+        )
+        .expect("write dep.rs");
+        std::fs::write(
+            &app_path,
+            concat!(
+                "fn invoke_report() -> u32 {\n",
+                "    use dep::{Report, collector::*};\n",
+                "    struct LocalCollector;\n",
+                "    impl Collector for LocalCollector {\n",
+                "        fn ping(&self) -> u32 {\n",
+                "            7\n",
+                "        }\n",
+                "    }\n",
+                "    Report::info(Report, LocalCollector)\n",
+                "}\n",
+            ),
+        )
+        .expect("write app.rs");
+
+        let app_deps = vec![("dep".to_owned(), 0usize)];
+        let mut outline = Outline {
+            roots: vec![
+                Root {
+                    unit: 0,
+                    name: "dep".to_owned(),
+                    path: dep_path.clone(),
+                    role: Role::Lib,
+                    edition: "2021".to_owned(),
+                    proc_macro: false,
+                },
+                Root {
+                    unit: 1,
+                    name: "app".to_owned(),
+                    path: app_path.clone(),
+                    role: Role::Bin,
+                    edition: "2021".to_owned(),
+                    proc_macro: false,
+                },
+            ],
+            crates: vec![declared_crate(dep_path), declared_crate(app_path)],
+            deps: vec![Vec::new(), app_deps],
+            cache: Files::default(),
+            procs: HashMap::default(),
+            pins: vec![None, None],
+        };
+        outline.load_all().expect("load outline");
+
+        let syms = Symbols::default();
+        let dep_sym = syms.intern("dep");
+        let mut dep_names = NamesCrate::default();
+        dep_names.edition = "2021".to_owned();
+        dep_names.eager = true;
+        let mut app_names = NamesCrate::default();
+        app_names.edition = "2021".to_owned();
+        app_names.deps = vec![(dep_sym, 0)];
+        app_names.eager = true;
+
+        let mut names = Names {
+            crates: vec![dep_names, app_names],
+            symbols: syms,
+        };
+        names.resolve(&mut outline).expect("resolve names");
+
+        let mut cx = Context::new(&outline, &names, Cache::default());
+        let collector_trait = outline.crates[0].files[0]
+            .items
+            .items
+            .iter()
+            .enumerate()
+            .find_map(|(i, it)| {
+                it.name
+                    .is_some_and(|n| outline.crates[0].files[0].source.text(n) == "Collector")
+                    .then_some(ItemRef {
+                        krate: 0,
+                        file: 0,
+                        item: i as u32,
+                    })
+            })
+            .expect("Collector trait");
+        let found = cx.trait_impls(collector_trait, None, &[1]);
+        assert!(
+            found
+                .iter()
+                .any(|b| matches!(b, crate::sema::impls::ImplRef::Body(_))),
+            "body-local impl for Collector must be indexed: {found:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
