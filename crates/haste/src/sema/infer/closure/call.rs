@@ -379,4 +379,72 @@ impl<'a> Infer<'_, 'a> {
         let frame = self.adt_frame(item, &def.generics.params, args)?;
         self.first_callable_bound(frame, &def.body, bounds)
     }
+
+    pub(in super::super) fn dyn_super_call(
+        &mut self,
+        step: (ExprId, Ty, u32),
+        ty: Ty,
+        args: List,
+    ) -> Result<Option<Ty>> {
+        let Kind::Dyn(of, parts, members, _) = *self.cx.types.kind(ty) else {
+            return Ok(None);
+        };
+        let (p, m) = (self.cx.types.substs(parts), self.cx.types.items(members));
+        let given = super::super::super::ty::object_parts(p, m).0.to_vec();
+        let bounds =
+            self.expand_super_bounds(vec![(of, std::iter::once(ty).chain(given).collect())])?;
+        let Some((call_of, substs)) = bounds
+            .into_iter()
+            .find(|(b, s)| self.is_callable_trait(*b) && s.len() >= 2)
+        else {
+            return Ok(None);
+        };
+        let tuple = self.resolve(substs[1]);
+        let Kind::Tuple(params) = *self.cx.types.kind(tuple) else {
+            return Ok(None);
+        };
+        let params = self.cx.types.substs(params).to_vec();
+        let lang = self.cx.lang(call_of);
+        let name = super::super::callable::callable_method_name(lang);
+        let is_mut = matches!(lang, Some("fn_mut" | "async_fn_mut"));
+        let is_async = matches!(lang, Some("async_fn" | "async_fn_mut" | "async_fn_once"));
+        if step.2 > 0 {
+            self.record_call_steps(step, is_mut)?;
+        }
+        self.infer_call_args(args, &params, None)?;
+        if matches!(name, "call_once" | "async_call_once") {
+            self.free_box(step.0, step.1)?;
+        }
+        let Some(method) = self.cx.trait_member(call_of, name) else {
+            bail!("`{}` has no `{name}`", self.cx.name(call_of))
+        };
+        self.out
+            .res
+            .insert(step.0, Res::fn_of(&self.cx.types, method, &[ty, tuple]));
+        let once = self
+            .cx
+            .lang_item(if is_async { "async_fn_once" } else { "fn_once" })
+            .unwrap_or(call_of);
+        self.project(once, ty, vec![tuple], "Output").map(Some)
+    }
+
+    pub(super) fn place_local(&self, expr: ExprId) -> Option<u32> {
+        match *self.body.expr(expr) {
+            Expr::Paren(inner)
+            | Expr::Field(inner, _)
+            | Expr::TupleField(inner, _)
+            | Expr::Index(inner, _)
+            | Expr::Unary(crate::body::UnOp::Deref, inner) => {
+                let inner_ty = self.resolve_opt(self.out.exprs[inner.0 as usize]);
+                (inner_ty == Ty::NONE || !matches!(self.cx.types.kind(inner_ty), Kind::Ptr(..)))
+                    .then(|| self.place_local(inner))
+                    .flatten()
+            }
+            Expr::Path(_) => match self.out.res.get(&expr) {
+                Some(crate::sema::infer::Res::Local(local)) => Some(*local),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
 }

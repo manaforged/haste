@@ -119,6 +119,7 @@ impl Infer<'_, '_> {
                 )?;
                 self.object_call((step.0, step.1), ty, args).map(Some)
             }
+            Kind::Dyn(..) => self.dyn_super_call(step, ty, args),
             Kind::Closure(..) => {
                 let mutably = self.closure_mutates(ty)?;
                 self.record_call_steps(step, mutably)?;
@@ -158,7 +159,7 @@ impl Infer<'_, '_> {
         }
     }
 
-    fn record_call_steps(
+    pub(super) fn record_call_steps(
         &mut self,
         (expr, found, steps): (ExprId, Ty, u32),
         mutably: bool,
@@ -408,7 +409,7 @@ impl Infer<'_, '_> {
         })
     }
 
-    fn free_box(&mut self, expr: ExprId, found: Ty) -> Result<()> {
+    pub(super) fn free_box(&mut self, expr: ExprId, found: Ty) -> Result<()> {
         let found = self.resolve(found);
         if self.cx.boxed(found).is_none() || self.out.autoderefs.get(&expr) != Some(&1) {
             bail!("a `dyn FnOnce` is called by value only through a `Box`");

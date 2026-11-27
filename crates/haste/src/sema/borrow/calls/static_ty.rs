@@ -12,7 +12,8 @@ use super::super::Checker;
 use super::super::checks::resolve_ast_type_path;
 use super::arg_refs::sig_param_idx;
 use super::lifetimes::{
-    LT_STATIC, for_each_param_bound_list, is_owned_container, is_prim_name, lifetime_is_static,
+    LT_STATIC, Lifetimes, collect_ty_lifetimes, for_each_param_bound_list, is_named_lt,
+    is_owned_container, is_prim_name, lifetime_is_static, pred_matches_name_in,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -676,4 +677,120 @@ pub(super) fn non_env_sources(
     srcs: &[super::super::propagate::BorrowSource],
 ) -> Vec<super::super::propagate::BorrowSource> {
     srcs.iter().filter(|s| !s.env_only).cloned().collect()
+}
+
+pub(super) fn collect_type_param_lt_bounds(
+    body: &Body,
+    src: &Source,
+    generics: &[crate::body::sig::Generic],
+    predicates: &[crate::body::sig::Predicate],
+    names: &[&str],
+    static_names: &[String],
+    out_named: &mut Vec<String>,
+) -> bool {
+    let mut saw_param = false;
+    for g in generics.iter().filter(|g| g.kind == GenericKind::Type) {
+        let g_name = src.text(g.name);
+        if !names.contains(&g_name) || static_names.iter().any(|s| s == g_name) {
+            continue;
+        }
+        saw_param = true;
+        let mut found = false;
+        let lists = std::iter::once(g.bounds).chain(
+            predicates
+                .iter()
+                .filter(|p| pred_matches_name_in(body, src, p, g_name))
+                .map(|p| p.bounds),
+        );
+        for bounds in lists {
+            for &b_id in body.list(bounds) {
+                match body.bounds[b_id as usize] {
+                    Bound::Lifetime(lt) => {
+                        let text = src.text(lt);
+                        if is_named_lt(text) {
+                            found = true;
+                            if !out_named.iter().any(|s| s == text) {
+                                out_named.push(text.to_owned());
+                            }
+                        }
+                    }
+                    Bound::Trait { path, .. } => {
+                        let mut lts = Lifetimes::default();
+                        for &seg_id in body.list(body.path(path).segments) {
+                            if let Some(args) = body.segments[seg_id as usize].args {
+                                match args {
+                                    Args::Angle(list) => {
+                                        for &a in body.list(list) {
+                                            match body.args[a as usize] {
+                                                GenericArg::Lifetime(lt) => {
+                                                    let text = src.text(lt);
+                                                    if is_named_lt(text)
+                                                        && !lts.named.contains(&text)
+                                                    {
+                                                        lts.named.push(text);
+                                                    }
+                                                }
+                                                GenericArg::Ty(t)
+                                                | GenericArg::Binding { ty: t, .. } => {
+                                                    collect_ty_lifetimes(body, src, t, &mut lts);
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                    Args::Paren { inputs, output } => {
+                                        for &t in body.list(inputs) {
+                                            collect_ty_lifetimes(body, src, TyId(t), &mut lts);
+                                        }
+                                        if let Some(o) = output {
+                                            collect_ty_lifetimes(body, src, o, &mut lts);
+                                        }
+                                    }
+                                    Args::ReturnType => {}
+                                }
+                            }
+                        }
+                        for lt in lts.named {
+                            found = true;
+                            if !out_named.iter().any(|s| s == lt) {
+                                out_named.push(lt.to_owned());
+                            }
+                        }
+                    }
+                    Bound::Use(_) => {}
+                }
+            }
+        }
+        if !found {
+            return false;
+        }
+    }
+    saw_param
+}
+
+pub(super) fn param_shares_ret_type_param(
+    sig: &Signature,
+    src: &Source,
+    typed: &crate::sema::infer::Typed,
+    local: u32,
+) -> bool {
+    let Some(ret_ast) = sig.ret else {
+        return false;
+    };
+    let Some(pos) = typed.params.iter().position(|&p| p == local) else {
+        return false;
+    };
+    let offset = usize::from(sig.receiver.is_some());
+    let Some(&(_, param_ty)) = pos.checked_sub(offset).and_then(|i| sig.params.get(i)) else {
+        return false;
+    };
+    let mut param_lts = Lifetimes::default();
+    collect_ty_lifetimes(&sig.body, src, param_ty, &mut param_lts);
+    let mut ret_lts = Lifetimes::default();
+    collect_ty_lifetimes(&sig.body, src, ret_ast, &mut ret_lts);
+    sig.generics
+        .iter()
+        .filter(|g| g.kind == GenericKind::Type)
+        .map(|g| src.text(g.name))
+        .any(|name| param_lts.names.contains(&name) && ret_lts.names.contains(&name))
 }

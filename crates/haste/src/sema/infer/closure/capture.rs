@@ -51,7 +51,7 @@ impl<'a> Infer<'_, 'a> {
         }
     }
 
-    fn resolve_opt(&self, ty: Ty) -> Ty {
+    pub(super) fn resolve_opt(&self, ty: Ty) -> Ty {
         if ty == Ty::NONE {
             Ty::NONE
         } else {
@@ -139,27 +139,38 @@ impl<'a> Infer<'_, 'a> {
 
     fn expr_proj(&mut self, expr: ExprId) -> Result<(Vec<(u32, u32)>, bool)> {
         let (mut rev, mut cur, mut known) = (Vec::new(), expr, true);
-        loop {
-            match *self.body.expr(cur) {
-                Expr::Paren(inner) => cur = inner,
-                Expr::TupleField(base, idx) if !self.out.autoderefs.contains_key(&cur) => {
-                    rev.push((base, (0, idx)));
-                    cur = base;
-                }
-                Expr::Field(base, _) if !self.out.autoderefs.contains_key(&cur) => {
-                    let Some(&idx) = self.out.fields.get(&cur) else {
-                        rev.clear();
-                        break;
-                    };
-                    rev.push((base, (0, idx)));
-                    cur = base;
-                }
-                Expr::Index(base, _) | Expr::Unary(UnOp::Deref, base) => {
-                    rev.clear();
-                    cur = base;
-                }
-                _ => break,
+        while let Some(next) = match *self.body.expr(cur) {
+            Expr::Paren(inner) => Some(inner),
+            Expr::TupleField(base, idx) if !self.out.autoderefs.contains_key(&cur) => {
+                rev.push((base, (0, idx)));
+                Some(base)
             }
+            Expr::Field(base, _) if !self.out.autoderefs.contains_key(&cur) => {
+                match self.out.fields.get(&cur) {
+                    Some(&idx) => {
+                        rev.push((base, (0, idx)));
+                        Some(base)
+                    }
+                    None => {
+                        rev.clear();
+                        None
+                    }
+                }
+            }
+            Expr::TupleField(base, _)
+            | Expr::Field(base, _)
+            | Expr::Index(base, _)
+            | Expr::Unary(UnOp::Deref, base) => {
+                rev.clear();
+                Some(base)
+            }
+            Expr::Path(_) => None,
+            _ => {
+                rev.clear();
+                None
+            }
+        } {
+            cur = next;
         }
         let mut out = Vec::with_capacity(rev.len());
         for (base, step) in rev.into_iter().rev() {
@@ -776,25 +787,5 @@ impl<'a> Infer<'_, 'a> {
             .filter(|uses| local < uses.first)
             .for_each(|uses| uses.mutated.push((local, expr)));
         Ok(())
-    }
-
-    fn place_local(&self, expr: ExprId) -> Option<u32> {
-        match *self.body.expr(expr) {
-            Expr::Paren(inner)
-            | Expr::Field(inner, _)
-            | Expr::TupleField(inner, _)
-            | Expr::Index(inner, _)
-            | Expr::Unary(UnOp::Deref, inner) => {
-                let inner_ty = self.resolve_opt(self.out.exprs[inner.0 as usize]);
-                (inner_ty == Ty::NONE || !matches!(self.cx.types.kind(inner_ty), Kind::Ptr(..)))
-                    .then(|| self.place_local(inner))
-                    .flatten()
-            }
-            Expr::Path(_) => match self.out.res.get(&expr) {
-                Some(Res::Local(local)) => Some(*local),
-                _ => None,
-            },
-            _ => None,
-        }
     }
 }

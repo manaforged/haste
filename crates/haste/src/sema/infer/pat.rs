@@ -463,6 +463,25 @@ impl Infer<'_, '_> {
             }
             self.out.field_pats.insert(field.pat, index);
             self.pat(field.pat, fields[index as usize], mode, field_pack)?;
+            if let Some(&local) = self.out.binds.get(&field.pat)
+                && let Ok(def) = self.cx.adt_def(item)
+                && let Some(field_def) = def.variants[variant as usize].fields.get(index as usize)
+                && let crate::body::Ty::Path(fp) = *def.body.ty(field_def.ty)
+                && let fp_data = def.body.path(fp)
+                && fp_data.qself.is_none()
+                && let &[seg] = def.body.list(fp_data.segments)
+                && def.body.segments[seg as usize].args.is_none()
+            {
+                let adt_src = &self.cx.file(item).source;
+                let fname = adt_src.text(def.body.segments[seg as usize].name);
+                if let Some(p_idx) = super::scope::type_params(&def.generics.params)
+                    .position(|g| adt_src.text(g.name) == fname)
+                    && let Some(&arg_ty) = slice.get(p_idx)
+                    && let Some(&(g_name, _)) = self.generics.iter().find(|&&(_, gt)| gt == arg_ty)
+                {
+                    self.param_origins.push((local, g_name));
+                }
+            }
         }
         Ok(())
     }
