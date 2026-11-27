@@ -173,13 +173,13 @@ impl CompilerBuilder {
 
     /// Selects a specific binary target.
     pub fn bin(mut self, bin: impl Into<String>) -> Self {
-        self.config.selection.bin = Some(bin.into());
+        self.config.selection.bin.push(bin.into());
         self
     }
 
     /// Selects a specific example target.
     pub fn example(mut self, example: impl Into<String>) -> Self {
-        self.config.selection.example = Some(example.into());
+        self.config.selection.example.push(example.into());
         self
     }
 
@@ -233,7 +233,7 @@ impl CompilerBuilder {
             }
             self.config.jobs = jobs;
         }
-        if self.config.selection.bin.is_some() && self.config.selection.example.is_some() {
+        if !self.config.selection.bin.is_empty() && !self.config.selection.example.is_empty() {
             return Err(Error::new(
                 ErrorKind::Config,
                 "cannot select both `bin` and `example` targets",

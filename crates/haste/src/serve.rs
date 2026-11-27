@@ -343,22 +343,25 @@ mod unix_ipc {
             crate::MessageFormat::JsonRenderDiagnostics => Some("json-render-diagnostics"),
         };
         let jobs = jobs.to_string();
-        for pkg in &sel.packages {
-            args.push("-p".to_owned());
-            args.push(pkg.clone());
+        for (flag, vals) in [
+            ("-p", &sel.packages),
+            ("--bin", &sel.bin),
+            ("--example", &sel.example),
+            ("--test", &sel.test),
+        ] {
+            for val in vals {
+                args.extend([flag.to_owned(), val.clone()]);
+            }
         }
         for (flag, val) in [
-            ("--bin", sel.bin.as_deref()),
-            ("--example", sel.example.as_deref()),
-            ("--test", sel.test.as_deref()),
             ("-F", features.as_deref()),
             ("--message-format", message_format),
             ("-j", Some(jobs.as_str())),
-        ] {
-            if let Some(val) = val {
-                args.push(flag.to_owned());
-                args.push(val.to_owned());
-            }
+        ]
+        .into_iter()
+        .filter_map(|(f, v)| v.map(|s| (f, s)))
+        {
+            args.extend([flag.to_owned(), val.to_owned()]);
         }
         args
     }
@@ -759,6 +762,7 @@ mod unix_ipc {
         fn daemon_args_forwards_all_selection_flags_and_jobs() {
             let sel = crate::Selection {
                 packages: vec!["pkg".to_owned(), "pkg2".to_owned()],
+                test: vec!["payments".to_owned(), "receipts".to_owned()],
                 workspace: true,
                 all_targets: true,
                 tests: true,
@@ -770,29 +774,22 @@ mod unix_ipc {
                 ..crate::Selection::default()
             };
             let args = daemon_args(&sel, true, true, 6);
-            for expected in [
-                "--release",
-                "--prepared",
-                "--workspace",
-                "--tests",
-                "--all-targets",
-                "--locked",
-                "--offline",
-                "-q",
-            ] {
+            for expected in
+                "--release --prepared --workspace --tests --all-targets --locked --offline -q"
+                    .split_whitespace()
+            {
                 assert!(args.iter().any(|a| a == expected), "missing {expected}");
             }
             for pair in [
                 ["-p", "pkg"],
                 ["-p", "pkg2"],
+                ["--test", "payments"],
+                ["--test", "receipts"],
                 ["-F", "a,b"],
                 ["--message-format", "json"],
                 ["-j", "6"],
             ] {
-                assert!(
-                    args.windows(2).any(|w| w == pair),
-                    "missing flag pair {pair:?}"
-                );
+                assert!(args.windows(2).any(|w| w == pair), "missing {pair:?}");
             }
         }
     }

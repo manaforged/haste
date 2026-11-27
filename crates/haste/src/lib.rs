@@ -84,9 +84,9 @@ pub(crate) enum MessageFormat {
 #[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
 pub(crate) struct Selection {
     pub packages: Vec<String>,
-    pub bin: Option<String>,
-    pub example: Option<String>,
-    pub test: Option<String>,
+    pub bin: Vec<String>,
+    pub example: Vec<String>,
+    pub test: Vec<String>,
     pub lib: bool,
     pub bins: bool,
     pub workspace: bool,

@@ -112,29 +112,82 @@ fn member_fns<'a>(
         .flat_map(move |krate| crate_fns(krate, &outline.crates[krate]))
 }
 
-fn target_name_matches(root_name: &str, selected: &str) -> bool {
+pub(crate) fn target_name_matches(root_name: &str, selected: &str) -> bool {
     root_name == selected || root_name.replace('-', "_") == selected.replace('-', "_")
 }
 
-fn test_target_selected(outline: &outline::Outline, krate: usize, sel: &crate::Selection) -> bool {
-    let test_name = sel.test.as_deref();
-    let bin_name = sel.bin.as_deref();
-    if !(sel.lib || sel.bins || test_name.is_some() || bin_name.is_some()) {
-        return true;
-    }
-    let root = &outline.roots[krate];
-    let is_lib_root = root.role == outline::Role::Lib
+pub(crate) fn is_lib_test_root(outline: &outline::Outline, root: &outline::Root) -> bool {
+    root.role == outline::Role::Lib
         || (root.role == outline::Role::Test
             && outline.roots.iter().any(|r| {
                 r.role == outline::Role::Lib && r.unit == root.unit && r.path == root.path
-            }));
+            }))
+}
+
+pub(crate) fn validate_selected_targets(workspace: &graph::Workspace) -> Result<()> {
+    let sel = crate::selection();
+    if sel.test.is_empty() && sel.bin.is_empty() && sel.example.is_empty() {
+        return Ok(());
+    }
+    let member_units: Vec<_> = workspace
+        .graph
+        .units
+        .iter()
+        .filter(|u| {
+            workspace.graph.members.contains(&u.package)
+                && (sel.packages.is_empty()
+                    || sel
+                        .packages
+                        .contains(&workspace.packages[u.package].locked.name))
+        })
+        .collect();
+    let checks: [(
+        &str,
+        &[String],
+        fn(&graph::manifest::Manifest) -> &[graph::manifest::TargetSpec],
+    ); 3] = [
+        ("test", &sel.test, |m| &m.tests),
+        ("bin", &sel.bin, |m| &m.bins),
+        ("example", &sel.example, |m| &m.examples),
+    ];
+    for (kind, wanted, specs) in checks {
+        for name in wanted {
+            let found = member_units.iter().any(|unit| {
+                specs(&workspace.packages[unit.package].manifest)
+                    .iter()
+                    .any(|t| t.enabled(&unit.features) && target_name_matches(&t.name, name))
+            });
+            if !found {
+                anyhow::bail!("no {kind} target named '{name}'");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn test_target_selected(outline: &outline::Outline, krate: usize, sel: &crate::Selection) -> bool {
+    if !(sel.lib
+        || sel.bins
+        || !sel.test.is_empty()
+        || !sel.bin.is_empty()
+        || !sel.example.is_empty())
+    {
+        return true;
+    }
+    let root = &outline.roots[krate];
+    let is_lib_root = is_lib_test_root(outline, root);
     (sel.lib && is_lib_root)
         || (sel.bins && root.role == outline::Role::Bin)
-        || bin_name
-            .is_some_and(|n| root.role == outline::Role::Bin && target_name_matches(&root.name, n))
-        || test_name.is_some_and(|n| {
-            root.role == outline::Role::Test && !is_lib_root && target_name_matches(&root.name, n)
-        })
+        || (root.role == outline::Role::Bin
+            && sel.bin.iter().any(|n| target_name_matches(&root.name, n)))
+        || (root.role == outline::Role::Example
+            && sel
+                .example
+                .iter()
+                .any(|n| target_name_matches(&root.name, n)))
+        || (root.role == outline::Role::Test
+            && !is_lib_root
+            && sel.test.iter().any(|n| target_name_matches(&root.name, n)))
 }
 
 fn item_coord(
@@ -443,7 +496,7 @@ fn report_cases(
         (Request::Build, Some(path)) => {
             if let Some(bin) = default_run_bin(workspace) {
                 let mut cfg = crate::config::Config::current();
-                cfg.selection.bin = Some(bin);
+                cfg.selection.bin = vec![bin];
                 crate::with_config(std::sync::Arc::new(cfg), || {
                     build.emit_executable(workspace, path, stats.is_none())
                 })
@@ -496,7 +549,7 @@ fn report_cases(
 
 fn default_run_bin(workspace: &graph::Workspace) -> Option<String> {
     let sel = crate::selection();
-    if sel.bin.is_some() || sel.example.is_some() {
+    if !sel.bin.is_empty() || !sel.example.is_empty() {
         return None;
     }
     let mut found = None;

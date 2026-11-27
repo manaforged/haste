@@ -305,29 +305,20 @@ fn apply_value_flag<I: Iterator<Item = std::ffi::OsString>>(
     eq_val: Option<&str>,
 ) -> Result<bool> {
     match name {
-        "-p" | "--package" => {
-            opts.selection.packages.push(take_non_empty(
-                args,
-                eq_val,
-                "--package takes a package name",
-            )?);
-        }
-        "--bin" => {
-            opts.selection.bin = Some(take_non_empty(args, eq_val, "--bin takes a binary name")?);
-        }
-        "--example" => {
-            opts.selection.example = Some(take_non_empty(
-                args,
-                eq_val,
-                "--example takes an example name",
-            )?);
-        }
-        "--test" => {
-            opts.selection.test = Some(take_non_empty(
-                args,
-                eq_val,
-                "--test takes a test target name",
-            )?);
+        "-p" | "--package" | "--bin" | "--example" | "--test" => {
+            let (dest, msg) = match name {
+                "-p" | "--package" => (
+                    &mut opts.selection.packages,
+                    "--package takes a package name",
+                ),
+                "--bin" => (&mut opts.selection.bin, "--bin takes a binary name"),
+                "--example" => (
+                    &mut opts.selection.example,
+                    "--example takes an example name",
+                ),
+                _ => (&mut opts.selection.test, "--test takes a test target name"),
+            };
+            dest.push(take_non_empty(args, eq_val, msg)?);
         }
         "-F" | "--features" => {
             let list = take_str(args, eq_val, "--features takes a feature list")?;
@@ -480,6 +471,14 @@ fn validate_command_opts(command: Command, opts: &ParsedOpts) -> Result<Command>
             effective_target.triple
         );
     }
+    if (matches!(command, Command::Request(Request::Run))
+        || (matches!(command, Command::Request(Request::Build)) && opts.out.is_some()))
+        && (opts.selection.bin.len() > 1
+            || opts.selection.example.len() > 1
+            || (!opts.selection.bin.is_empty() && !opts.selection.example.is_empty()))
+    {
+        anyhow::bail!("cannot select multiple binary or example targets when running or linking");
+    }
     if opts.watch && !matches!(command, Command::Request(Request::Run)) {
         anyhow::bail!("--watch is only supported with `haste run`");
     }
@@ -509,6 +508,7 @@ fn build_config(command: Command, opts: &ParsedOpts) -> crate::config::Config {
     cfg.no_run = opts.no_run;
     cfg.test_mode = matches!(command, Command::Request(Request::Test))
         || opts.selection.tests
+        || !opts.selection.test.is_empty()
         || opts.selection.all_targets
         || (matches!(command, Command::Serve(ServeAction::Run))
             && crate::env_flag("HASTE_SERVE_TEST"));
@@ -762,30 +762,38 @@ mod tests {
     }
 
     #[test]
-    fn parses_multiple_package_flags_in_order() {
-        let ((_, _, _, _, _, cfg), _) = parse_strs(&["check", "-p", "a", "-p", "b", "--package=c"])
-            .expect("valid")
-            .expect("not meta");
-        assert_eq!(cfg.selection.packages, vec!["a", "b", "c"]);
+    fn parses_repeated_target_and_package_flags_and_enables_test_mode() {
+        let cfg = |a: &[&str]| parse_strs(a).expect("valid").expect("not meta").0.5;
+        assert_eq!(
+            cfg(&["check", "-p", "a", "-p", "b", "--package=c"])
+                .selection
+                .packages,
+            vec!["a", "b", "c"]
+        );
+        let check_test = cfg(&["check", "--test", "payments"]);
+        assert!(check_test.test_mode && check_test.selection.test == vec!["payments"]);
+        let multi = cfg(&[
+            "test", "--test", "payments", "--test", "receipts", "--bin", "a", "--bin=b",
+        ]);
+        assert_eq!(multi.selection.test, vec!["payments", "receipts"]);
+        assert_eq!(multi.selection.bin, vec!["a", "b"]);
+        assert!(parse_strs(&["run", "--bin", "a", "--bin", "b"]).is_err());
     }
 
     #[test]
     fn clean_parses_workspace_path_and_all_flag() {
-        let ((cmd, path, _, _, _, _), _) =
-            parse_strs(&["clean"]).expect("valid").expect("not meta");
+        let clean = |a: &[&str]| {
+            let ((cmd, path, _, _, _, _), _) = parse_strs(a).expect("valid").expect("not meta");
+            (cmd, path)
+        };
+        let (cmd, path) = clean(&["clean"]);
         assert!(matches!(cmd, Command::Clean { all: false }) && path.as_os_str().is_empty());
-
-        let ((cmd, path, _, _, _, _), _) = parse_strs(&["clean", "examples/hello"])
-            .expect("valid")
-            .expect("not meta");
-        assert!(matches!(cmd, Command::Clean { all: false }));
-        assert_eq!(path, PathBuf::from("examples/hello"));
-
-        let ((cmd, path, _, _, _, _), _) = parse_strs(&["clean", "--all"])
-            .expect("valid")
-            .expect("not meta");
+        let (cmd, path) = clean(&["clean", "examples/hello"]);
+        assert!(
+            matches!(cmd, Command::Clean { all: false }) && path == PathBuf::from("examples/hello")
+        );
+        let (cmd, path) = clean(&["clean", "--all"]);
         assert!(matches!(cmd, Command::Clean { all: true }) && path.as_os_str().is_empty());
-
         assert!(parse_strs(&["clean", "--all", "examples/hello"]).is_err());
     }
 }
