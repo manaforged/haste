@@ -142,12 +142,13 @@ fn closure_owners(types: &Types, ty: Ty, out: &mut Vec<Instance>) {
     }
 }
 
-/// Drops the reached functions `dead`, whose items an edit replaced, then infers `roots` and every function they call that is not reached, and returns the indexes of those.
-pub fn reach_anew(
+/// Drops `dead` and re-reaches from `roots`, optionally limiting crate-level ADT/const/impl checks to `only_crates`.
+pub fn reach_anew_in(
     cx: &mut Context<'_>,
     reached: &mut Reached,
     dead: &[usize],
     roots: &[Instance],
+    only_crates: Option<&[u32]>,
 ) -> Vec<usize> {
     for &index in dead {
         reached.index.remove(&reached.list[index].0);
@@ -157,13 +158,13 @@ pub fn reach_anew(
             Err("replaced by an edit".to_owned()),
         );
     }
-    reached.link(dead);
+    reached.unlink(dead);
     let mut found = drain(cx, reached, roots.to_vec());
     let extra = enqueue_bounds_check(cx, reached);
     if !extra.is_empty() {
         found.extend(drain_wave(cx, reached, extra, true));
     }
-    super::crate_check::check_local_crate_items(cx, reached, roots, true);
+    super::crate_check::check_local_crate_items_in(cx, reached, roots, true, only_crates);
     reached.pin_roots(roots);
     reached.link(&found);
     found

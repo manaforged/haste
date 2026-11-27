@@ -2,7 +2,6 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use rustc_hash::FxHashMap as HashMap;
 
 use crate::cli::{Failures, test_items};
 use crate::graph::{self, Targets};
@@ -14,17 +13,17 @@ use crate::sema::{self, Cache, Edited};
 
 mod batch;
 mod json_diag;
+mod refresh;
 mod report;
 pub(crate) mod substrate;
 mod test_args;
 mod watch;
 
 use batch::{Batch, BatchKind};
+use refresh::{refresh_edits, update_stamps};
 use substrate::{cache_with_substrate, save_jit_substrate};
 use test_args::map_tests;
-use watch::{
-    Stamp, Watch, body_edits, edits, paths, pre_stamps, stamps, stamps_with_pre, stamps_with_seen,
-};
+use watch::{Watch, body_edits, paths, pre_stamps, stamps, stamps_with_pre};
 
 /// A loaded workspace kept between requests: its compilation, the `case_` functions and the binary's reach once a request needs them, and the binary once a request runs it.
 pub struct Build {
@@ -353,7 +352,8 @@ impl Build {
 
     /// Brings the build up to date with the local files: infers and compiles again the functions of files whose bodies changed, reads again a crate whose items changed, and loads from nothing when that fails.
     pub fn refresh(&mut self, workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
-        let Ok((stale, crates)) = edits(workspace, &mut self.stamps, &mut self.compilation.outline)
+        let Ok((stale, crates)) =
+            refresh_edits(workspace, &mut self.stamps, &mut self.compilation.outline)
         else {
             return self.rebuild(workspace, targets);
         };
@@ -412,12 +412,12 @@ impl Build {
             self.program =
                 main.and_then(|main| Program::new(&mut self.compilation, store, main).ok());
         }
-        let seen: HashMap<PathBuf, Stamp> = self
-            .stamps
-            .iter()
-            .map(|watch| (watch.path.clone(), watch.stamp))
-            .collect();
-        self.stamps = stamps_with_seen(workspace, &self.compilation.outline, &seen);
+        update_stamps(
+            workspace,
+            &mut self.stamps,
+            &self.compilation.outline,
+            &crates,
+        );
         let compilation = &self.compilation;
         [&mut self.cases, &mut self.binary]
             .into_iter()

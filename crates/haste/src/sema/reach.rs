@@ -18,7 +18,7 @@ mod unwind;
 mod wave;
 
 pub(super) use collect::run_scoped;
-pub use collect::{reach_again, reach_anew, reach_wave};
+pub use collect::{reach_again, reach_anew_in, reach_wave};
 pub(crate) use items::lay_out;
 pub(crate) use items::typed_once;
 pub(super) use items::{infer_entry, is_inferring};
@@ -291,6 +291,15 @@ impl Reached {
         self.crate_errors.clear();
     }
 
+    pub(in crate::sema::reach) fn retain_crate_errors(
+        &mut self,
+        mut keep_crate: impl FnMut(u32) -> bool,
+    ) {
+        self.crate_errors.retain(|&at| {
+            self.states[at] != ReachedEntry::Replaced && keep_crate(self.list[at].0.0.krate)
+        });
+    }
+
     pub(in crate::sema::reach) fn note_crate_error(&mut self, at: usize) {
         if !self.crate_errors.contains(&at) {
             self.crate_errors.push(at);
@@ -348,6 +357,21 @@ impl Reached {
                 self.pinned[id] = true;
             }
         }
+    }
+
+    fn unlink(&mut self, indices: &[usize]) {
+        self.calls.resize(self.list.len(), Vec::new());
+        self.indirect.resize(self.list.len(), Vec::new());
+        self.call_sites
+            .retract(indices, &self.calls, &self.indirect);
+        for &at in indices {
+            self.calls[at].clear();
+            self.indirect[at].clear();
+        }
+        *self
+            .may_unwind_cache
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     fn link(&mut self, indices: &[usize]) {

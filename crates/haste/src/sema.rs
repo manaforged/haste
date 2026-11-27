@@ -275,11 +275,6 @@ impl<'a> Context<'a> {
                     .is_none_or(|found| index as usize >= found.file.items.items.len())
             })
         };
-        Naming {
-            types: &self.types,
-            mine: &gone,
-            memo: HashMap::default(),
-        }
-        .touches(instance)
+        Naming::new(&self.types, &gone).touches(instance)
     }
 }

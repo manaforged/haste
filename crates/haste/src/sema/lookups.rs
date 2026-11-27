@@ -10,6 +10,7 @@ use crate::body::sig::{self, Signature};
 use crate::names::{ItemRef, ModRef};
 use crate::outline::Outline;
 
+use super::substs::Substs;
 use super::table::{self, Table};
 use super::ty::{self, Types};
 use super::{impls, infer, reach, read_lock, summary, traits, write_lock};
@@ -26,33 +27,30 @@ pub(super) struct SegKey {
 impl SegKey {
     pub(super) fn from_slice(segments: &[crate::names::Sym]) -> Self {
         let mut inline = [0; 4];
-        if segments.len() <= inline.len() {
+        let (len, overflow) = if segments.len() <= inline.len() {
             for (slot, sym) in inline.iter_mut().zip(segments) {
                 *slot = sym.0;
             }
-            return Self {
-                inline,
-                len: segments.len() as u8,
-                overflow: None,
-            };
-        }
+            (segments.len() as u8, None)
+        } else {
+            (u8::MAX, Some(Arc::from(segments)))
+        };
         Self {
             inline,
-            len: u8::MAX,
-            overflow: Some(Arc::from(segments)),
+            len,
+            overflow,
         }
     }
 
     pub(super) fn push_syms(&self, out: &mut Vec<crate::names::Sym>) {
-        if let Some(overflow) = &self.overflow {
-            out.extend_from_slice(overflow);
-        } else {
-            out.extend(
+        match &self.overflow {
+            Some(many) => out.extend_from_slice(many),
+            None => out.extend(
                 self.inline[..usize::from(self.len)]
                     .iter()
                     .copied()
                     .map(crate::names::Sym),
-            );
+            ),
         }
     }
 }
@@ -139,15 +137,13 @@ impl LangMap {
     }
 
     pub(super) fn from_map(map: HashMap<ItemRef, Box<str>>) -> Self {
-        let (mut crates_lo, mut crates_hi, mut any_high) = (0u64, 0u64, false);
-        let mut bloom = [0u64; 256];
+        let (mut crates_lo, mut crates_hi, mut any_high, mut bloom) =
+            (0u64, 0u64, false, [0u64; 256]);
         for &item in map.keys() {
-            if item.krate < 64 {
-                crates_lo |= 1u64 << item.krate;
-            } else if item.krate < 128 {
-                crates_hi |= 1u64 << (item.krate - 64);
-            } else {
-                any_high = true;
+            match item.krate {
+                k if k < 64 => crates_lo |= 1u64 << k,
+                k if k < 128 => crates_hi |= 1u64 << (k - 64),
+                _ => any_high = true,
             }
             let (w1, m1, w2, m2) = Self::bloom_bits(item);
             bloom[w1] |= m1;
@@ -164,12 +160,10 @@ impl LangMap {
 
     #[inline]
     pub(super) fn may_contain(&self, item: ItemRef) -> bool {
-        let has_krate = if item.krate < 64 {
-            self.crates_lo & (1u64 << item.krate) != 0
-        } else if item.krate < 128 {
-            self.crates_hi & (1u64 << (item.krate - 64)) != 0
-        } else {
-            self.any_high
+        let has_krate = match item.krate {
+            k if k < 64 => self.crates_lo & (1u64 << k) != 0,
+            k if k < 128 => self.crates_hi & (1u64 << (k - 64)) != 0,
+            _ => self.any_high,
         };
         if !has_krate {
             return false;
@@ -212,33 +206,13 @@ pub(super) struct Lookups {
     pub(super) trait_autos: Table<ItemRef, bool>,
     pub(super) type_defs: Table<(TypeScope, SegKey), crate::names::Def>,
     pub(super) impl_traits: Table<impls::ImplRef, Option<ItemRef>>,
-    pub(super) selections: Table<
-        (ItemRef, ty::Ty, super::substs::Substs),
-        Option<(impls::ImplRef, super::substs::Substs)>,
-    >,
+    pub(super) selections: Table<(ItemRef, ty::Ty, Substs), Option<(impls::ImplRef, Substs)>>,
     pub(super) auto_traits: Table<(ItemRef, ty::Ty), bool>,
     pub(super) checked_impls: table::Flight<impls::ImplRef, bool>,
-    pub(super) projections: Table<
-        (
-            ItemRef,
-            ty::Ty,
-            super::substs::Substs,
-            crate::names::Sym,
-            super::substs::Substs,
-        ),
-        Option<ty::Ty>,
-    >,
-    pub(super) trait_calls: Table<(ItemRef, super::substs::Substs), infer::Res>,
-    pub(super) assoc_types: Table<
-        (
-            ItemRef,
-            ty::Ty,
-            super::substs::Substs,
-            ItemRef,
-            super::substs::Substs,
-        ),
-        ty::Ty,
-    >,
+    pub(super) projections:
+        Table<(ItemRef, ty::Ty, Substs, crate::names::Sym, Substs), Option<ty::Ty>>,
+    pub(super) trait_calls: Table<(ItemRef, Substs), infer::Res>,
+    pub(super) assoc_types: Table<(ItemRef, ty::Ty, Substs, ItemRef, Substs), ty::Ty>,
     pub(super) summaries: table::Flight<ItemRef, summary::SummaryKind>,
     pub(super) verdicts: Table<ItemRef, ()>,
     pub(super) fresh_summaries: Table<ItemRef, (bool, u64, Box<[u8]>)>,
@@ -266,30 +240,25 @@ impl Lookups {
     }
 
     fn reset_after_names(&mut self, outline: &Outline, fixed_stable: bool) {
+        let fixed_item = |i: ItemRef| fixed_stable && outline.is_fixed(i.krate);
         self.selections.retain(|_, found| {
             matches!(found, Some((impls::ImplRef::Module { .. }, _)))
-                || (fixed_stable
-                    && matches!(found, Some((impls::ImplRef::Body(item), _)) if outline.is_fixed(item.krate)))
+                || matches!(found, Some((impls::ImplRef::Body(item), _)) if fixed_item(*item))
         });
         self.projections.retain(|_, found| found.is_some());
         self.forms.retain(|_, found| found.is_some());
         self.scope_traits
             .retain(|home, _| outline.is_fixed(home.krate));
-        if fixed_stable {
-            self.reveals
-                .retain(|&(item, substs)| outline.is_fixed(item.krate) && substs.is_empty());
-            self.type_defs.retain(|&(sc, _), _| {
-                outline.is_fixed(sc.0.krate)
-                    && sc.1.is_none_or(|i| outline.is_fixed(i.krate))
-                    && sc.2.is_none_or(|i| outline.is_fixed(i.krate))
-            });
-            self.trait_calls
-                .retain(|&(item, substs), _| outline.is_fixed(item.krate) && substs.is_empty());
-        } else {
-            self.reveals.clear();
-            self.type_defs.clear();
-            self.trait_calls.clear();
-        }
+        self.reveals
+            .retain(|&(item, substs)| fixed_item(item) && substs.is_empty());
+        self.type_defs.retain(|&(sc, _), _| {
+            fixed_stable
+                && outline.is_fixed(sc.0.krate)
+                && sc.1.is_none_or(|i| outline.is_fixed(i.krate))
+                && sc.2.is_none_or(|i| outline.is_fixed(i.krate))
+        });
+        self.trait_calls
+            .retain(|&(item, substs), _| fixed_item(item) && substs.is_empty());
         self.provisional_rets.clear();
         self.assoc_types.clear();
         self.auto_traits.clear();
@@ -298,10 +267,18 @@ impl Lookups {
 
     pub(super) fn reconcile(&mut self, outline: &Outline, answer: Option<Answer>) {
         let after_names = matches!(answer, Some(Answer::Names));
-        if !after_names && extents_match(&read_lock(&self.state.loaded), outline) {
-            return;
+        if !after_names {
+            let cur = read_lock(&self.state.loaded);
+            if cur.len() == outline.crates.len()
+                && cur
+                    .iter()
+                    .zip(&outline.crates)
+                    .all(|(a, c)| *a == c.extent())
+            {
+                return;
+            }
         }
-        let loaded: Vec<crate::outline::tree::CrateExtent> = outline
+        let loaded: Vec<_> = outline
             .crates
             .iter()
             .map(crate::outline::tree::Crate::extent)
@@ -311,9 +288,7 @@ impl Lookups {
         if *guard == loaded {
             if after_names {
                 self.reset_after_names(outline, true);
-                retain_heads(&mut self.heads, outline, true, |k| {
-                    guard.get(k as usize) == loaded.get(k as usize)
-                });
+                retain_heads(&mut self.heads, outline, true, |_| true);
             }
             return;
         }
@@ -331,68 +306,20 @@ impl Lookups {
         if after_names {
             self.reset_after_names(outline, !reset_fixed);
         }
-        if same_len {
-            self.modules
-                .retain(|k, _| guard.get(*k as usize) == loaded.get(*k as usize));
-            self.owners
-                .retain(|k, _| guard.get(*k as usize) == loaded.get(*k as usize));
-            self.scope_traits.retain(|home, _| {
-                guard.get(home.krate as usize) == loaded.get(home.krate as usize)
-            });
-            self.trait_autos.retain(|item, _| {
-                guard.get(item.krate as usize) == loaded.get(item.krate as usize)
-            });
-            retain_heads(&mut self.heads, outline, after_names, |k| {
-                guard.get(k as usize) == loaded.get(k as usize)
-            });
-            self.summaries.retain_keys(|item| {
-                guard.get(item.krate as usize) == loaded.get(item.krate as usize)
-            });
-            if guard
-                .iter()
-                .zip(&loaded)
-                .any(|(a, b)| a.consumed != b.consumed)
-            {
-                self.discriminants.retain(|item, _| {
-                    guard.get(item.krate as usize) == loaded.get(item.krate as usize)
-                });
-                self.glues.clear();
-            }
-        } else {
-            self.modules.clear();
-            self.owners.clear();
-            self.scope_traits.clear();
-            self.trait_autos.clear();
-            self.heads.clear();
-            self.discriminants.clear();
-            self.reprs.clear();
-            self.attrs.clear();
-            self.summaries = table::Flight::default();
-            self.glues.clear();
-        }
-        if self.lang_items.get().is_some() && lang_files_changed(outline, &guard, &loaded, same_len)
+        let lang_bit = crate::outline::item::mark("lang");
+        if self.lang_items.get().is_some()
+            && (!same_len
+                || guard.iter().zip(&loaded).enumerate().any(|(k, (a, b))| {
+                    a.files != b.files
+                        && (b.files < a.files
+                            || slice_has_mark(&outline.crates[k].files[a.files..], lang_bit))
+                }))
         {
             self.lang_items = Arc::new(std::sync::OnceLock::new());
         }
         if reset_sysroot {
             *write_lock(&self.state.langs) = None;
             *write_lock(&self.state.primitives) = None;
-        }
-        if same_len {
-            if let Some(heads) = &mut self.sysroot_heads {
-                let stale_any = heads
-                    .keys()
-                    .any(|&k| guard.get(k as usize) != loaded.get(k as usize));
-                if stale_any {
-                    let map = Arc::make_mut(heads);
-                    map.retain(|&k, _| guard.get(k as usize) == loaded.get(k as usize));
-                    if map.is_empty() {
-                        self.sysroot_heads = None;
-                    }
-                }
-            }
-        } else {
-            self.sysroot_heads = None;
         }
         if reset_fixed {
             self.file_index = Arc::new(std::sync::OnceLock::new());
@@ -403,24 +330,64 @@ impl Lookups {
             self.has_new_sysroot_instances
                 .store(false, Ordering::Relaxed);
         }
+        if same_len {
+            let same_krate = |k: u32| guard.get(k as usize) == loaded.get(k as usize);
+            self.modules.retain(|k, _| same_krate(*k));
+            self.owners.retain(|k, _| same_krate(*k));
+            self.scope_traits.retain(|home, _| same_krate(home.krate));
+            self.trait_autos.retain(|item, _| same_krate(item.krate));
+            retain_heads(&mut self.heads, outline, after_names, same_krate);
+            self.summaries.retain_keys(|item| same_krate(item.krate));
+            if guard
+                .iter()
+                .zip(&loaded)
+                .any(|(a, b)| a.consumed != b.consumed)
+            {
+                self.discriminants.retain(|item, _| same_krate(item.krate));
+                self.glues.clear();
+            }
+            if let Some(heads) = &mut self.sysroot_heads
+                && heads.keys().any(|&k| !same_krate(k))
+            {
+                let map = Arc::make_mut(heads);
+                map.retain(|&k, _| same_krate(k));
+                if map.is_empty() {
+                    self.sysroot_heads = None;
+                }
+            }
+            self.checked_impls.retain_entries(|b, &s| {
+                s && same_krate(match *b {
+                    impls::ImplRef::Module { krate, .. } => krate,
+                    impls::ImplRef::Body(item) => item.krate,
+                })
+            });
+        } else {
+            self.modules.clear();
+            self.owners.clear();
+            self.scope_traits.clear();
+            self.trait_autos.clear();
+            self.heads.clear();
+            self.discriminants.clear();
+            self.reprs.clear();
+            self.attrs.clear();
+            self.summaries.clear();
+            self.glues.clear();
+            self.checked_impls.clear();
+            self.sysroot_heads = None;
+        }
         *write_lock(&self.state.global_allocator) = None;
         self.trait_calls.clear();
         self.assoc_types.clear();
         self.type_defs.clear();
         self.auto_traits.clear();
-        if same_len {
-            self.checked_impls.retain_entries(|block, &settled| {
-                let k = match *block {
-                    impls::ImplRef::Module { krate, .. } => krate,
-                    impls::ImplRef::Body(item) => item.krate,
-                } as usize;
-                settled && guard.get(k) == loaded.get(k)
-            });
-        } else {
-            self.checked_impls = table::Flight::default();
-        }
         *guard = loaded;
     }
+}
+
+fn slice_has_mark(files: &[Arc<crate::outline::tree::File>], bit: u16) -> bool {
+    files
+        .iter()
+        .any(|f| f.items.marks.iter().any(|&(_, bits)| bits & bit != 0))
 }
 
 fn retain_heads(
@@ -434,47 +401,14 @@ fn retain_heads(
             impls::Holder::Crate(k) => k,
             impls::Holder::Body(item) => return !after_names && same_krate(item.krate),
         };
-        if !same_krate(k) {
-            return false;
-        }
-        if !after_names || index.complete() {
-            return true;
-        }
-        if outline.is_fixed(k) && index.reusable_after_names() {
-            Arc::make_mut(index).clear_asked();
-            return true;
-        }
-        false
+        same_krate(k)
+            && (!after_names
+                || index.complete()
+                || (outline.is_fixed(k) && index.reusable_after_names() && {
+                    Arc::make_mut(index).clear_asked();
+                    true
+                }))
     });
-}
-
-fn extents_match(loaded: &[crate::outline::tree::CrateExtent], outline: &Outline) -> bool {
-    loaded.len() == outline.crates.len()
-        && loaded
-            .iter()
-            .zip(&outline.crates)
-            .all(|(a, c)| *a == c.extent())
-}
-
-fn lang_files_changed(
-    outline: &Outline,
-    prev: &[crate::outline::tree::CrateExtent],
-    next: &[crate::outline::tree::CrateExtent],
-    same_len: bool,
-) -> bool {
-    if !same_len {
-        return true;
-    }
-    let lang_bit = crate::outline::item::mark("lang");
-    prev.iter().zip(next).enumerate().any(|(k, (a, b))| {
-        if a.files == b.files {
-            return false;
-        }
-        b.files < a.files
-            || outline.crates[k].files[a.files..]
-                .iter()
-                .any(|f| f.items.marks.iter().any(|&(_, bits)| bits & lang_bit != 0))
-    })
 }
 
 impl Cache {
@@ -490,10 +424,8 @@ impl Cache {
         &mut self,
         heads: &Option<Arc<HashMap<u32, Arc<impls::Index>>>>,
     ) {
-        if self.lookups.sysroot_heads.is_none()
-            && let Some(heads) = heads
-        {
-            self.lookups.sysroot_heads = Some(Arc::clone(heads));
+        if self.lookups.sysroot_heads.is_none() {
+            self.lookups.sysroot_heads = heads.clone();
         }
     }
 
@@ -525,13 +457,9 @@ impl Cache {
 
     /// Returns whether any new sysroot `PolySummary` or concrete sysroot instance was built in this session.
     pub fn has_new_sysroot_summaries(&self) -> bool {
-        self.lookups
-            .has_new_sysroot_summaries
-            .load(Ordering::Relaxed)
-            || self
-                .lookups
-                .has_new_sysroot_instances
-                .load(Ordering::Relaxed)
+        let l = &self.lookups;
+        l.has_new_sysroot_summaries.load(Ordering::Relaxed)
+            || l.has_new_sysroot_instances.load(Ordering::Relaxed)
     }
 
     /// Whether each type is structurally `Unpin`, with the depth its answer looked below it.
@@ -568,13 +496,8 @@ impl Cache {
                 } else {
                     deps.as_deref_mut()
                 };
-                if let Some(builder) = target
-                    && let Err(e) = builder.add_summary(*key, bytes)
-                {
-                    err = Some(e);
-                    return true;
-                }
-                false
+                err = target.and_then(|b| b.add_summary(*key, bytes).err());
+                err.is_some()
             });
         if let Some(e) = err {
             return Err(e);
@@ -607,38 +530,7 @@ impl Cache {
 
     /// Drops what the store keeps about the items that `edited` holds, and about the instances, types and lookups that name one of them.
     pub fn forget(&mut self, outline: &Outline, edited: Edited<'_>) {
-        let mine = |item: ItemRef| edited.holds(item.krate, item.file);
-        let block_kept = |block: &impls::ImplRef| match *block {
-            impls::ImplRef::Module { krate, index } => outline.crates[krate as usize]
-                .impls
-                .get(index as usize)
-                .is_some_and(|entry| {
-                    !edited.holds(krate, entry.file as u32)
-                        && !entry
-                            .parts
-                            .iter()
-                            .any(|&part| edited.holds(krate, part as u32))
-                }),
-            impls::ImplRef::Body(item) => !mine(item),
-        };
-        self.signatures.retain(|item, _| !mine(*item));
-        self.bodies.retain(|item, _| !mine(*item));
-        self.adts.retain(|item, _| !mine(*item));
-        self.headers.retain(|block, _| block_kept(block));
-        let mut naming = Naming {
-            types: &self.types,
-            mine: &mine,
-            memo: HashMap::default(),
-        };
-        self.finals.retain(|instance, _| !naming.touches(instance));
-        self.layouts.retain(|ty, _| !naming.names(*ty));
-        self.tails.retain(|ty, _| !naming.names(*ty));
-        self.closures.retain(|ty, _| !naming.names(*ty));
-        self.evaluated
-            .retain(|instance, _| !naming.touches(instance));
-        self.runner.clear();
-        self.lookups
-            .forget_edited(edited, &mut naming, &mine, &block_kept);
+        self.invalidate(outline, std::iter::empty(), edited);
     }
 
     /// Drops what the store keeps about what `edited` holds and returns the indexes of the instances in `list` that it touched.
@@ -648,93 +540,135 @@ impl Cache {
         list: impl Iterator<Item = &'l reach::Instance>,
         edited: Edited<'_>,
     ) -> Vec<usize> {
-        let touched = self.touched(list, edited);
-        self.forget(outline, edited);
+        let mine = |item: ItemRef| edited.holds(item.krate, item.file);
+        let block_kept = |block: &impls::ImplRef| match *block {
+            impls::ImplRef::Module { krate, index } => outline.crates[krate as usize]
+                .impls
+                .get(index as usize)
+                .is_some_and(|e| {
+                    !edited.holds(krate, e.file as u32)
+                        && !e.parts.iter().any(|&p| edited.holds(krate, p as u32))
+                }),
+            impls::ImplRef::Body(item) => !mine(item),
+        };
+        let mut naming = Naming::new(&self.types, &mine);
+        let touched: Vec<usize> = list
+            .enumerate()
+            .filter_map(|(i, inst)| naming.touches(inst).then_some(i))
+            .collect();
+        macro_rules! retain_each {
+            ($pred:expr; $($t:expr),+ $(,)?) => { $($t.retain($pred);)+ };
+        }
+        retain_each!(
+            |item, _| !mine(*item);
+            self.signatures, self.bodies, self.adts, self.lookups.trait_autos,
+            self.lookups.trait_defs, self.lookups.discriminants, self.lookups.reprs, self.lookups.attrs
+        );
+        self.headers.retain(|block, _| block_kept(block));
+        retain_each!(|instance, _| !naming.touches(instance); self.finals, self.evaluated, self.lookups.provisional_rets);
+        retain_each!(
+            |ty, _| !naming.names(*ty);
+            self.layouts, self.tails, self.closures, self.lookups.drops, self.lookups.own_drops,
+            self.lookups.unpins, self.lookups.freezes, self.lookups.glues, self.lookups.fields, self.lookups.futures
+        );
+        self.runner.clear();
+        self.lookups
+            .forget_edited(outline, edited, &mut naming, &block_kept);
         touched
     }
+}
 
-    /// The indexes of the instances in `list` that are functions `edited` holds or take a type that names one of its items.
-    pub fn touched<'l>(
-        &self,
-        list: impl Iterator<Item = &'l reach::Instance>,
-        edited: Edited<'_>,
-    ) -> Vec<usize> {
-        let mine = |item: ItemRef| edited.holds(item.krate, item.file);
-        let mut naming = Naming {
-            types: &self.types,
-            mine: &mine,
-            memo: HashMap::default(),
-        };
-        list.enumerate()
-            .filter(|(_, instance)| naming.touches(instance))
-            .map(|(at, _)| at)
-            .collect()
-    }
+fn has_mark(outline: &Outline, crates: &[u32], name: &str) -> bool {
+    let bit = crate::outline::item::mark(name);
+    crates
+        .iter()
+        .any(|&k| slice_has_mark(&outline.crates[k as usize].files, bit))
 }
 
 impl Lookups {
     fn forget_edited<F: Fn(ItemRef) -> bool>(
         &mut self,
+        outline: &Outline,
         edited: Edited<'_>,
         naming: &mut Naming<'_, F>,
-        mine: &F,
         block_kept: &dyn Fn(&impls::ImplRef) -> bool,
     ) {
-        self.drops.retain(|ty, _| !naming.names(*ty));
-        self.own_drops.retain(|ty, _| !naming.names(*ty));
-        self.unpins.retain(|ty, _| !naming.names(*ty));
-        self.freezes.retain(|ty, _| !naming.names(*ty));
-        self.glues.retain(|ty, _| !naming.names(*ty));
-        self.fields.retain(|ty, _| !naming.names(*ty));
+        let mine = naming.mine;
         self.forms.retain(|(form, _), found| {
             let own = match *form {
-                infer::Form::Adt(item) | infer::Form::Fn(item) => !mine(item),
-                infer::Form::Impl(block) => block_kept(&block),
+                infer::Form::Adt(i) | infer::Form::Fn(i) => !mine(i),
+                infer::Form::Impl(b) => block_kept(&b),
             };
             own && found
                 .iter()
-                .flat_map(|types| types.iter().flatten())
+                .flat_map(|t| t.iter().flatten())
                 .all(|&ty| !naming.names(ty))
         });
         self.reveals.retain(|instance| !naming.touches(instance));
-        self.provisional_rets
-            .retain(|instance, _| !naming.touches(instance));
-        self.futures.retain(|ty, _| !naming.names(*ty));
         self.impl_traits.retain(|block, _| block_kept(block));
         self.heads.retain(|holder, _| match *holder {
             impls::Holder::Crate(krate) => !edited.touches_crate(krate),
             impls::Holder::Body(item) => !mine(item),
         });
-        self.modules
-            .retain(|krate, _| !edited.touches_crate(*krate));
-        self.owners.retain(|krate, _| !edited.touches_crate(*krate));
-        self.scope_traits
-            .retain(|home, _| !edited.touches_crate(home.krate));
-        self.trait_autos.retain(|item, _| !mine(*item));
-        self.type_defs
-            .retain(|key, _| !edited.touches_crate(key.0.0.krate));
-        self.trait_defs.retain(|item, _| !mine(*item));
-        self.selections.clear();
-        self.auto_traits.clear();
-        self.checked_impls = table::Flight::default();
-        self.projections.clear();
-        *write_lock(&self.state.global_allocator) = None;
-        self.trait_calls.clear();
-        self.assoc_types.clear();
-        self.summaries = table::Flight::default();
-        self.discriminants.retain(|item, _| !mine(*item));
-        self.reprs.retain(|item, _| !mine(*item));
-        self.attrs.retain(|item, _| !mine(*item));
-        if self.lang_items.get().is_some() {
-            self.lang_items = Arc::new(std::sync::OnceLock::new());
+        let keep_crate = |k: u32| !edited.touches_crate(k);
+        self.modules.retain(|k, _| keep_crate(*k));
+        self.owners.retain(|k, _| keep_crate(*k));
+        self.scope_traits.retain(|home, _| keep_crate(home.krate));
+        self.type_defs.retain(|key, _| keep_crate(key.0.0.krate));
+        self.selections.retain(|(tr, ty, s), found| {
+            naming.trait_kept(*tr, *ty, *s)
+                && found
+                    .as_ref()
+                    .is_none_or(|(b, a)| block_kept(b) && !naming.substs(*a))
+        });
+        self.auto_traits
+            .retain(|(tr, ty), _| naming.trait_kept(*tr, *ty, Substs::EMPTY));
+        self.checked_impls.retain_keys(|block| block_kept(block));
+        self.projections.retain(|(tr, ty, s, _, gat), found| {
+            naming.trait_kept(*tr, *ty, *s)
+                && !naming.substs(*gat)
+                && found.is_none_or(|t| !naming.names(t))
+        });
+        self.trait_calls.retain(|(i, s), r| {
+            naming.fn_kept(*i, *s)
+                && match *r {
+                    infer::Res::Local(_) => true,
+                    infer::Res::Fn(ri, rs) | infer::Res::Ctor(ri, _, rs) => naming.fn_kept(ri, rs),
+                    infer::Res::Const(ty) => !naming.names(ty),
+                }
+        });
+        self.assoc_types.retain(|(tr, ty, s, a, gat), res| {
+            naming.trait_kept(*tr, *ty, *s)
+                && !mine(*a)
+                && !naming.substs(*gat)
+                && !naming.names(*res)
+        });
+        self.summaries.retain_keys(|item| !mine(*item));
+        let mut alloc = write_lock(&self.state.global_allocator);
+        if matches!(*alloc, Some(Some(i)) if mine(i))
+            || matches!((*alloc, edited), (Some(None), Edited::Crates(c)) if has_mark(outline, c, "global_allocator"))
+        {
+            *alloc = None;
+        }
+        drop(alloc);
+        if let Edited::Crates(crates) = edited {
+            if self.lang_items.get().is_some_and(|l| {
+                l.map.keys().any(|i| crates.contains(&i.krate)) || has_mark(outline, crates, "lang")
+            }) {
+                self.lang_items = Arc::new(std::sync::OnceLock::new());
+            }
+            let mut guard = write_lock(&self.state.loaded);
+            if guard.len() == outline.crates.len() {
+                for &k in crates {
+                    guard[k as usize] = outline.crates[k as usize].extent();
+                }
+            }
         }
         let mut langs = write_lock(&self.state.langs);
-        if langs.as_ref().is_some_and(|found| {
-            found
-                .crates
-                .iter()
-                .any(|&krate| edited.touches_crate(krate))
-        }) {
+        if langs
+            .as_ref()
+            .is_some_and(|f| f.crates.iter().any(|&k| edited.touches_crate(k)))
+        {
             *langs = None;
         }
     }
@@ -765,36 +699,89 @@ impl Edited<'_> {
     }
 }
 
+fn memo_hit(memo: &[u8], idx: usize) -> Option<bool> {
+    let v = *memo.get(idx)?;
+    (v != 0).then_some(v == 2)
+}
+
+fn memo_set(memo: &mut Vec<u8>, idx: usize, found: bool) -> bool {
+    if memo.len() <= idx {
+        memo.resize(idx + 1, 0);
+    }
+    memo[idx] = u8::from(found) + 1;
+    found
+}
+
 pub(super) struct Naming<'t, F> {
     pub(super) types: &'t Types,
     pub(super) mine: &'t F,
-    pub(super) memo: HashMap<ty::Ty, bool>,
+    memo: Vec<u8>,
+    substs_memo: Vec<u8>,
 }
 
-impl<F: Fn(ItemRef) -> bool> Naming<'_, F> {
+impl<'t, F: Fn(ItemRef) -> bool> Naming<'t, F> {
+    pub(super) fn new(types: &'t Types, mine: &'t F) -> Self {
+        Self {
+            types,
+            mine,
+            memo: Vec::new(),
+            substs_memo: Vec::new(),
+        }
+    }
+
     pub(super) fn touches(&mut self, (item, substs): &reach::Instance) -> bool {
-        (self.mine)(*item) || self.types.substs(*substs).iter().any(|ty| self.names(*ty))
+        !self.fn_kept(*item, *substs)
+    }
+
+    fn fn_kept(&mut self, item: ItemRef, substs: Substs) -> bool {
+        !(self.mine)(item) && !self.substs(substs)
+    }
+
+    fn trait_kept(&mut self, item: ItemRef, ty: ty::Ty, substs: Substs) -> bool {
+        self.fn_kept(item, substs) && !self.names(ty)
+    }
+
+    fn substs(&mut self, substs: Substs) -> bool {
+        if substs.is_empty() {
+            return false;
+        }
+        let idx = substs.0 as usize;
+        memo_hit(&self.substs_memo, idx).unwrap_or_else(|| {
+            let found = self.types.substs(substs).iter().any(|ty| self.names(*ty));
+            memo_set(&mut self.substs_memo, idx, found)
+        })
     }
 
     fn names(&mut self, ty: ty::Ty) -> bool {
-        if let Some(&known) = self.memo.get(&ty) {
+        if ty == ty::Ty::NONE {
+            return false;
+        }
+        let idx = ty.0 as usize;
+        if let Some(known) = memo_hit(&self.memo, idx) {
             return known;
         }
-        let kind = self.types.kind(ty);
-        let own = match kind {
-            ty::Kind::Adt(item, _)
-            | ty::Kind::FnDef(item, _)
-            | ty::Kind::Closure(item, ..)
-            | ty::Kind::Dyn(item, ..) => (self.mine)(*item),
+        let found = match *self.types.kind(ty) {
+            ty::Kind::Tuple(items) => self.substs(items),
+            ty::Kind::Ref(_, i)
+            | ty::Kind::Ptr(_, i)
+            | ty::Kind::Slice(i)
+            | ty::Kind::Pat(i, ..) => self.names(i),
+            ty::Kind::Array(i, l) => self.names(i) || self.names(l),
+            ty::Kind::Adt(i, a)
+            | ty::Kind::FnDef(i, a)
+            | ty::Kind::Closure(i, a, ..)
+            | ty::Kind::Dyn(i, a, ..) => (self.mine)(i) || self.substs(a),
+            ty::Kind::FnPtr(p, r) | ty::Kind::UnsafeFnPtr(p, r) => self.names(r) || self.substs(p),
             ty::Kind::Proj(id) => {
-                let def = self.types.proj(*id);
-                (self.mine)(def.of) || (self.mine)(def.assoc)
+                let d = self.types.proj(id);
+                (self.mine)(d.of)
+                    || (self.mine)(d.assoc)
+                    || self.names(d.self_ty)
+                    || self.substs(d.args)
+                    || self.substs(d.own)
             }
             _ => false,
         };
-        let inner: Vec<ty::Ty> = kind.children(self.types).collect();
-        let found = own || inner.into_iter().any(|inner| self.names(inner));
-        self.memo.insert(ty, found);
-        found
+        memo_set(&mut self.memo, idx, found)
     }
 }

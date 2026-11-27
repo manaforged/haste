@@ -78,8 +78,24 @@ pub(super) fn check_local_crate_items(
     roots: &[Instance],
     force_commit: bool,
 ) {
-    reached.clear_crate_errors();
-    let crates = local_crates(cx, roots);
+    check_local_crate_items_in(cx, reached, roots, force_commit, None);
+}
+
+/// Validates local crate constants, statics, trait impls, and ADTs, optionally limited to `only_crates`.
+pub(super) fn check_local_crate_items_in(
+    cx: &mut Context<'_>,
+    reached: &mut Reached,
+    roots: &[Instance],
+    force_commit: bool,
+    only_crates: Option<&[u32]>,
+) {
+    let mut crates = local_crates(cx, roots);
+    if let Some(filter) = only_crates {
+        reached.retain_crate_errors(|krate| !filter.contains(&krate));
+        crates.retain(|krate| filter.contains(krate));
+    } else {
+        reached.clear_crate_errors();
+    }
     let mut items = Vec::new();
     let mut impls = Vec::new();
     for krate in crates {
