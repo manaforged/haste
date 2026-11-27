@@ -9,7 +9,7 @@ use super::super::impls::{Holder, ImplRef};
 use super::super::infer::{
     Coercion, Form, LazyTables, Res, Shape, Typed, is_concrete_fn, shape_calls,
 };
-use super::super::lookups::{Cache, Naming};
+use super::super::lookups::{Cache, Lookups, Naming};
 use super::super::substs::Substs;
 use super::super::summary::{ConstHole, PolyObligation, PolySummary, SummaryKind};
 use super::super::{Context, write_lock};
@@ -338,35 +338,7 @@ pub fn reload_invalidate(
     reached: &Reached,
     scope: &ReloadScope,
 ) -> (Vec<usize>, Vec<usize>, HashSet<ItemRef>) {
-    let mut missing_owners = HashSet::default();
-    let mut note_missing = |item: ItemRef| {
-        if body_expansion_missing(outline, &scope.crates, item) {
-            missing_owners.insert(item.body_owner());
-        }
-    };
-    for (idx, ((item, _), _)) in reached.list.iter().enumerate() {
-        if reached.states.get(idx) != Some(&ReachedEntry::Replaced) {
-            note_missing(*item);
-        }
-    }
-    store.headers.retain(|block, _| {
-        if let ImplRef::Body(item) = *block {
-            note_missing(item);
-        }
-        true
-    });
-    store.signatures.retain(|item, _| {
-        note_missing(*item);
-        true
-    });
-    store.bodies.retain(|item, _| {
-        note_missing(*item);
-        true
-    });
-    store.adts.retain(|item, _| {
-        note_missing(*item);
-        true
-    });
+    let missing_owners = collect_missing_owners(store, outline, reached, scope);
     let item_dirty = |item: ItemRef| {
         scope.is_item_dirty(item)
             || missing_owners.contains(&item)
@@ -378,19 +350,7 @@ pub fn reload_invalidate(
             || body_expansion_missing(outline, &scope.crates, item)
     };
     let block_kept = |block: &ImplRef| match *block {
-        ImplRef::Module { krate, index } => {
-            scope.dirty_files.is_empty()
-                || outline.crates[krate as usize]
-                    .impls
-                    .get(index as usize)
-                    .is_some_and(|e| {
-                        !scope.is_dirty_file(krate, e.file as u32)
-                            && !e
-                                .parts
-                                .iter()
-                                .any(|&p| scope.is_dirty_file(krate, p as u32))
-                    })
-        }
+        ImplRef::Module { krate, index } => module_block_kept(outline, scope, krate, index),
         ImplRef::Body(item) => !item_dirty(item),
     };
     let mut naming = Naming::new(&store.types, &old_ref_dirty);
@@ -398,94 +358,23 @@ pub fn reload_invalidate(
         || !scope.dirty_files.is_empty()
         || !missing_owners.is_empty();
     let has_any_dirty = has_old_dirty || !scope.all_dirty_items.is_empty();
-    let mut touched_set = vec![false; reached.list.len()];
-    let mut touched_instances: HashSet<Instance> = HashSet::default();
-    for (idx, ((item, substs), res)) in reached.list.iter().enumerate() {
-        if reached.states.get(idx) == Some(&ReachedEntry::Replaced) {
-            continue;
-        }
-        let dirty = res.is_err()
-            || item_dirty(*item)
-            || (has_old_dirty
-                && (naming.substs(*substs)
-                    || res.as_ref().is_ok_and(|typed| {
-                        typed_mentions_dirty(typed, &mut naming, &old_ref_dirty)
-                    })));
-        if dirty {
-            touched_set[idx] = true;
-            touched_instances.insert((*item, *substs));
-        }
-    }
-    for &idx in &reached.crate_errors {
-        if let Some(((item, substs), _)) = reached.list.get(idx)
-            && reached.states.get(idx) != Some(&ReachedEntry::Replaced)
-        {
-            touched_set[idx] = true;
-            touched_instances.insert((*item, *substs));
-        }
-    }
-    let mut opaque_dirty = HashSet::default();
-    for (idx, &dirty) in touched_set.iter().enumerate() {
-        if dirty
-            && store
-                .signatures
-                .get(&reached.list[idx].0.0)
-                .is_some_and(|s| s.opaque || s.is_async)
-        {
-            opaque_dirty.insert(idx);
-        }
-    }
-    if !opaque_dirty.is_empty() {
-        loop {
-            let mut added = false;
-            for (caller, callees) in reached.calls.iter().enumerate() {
-                if !touched_set[caller] && callees.iter().any(|c| opaque_dirty.contains(c)) {
-                    touched_set[caller] = true;
-                    touched_instances.insert(reached.list[caller].0);
-                    if store
-                        .signatures
-                        .get(&reached.list[caller].0.0)
-                        .is_some_and(|s| s.opaque || s.is_async)
-                    {
-                        opaque_dirty.insert(caller);
-                    }
-                    added = true;
-                }
-            }
-            if !added {
-                break;
-            }
-        }
-    }
-    let mut dead_set = vec![false; reached.list.len()];
-    let mut in_place = Vec::new();
-    for (idx, &dirty) in touched_set.iter().enumerate() {
-        if !dirty {
-            continue;
-        }
-        let ((item, _), res) = &reached.list[idx];
-        let keep_in_place = !has_old_dirty
-            && reached.states.get(idx) == Some(&ReachedEntry::Settled)
-            && res.is_ok()
-            && !opaque_dirty.contains(&idx)
-            && !old_ref_dirty(*item)
-            && outline
-                .crates
-                .get(item.krate as usize)
-                .and_then(|c| c.files.get(item.file as usize))
-                .and_then(|f| f.items.items.get(item.item as usize))
-                .is_some();
-        if keep_in_place {
-            in_place.push(idx);
-        } else {
-            dead_set[idx] = true;
-        }
-    }
-    let touched = if dead_set.iter().any(|&d| d) {
-        close_dead_callers(reached, &mut dead_set)
-    } else {
-        Vec::new()
-    };
+    let (mut touched_set, mut touched_instances) = touch_reached(
+        reached,
+        has_old_dirty,
+        &item_dirty,
+        &mut naming,
+        &old_ref_dirty,
+    );
+    let opaque_dirty =
+        spread_opaque_touches(store, reached, &mut touched_set, &mut touched_instances);
+    let (touched, in_place) = split_touched(
+        outline,
+        reached,
+        &touched_set,
+        &opaque_dirty,
+        has_old_dirty,
+        &old_ref_dirty,
+    );
 
     macro_rules! retain_each {
         ($pred:expr; $($t:expr),+ $(,)?) => { $($t.retain($pred);)+ };
@@ -521,28 +410,7 @@ pub fn reload_invalidate(
 
     let lk = &mut store.lookups;
     if has_any_dirty {
-        lk.forms.retain(|(form, _), found| {
-            let own = match *form {
-                Form::Adt(i) | Form::Fn(i) => !old_ref_dirty(i),
-                Form::Impl(b) => block_kept(&b),
-            };
-            own && (!has_old_dirty
-                || found
-                    .iter()
-                    .flat_map(|t| t.iter().flatten())
-                    .all(|&ty| !naming.names(ty)))
-        });
-        lk.impl_traits.retain(|block, _| block_kept(block));
-        lk.checked_impls.retain_keys(|block| block_kept(block));
-        lk.selections.retain(|(tr, ty, s), found| {
-            (!has_old_dirty || naming.trait_kept(*tr, *ty, *s))
-                && found
-                    .as_ref()
-                    .is_none_or(|(b, a)| block_kept(b) && !(has_old_dirty && naming.substs(*a)))
-        });
-        lk.trait_calls.retain(|(i, s), r| {
-            !has_old_dirty || (naming.fn_kept(*i, *s) && !res_dirty(*r, &mut naming))
-        });
+        retain_impl_lookups(lk, has_old_dirty, &mut naming, &old_ref_dirty, &block_kept);
     }
     if has_old_dirty || !touched_instances.is_empty() {
         lk.reveals.retain(|instance| {
@@ -551,25 +419,253 @@ pub fn reload_invalidate(
                 && !touched_instances.contains(instance)
         });
     }
+    retain_crate_lookups(lk, scope, has_any_dirty, &item_dirty);
+    retain_module_lookups(lk, scope, has_old_dirty, &old_ref_dirty);
+    if has_old_dirty {
+        retain_trait_lookups(lk, &mut naming, &old_ref_dirty);
+    }
+    let evicted_summaries =
+        evict_summaries(lk, has_old_dirty, &item_dirty, &mut naming, &old_ref_dirty);
+    if !scope.dirty_crates.is_empty() {
+        reset_crate_state(lk, outline, scope);
+    }
+    (touched, in_place, evicted_summaries)
+}
+
+fn collect_missing_owners(
+    store: &mut Cache,
+    outline: &Outline,
+    reached: &Reached,
+    scope: &ReloadScope,
+) -> HashSet<ItemRef> {
+    let mut missing_owners = HashSet::default();
+    let mut note_missing = |item: ItemRef| {
+        if body_expansion_missing(outline, &scope.crates, item) {
+            missing_owners.insert(item.body_owner());
+        }
+    };
+    for (idx, ((item, _), _)) in reached.list.iter().enumerate() {
+        if reached.states.get(idx) != Some(&ReachedEntry::Replaced) {
+            note_missing(*item);
+        }
+    }
+    store.headers.retain(|block, _| {
+        if let ImplRef::Body(item) = *block {
+            note_missing(item);
+        }
+        true
+    });
+    store.signatures.retain(|item, _| {
+        note_missing(*item);
+        true
+    });
+    store.bodies.retain(|item, _| {
+        note_missing(*item);
+        true
+    });
+    store.adts.retain(|item, _| {
+        note_missing(*item);
+        true
+    });
+    missing_owners
+}
+
+fn module_block_kept(outline: &Outline, scope: &ReloadScope, krate: u32, index: u32) -> bool {
+    scope.dirty_files.is_empty()
+        || outline.crates[krate as usize]
+            .impls
+            .get(index as usize)
+            .is_some_and(|e| {
+                !scope.is_dirty_file(krate, e.file as u32)
+                    && !e
+                        .parts
+                        .iter()
+                        .any(|&p| scope.is_dirty_file(krate, p as u32))
+            })
+}
+
+fn touch_reached<F: Fn(ItemRef) -> bool>(
+    reached: &Reached,
+    has_old_dirty: bool,
+    item_dirty: &impl Fn(ItemRef) -> bool,
+    naming: &mut Naming<'_, F>,
+    old_ref_dirty: &F,
+) -> (Vec<bool>, HashSet<Instance>) {
+    let mut touched_set = vec![false; reached.list.len()];
+    let mut touched_instances: HashSet<Instance> = HashSet::default();
+    for (idx, ((item, substs), res)) in reached.list.iter().enumerate() {
+        if reached.states.get(idx) == Some(&ReachedEntry::Replaced) {
+            continue;
+        }
+        let dirty = res.is_err()
+            || item_dirty(*item)
+            || (has_old_dirty
+                && (naming.substs(*substs)
+                    || res.as_ref().is_ok_and(|typed| {
+                        typed_mentions_dirty(typed, &mut *naming, old_ref_dirty)
+                    })));
+        if dirty {
+            touched_set[idx] = true;
+            touched_instances.insert((*item, *substs));
+        }
+    }
+    for &idx in &reached.crate_errors {
+        if let Some(((item, substs), _)) = reached.list.get(idx)
+            && reached.states.get(idx) != Some(&ReachedEntry::Replaced)
+        {
+            touched_set[idx] = true;
+            touched_instances.insert((*item, *substs));
+        }
+    }
+    (touched_set, touched_instances)
+}
+
+fn opaque_signature(store: &Cache, item: ItemRef) -> bool {
+    store
+        .signatures
+        .get(&item)
+        .is_some_and(|s| s.opaque || s.is_async)
+}
+
+fn spread_opaque_touches(
+    store: &Cache,
+    reached: &Reached,
+    touched_set: &mut [bool],
+    touched_instances: &mut HashSet<Instance>,
+) -> HashSet<usize> {
+    let mut opaque_dirty = HashSet::default();
+    for (idx, &dirty) in touched_set.iter().enumerate() {
+        if dirty && opaque_signature(store, reached.list[idx].0.0) {
+            opaque_dirty.insert(idx);
+        }
+    }
+    if opaque_dirty.is_empty() {
+        return opaque_dirty;
+    }
+    loop {
+        let mut added = false;
+        for (caller, callees) in reached.calls.iter().enumerate() {
+            if !touched_set[caller] && callees.iter().any(|c| opaque_dirty.contains(c)) {
+                touched_set[caller] = true;
+                touched_instances.insert(reached.list[caller].0);
+                if opaque_signature(store, reached.list[caller].0.0) {
+                    opaque_dirty.insert(caller);
+                }
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+    opaque_dirty
+}
+
+fn split_touched(
+    outline: &Outline,
+    reached: &Reached,
+    touched_set: &[bool],
+    opaque_dirty: &HashSet<usize>,
+    has_old_dirty: bool,
+    old_ref_dirty: &impl Fn(ItemRef) -> bool,
+) -> (Vec<usize>, Vec<usize>) {
+    let mut dead_set = vec![false; reached.list.len()];
+    let mut in_place = Vec::new();
+    for (idx, &dirty) in touched_set.iter().enumerate() {
+        if !dirty {
+            continue;
+        }
+        let ((item, _), res) = &reached.list[idx];
+        let keep_in_place = !has_old_dirty
+            && reached.states.get(idx) == Some(&ReachedEntry::Settled)
+            && res.is_ok()
+            && !opaque_dirty.contains(&idx)
+            && !old_ref_dirty(*item)
+            && outline
+                .crates
+                .get(item.krate as usize)
+                .and_then(|c| c.files.get(item.file as usize))
+                .and_then(|f| f.items.items.get(item.item as usize))
+                .is_some();
+        if keep_in_place {
+            in_place.push(idx);
+        } else {
+            dead_set[idx] = true;
+        }
+    }
+    let touched = if dead_set.iter().any(|&d| d) {
+        close_dead_callers(reached, &mut dead_set)
+    } else {
+        Vec::new()
+    };
+    (touched, in_place)
+}
+
+fn retain_impl_lookups<F: Fn(ItemRef) -> bool>(
+    lk: &mut Lookups,
+    has_old_dirty: bool,
+    naming: &mut Naming<'_, F>,
+    old_ref_dirty: &F,
+    block_kept: &impl Fn(&ImplRef) -> bool,
+) {
+    lk.forms.retain(|(form, _), found| {
+        let own = match *form {
+            Form::Adt(i) | Form::Fn(i) => !old_ref_dirty(i),
+            Form::Impl(b) => block_kept(&b),
+        };
+        own && (!has_old_dirty
+            || found
+                .iter()
+                .flat_map(|t| t.iter().flatten())
+                .all(|&ty| !naming.names(ty)))
+    });
+    lk.impl_traits.retain(|block, _| block_kept(block));
+    lk.checked_impls.retain_keys(|block| block_kept(block));
+    lk.selections.retain(|(tr, ty, s), found| {
+        (!has_old_dirty || naming.trait_kept(*tr, *ty, *s))
+            && found
+                .as_ref()
+                .is_none_or(|(b, a)| block_kept(b) && !(has_old_dirty && naming.substs(*a)))
+    });
+    lk.trait_calls.retain(|(i, s), r| {
+        !has_old_dirty || (naming.fn_kept(*i, *s) && !res_dirty(*r, &mut *naming))
+    });
+}
+
+fn retain_crate_lookups(
+    lk: &mut Lookups,
+    scope: &ReloadScope,
+    has_any_dirty: bool,
+    item_dirty: &impl Fn(ItemRef) -> bool,
+) {
     if !scope.dirty_crates.is_empty() || has_any_dirty {
         lk.heads.retain(|holder, _| match *holder {
             Holder::Crate(krate) => !scope.dirty_crates.contains(&krate),
             Holder::Body(item) => !item_dirty(item),
         });
     }
-    if !scope.dirty_crates.is_empty() {
-        lk.modules.retain(|k, _| !scope.dirty_crates.contains(k));
-        lk.owners.retain(|k, _| !scope.dirty_crates.contains(k));
-        if let Some(heads) = &mut lk.sysroot_heads
-            && heads.keys().any(|k| scope.dirty_crates.contains(k))
-        {
-            let map = Arc::make_mut(heads);
-            map.retain(|k, _| !scope.dirty_crates.contains(k));
-            if map.is_empty() {
-                lk.sysroot_heads = None;
-            }
+    if scope.dirty_crates.is_empty() {
+        return;
+    }
+    lk.modules.retain(|k, _| !scope.dirty_crates.contains(k));
+    lk.owners.retain(|k, _| !scope.dirty_crates.contains(k));
+    if let Some(heads) = &mut lk.sysroot_heads
+        && heads.keys().any(|k| scope.dirty_crates.contains(k))
+    {
+        let map = Arc::make_mut(heads);
+        map.retain(|k, _| !scope.dirty_crates.contains(k));
+        if map.is_empty() {
+            lk.sysroot_heads = None;
         }
     }
+}
+
+fn retain_module_lookups(
+    lk: &mut Lookups,
+    scope: &ReloadScope,
+    has_old_dirty: bool,
+    old_ref_dirty: &impl Fn(ItemRef) -> bool,
+) {
     if !scope.dirty_modules.is_empty() {
         lk.scope_traits
             .retain(|home, _| !scope.dirty_modules.contains(home));
@@ -577,8 +673,8 @@ pub fn reload_invalidate(
     if !scope.dirty_modules.is_empty() || has_old_dirty {
         lk.type_defs.retain(|key, def| {
             !scope.dirty_modules.contains(&key.0.0)
-                && !key.0.1.is_some_and(&old_ref_dirty)
-                && !key.0.2.is_some_and(&old_ref_dirty)
+                && !key.0.1.is_some_and(old_ref_dirty)
+                && !key.0.2.is_some_and(old_ref_dirty)
                 && match *def {
                     Def::Item(i) | Def::Variant(i, _) => !old_ref_dirty(i),
                     Def::Module(m) => !scope.dirty_modules.contains(&m),
@@ -586,27 +682,41 @@ pub fn reload_invalidate(
                 }
         });
     }
-    if has_old_dirty {
-        lk.auto_traits
-            .retain(|(tr, ty), _| naming.trait_kept(*tr, *ty, Substs::EMPTY));
-        lk.projections.retain(|(tr, ty, s, _, gat), found| {
-            naming.trait_kept(*tr, *ty, *s)
-                && !naming.substs(*gat)
-                && found.is_none_or(|t| !naming.names(t))
-        });
-        lk.assoc_types.retain(|(tr, ty, s, a, gat), res| {
-            naming.trait_kept(*tr, *ty, *s)
-                && !old_ref_dirty(*a)
-                && !naming.substs(*gat)
-                && !naming.names(*res)
-        });
-    }
+}
+
+fn retain_trait_lookups<F: Fn(ItemRef) -> bool>(
+    lk: &mut Lookups,
+    naming: &mut Naming<'_, F>,
+    old_ref_dirty: &F,
+) {
+    lk.auto_traits
+        .retain(|(tr, ty), _| naming.trait_kept(*tr, *ty, Substs::EMPTY));
+    lk.projections.retain(|(tr, ty, s, _, gat), found| {
+        naming.trait_kept(*tr, *ty, *s)
+            && !naming.substs(*gat)
+            && found.is_none_or(|t| !naming.names(t))
+    });
+    lk.assoc_types.retain(|(tr, ty, s, a, gat), res| {
+        naming.trait_kept(*tr, *ty, *s)
+            && !old_ref_dirty(*a)
+            && !naming.substs(*gat)
+            && !naming.names(*res)
+    });
+}
+
+fn evict_summaries<F: Fn(ItemRef) -> bool>(
+    lk: &mut Lookups,
+    has_old_dirty: bool,
+    item_dirty: &impl Fn(ItemRef) -> bool,
+    naming: &mut Naming<'_, F>,
+    old_ref_dirty: &F,
+) -> HashSet<ItemRef> {
     let mut evicted_summaries = HashSet::default();
     lk.summaries.retain_entries(|item, kind| {
         let keep = !item_dirty(*item)
             && match kind {
                 SummaryKind::Poly(summary) => {
-                    !has_old_dirty || !poly_summary_dirty(summary, &mut naming, &old_ref_dirty)
+                    !has_old_dirty || !poly_summary_dirty(summary, &mut *naming, old_ref_dirty)
                 }
                 SummaryKind::MonomorphicHints(hints) => {
                     !has_old_dirty || !hints.values().any(|&i| old_ref_dirty(i))
@@ -619,22 +729,23 @@ pub fn reload_invalidate(
         }
         keep
     });
-    if !scope.dirty_crates.is_empty() {
-        lk.file_index = Arc::new(OnceLock::new());
-        let mut langs = write_lock(&lk.state.langs);
-        if langs
-            .as_ref()
-            .is_some_and(|f| f.crates.iter().any(|k| scope.dirty_crates.contains(k)))
-        {
-            *langs = None;
-        }
-        drop(langs);
-        let mut guard = write_lock(&lk.state.loaded);
-        if guard.len() == outline.crates.len() {
-            for &k in &scope.crates {
-                guard[k as usize] = outline.crates[k as usize].extent();
-            }
+    evicted_summaries
+}
+
+fn reset_crate_state(lk: &mut Lookups, outline: &Outline, scope: &ReloadScope) {
+    lk.file_index = Arc::new(OnceLock::new());
+    let mut langs = write_lock(&lk.state.langs);
+    if langs
+        .as_ref()
+        .is_some_and(|f| f.crates.iter().any(|k| scope.dirty_crates.contains(k)))
+    {
+        *langs = None;
+    }
+    drop(langs);
+    let mut guard = write_lock(&lk.state.loaded);
+    if guard.len() == outline.crates.len() {
+        for &k in &scope.crates {
+            guard[k as usize] = outline.crates[k as usize].extent();
         }
     }
-    (touched, in_place, evicted_summaries)
 }
