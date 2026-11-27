@@ -187,31 +187,6 @@ pub(in super::super) fn receiver_has_any_named(src: &Source, item: &Item, named:
     false
 }
 
-fn impl_self_lifetimes(
-    cx: &mut crate::sema::Context<'_>,
-    item: crate::names::ItemRef,
-    static_names: &[String],
-) -> (bool, bool, Vec<String>) {
-    let Some(block) = cx.owner_impl(item) else {
-        return (false, false, Vec::new());
-    };
-    let Ok(hdr) = cx.impl_header(block) else {
-        return (false, false, Vec::new());
-    };
-    let has_lt_generic = hdr
-        .generics
-        .iter()
-        .any(|g| g.kind == crate::body::sig::GenericKind::Lifetime);
-    let impl_src = &cx.impl_file(block).source;
-    let has_non_static_ty = crate::sema::infer::scope::type_params(&hdr.generics)
-        .any(|g| !static_names.iter().any(|s| s == impl_src.text(g.name)));
-    let mut lts = Lifetimes::default();
-    collect_ty_lifetimes(&hdr.body, impl_src, hdr.self_ty, &mut lts);
-    let has_lt = has_lt_generic || has_non_static_ty || lts.has_elided || !lts.named.is_empty();
-    let has_elided = has_lt && lts.named.is_empty();
-    (has_lt, has_elided, owned_lts(lts.named))
-}
-
 pub(in super::super) struct ParamLifetimes {
     pub(in super::super) is_static: Vec<bool>,
     pub(in super::super) inner_is_static: Vec<bool>,
@@ -317,7 +292,8 @@ pub(in super::super) fn compute_param_lifetimes(
             *slot = false;
         }
     }
-    let (impl_has_lt, impl_has_elided, impl_named) = impl_self_lifetimes(cx, item, static_names);
+    let (impl_has_lt, impl_has_elided, impl_named) =
+        super::closure::impl_self_lifetimes(cx, item, static_names);
     let mut cursor = 0usize;
     if let Some((kind, _)) = sig.receiver {
         if let Some(&local) = typed.params.get(cursor)
@@ -411,6 +387,21 @@ fn record_param_ty(
     info.has_elided_lt[slot] =
         has_elided_or_unbounded_lt(sig, src, &lts, impl_has_lt, static_names);
     info.named_lts[slot] = owned_lts(lts.named);
+    if info.has_elided_lt[slot]
+        && !lts.has_elided
+        && !(impl_has_lt && lts.names.contains(&"Self"))
+        && super::static_ty::collect_type_param_lt_bounds(
+            &sig.body,
+            src,
+            &sig.generics,
+            &sig.predicates,
+            &lts.names,
+            static_names,
+            &mut info.named_lts[slot],
+        )
+    {
+        info.has_elided_lt[slot] = false;
+    }
     if let AstTy::Ref {
         lifetime,
         ty: inner,

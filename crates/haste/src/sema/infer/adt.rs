@@ -422,7 +422,25 @@ impl<'a> Infer<'_, 'a> {
         };
         let adt = self.cx.types.intern(Kind::Adt(item, args));
         if let Some(expected) = expected {
-            self.trial(|infer| Ok(infer.unifies(adt, expected).then_some(())))?;
+            let expected_sized = match self.cx.types.kind(self.resolve(expected)) {
+                Kind::Adt(exp_item, exp_args) => {
+                    let exp_slice = self.cx.types.substs(*exp_args).to_vec();
+                    !self
+                        .adt_tail_field(*exp_item, &exp_slice)?
+                        .is_some_and(|t| {
+                            matches!(
+                                self.cx.types.kind(self.resolve(t)),
+                                Kind::Slice(_)
+                                    | Kind::Dyn(..)
+                                    | Kind::Prim(crate::names::Primitive::Str)
+                            )
+                        })
+                }
+                _ => true,
+            };
+            if expected_sized {
+                self.trial(|infer| Ok(infer.unifies(adt, expected).then_some(())))?;
+            }
         }
         let slice = self.cx.types.substs(args).to_vec();
         let tys = self.adt_fields(item, &slice)?[variant as usize].clone();

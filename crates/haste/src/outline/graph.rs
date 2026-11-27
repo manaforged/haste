@@ -405,6 +405,10 @@ fn root_crate(workspace: &Workspace, targets: &Targets, root: &Root, test: bool)
     } else {
         crate::graph::script::crate_vars(workspace, root.unit)
     };
+    vars.push(("CARGO_CRATE_NAME".to_owned(), root.name.replace('-', "_")));
+    if root.role == Role::Bin {
+        vars.push(("CARGO_BIN_NAME".to_owned(), root.name.clone()));
+    }
     let mut errors = Vec::new();
     if root.role == Role::Test {
         let tmp = target_tmpdir(workspace, root);

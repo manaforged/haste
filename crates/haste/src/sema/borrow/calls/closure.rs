@@ -582,4 +582,52 @@ impl Checker<'_, '_> {
             }
         }
     }
+
+    pub(super) fn param_shares_ret_ty(&mut self, local: u32) -> bool {
+        self.param_lts
+            .only_type_param
+            .get(local as usize)
+            .copied()
+            .unwrap_or(false)
+            && self.cx.signature(self.item).is_ok_and(|sig| {
+                super::static_ty::param_shares_ret_type_param(&sig, self.src, self.typed, local)
+            })
+    }
+}
+
+pub(super) fn impl_self_lifetimes(
+    cx: &mut crate::sema::Context<'_>,
+    item: crate::names::ItemRef,
+    static_names: &[String],
+) -> (bool, bool, Vec<String>) {
+    let Some(block) = cx.owner_impl(item) else {
+        return (false, false, Vec::new());
+    };
+    let Ok(hdr) = cx.impl_header(block) else {
+        return (false, false, Vec::new());
+    };
+    let has_lt_generic = hdr
+        .generics
+        .iter()
+        .any(|g| g.kind == crate::body::sig::GenericKind::Lifetime);
+    let impl_src = &cx.impl_file(block).source;
+    let has_non_static_ty = crate::sema::infer::scope::type_params(&hdr.generics)
+        .any(|g| !static_names.iter().any(|s| s == impl_src.text(g.name)));
+    let mut lts = super::lifetimes::Lifetimes::default();
+    super::lifetimes::collect_ty_lifetimes(&hdr.body, impl_src, hdr.self_ty, &mut lts);
+    let mut named: Vec<String> = lts.named.into_iter().map(str::to_owned).collect();
+    let bounded_by_lt = !lts.has_elided
+        && has_non_static_ty
+        && super::static_ty::collect_type_param_lt_bounds(
+            &hdr.body,
+            impl_src,
+            &hdr.generics,
+            &hdr.predicates,
+            &lts.names,
+            static_names,
+            &mut named,
+        );
+    let has_lt = has_lt_generic || has_non_static_ty || lts.has_elided || !named.is_empty();
+    let has_elided = has_lt && named.is_empty() && !bounded_by_lt;
+    (has_lt, has_elided, named)
 }

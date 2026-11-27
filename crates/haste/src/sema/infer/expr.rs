@@ -436,6 +436,11 @@ impl Infer<'_, '_> {
     }
 
     fn other_call(&mut self, expr: ExprId, found: Ty, callee_ty: Ty, args: List) -> Result<Ty> {
+        if matches!(self.cx.types.kind(callee_ty), Kind::Dyn(..))
+            && let Some(ret) = self.dyn_super_call((expr, found, 0), callee_ty, args)?
+        {
+            return Ok(ret);
+        }
         if self.poly.is_some()
             && matches!(
                 self.cx.types.kind(callee_ty),

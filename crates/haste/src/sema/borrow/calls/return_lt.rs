@@ -131,9 +131,10 @@ impl super::super::Checker<'_, '_> {
                 ),
             ));
         }
-        if req
-            .iter()
-            .any(|&r| self.param_satisfies_lt_mode(src.target, &[r], false, false))
+        if self.param_shares_ret_ty(src.target)
+            || req
+                .iter()
+                .any(|&r| self.param_satisfies_lt_mode(src.target, &[r], false, false))
         {
             return Ok(());
         }
