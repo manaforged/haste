@@ -180,3 +180,91 @@ fn profile_overrides_parse_debug_assertions_and_panic_from_workspace_and_member(
 
     drop(std::fs::remove_dir_all(&top));
 }
+
+#[test]
+fn workspace_members_recursive_glob_and_watched_dirs() {
+    let top = temp_dir("ws-recursive-glob");
+    std::fs::write(
+        top.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"trees/**/leaf\"]\n",
+    )
+    .expect("write root Cargo.toml");
+
+    write_member(&top, "trees/leaf", "leaf-0", "2021");
+    write_member(&top, "trees/a/leaf", "leaf-1", "2021");
+    write_member(&top, "trees/b/c/leaf", "leaf-2", "2021");
+    std::fs::create_dir_all(top.join("trees/d/e")).expect("mkdir empty branch");
+    write_member(&top, "trees/b/other", "other", "2021");
+
+    let ws = manifest::workspace_of(&top).expect("read ws");
+    let got: BTreeSet<PathBuf> = manifest::workspace_member_dirs(&top, ws.as_ref(), "members")
+        .into_iter()
+        .map(|p| manifest::normalize(&p))
+        .collect();
+    let expected: BTreeSet<PathBuf> = [
+        top.join("trees/leaf"),
+        top.join("trees/a/leaf"),
+        top.join("trees/b/c/leaf"),
+    ]
+    .into_iter()
+    .map(|p| manifest::normalize(&p))
+    .collect();
+    assert_eq!(got, expected);
+
+    let glob_dirs: BTreeSet<PathBuf> = manifest::member_glob_dirs(&top)
+        .into_iter()
+        .map(|p| manifest::normalize(&p))
+        .collect();
+    for expected_dir in [
+        top.join("trees"),
+        top.join("trees/leaf"),
+        top.join("trees/a"),
+        top.join("trees/b"),
+        top.join("trees/b/c"),
+        top.join("trees/d"),
+        top.join("trees/d/e"),
+    ] {
+        assert!(
+            glob_dirs.contains(&manifest::normalize(&expected_dir)),
+            "missing watched recursive glob dir {}",
+            expected_dir.display()
+        );
+    }
+
+    drop(std::fs::remove_dir_all(&top));
+}
+
+#[test]
+fn workspace_members_char_class_negation_follows_cargo_glob() {
+    let top = temp_dir("ws-char-class");
+    std::fs::write(
+        top.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"caret/[^a]\", \"bang/[!a]\"]\n",
+    )
+    .expect("write root Cargo.toml");
+
+    write_member(&top, "caret/^", "caret-hat", "2021");
+    write_member(&top, "caret/a", "caret-a", "2021");
+    write_member(&top, "caret/b", "caret-b", "2021");
+    write_member(&top, "bang/^", "bang-hat", "2021");
+    write_member(&top, "bang/a", "bang-a", "2021");
+    write_member(&top, "bang/b", "bang-b", "2021");
+
+    let ws = manifest::workspace_of(&top).expect("read ws");
+    let got: BTreeSet<PathBuf> = manifest::workspace_member_dirs(&top, ws.as_ref(), "members")
+        .into_iter()
+        .map(|p| manifest::normalize(&p))
+        .collect();
+    let expected: BTreeSet<PathBuf> = [
+        top.join("caret/^"),
+        top.join("caret/a"),
+        top.join("bang/^"),
+        top.join("bang/b"),
+    ]
+    .into_iter()
+    .map(|p| manifest::normalize(&p))
+    .collect();
+    assert_eq!(got, expected);
+
+    drop(std::fs::remove_dir_all(&top));
+}
