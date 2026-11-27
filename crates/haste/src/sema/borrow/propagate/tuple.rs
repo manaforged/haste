@@ -263,7 +263,8 @@ impl<'a> Checker<'_, 'a> {
                 .cloned()
                 .collect();
             if self.is_iter_copied_call(iter) {
-                self.unwrap_outer_container_loans(srcs, state, true)
+                let iter_ty = self.expr_ty(iter);
+                self.unwrap_outer_container_loans_with_res(srcs, state, true, iter_ty)
             } else {
                 srcs
             }

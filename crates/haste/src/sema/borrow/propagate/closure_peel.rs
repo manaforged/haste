@@ -314,9 +314,64 @@ impl Checker<'_, '_> {
             cur = self.builtin_deref_ty(cur).unwrap_or(Ty::NONE);
         }
         if cur != Ty::NONE && matches!(*self.cx.types.kind(cur), Kind::Ref(Mut::Not, _)) {
-            self.unwrap_outer_container_loans(srcs, state, true)
+            self.unwrap_outer_container_loans_with_res(srcs, state, true, self.expr_ty(call_expr))
         } else {
             srcs
         }
+    }
+
+    pub(in super::super) fn unwrap_outer_container_loans_with_res(
+        &mut self,
+        sources: Vec<super::BorrowSource>,
+        state: &super::super::State,
+        unwrap_temp: bool,
+        res_ty: Ty,
+    ) -> Vec<super::BorrowSource> {
+        let res_depth = self.ty_max_ref_depth(res_ty);
+        let targets: Vec<u32> = sources.iter().map(|s| s.target).collect();
+        let mut out = Vec::new();
+        let mut rest = Vec::new();
+        for s in sources {
+            if !self.try_promote_by_val_param(&s, &targets, res_depth, state, &mut out) {
+                rest.push(s);
+            }
+        }
+        out.extend(self.unwrap_outer_container_loans_inner(
+            rest,
+            state,
+            unwrap_temp,
+            Some((res_ty, true)),
+        ));
+        super::dedup_sources(out)
+    }
+
+    pub(super) fn unwrap_ref_place_container_loan(
+        &mut self,
+        local: u32,
+        steps: &[super::super::places::PlaceStep],
+        loan: &super::super::Loan,
+        mutable: bool,
+        state: &super::super::State,
+        out: &mut Vec<super::BorrowSource>,
+    ) -> bool {
+        let Kind::Ref(_, inner) = *self.cx.types.kind(self.local_ty(local)) else {
+            return false;
+        };
+        if !self.is_ref_ty(inner)
+            || steps.first() != Some(&super::super::places::PlaceStep::Deref)
+            || self.from_caller(loan.target, loan.through_ref)
+            || self.is_param_local(loan.target)
+            || self.is_closure_param(loan.target)
+            || !self.ty_holds_borrow(self.local_ty(loan.target))
+        {
+            return false;
+        }
+        for l in state.loans.iter().filter(|l| l.holder == Some(loan.target)) {
+            out.push(super::BorrowSource {
+                mutable: mutable && l.mutable,
+                ..super::BorrowSource::from_loan(l)
+            });
+        }
+        true
     }
 }

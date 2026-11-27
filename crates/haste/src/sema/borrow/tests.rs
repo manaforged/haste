@@ -591,3 +591,200 @@ fn unwrap_container_loans_strips_copied_vec_and_preserves_inner_local_borrow() {
     assert_eq!(dangling_out.len(), 1);
     assert_eq!(dangling_out[0].target, local_str);
 }
+
+#[test]
+fn owned_borrow_param_iter_deref_allows_caller_borrow_and_rejects_local_vec() {
+    use std::sync::Arc;
+
+    use crate::body::{Expr, ExprId, Pat, Stmt};
+    use crate::names::Primitive;
+    use crate::sema::infer::{
+        Adjust, BodyTables, Coercion, LazyTables, Local, Res, SyntaxTables, Typed,
+    };
+    use crate::sema::substs::PackedMap;
+    use crate::sema::ty::{Kind, Mut};
+    use crate::sema::{Cache, Context};
+
+    let code = concat!(
+        "pub struct MyVec<T> { pub item: T }\n",
+        "pub struct Iter<'a, T> { pub item: &'a T }\n",
+        "pub struct Enumerate<I> { pub inner: I }\n",
+        "impl<T> MyVec<T> {\n",
+        "    pub fn new() -> MyVec<T> { loop {} }\n",
+        "    pub fn push(&mut self, value: T) {}\n",
+        "    pub fn iter(&self) -> Iter<'_, T> { loop {} }\n",
+        "}\n",
+        "impl<'a, T> Iter<'a, T> {\n",
+        "    pub fn enumerate(self) -> Enumerate<Iter<'a, T>> { loop {} }\n",
+        "}\n",
+        "pub fn pos<'a>(v: MyVec<&'a u8>) -> MyVec<&'a u8> {\n",
+        "    let mut out = MyVec::new();\n",
+        "    for (_idx, line) in v.iter().enumerate() { out.push(line); }\n",
+        "    out\n",
+        "}\n",
+        "pub fn neg<'a>(v: MyVec<u8>) -> &'a u8 {\n",
+        "    for line in v.iter() { return line; }\n",
+        "    loop {}\n",
+        "}\n",
+    );
+    let (outline, names) = test_outline(code, "2021");
+    let (my_vec, iter_adt, enum_adt) = (
+        find_item_in(&outline, "MyVec"),
+        find_item_in(&outline, "Iter"),
+        find_item_in(&outline, "Enumerate"),
+    );
+    let (new_fn, push_fn, iter_fn, enum_fn, pos_fn, neg_fn) = (
+        find_item_in(&outline, "new"),
+        find_item_in(&outline, "push"),
+        find_item_in(&outline, "iter"),
+        find_item_in(&outline, "enumerate"),
+        find_item_in(&outline, "pos"),
+        find_item_in(&outline, "neg"),
+    );
+
+    let mut cx = Context::new(&outline, &names, Cache::default());
+    let (u8_ty, usize_ty) = (
+        cx.types.prim(Primitive::U8),
+        cx.types.prim(Primitive::Usize),
+    );
+    let ref_u8 = cx.types.intern(Kind::Ref(Mut::Not, u8_ty));
+    let ref_ref_u8 = cx.types.intern(Kind::Ref(Mut::Not, ref_u8));
+    let vec_ref_u8 = cx.types.adt(my_vec, &[ref_u8]);
+    let iter_ref_u8 = cx.types.adt(iter_adt, &[ref_u8]);
+    let enum_iter_ref_u8 = cx.types.adt(enum_adt, &[iter_ref_u8]);
+    let vec_u8 = cx.types.adt(my_vec, &[u8_ty]);
+    let slice_u8 = cx.types.intern(Kind::Slice(u8_ty));
+    let iter_u8 = cx.types.intern(Kind::Ref(Mut::Not, slice_u8));
+    let unit = cx.types.unit();
+    let substs_ref_u8 = cx.types.intern_substs(&[ref_u8]);
+    let substs_u8 = cx.types.intern_substs(&[u8_ty]);
+    let src = &outline.crates[0].files[0].source;
+
+    let check_case =
+        |cx: &mut Context<'_>, fn_item, v_ty, iter_ty, iter_substs, line_ty, coerce_line: bool| {
+            let sig = cx.signature(fn_item).expect("sig");
+            let body = cx.body(fn_item).expect("body");
+            let mut binds = Vec::new();
+            if let Some(out_pat) = body.stmts.iter().find_map(|s| match *s {
+                Stmt::Let { pat, .. } => Some(pat),
+                _ => None,
+            }) {
+                binds.push((out_pat, 1));
+            }
+            let line_local = if coerce_line { 3 } else { 2 };
+            let for_pat = body
+                .exprs
+                .iter()
+                .find_map(|e| match *e {
+                    Expr::For { pat, .. } => Some(pat),
+                    _ => None,
+                })
+                .expect("for pat");
+            match *body.pat(for_pat) {
+                Pat::Tuple(list) => {
+                    let ids = body.list(list);
+                    binds.push((crate::body::PatId(ids[0]), 2));
+                    binds.push((crate::body::PatId(ids[1]), 3));
+                }
+                _ => binds.push((for_pat, 2)),
+            }
+            let mut exprs = vec![unit; body.exprs.len()];
+            let mut res = Vec::new();
+            let mut adjusts = Vec::new();
+            let mut coercions = Vec::new();
+            let adj = |m| Adjust {
+                derefs: 0,
+                autoref: Some(m),
+            };
+            for (i, e) in body.exprs.iter().enumerate() {
+                let id = ExprId(i as u32);
+                match *e {
+                    Expr::Call(..) => {
+                        exprs[i] = vec_ref_u8;
+                        res.push((id, Res::Fn(new_fn, substs_ref_u8)));
+                    }
+                    Expr::Method { name, .. } => match src.text(name) {
+                        "iter" => {
+                            exprs[i] = iter_ty;
+                            res.push((id, Res::Fn(iter_fn, iter_substs)));
+                            adjusts.push((id, adj(Mut::Not)));
+                        }
+                        "enumerate" => {
+                            exprs[i] = enum_iter_ref_u8;
+                            res.push((id, Res::Fn(enum_fn, substs_ref_u8)));
+                        }
+                        "push" => {
+                            res.push((id, Res::Fn(push_fn, substs_ref_u8)));
+                            adjusts.push((id, adj(Mut::Mut)));
+                        }
+                        _ => {}
+                    },
+                    Expr::Path(pid) => {
+                        let segs = body.list(body.path(pid).segments);
+                        match segs
+                            .last()
+                            .map(|&s| src.text(body.segments[s as usize].name))
+                        {
+                            Some("v") => {
+                                exprs[i] = v_ty;
+                                res.push((id, Res::Local(0)));
+                            }
+                            Some("out") => {
+                                exprs[i] = vec_ref_u8;
+                                res.push((id, Res::Local(1)));
+                            }
+                            Some("line") => {
+                                exprs[i] = line_ty;
+                                res.push((id, Res::Local(line_local)));
+                                if coerce_line {
+                                    coercions.push((
+                                        id,
+                                        Coercion::Deref(vec![(ref_ref_u8, None)], ref_u8),
+                                    ));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut locals = vec![Local { ty: v_ty }, Local { ty: vec_ref_u8 }];
+            if coerce_line {
+                locals.push(Local { ty: usize_ty });
+            }
+            locals.push(Local { ty: line_ty });
+            let tables = BodyTables {
+                syntax: Arc::new(SyntaxTables {
+                    binds: PackedMap::pack(binds),
+                    adjusts: PackedMap::pack(adjusts),
+                    ..SyntaxTables::default()
+                }),
+                exprs: exprs.into_boxed_slice(),
+                res: PackedMap::pack(res),
+                coercions: PackedMap::pack(coercions),
+                ..BodyTables::default()
+            };
+            let typed = Typed {
+                tables: LazyTables::Eager(Arc::new(tables)),
+                locals,
+                params: vec![0],
+                ret: Some(if coerce_line { vec_ref_u8 } else { ref_u8 }),
+                ..Typed::default()
+            };
+            super::check(cx, fn_item, (&body, &sig), src, &typed)
+        };
+
+    let pos_res = check_case(
+        &mut cx,
+        pos_fn,
+        vec_ref_u8,
+        iter_ref_u8,
+        substs_ref_u8,
+        ref_ref_u8,
+        true,
+    );
+    assert!(pos_res.is_ok());
+    let neg_res = check_case(&mut cx, neg_fn, vec_u8, iter_u8, substs_u8, ref_u8, false);
+    assert!(neg_res.is_err());
+}

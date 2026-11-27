@@ -187,12 +187,8 @@ impl Checker<'_, '_> {
                     self.fallback_sources_with_steps(target, ctx.steps_match_fallback);
                 if ctx.behind_ref && self.is_copy[local as usize] && !ctx.is_param {
                     let local_ty = self.local_ty(local);
-                    sources = self.unwrap_outer_container_loans_inner(
-                        sources,
-                        state,
-                        true,
-                        Some((local_ty, true)),
-                    );
+                    sources =
+                        self.unwrap_outer_container_loans_with_res(sources, state, true, local_ty);
                 }
                 self.push_sources_for_local(local, &sources, None, state);
             }

@@ -11,7 +11,7 @@ use super::super::{Checker, State, is_temp_holder};
 use super::{BorrowSource, dedup_sources, state_holds_other_target};
 
 impl Checker<'_, '_> {
-    fn try_promote_by_val_param(
+    pub(super) fn try_promote_by_val_param(
         &mut self,
         s: &BorrowSource,
         targets: &[u32],
@@ -75,8 +75,17 @@ impl Checker<'_, '_> {
         sources: Vec<BorrowSource>,
         state: &State,
     ) -> Vec<BorrowSource> {
-        let is_deref = matches!(*self.body.expr(expr), Expr::Unary(UnOp::Deref, _));
-        let expr_ty = self.expr_ty(expr);
+        let is_deref = matches!(*self.body.expr(expr), Expr::Unary(UnOp::Deref, _))
+            || self.expr_derefs_ref(expr);
+        let expr_ty = match self
+            .typed
+            .coercions
+            .get(&expr)
+            .map(crate::sema::infer::Coercion::leaf)
+        {
+            Some(crate::sema::infer::Coercion::Deref(_, to)) => *to,
+            _ => self.expr_ty(expr),
+        };
         let base_is_ref = self.is_ref_ty(base_ty);
         let inner_static_res = base_is_ref.then_some((expr_ty, is_deref));
         let no_temps = sources
@@ -737,11 +746,13 @@ impl Checker<'_, '_> {
             if self.is_param_local(s.target) || self.is_closure_param(s.target) {
                 let target_ty = self.local_ty(s.target);
                 if target_ty != Ty::NONE {
+                    let is_ref = self.is_ref_ty(target_ty);
                     let inner = match *self.cx.types.kind(target_ty) {
                         Kind::Ref(_, pointee) => pointee,
                         _ => target_ty,
                     };
-                    if self.ty_holds_borrow(inner)
+                    if is_ref
+                        && self.ty_holds_borrow(inner)
                         && (call_depth <= self.ty_max_ref_depth(inner)
                             || (Some(s.target) != root && recv_is_mut_ref && clears_mut))
                     {
@@ -755,35 +766,5 @@ impl Checker<'_, '_> {
             }
         }
         expanded
-    }
-
-    pub(super) fn unwrap_ref_place_container_loan(
-        &mut self,
-        local: u32,
-        steps: &[PlaceStep],
-        loan: &super::super::Loan,
-        mutable: bool,
-        state: &State,
-        out: &mut Vec<BorrowSource>,
-    ) -> bool {
-        let Kind::Ref(_, inner) = *self.cx.types.kind(self.local_ty(local)) else {
-            return false;
-        };
-        if !self.is_ref_ty(inner)
-            || steps.first() != Some(&PlaceStep::Deref)
-            || self.from_caller(loan.target, loan.through_ref)
-            || self.is_param_local(loan.target)
-            || self.is_closure_param(loan.target)
-            || !self.ty_holds_borrow(self.local_ty(loan.target))
-        {
-            return false;
-        }
-        for l in state.loans.iter().filter(|l| l.holder == Some(loan.target)) {
-            out.push(BorrowSource {
-                mutable: mutable && l.mutable,
-                ..BorrowSource::from_loan(l)
-            });
-        }
-        true
     }
 }
