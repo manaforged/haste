@@ -383,6 +383,7 @@ pub(crate) mod apple_args {
         use std::ffi::{CStr, CString};
 
         use super::*;
+        use crate::host::HostSymbol;
 
         #[test]
         fn guard_overrides_and_restores_apple_argv() {

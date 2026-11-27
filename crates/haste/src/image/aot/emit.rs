@@ -278,7 +278,8 @@ impl Image {
         cx: &mut crate::sema::Context<'_>,
         reached: &crate::sema::reach::Reached,
     ) -> Result<Executable> {
-        let state = lock(self.aot().context("image has no AOT recording")?);
+        let mut state = lock(self.aot().context("image has no AOT recording")?);
+        repair_foreign_host_libs(cx, reached, &mut state);
         let (debug_info, symbols, fn_align) =
             crate::with_cfg(|c| (c.debug_info, c.symbols, c.fn_align));
         let mut aot_roots = vec![lang_start, user_main];
@@ -542,6 +543,68 @@ fn user_panic_abort(
     })
 }
 
+fn crate_fallback_lib(
+    cx: &crate::sema::Context<'_>,
+    item: crate::names::ItemRef,
+    name: &str,
+) -> Option<String> {
+    if let Some(explicit) = cx.link_lib(item) {
+        return Some(explicit);
+    }
+    let libs = cx.crate_link_libs(item.krate);
+    if libs.is_empty() {
+        return None;
+    }
+    #[cfg(target_vendor = "apple")]
+    if crate::image::in_apple_libsystem(name) {
+        return None;
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    if HostSymbol::resolve_for_lib(name, None, false).is_some() {
+        return None;
+    }
+    libs.iter()
+        .find(|lib| HostSymbol::resolve_for_lib(name, Some(lib), false).is_some())
+        .cloned()
+        .or_else(|| libs.first().cloned())
+}
+
+fn repair_foreign_host_libs(
+    cx: &crate::sema::Context<'_>,
+    reached: &crate::sema::reach::Reached,
+    state: &mut AotState,
+) {
+    for (&idx, sym) in &mut state.foreign_fns {
+        if let HostSymbol::Dynamic { name, lib } = sym
+            && lib.is_none()
+            && let Some(((item, _), _)) = reached.list.get(idx)
+            && let Some(found) = crate_fallback_lib(cx, *item, name)
+        {
+            *lib = Some(found.into_boxed_str());
+        }
+    }
+    for (&idx, entry) in &mut state.statics {
+        if let AotStatic::Foreign {
+            host: Some(HostSymbol::Dynamic { name, lib }),
+            ..
+        } = entry
+            && lib.is_none()
+            && let Some(((item, _), _)) = reached.list.get(idx)
+            && let Some(found) = crate_fallback_lib(cx, *item, name)
+        {
+            *lib = Some(found.into_boxed_str());
+        }
+    }
+}
+
+fn push_macho_framework_path(exe: &mut Executable, raw: &str) {
+    if let Some(path) = crate::aot::Plan::macho_framework_path(raw)
+        && !exe.extra_libs.contains(&path)
+    {
+        exe.extra_libs.push(path);
+    }
+}
+
 fn collect_macho_frameworks(
     cx: &crate::sema::Context<'_>,
     reached: &crate::sema::reach::Reached,
@@ -567,13 +630,13 @@ fn collect_macho_frameworks(
                 if kind == crate::graph::script::LinkKind::Framework {
                     let fw = name.trim().trim_end_matches(".framework");
                     if !fw.is_empty() {
-                        let path = format!("/System/Library/Frameworks/{fw}.framework/{fw}");
-                        if !exe.extra_libs.contains(&path) {
-                            exe.extra_libs.push(path);
-                        }
+                        push_macho_framework_path(exe, &format!("framework={fw}"));
                     }
                 }
             }
+        }
+        for raw in cx.crate_link_libs(k as u32) {
+            push_macho_framework_path(exe, raw);
         }
         for &(_, dep) in &cx.outline.deps[k] {
             if let Some(slot) = seen_crates.get_mut(dep)
@@ -583,5 +646,110 @@ fn collect_macho_frameworks(
                 queue.push(dep);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::names::{Crate as NamesCrate, ItemRef, Names, Symbols};
+    use crate::outline::tree::{Crate, File, Files};
+    use crate::outline::{Outline, Role, Root};
+    use crate::sema::reach::Reached;
+    use crate::sema::substs::Substs;
+    use crate::sema::{Cache, Context};
+
+    #[test]
+    fn collect_macho_frameworks_and_repair_foreign_libs_use_crate_link_libs() {
+        let src = crate::outline::source::Source::parse(
+            std::path::PathBuf::from("lib.rs"),
+            "extern \"C\" { fn CFTimeZoneCopySystem(); fn free(); }".to_owned(),
+        )
+        .expect("parse source");
+        let items = crate::outline::scan::scan(&src).expect("scan source");
+        let tree = Crate {
+            files: vec![std::sync::Arc::new(File::new(src, items, false))],
+            link_libs: vec!["framework=CoreFoundation".to_owned()],
+            ..Crate::default()
+        };
+        let outline = Outline {
+            roots: vec![Root {
+                unit: 0,
+                name: "core_foundation_sys".to_owned(),
+                path: std::path::PathBuf::from("lib.rs"),
+                role: Role::Lib,
+                edition: "2021".to_owned(),
+                proc_macro: false,
+            }],
+            crates: vec![tree],
+            deps: vec![Vec::new()],
+            cache: Files::default(),
+            procs: HashMap::default(),
+            pins: vec![None],
+        };
+        let names = Names {
+            crates: vec![NamesCrate::default()],
+            symbols: Symbols::default(),
+        };
+        let cx = Context::new(&outline, &names, Cache::default());
+        let mut reached = Reached::default();
+        let cf_item = ItemRef {
+            krate: 0,
+            file: 0,
+            item: 0,
+        };
+        let free_item = ItemRef {
+            krate: 0,
+            file: 0,
+            item: 1,
+        };
+        reached
+            .list
+            .push(((cf_item, Substs::EMPTY), Err(String::new())));
+        reached
+            .list
+            .push(((free_item, Substs::EMPTY), Err(String::new())));
+
+        let mut state = AotState::new(2).into_inner().expect("aot state");
+        state.foreign_fns.insert(
+            0,
+            HostSymbol::Dynamic {
+                name: "CFTimeZoneCopySystem".into(),
+                lib: None,
+            },
+        );
+        state.foreign_fns.insert(
+            1,
+            HostSymbol::Dynamic {
+                name: "free".into(),
+                lib: None,
+            },
+        );
+        repair_foreign_host_libs(&cx, &reached, &mut state);
+
+        assert_eq!(
+            state.foreign_fns.get(&0),
+            Some(&HostSymbol::Dynamic {
+                name: "CFTimeZoneCopySystem".into(),
+                lib: Some("framework=CoreFoundation".into()),
+            })
+        );
+        #[cfg(target_vendor = "apple")]
+        assert_eq!(
+            state.foreign_fns.get(&1),
+            Some(&HostSymbol::Dynamic {
+                name: "free".into(),
+                lib: None,
+            })
+        );
+
+        let mut live = AotReach::new(2, &[0]);
+        live.order.push(0);
+        let mut exe = Executable::new(haste_codegen::Target::host());
+        collect_macho_frameworks(&cx, &reached, &live, &mut exe);
+        assert_eq!(
+            exe.extra_libs,
+            vec!["/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"]
+        );
     }
 }

@@ -38,6 +38,14 @@ check_accept_ok() {
         return 1
     fi
 }
+reject_diag_ok() {
+    local status=$1 err_file=$2
+    [ "$status" -ne 0 ] && [ "$status" -lt 128 ] || return 1
+    if grep -Eq 'panicked at|SIGSEGV|SIGABRT|SIGBUS' "$err_file"; then
+        return 1
+    fi
+    grep -qi 'error' "$err_file"
+}
 check_reject() {
     local label=$1 body=$2 out_msg=$3 dir="$tmp/reject_$1" pkg="reject_$1" c_status=0 h_status=0 p_c p_h
     write_scratch_crate "$dir" "$pkg" "$body"
@@ -45,18 +53,20 @@ check_reject() {
     p_c=$!
     (
         local b_status=0 r_status=0
-        run_haste build "$dir" </dev/null >/dev/null 2>&1 || b_status=$?
-        run_haste run "$dir" </dev/null >/dev/null 2>&1 || r_status=$?
+        run_haste build "$dir" </dev/null >/dev/null 2>"$dir/build.err" || b_status=$?
+        run_haste run "$dir" </dev/null >/dev/null 2>"$dir/run.err" || r_status=$?
         printf '%s %s\n' "$b_status" "$r_status" >"$dir/haste.status"
-        [ "$b_status" -ne 0 ] && [ "$r_status" -ne 0 ]
+        reject_diag_ok "$b_status" "$dir/build.err" && reject_diag_ok "$r_status" "$dir/run.err"
     ) &
     p_h=$!
     wait "$p_c" || c_status=$?
     wait "$p_h" || h_status=$?
     if [ "$c_status" -eq 0 ] || [ "$h_status" -ne 0 ]; then
-        local hr
+        local hr b_tail r_tail
         hr=$(cat "$dir/haste.status" 2>/dev/null || echo "? ?")
-        echo "reject $label DIFF: cargo=$c_status build/run=($hr)" >"$out_msg"
+        b_tail=$(tail -2 "$dir/build.err" 2>/dev/null | tr '\n' ' ' | cut -c1-120)
+        r_tail=$(tail -2 "$dir/run.err" 2>/dev/null | tr '\n' ' ' | cut -c1-120)
+        echo "reject $label DIFF: cargo=$c_status build/run=($hr) build_err=($b_tail) run_err=($r_tail)" >"$out_msg"
         return 1
     fi
 }
@@ -64,7 +74,7 @@ check_malformed() {
     local out_msg=$1 mal_status=0
     write_scratch_crate "$tmp/malformed" "malformed" 'macro x'
     run_haste debug items "$tmp/malformed" </dev/null >/dev/null 2>"$tmp/malformed.err" || mal_status=$?
-    if [ "$mal_status" -ge 128 ] || grep -q 'panicked at' "$tmp/malformed.err"; then
+    if [ "$mal_status" -ge 128 ] || grep -Eq 'panicked at|SIGSEGV|SIGABRT|SIGBUS' "$tmp/malformed.err"; then
         echo "malformed macro DIFF: status $mal_status: $(tail -2 "$tmp/malformed.err")" >"$out_msg"
         return 1
     fi

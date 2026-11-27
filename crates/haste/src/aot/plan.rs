@@ -286,6 +286,17 @@ impl<'a> Plan<'a> {
         Ok(plan)
     }
 
+    pub(crate) fn macho_framework_path(raw: &str) -> Option<String> {
+        let raw = raw.trim();
+        let fw = raw
+            .strip_prefix("framework:")
+            .or_else(|| raw.strip_prefix("framework="))
+            .or_else(|| raw.strip_suffix(".framework"))?
+            .trim()
+            .trim_end_matches(".framework");
+        (!fw.is_empty()).then(|| format!("/System/Library/Frameworks/{fw}.framework/{fw}"))
+    }
+
     pub(super) fn macho_libs(
         &self,
         extra_libs: &[String],
@@ -509,16 +520,8 @@ fn normalize_macho_lib(raw: &str, extra_libs: &[String]) -> Option<String> {
     if raw.starts_with('/') || raw.starts_with('@') {
         return Some(raw.to_owned());
     }
-    if let Some(fw) = raw
-        .strip_prefix("framework:")
-        .or_else(|| raw.strip_prefix("framework="))
-        .or_else(|| raw.strip_suffix(".framework"))
-    {
-        let fw = fw.trim().trim_end_matches(".framework");
-        if fw.is_empty() {
-            return None;
-        }
-        return Some(format!("/System/Library/Frameworks/{fw}.framework/{fw}"));
+    if let Some(fw_path) = Plan::macho_framework_path(raw) {
+        return Some(fw_path);
     }
     let fw_suffix = format!("/{raw}.framework/{raw}");
     if let Some(found) = extra_libs.iter().find(|p| p.ends_with(&fw_suffix)) {
@@ -547,4 +550,52 @@ fn normalize_macho_lib(raw: &str, extra_libs: &[String]) -> Option<String> {
     } else {
         format!("@rpath/lib{raw}.dylib")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn macho_framework_path_and_extra_libs_dedup_keep_ordinal() {
+        let cf = "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation";
+        assert_eq!(
+            Plan::macho_framework_path("framework=CoreFoundation").as_deref(),
+            Some(cf)
+        );
+        assert_eq!(
+            Plan::macho_framework_path("framework:Security").as_deref(),
+            Some("/System/Library/Frameworks/Security.framework/Security")
+        );
+        assert_eq!(Plan::macho_framework_path("framework="), None);
+
+        let darwin = haste_codegen::Target::find("aarch64-apple-darwin").expect("darwin target");
+        let mut exe = Executable::new(darwin);
+        exe.extra_libs.push(cf.to_owned());
+        exe.relocs.push(crate::aot::CodeReloc {
+            offset: 0,
+            kind: haste_codegen::RelocKind::Arm64Call26,
+            symbol: Symbol::Host(HostSymbol::Dynamic {
+                name: "puts".into(),
+                lib: None,
+            }),
+        });
+        exe.relocs.push(crate::aot::CodeReloc {
+            offset: 4,
+            kind: haste_codegen::RelocKind::Arm64Call26,
+            symbol: Symbol::Host(HostSymbol::Dynamic {
+                name: "CFTimeZoneCopySystem".into(),
+                lib: Some("framework=CoreFoundation".into()),
+            }),
+        });
+        let plan = Plan::collect(&exe, &[]).expect("collect plan");
+        let (libs, ordinals, two_level) = plan.macho_libs(&exe.extra_libs);
+        assert_eq!(libs, vec!["/usr/lib/libSystem.B.dylib", cf]);
+        assert!(two_level);
+        assert_eq!(ordinals[plan.import_idx("puts").expect("puts")], Some(1));
+        assert_eq!(
+            ordinals[plan.import_idx("CFTimeZoneCopySystem").expect("cf")],
+            Some(2)
+        );
+    }
 }

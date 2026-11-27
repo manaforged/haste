@@ -544,7 +544,12 @@ fn resolve_symbol_with_fallback(
     if libs.is_empty() {
         return HostSymbol::resolve_for_lib(name, None, aot);
     }
-    if HostSymbol::resolve_for_lib(name, None, false).is_some() {
+    // The live process is no oracle on Apple: a framework that an earlier lookup opened would look global.
+    #[cfg(target_vendor = "apple")]
+    let global = in_apple_libsystem(name);
+    #[cfg(not(target_vendor = "apple"))]
+    let global = HostSymbol::resolve_for_lib(name, None, false).is_some();
+    if global {
         return HostSymbol::resolve_for_lib(name, None, aot);
     }
     for lib in libs {
@@ -556,6 +561,29 @@ fn resolve_symbol_with_fallback(
         return HostSymbol::resolve_for_lib(name, Some(lib), true);
     }
     None
+}
+
+#[cfg(target_vendor = "apple")]
+/// Whether the macOS system C runtime exports `name`, independent of what this process has loaded.
+fn in_apple_libsystem(name: &str) -> bool {
+    let Ok(cname) = std::ffi::CString::new(name) else {
+        return false;
+    };
+    static LIBSYSTEM: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let handle = *LIBSYSTEM.get_or_init(|| {
+        // SAFETY: static NUL-terminated path to the macOS system C runtime library.
+        unsafe {
+            libc::dlopen(
+                c"/usr/lib/libSystem.B.dylib".as_ptr(),
+                libc::RTLD_LAZY | libc::RTLD_LOCAL,
+            ) as usize
+        }
+    }) as *mut core::ffi::c_void;
+    if handle.is_null() {
+        return false;
+    }
+    // SAFETY: `handle` is an open dlopen handle and `cname` is NUL-terminated.
+    unsafe { !libc::dlsym(handle, cname.as_ptr()).is_null() }
 }
 
 pub(super) fn weak(cx: &Context<'_>, item: crate::names::ItemRef) -> bool {

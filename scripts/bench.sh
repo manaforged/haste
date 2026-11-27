@@ -527,41 +527,30 @@ if suite in ("all", "self"):
     if run_cold:
         self_haste_env = isolated_haste_env("self")
         self_cargo_check_target = os.path.join(cargo_tmp, "self_cargo_check_target")
-        self_cargo_build_target = os.path.join(cargo_tmp, "self_cargo_build_target")
         cargo_self_check_cmd = cargo_cmd("check", self_cargo_check_target)
-        cargo_self_build_cmd = cargo_cmd("build", self_cargo_build_target)
         h_self_cold = run_timed(haste_self_cmd, env=self_haste_env)
         c_self_check_cold = run_timed(cargo_self_check_cmd, env=cargo_env)
-        c_self_build_cold = run_timed(cargo_self_build_cmd, env=cargo_env)
     else:
         self_haste_env = warm_haste_env
         self_cargo_check_target = os.path.join(cache_dir, "self_cargo_check")
-        self_cargo_build_target = os.path.join(cache_dir, "self_cargo")
         os.makedirs(self_cargo_check_target, exist_ok=True)
-        os.makedirs(self_cargo_build_target, exist_ok=True)
         cargo_self_check_cmd = cargo_cmd("check", self_cargo_check_target)
-        cargo_self_build_cmd = cargo_cmd("build", self_cargo_build_target)
         procs = [
             subprocess.Popen(haste_self_cmd, env=self_haste_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL),
             subprocess.Popen(cargo_self_check_cmd, env=cargo_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL),
-            subprocess.Popen(cargo_self_build_cmd, env=cargo_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL),
         ]
         if any(p.wait() != 0 for p in procs):
             sys.exit(1)
         h_self_cold = None
         c_self_check_cold = None
-        c_self_build_cold = None
     h_self_noop = median_ms(5, haste_self_cmd, env=self_haste_env)
     c_self_check_noop = median_ms(5, cargo_self_check_cmd, env=cargo_env)
-    c_self_build_noop = median_ms(5, cargo_self_build_cmd, env=cargo_env)
 
     self_rows = []
     if h_self_cold is not None:
         self_rows.append(("Cold debug (`haste build` vs `cargo check`)", h_self_cold, c_self_check_cold))
-        self_rows.append(("Cold debug (`haste build` vs `cargo build`)", h_self_cold, c_self_build_cold))
     self_rows.append(("Unchanged no-op (`haste build` vs `cargo check`)", h_self_noop, c_self_check_noop))
-    self_rows.append(("Unchanged no-op (`haste build` vs `cargo build`)", h_self_noop, c_self_build_noop))
-    print_build_table("### Self-Host Build Speed (`.`)", self_rows, sections > 0)
+    print_build_table("### Self-Host Check Speed (`.`)", self_rows, sections > 0)
     sections += 1
 
 if suite in ("all", "compute"):
