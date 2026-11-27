@@ -241,7 +241,7 @@ fn wavefront_worker(
     let mut batch_sealed = HashSet::default();
     let mut local_filter = ReachFilter::default();
     let mut synced_len = (0usize, 0usize);
-    let sync_filter = cx.store.lookups.skip_warm_sysroot_bodies;
+    let sync_filter = false;
     let mut active = ActiveGuard(mutex, cvar, 0);
     loop {
         let delta = {

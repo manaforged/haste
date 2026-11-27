@@ -41,11 +41,11 @@ impl Reached {
         for (new, &old) in order.iter().enumerate() {
             new_of[old] = new;
         }
-        permute(&mut self.list, &new_of);
-        permute(&mut self.states, &new_of);
-        permute(&mut self.pinned, &new_of);
-        permute(&mut self.calls, &new_of);
-        permute(&mut self.indirect, &new_of);
+        permute_by_order(&mut self.list, &order);
+        permute_by_order(&mut self.states, &order);
+        permute_by_order(&mut self.pinned, &order);
+        permute_by_order(&mut self.calls, &order);
+        permute_by_order(&mut self.indirect, &order);
         for edges in self.calls.iter_mut().chain(self.indirect.iter_mut()) {
             edges.iter_mut().for_each(|at| *at = new_of[*at]);
         }
@@ -77,12 +77,11 @@ fn instance_key(cx: &Context<'_>, (item, substs): Instance) -> (ItemRef, Vec<u64
     )
 }
 
-fn permute<T>(items: &mut Vec<T>, new_of: &[usize]) {
-    let mut tagged: Vec<(usize, T)> = std::mem::take(items)
-        .into_iter()
-        .enumerate()
-        .map(|(old, item)| (new_of[old], item))
-        .collect();
-    tagged.sort_unstable_by_key(|&(new, _)| new);
-    items.extend(tagged.into_iter().map(|(_, item)| item));
+fn permute_by_order<T>(items: &mut Vec<T>, order: &[usize]) {
+    let mut slots: Vec<Option<T>> = items.drain(..).map(Some).collect();
+    for &old in order {
+        if let Some(item) = slots[old].take() {
+            items.push(item);
+        }
+    }
 }

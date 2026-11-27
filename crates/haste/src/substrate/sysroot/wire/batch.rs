@@ -76,7 +76,11 @@ fn plan_sym_chunks<'a>(
         }
         return Ok((Vec::new(), vec![0; sections.len()]));
     }
-    let chunk_syms = total_syms.div_ceil(workers).max(256);
+    let chunk_syms = if total_syms >= 4096 {
+        total_syms.div_ceil(workers * 2).max(256)
+    } else {
+        total_syms.div_ceil(workers).max(256)
+    };
     let mut chunks = Vec::new();
     let mut chunk_counts = vec![0usize; sections.len()];
     for (item_idx, sec) in sections.iter().enumerate() {
@@ -210,11 +214,11 @@ fn decode_files_and_syms<'a>(
     stage1.sort_unstable_by(|a, b| {
         let wa = match a {
             Stage1Task::File { slice, .. } => slice.len(),
-            Stage1Task::Sym(chunk) => chunk.bytes.len() * 4,
+            Stage1Task::Sym(chunk) => chunk.bytes.len(),
         };
         let wb = match b {
             Stage1Task::File { slice, .. } => slice.len(),
-            Stage1Task::Sym(chunk) => chunk.bytes.len() * 4,
+            Stage1Task::Sym(chunk) => chunk.bytes.len(),
         };
         wb.cmp(&wa)
     });
@@ -459,7 +463,7 @@ fn decode_batch_sections<'a>(
             let mut ncur = Cursor::new(slice);
             let split = split_names_crate_scopes(&mut ncur)?;
             let body_slice = &slice[ncur.pos..];
-            if split.total_bytes >= 16 * 1024 && split.slices.len() >= 16 && crate::jobs() > 1 {
+            if split.total_bytes >= 8 * 1024 && split.slices.len() >= 2 && crate::jobs() > 1 {
                 let chunks = chunk_scope_slices(split.slices);
                 crate_chunks[pos] = vec![None; chunks.len()];
                 for (cidx, (chunk_slices, chunk_bytes)) in chunks.into_iter().enumerate() {

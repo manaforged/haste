@@ -12,7 +12,7 @@ use crate::outline::Outline;
 
 use super::table::{self, Table};
 use super::ty::{self, Types};
-use super::{impls, infer, reach, summary, traits, write_lock};
+use super::{impls, infer, reach, read_lock, summary, traits, write_lock};
 
 pub(super) type TypeScope = (ModRef, Option<ItemRef>, Option<ItemRef>, u8, Option<u32>);
 
@@ -298,6 +298,9 @@ impl Lookups {
 
     pub(super) fn reconcile(&mut self, outline: &Outline, answer: Option<Answer>) {
         let after_names = matches!(answer, Some(Answer::Names));
+        if !after_names && extents_match(&read_lock(&self.state.loaded), outline) {
+            return;
+        }
         let loaded: Vec<crate::outline::tree::CrateExtent> = outline
             .crates
             .iter()
@@ -308,18 +311,8 @@ impl Lookups {
         if *guard == loaded {
             if after_names {
                 self.reset_after_names(outline, true);
-                self.heads.retain(|holder, index| {
-                    let impls::Holder::Crate(k) = *holder else {
-                        return false;
-                    };
-                    if index.complete() {
-                        return true;
-                    }
-                    if outline.is_fixed(k) && index.reusable_after_names() {
-                        Arc::make_mut(index).clear_asked();
-                        return true;
-                    }
-                    false
+                retain_heads(&mut self.heads, outline, true, |k| {
+                    guard.get(k as usize) == loaded.get(k as usize)
                 });
             }
             return;
@@ -349,25 +342,8 @@ impl Lookups {
             self.trait_autos.retain(|item, _| {
                 guard.get(item.krate as usize) == loaded.get(item.krate as usize)
             });
-            self.heads.retain(|holder, index| {
-                let k = match *holder {
-                    impls::Holder::Crate(k) => k,
-                    impls::Holder::Body(item) => {
-                        return !after_names
-                            && guard.get(item.krate as usize) == loaded.get(item.krate as usize);
-                    }
-                };
-                if guard.get(k as usize) != loaded.get(k as usize) {
-                    return false;
-                }
-                if !after_names || index.complete() {
-                    return true;
-                }
-                if outline.is_fixed(k) && index.reusable_after_names() {
-                    Arc::make_mut(index).clear_asked();
-                    return true;
-                }
-                false
+            retain_heads(&mut self.heads, outline, after_names, |k| {
+                guard.get(k as usize) == loaded.get(k as usize)
             });
             self.summaries.retain_keys(|item| {
                 guard.get(item.krate as usize) == loaded.get(item.krate as usize)
@@ -445,6 +421,39 @@ impl Lookups {
         }
         *guard = loaded;
     }
+}
+
+fn retain_heads(
+    heads: &mut Table<impls::Holder, Arc<impls::Index>>,
+    outline: &Outline,
+    after_names: bool,
+    same_krate: impl Fn(u32) -> bool,
+) {
+    heads.retain(|holder, index| {
+        let k = match *holder {
+            impls::Holder::Crate(k) => k,
+            impls::Holder::Body(item) => return !after_names && same_krate(item.krate),
+        };
+        if !same_krate(k) {
+            return false;
+        }
+        if !after_names || index.complete() {
+            return true;
+        }
+        if outline.is_fixed(k) && index.reusable_after_names() {
+            Arc::make_mut(index).clear_asked();
+            return true;
+        }
+        false
+    });
+}
+
+fn extents_match(loaded: &[crate::outline::tree::CrateExtent], outline: &Outline) -> bool {
+    loaded.len() == outline.crates.len()
+        && loaded
+            .iter()
+            .zip(&outline.crates)
+            .all(|(a, c)| *a == c.extent())
 }
 
 fn lang_files_changed(
