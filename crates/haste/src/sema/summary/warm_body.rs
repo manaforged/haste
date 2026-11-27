@@ -404,6 +404,97 @@ fn opt_vec<T>(
     }
 }
 
+fn read_path(c: &mut Cursor<'_>) -> Result<Path> {
+    Ok(Path {
+        qself: read_opt(c, |c2| Ok((TyId(c2.u32()?), read_opt_u32(c2)?.map(PathId))))?,
+        global: c.u8()? != 0,
+        start: c.u32()?,
+        segments: read_list(c)?,
+    })
+}
+
+fn read_segment(c: &mut Cursor<'_>) -> Result<Segment> {
+    Ok(Segment {
+        name: c.u32()?,
+        args: read_args(c)?,
+    })
+}
+
+fn read_generic_arg(c: &mut Cursor<'_>) -> Result<GenericArg> {
+    Ok(match c.u8()? {
+        0 => GenericArg::Ty(TyId(c.u32()?)),
+        1 => GenericArg::Lifetime(c.u32()?),
+        2 => GenericArg::Const(ExprId(c.u32()?)),
+        3 => GenericArg::Binding {
+            name: c.u32()?,
+            args: read_args(c)?,
+            ty: TyId(c.u32()?),
+        },
+        4 => GenericArg::Constraint {
+            name: c.u32()?,
+            bounds: read_list(c)?,
+        },
+        _ => bail!("invalid generic arg tag"),
+    })
+}
+
+fn read_bound(c: &mut Cursor<'_>) -> Result<Bound> {
+    Ok(match c.u8()? {
+        0 => {
+            let path = PathId(c.u32()?);
+            let f = c.u8()?;
+            Bound::Trait {
+                path,
+                maybe: f & 1 != 0,
+                constness: f & 2 != 0,
+            }
+        }
+        1 => Bound::Lifetime(c.u32()?),
+        2 => Bound::Use(c.u32()?),
+        _ => bail!("invalid bound tag"),
+    })
+}
+
+fn read_arm(c: &mut Cursor<'_>) -> Result<Arm> {
+    Ok(Arm {
+        pat: PatId(c.u32()?),
+        guard: read_opt_u32(c)?.map(ExprId),
+        body: ExprId(c.u32()?),
+    })
+}
+
+fn read_field_init(c: &mut Cursor<'_>) -> Result<FieldInit> {
+    Ok(FieldInit {
+        name: c.u32()?,
+        value: ExprId(c.u32()?),
+    })
+}
+
+fn read_field_pat(c: &mut Cursor<'_>) -> Result<FieldPat> {
+    Ok(FieldPat {
+        name: c.u32()?,
+        pat: PatId(c.u32()?),
+    })
+}
+
+fn read_param(c: &mut Cursor<'_>) -> Result<Param> {
+    Ok(Param {
+        pat: PatId(c.u32()?),
+        ty: read_opt_u32(c)?.map(TyId),
+    })
+}
+
+fn read_attr(c: &mut Cursor<'_>) -> Result<(Node, u32, u32)> {
+    let node = match c.u8()? {
+        0 => Node::Stmt(c.u32()?),
+        1 => Node::Arm(c.u32()?),
+        2 => Node::Field(c.u32()?),
+        3 => Node::Expr(ExprId(c.u32()?)),
+        _ => bail!("invalid attr node tag"),
+    };
+    Ok((node, c.u32()?, c.u32()?))
+}
+
 pub(super) fn read_body(cur: &mut Cursor<'_>) -> Result<Body> {
     let flags = cur.u32()?;
     Ok(Body {
@@ -413,90 +504,17 @@ pub(super) fn read_body(cur: &mut Cursor<'_>) -> Result<Body> {
         pats: opt_vec(cur, flags, 3, read_pat)?,
         pat_spans: opt_vec(cur, flags, 4, |c| Ok((c.u32()?, c.u32()?)))?,
         tys: opt_vec(cur, flags, 5, read_syntax_ty)?,
-        paths: opt_vec(cur, flags, 6, |c| {
-            Ok(Path {
-                qself: read_opt(c, |c2| Ok((TyId(c2.u32()?), read_opt_u32(c2)?.map(PathId))))?,
-                global: c.u8()? != 0,
-                start: c.u32()?,
-                segments: read_list(c)?,
-            })
-        })?,
+        paths: opt_vec(cur, flags, 6, read_path)?,
         stmts: opt_vec(cur, flags, 7, read_stmt)?,
-        segments: opt_vec(cur, flags, 8, |c| {
-            Ok(Segment {
-                name: c.u32()?,
-                args: read_args(c)?,
-            })
-        })?,
-        args: opt_vec(cur, flags, 9, |c| {
-            Ok(match c.u8()? {
-                0 => GenericArg::Ty(TyId(c.u32()?)),
-                1 => GenericArg::Lifetime(c.u32()?),
-                2 => GenericArg::Const(ExprId(c.u32()?)),
-                3 => GenericArg::Binding {
-                    name: c.u32()?,
-                    args: read_args(c)?,
-                    ty: TyId(c.u32()?),
-                },
-                4 => GenericArg::Constraint {
-                    name: c.u32()?,
-                    bounds: read_list(c)?,
-                },
-                _ => bail!("invalid generic arg tag"),
-            })
-        })?,
-        bounds: opt_vec(cur, flags, 10, |c| {
-            Ok(match c.u8()? {
-                0 => {
-                    let path = PathId(c.u32()?);
-                    let f = c.u8()?;
-                    Bound::Trait {
-                        path,
-                        maybe: f & 1 != 0,
-                        constness: f & 2 != 0,
-                    }
-                }
-                1 => Bound::Lifetime(c.u32()?),
-                2 => Bound::Use(c.u32()?),
-                _ => bail!("invalid bound tag"),
-            })
-        })?,
-        arms: opt_vec(cur, flags, 11, |c| {
-            Ok(Arm {
-                pat: PatId(c.u32()?),
-                guard: read_opt_u32(c)?.map(ExprId),
-                body: ExprId(c.u32()?),
-            })
-        })?,
-        fields: opt_vec(cur, flags, 12, |c| {
-            Ok(FieldInit {
-                name: c.u32()?,
-                value: ExprId(c.u32()?),
-            })
-        })?,
-        field_pats: opt_vec(cur, flags, 13, |c| {
-            Ok(FieldPat {
-                name: c.u32()?,
-                pat: PatId(c.u32()?),
-            })
-        })?,
-        params: opt_vec(cur, flags, 14, |c| {
-            Ok(Param {
-                pat: PatId(c.u32()?),
-                ty: read_opt_u32(c)?.map(TyId),
-            })
-        })?,
+        segments: opt_vec(cur, flags, 8, read_segment)?,
+        args: opt_vec(cur, flags, 9, read_generic_arg)?,
+        bounds: opt_vec(cur, flags, 10, read_bound)?,
+        arms: opt_vec(cur, flags, 11, read_arm)?,
+        fields: opt_vec(cur, flags, 12, read_field_init)?,
+        field_pats: opt_vec(cur, flags, 13, read_field_pat)?,
+        params: opt_vec(cur, flags, 14, read_param)?,
         ids: opt_vec(cur, flags, 15, |c| c.u32())?,
-        attrs: opt_vec(cur, flags, 16, |c| {
-            let node = match c.u8()? {
-                0 => Node::Stmt(c.u32()?),
-                1 => Node::Arm(c.u32()?),
-                2 => Node::Field(c.u32()?),
-                3 => Node::Expr(ExprId(c.u32()?)),
-                _ => bail!("invalid attr node tag"),
-            };
-            Ok((node, c.u32()?, c.u32()?))
-        })?,
+        attrs: opt_vec(cur, flags, 16, read_attr)?,
         root: (flags & (1 << 18) != 0)
             .then(|| cur.u32().map(ExprId))
             .transpose()?,
