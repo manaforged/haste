@@ -704,3 +704,57 @@ fn thread_loop_spec_preserves_dominance_when_dirty_block_reenters_latch() {
     verify_and_compile_both(&func);
     assert_eq!(jit_run_1(&func, 5), 15);
 }
+
+#[test]
+fn pass_tailrec_allows_cold_stack_addr_and_rejects_live_stack_addr() {
+    let make = |in_tail: bool| {
+        build_fn(native_sig(1, 1), |b, p| {
+            b.func.self_slots.push(0);
+            let sig = b.import_signature(native_sig(1, 1));
+            let (panic_blk, check, base, rec) = (
+                b.create_block(),
+                b.create_block(),
+                b.create_block(),
+                b.create_block(),
+            );
+            let slot = b.create_stack_slot(8, 3);
+            let bad = b.ins().icmp_imm(IntCC::SignedLessThan, p[0], 0);
+            b.ins().brif(bad, panic_blk, &[], check, &[]);
+
+            b.switch_to_block(panic_blk);
+            let cold_addr = b.ins().stack_addr(Type::I64, slot, 0);
+            let _ = b.ins().load(Type::I64, cold_addr, 0);
+            b.ins().trap();
+
+            b.switch_to_block(check);
+            let zero = b.ins().icmp_imm(IntCC::Equal, p[0], 0);
+            b.ins().brif(zero, base, &[], rec, &[]);
+
+            b.switch_to_block(base);
+            let c0 = b.ins().iconst(Type::I64, 0);
+            b.ins().return_(&[c0]);
+
+            b.switch_to_block(rec);
+            if in_tail {
+                let tail_addr = b.ins().stack_addr(Type::I64, slot, 0);
+                let _ = b.ins().load(Type::I64, tail_addr, 0);
+            }
+            let next = b.ins().iadd_imm(p[0], -1);
+            let sym = b.ins().slot_addr(0);
+            let callee = b.ins().load(Type::I64, sym, 0);
+            let call = b.ins().call_indirect(sig, callee, &[next]);
+            let res = b.inst_results(call)[0];
+            b.ins().return_(&[res]);
+        })
+    };
+    let mut cold_ok = make(false);
+    run_full(&mut cold_ok);
+    assert_eq!(count_ops(&cold_ok, |op| matches!(op, Op::Call { .. })), 0);
+    verify_and_compile_both(&cold_ok);
+    assert_eq!(jit_run_1(&cold_ok, 10), 0);
+
+    let mut live_bad = make(true);
+    let changed = crate::tailrec::run(&mut live_bad, &host_full());
+    assert!(changed.is_empty());
+    assert_eq!(count_ops(&live_bad, |op| matches!(op, Op::Call { .. })), 1);
+}
