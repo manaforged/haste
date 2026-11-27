@@ -584,9 +584,13 @@ impl<'a> Infer<'_, 'a> {
             | Kind::Value(_)
             | Kind::Var(_)
             | Kind::IntVar(_)
-            | Kind::FloatVar(_)
-            | Kind::Param(_)
-            | Kind::Proj(_) => (true, usize::MAX),
+            | Kind::FloatVar(_) => (true, usize::MAX),
+            Kind::Param(_) | Kind::Proj(_) => {
+                let holds = !self.root_is_user()
+                    || (self.poly.is_some()
+                        && self.poly_holds_in_env(of, ty, &[]).unwrap_or(false));
+                (holds, usize::MAX)
+            }
             Kind::Ptr(..) => (false, usize::MAX),
             Kind::Ref(Mut::Not, inner) => match self.cx.lang_item("sync") {
                 Some(sync_of) => self.thread_auto_holds_dep(sync_of, inner),
@@ -707,21 +711,17 @@ impl<'a> Infer<'_, 'a> {
 
     fn select_auto_impl(&mut self, of: ItemRef, ty: Ty) -> (bool, usize) {
         let saved_dep = std::mem::replace(&mut self.auto_dep, usize::MAX);
-        let before = self.cycle_hits;
         let asks_before = self.cx.asks.count();
         let picked = self.probe(|infer| infer.select(of, ty, &[]));
         let dep = std::mem::replace(&mut self.auto_dep, saved_dep);
         match picked {
             Ok(Some(_)) => (true, dep),
-            Ok(None) if self.cycle_hits == before && self.cx.asks.count() == asks_before => {
-                (false, usize::MAX)
-            }
-            Ok(None) if self.cx.asks.count() != asks_before => (true, usize::MAX),
+            Ok(None) if self.cx.asks.count() == asks_before => (false, usize::MAX),
+            Ok(None) => (true, usize::MAX),
             Err(_) => {
                 self.cycle_hits += 1;
                 (true, 0)
             }
-            Ok(None) => (true, 0),
         }
     }
 
@@ -763,7 +763,7 @@ impl<'a> Infer<'_, 'a> {
             self.parts_auto_holds(of, ty)
         };
         self.auto_stack.pop();
-        let cache = cacheable && (holds || self.cx.asks.count() == asks_before);
+        let cache = cacheable && self.cx.asks.count() == asks_before;
         self.finish_auto_node((of, ty), cache, my_depth, holds, dep)
     }
 }

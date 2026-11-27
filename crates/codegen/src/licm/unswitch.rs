@@ -51,18 +51,12 @@ fn effect_free(func: &Function, block: Block) -> bool {
         })
 }
 
-fn region_escapes(
-    func: &Function,
-    head: Block,
-    exit: Block,
-    region: &[bool],
-    defs: &[Option<Block>],
-) -> bool {
-    let from_region = |v: Value| {
+fn loop_escapes(func: &Function, each: &Loop, exit: Block, defs: &[Option<Block>]) -> bool {
+    let from_loop = |v: Value| {
         defs.get(v.index())
             .copied()
             .flatten()
-            .is_some_and(|b| region[b.index()])
+            .is_some_and(|b| is_in_loop(each, b))
     };
     let mut seen = vec![false; func.blocks.len()];
     seen[exit.index()] = true;
@@ -72,13 +66,13 @@ fn region_escapes(
             let mut hit = false;
             func.insts[inst.index()]
                 .op
-                .for_operands(|v| hit |= from_region(v));
+                .for_operands(|v| hit |= from_loop(v));
             if hit {
                 return true;
             }
         }
         for next in func.successors(block) {
-            if next != head && !std::mem::replace(&mut seen[next.index()], true) {
+            if next != each.head && !std::mem::replace(&mut seen[next.index()], true) {
                 todo.push(next);
             }
         }
@@ -97,7 +91,7 @@ fn find_exit_test(
         defs.get(v.index())
             .copied()
             .flatten()
-            .is_none_or(|b| !is_in_loop(each, b))
+            .is_none_or(|b| cfg.dominates(b, entry))
     };
     cfg.rpo
         .iter()
@@ -129,7 +123,7 @@ fn find_exit_test(
                         && effect_free(func, b)
                         && exits_only_to(func, each, b, exit, &exit_args)
                 });
-            (clean && !region_escapes(func, each.head, exit, &region, defs)).then(|| ExitTest {
+            (clean && !loop_escapes(func, each, exit, defs)).then(|| ExitTest {
                 head: each.head,
                 entry,
                 test,

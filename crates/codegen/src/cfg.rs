@@ -480,7 +480,8 @@ pub(crate) fn drop_bare_preheaders(func: &mut Function, made: &[(Block, Block)])
         .copied()
         .filter(|&(pre, head)| {
             let data = &func.blocks[pre.index()];
-            matches!(data.insts[..], [jump] if matches!(&func.insts[jump.index()].op, Op::Jump(target, args) if *target == head && *args == data.params))
+            data.params.is_empty()
+                && matches!(data.insts[..], [jump] if matches!(&func.insts[jump.index()].op, Op::Jump(target, args) if *target == head && args.is_empty()))
         })
         .collect();
     if bare.is_empty() {

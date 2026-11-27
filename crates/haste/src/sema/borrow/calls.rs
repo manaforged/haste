@@ -342,15 +342,14 @@ impl Checker<'_, '_> {
             )?
         } else {
             let derefs = self.typed.adjusts.get(&expr).map_or(0, |a| a.derefs);
-            let sig = self.callee_sig(expr, None);
-            if derefs > 0
-                && sig
-                    .as_deref()
-                    .is_some_and(|s| matches!(s.receiver, Some((SelfKind::Value, _))))
-            {
+            let by_val_deref = derefs > 0
+                && self
+                    .callee_sig(expr, None)
+                    .is_some_and(|s| matches!(s.receiver, Some((SelfKind::Value, _))));
+            if by_val_deref {
                 self.check_method_by_val_derefs(expr, receiver, derefs, state, outer_live, depth)?;
             } else {
-                self.check_expr(receiver, state, false, outer_live, true, depth)?;
+                self.check_by_val_receiver(receiver, state, outer_live, depth)?;
             }
             None
         };

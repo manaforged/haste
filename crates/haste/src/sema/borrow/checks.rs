@@ -215,8 +215,69 @@ pub(super) fn temp_target_for(depth: u32) -> u32 {
 }
 
 impl Checker<'_, '_> {
+    pub(super) fn is_dyn_only_borrow(&mut self, ty: Ty) -> bool {
+        ty != Ty::NONE && self.ty_holds_borrow(ty) && !self.ty_holds_non_dyn_borrow(ty)
+    }
+
+    pub(super) fn source_peeled_outer_ref(
+        &mut self,
+        expr: ExprId,
+        s: &super::propagate::BorrowSource,
+    ) -> bool {
+        let (c_ty, e_ty) = (self.local_ty(s.target), self.expr_ty(expr));
+        let derefed = !s.origin_only
+            && s.steps
+                .iter()
+                .any(|st| matches!(st, super::places::PlaceStep::Deref));
+        self.is_ref_ty(c_ty)
+            && e_ty != Ty::NONE
+            && !self.is_dyn_only_borrow(e_ty)
+            && (derefed || self.ty_max_ref_depth(e_ty) < self.ty_max_ref_depth(c_ty))
+    }
+
+    pub(super) fn check_static_param_escape(&self, expr: ExprId) -> Result<()> {
+        if let Some(local) = self.find_non_static_param_in_expr(expr) {
+            return Err(self.does_not_live_long_enough(Some(expr), local));
+        }
+        Ok(())
+    }
+
+    fn find_non_static_param_in_expr(&self, expr: ExprId) -> Option<u32> {
+        match *self.body.expr(expr) {
+            Expr::Paren(inner) | Expr::Cast(inner, _) => self.find_non_static_param_in_expr(inner),
+            Expr::Path(_) => match self.typed.res.get(&expr) {
+                Some(Res::Local(local)) if self.is_non_static_param(*local) => Some(*local),
+                _ => None,
+            },
+            Expr::Tuple(list) | Expr::Array(list) => self
+                .body
+                .list(list)
+                .iter()
+                .find_map(|&e| self.find_non_static_param_in_expr(ExprId(e))),
+            Expr::Call(callee, args)
+                if matches!(self.typed.res.get(&callee), Some(Res::Ctor(..)))
+                    || matches!(self.typed.res.get(&expr), Some(Res::Ctor(..)))
+                    || self.cx.boxed(self.expr_ty(expr)).is_some() =>
+            {
+                self.body
+                    .list(args)
+                    .iter()
+                    .find_map(|&e| self.find_non_static_param_in_expr(ExprId(e)))
+            }
+            Expr::Struct { fields, base, .. } => self
+                .body
+                .list(fields)
+                .iter()
+                .find_map(|&f| {
+                    self.find_non_static_param_in_expr(self.body.fields[f as usize].value)
+                })
+                .or_else(|| base.and_then(|b| self.find_non_static_param_in_expr(b))),
+            _ => None,
+        }
+    }
+
     pub(super) fn check_stmt_temp_escape(
-        &self,
+        &mut self,
         state: &State,
         min_depth: u32,
         check_locals: &[u32],
