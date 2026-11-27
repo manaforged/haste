@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use super::{Targets, Workspace};
 
 /// What a build script printed that changes how its package builds.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Output {
     pub names: BTreeSet<String>,
     pub pairs: BTreeSet<(String, String)>,

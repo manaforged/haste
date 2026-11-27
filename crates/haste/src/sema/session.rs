@@ -20,6 +20,7 @@ impl<'a> Context<'a> {
         self.store.lookups.summaries = table::Flight::default();
         self.store.lookups.selections.clear();
         self.store.lookups.auto_traits.clear();
+        self.store.lookups.checked_impls = table::Flight::default();
         self.store.lookups.projections.clear();
         self.store.lookups.trait_calls.clear();
         self.store.lookups.assoc_types.clear();

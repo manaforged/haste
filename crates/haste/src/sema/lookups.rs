@@ -203,6 +203,7 @@ pub(super) struct Lookups {
         Option<(impls::ImplRef, super::substs::Substs)>,
     >,
     pub(super) auto_traits: Table<(ItemRef, ty::Ty), bool>,
+    pub(super) checked_impls: table::Flight<impls::ImplRef, bool>,
     pub(super) projections: Table<
         (
             ItemRef,
@@ -264,6 +265,7 @@ impl Lookups {
         self.trait_calls.clear();
         self.assoc_types.clear();
         self.auto_traits.clear();
+        self.checked_impls.retain_entries(|_, &settled| settled);
     }
 
     pub(super) fn reconcile(&mut self, outline: &Outline, answer: Option<Answer>) {
@@ -353,6 +355,17 @@ impl Lookups {
         self.assoc_types.clear();
         self.type_defs.clear();
         self.auto_traits.clear();
+        if same_len {
+            self.checked_impls.retain_entries(|block, &settled| {
+                let k = match *block {
+                    impls::ImplRef::Module { krate, .. } => krate,
+                    impls::ImplRef::Body(item) => item.krate,
+                } as usize;
+                settled && guard.get(k) == loaded.get(k)
+            });
+        } else {
+            self.checked_impls = table::Flight::default();
+        }
         *guard = loaded;
     }
 }
@@ -611,6 +624,7 @@ impl Lookups {
         self.trait_defs.retain(|item, _| !mine(*item));
         self.selections.clear();
         self.auto_traits.clear();
+        self.checked_impls = table::Flight::default();
         self.projections.clear();
         *write_lock(&self.state.global_allocator) = None;
         self.trait_calls.clear();

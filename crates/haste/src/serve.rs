@@ -58,6 +58,33 @@ impl Served<'_> {
             .collect()
     }
 
+    fn local_script_snapshot(
+        workspace: &graph::Workspace,
+    ) -> Vec<(
+        usize,
+        Option<std::sync::Arc<graph::script::Output>>,
+        Vec<(PathBuf, u64, i128)>,
+    )> {
+        workspace
+            .graph
+            .units
+            .iter()
+            .enumerate()
+            .filter_map(|(unit, entry)| {
+                let pkg = &workspace.packages[entry.package];
+                if !pkg.local() || pkg.manifest.build.is_none() {
+                    return None;
+                }
+                let mut out_stamps = Vec::new();
+                let out_dir = graph::store::dir(workspace, unit).join("out");
+                if out_dir.exists() {
+                    graph::store::walk(&out_dir, &mut out_stamps);
+                }
+                Some((unit, entry.script.clone(), out_stamps))
+            })
+            .collect()
+    }
+
     /// Loads the workspace again, running changed build scripts, when the lock file, a local manifest, a local build script, a target directory, or a watched input changed since it loaded; returns whether it did.
     fn reload(&mut self) -> Result<bool> {
         let manifests_ok = self
@@ -67,12 +94,19 @@ impl Served<'_> {
         let targets_ok =
             crate::substrate::noop::target_discovery_stamp(self.workspace) == self.target_stamp;
         let rustflags_now = Self::rustflags_snapshot();
-        if manifests_ok
-            && targets_ok
-            && rustflags_now == self.rustflags_env
-            && watched_stamps(self.workspace) == self.watched
-        {
-            return Ok(false);
+        let watched_now = watched_stamps(self.workspace);
+        if manifests_ok && targets_ok && rustflags_now == self.rustflags_env {
+            if watched_now == self.watched {
+                return Ok(false);
+            }
+            let before = Self::local_script_snapshot(self.workspace);
+            for &(unit, _, _) in &before {
+                self.workspace.graph.units[unit].script = None;
+            }
+            crate::scripts::settle(self.workspace, self.targets)?;
+            self.watched = watched_stamps(self.workspace);
+            let after = Self::local_script_snapshot(self.workspace);
+            return Ok(before != after);
         }
         *self.workspace = crate::cli::load_workspace(self.root, self.targets)?;
         self.manifests = Served::manifests(self.workspace, self.root);
