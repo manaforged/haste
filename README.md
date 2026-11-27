@@ -1,11 +1,11 @@
 # haste
 
-haste is an experimental Rust compiler, in-memory JIT runner, and pure-Rust zero-linker AOT builder with no LLVM in the compiler binary (shared build artifacts live under `~/.cache/haste` instead of per-project `target/` directories).
+haste is an experimental Rust compiler, in-memory JIT runner, and zero-linker AOT builder for pure-Rust crates. Shared build artifacts live under `~/.cache/haste` (`HASTE_HOME`) instead of per-project `target/` directories.
 
 - **Live hot-reload in a running process (Unix):** edit a function in [`examples/live-server`](examples/live-server/src/main.rs), save, and hit the same TCP server again — same PID, updated response in under 100 ms (`haste run --watch examples/live-server`).
 - **In-memory execution and tests (Unix):** run binaries (`haste run`) and `#[test]` / `#[tokio::test]` suites (`haste test`) without invoking an external linker.
-- **Sub-10 ms resident-daemon edits on bundled `tests/diff`:** `7.1–8.4 ms` on single-line edits with `--daemon` (`8.8x–19.5x` vs `cargo check`); unchanged no-ops exit in `0.5–2.4 ms`.
-- **Pure-Rust zero-linker AOT & cross-compilation:** emit native ELF, Mach-O, and experimental PE32+ executables directly for pure-Rust crates (`haste --release build --target ... -o`; Windows is AOT-only — no JIT, daemon, hot-reload, or PDBs). On 5 compute microbenchmarks, `--release` output runs at `0.68x–1.05x` of `rustc -O3`. See [Limits](#limits) for C archive, debug-info, and trap caveats.
+- **Sub-10 ms resident-daemon edits on bundled `tests/diff`:** `7.1–8.4 ms` on single-line edits with `haste build --daemon` (`8.8x–19.5x` vs `cargo check`; one-shot `haste build` without `--daemon` takes `81.8–130 ms` on the same fixture; unchanged no-ops exit in `0.5–2.4 ms`).
+- **Pure-Rust zero-linker AOT & cross-compilation:** emit native ELF, Mach-O, and experimental PE32+ executables directly for pure-Rust crates (`haste --release build --target ... -o`; Windows is AOT-only — no JIT, daemon, hot-reload, or PDBs). On 5 synthetic compute loops, `--release` output runs at `0.68x–1.05x` of `rustc -O3` time (`< 1.0x` = faster). See [Limits](#limits) for C archive, debug-info, and trap caveats.
 - **Built for fast local dev loops; keep `rustc` in CI:** experimental (`version = "0.0.0"`, no tagged release yet). See [Crate compatibility](#crate-compatibility), [Limits](#limits), and [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Install and quickstart
@@ -119,9 +119,9 @@ On a larger private multi-crate workspace (not bundled; `340` crates, `45` build
 
 The compute tables below show baseline-subtracted `net` times (`scripts/bench.sh` prints both `net` and `raw` times as `<net> (raw <raw>)`), subtracting each compiler's warmed empty-main startup baseline (median of 7) and verifying bit-identical outputs across `haste --release`, stock `rustc -C opt-level=3`, and matched-flag `rustc -C opt-level=3 -C target-cpu=native -C panic=abort`. In `--release` AOT builds (`haste --release build -o`), bounds, divide-by-zero, and signed `MIN / -1` division-overflow checks lower to hardware traps unless `catch_unwind` or `std::thread::{spawn, spawn_unchecked, spawn_scoped, scope}` is reached (while `haste --release test` and JIT always keep unwinding enabled, and integer `+`/`-`/`*` wrap in `--release`).
 
-#### Linux x86-64 (`rustc 1.99.1`, empty-main baseline: 0.2 ms across all three)
+#### Linux x86-64 (`rustc 1.99.1`, empty-main baseline: 0.2 ms across all three; ratios are `haste / rustc`, `< 1.00x` = haste faster)
 
-| Workload | `haste --release` (net) | `rustc -O3` (net) | vs `-O3` | `rustc -O3 native+abort` (net) | vs matched | Output |
+| Workload | `haste --release` (net) | `rustc -O3` (net) | `haste / -O3` | `rustc -O3 native+abort` (net) | `haste / matched` | Output |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
 | `sha256` (2M blocks) | 229 ms | 289 ms | **0.79x** | 253 ms | **0.90x** | exact match (`2980548810864065682`) |
 | `sieve` (20x 4M primes) | 44.7 ms | 65.3 ms | **0.68x** | 51.6 ms | **0.87x** | exact match (`10840522878760`) |
@@ -129,9 +129,9 @@ The compute tables below show baseline-subtracted `net` times (`scripts/bench.sh
 | `scan` (1200x JSON byte scanner) | 66.9 ms | 76.8 ms | **0.87x** | 77.3 ms | **0.87x** | exact match (`2400205310288`) |
 | `fp_iter` (4096x f64 generic iterator) | 164 ms | 161 ms | 1.02x | 164 ms | **1.00x** | exact match (`4733336957083238967`) |
 
-#### macOS ARM64 (`rustc 1.98.1`, empty-main baseline: `haste` 1.6 ms, `-O3` 3.8 ms, matched 3.2 ms)
+#### macOS ARM64 (`rustc 1.98.1`, empty-main baseline: `haste` 1.6 ms, `-O3` 3.8 ms, matched 3.2 ms; ratios are `haste / rustc`, `< 1.00x` = haste faster)
 
-| Workload | `haste --release` (net) | `rustc -O3` (net) | vs `-O3` | `rustc -O3 native+abort` (net) | vs matched | Output |
+| Workload | `haste --release` (net) | `rustc -O3` (net) | `haste / -O3` | `rustc -O3 native+abort` (net) | `haste / matched` | Output |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
 | `sha256` (2M blocks) | 282 ms | 290 ms | **0.97x** | 291 ms | **0.97x** | exact match (`2980548810864065682`) |
 | `sieve` (20x 4M primes) | 61.8 ms | 81.1 ms | **0.76x** | 81.6 ms | **0.76x** | exact match (`10840522878760`) |
