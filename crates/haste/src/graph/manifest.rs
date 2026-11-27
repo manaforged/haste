@@ -76,6 +76,7 @@ pub struct Manifest {
     pub name: String,
     pub version: Option<semver::Version>,
     pub edition: String,
+    pub resolver: Option<u8>,
     pub meta: PackageMeta,
     pub links: Option<String>,
     pub default_run: Option<String>,
@@ -471,6 +472,38 @@ fn edition_of(package: &Table, workspace: Option<&Table>) -> String {
     inherited_text_or(package, workspace, "edition", "2015")
 }
 
+fn resolver_of(table: &Table) -> Option<u8> {
+    match text(table, "resolver")? {
+        "1" => Some(1),
+        "2" => Some(2),
+        "3" => Some(3),
+        _ => None,
+    }
+}
+
+/// Whether feature resolution uses Cargo's v2/v3 host/target split for `workspace` and `members`.
+pub(super) fn uses_resolver_v2(
+    workspace: Option<&Table>,
+    packages: &[super::Package],
+    members: &[usize],
+) -> bool {
+    if let Some(ws) = workspace {
+        return matches!(resolver_of(ws), Some(2 | 3));
+    }
+    let Some(&member) = members.first() else {
+        return true;
+    };
+    let manifest = &packages[member].manifest;
+    match manifest.resolver {
+        Some(1) => false,
+        Some(2 | 3) => true,
+        _ => manifest
+            .edition
+            .parse::<u32>()
+            .is_ok_and(|year| year >= 2021),
+    }
+}
+
 fn package_meta(package: &Table, workspace: Option<&Table>) -> PackageMeta {
     let authors = strings(inherited_value(package, workspace, "authors")).join(":");
     PackageMeta {
@@ -511,6 +544,7 @@ fn manifest_of(dir: &Path, root: &Table, workspace: Option<&Table>) -> Result<Ma
         dir: dir.to_owned(),
         version,
         edition: edition_of(package, workspace),
+        resolver: resolver_of(package),
         meta: package_meta(package, workspace),
         links: text(package, "links").map(str::to_owned),
         default_run: text(package, "default-run").map(str::to_owned),

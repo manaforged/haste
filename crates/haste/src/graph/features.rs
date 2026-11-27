@@ -15,6 +15,7 @@ struct Resolver<'a> {
     packages: &'a [Package],
     targets: &'a super::Targets,
     members: &'a [usize],
+    unify_sides: bool,
     units: Vec<Unit>,
     by_key: BTreeMap<(usize, Side), usize>,
     enabled: Vec<BTreeSet<String>>,
@@ -90,6 +91,14 @@ fn validate_features(packages: &[Package], members: &[usize], features: &[&str])
 }
 
 impl Resolver<'_> {
+    fn sibling(&self, package: usize, side: Side) -> Option<usize> {
+        let other = match side {
+            Side::Target => Side::Host,
+            Side::Host => Side::Target,
+        };
+        self.by_key.get(&(package, other)).copied()
+    }
+
     fn unit(&mut self, package: usize, side: Side) -> usize {
         if let Some(unit) = self.by_key.get(&(package, side)) {
             return *unit;
@@ -112,6 +121,13 @@ impl Resolver<'_> {
             .collect();
         self.queue
             .extend(required.into_iter().map(|key| (unit, Step::Dep(key))));
+        if self.unify_sides
+            && let Some(other) = self.sibling(package, side)
+        {
+            let existing: Vec<String> = self.units[other].features.iter().cloned().collect();
+            self.queue
+                .extend(existing.into_iter().map(|feat| (unit, Step::Feature(feat))));
+        }
         unit
     }
 
@@ -144,6 +160,14 @@ impl Resolver<'_> {
         }
         if !self.units[unit].features.insert(name.clone()) {
             return;
+        }
+        if self.unify_sides {
+            let Unit { package, side, .. } = self.units[unit];
+            if let Some(other) = self.sibling(package, side)
+                && !self.units[other].features.contains(&name)
+            {
+                self.queue.push_back((other, Step::Feature(name.clone())));
+            }
         }
         match known {
             Some(values) => values.into_iter().for_each(|value| self.value(unit, value)),
@@ -240,20 +264,21 @@ impl Resolver<'_> {
     }
 }
 
-/// Resolves the features of every unit reachable from `members`, as Cargo's resolver 2 does for `normal` and `build` edges.
+/// Resolves the features of every unit reachable from `members`, using Cargo resolver 1 feature unification across target and host when configured or implied by edition/workspace, and resolver 2 isolation otherwise.
 pub fn resolve(
     packages: &[Package],
     targets: &super::Targets,
     members: &[usize],
     features: &[&str],
-    default_features: bool,
-    all_features: bool,
+    (default_features, all_features, workspace): (bool, bool, Option<&toml::Table>),
 ) -> Result<Graph> {
     validate_features(packages, members, features)?;
+    let unify_sides = !super::manifest::uses_resolver_v2(workspace, packages, members);
     let mut resolver = Resolver {
         packages,
         targets,
         members,
+        unify_sides,
         units: Vec::new(),
         by_key: BTreeMap::new(),
         enabled: Vec::new(),
@@ -312,4 +337,154 @@ pub fn resolve(
         units: resolver.units,
         members: members.to_vec(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::graph::cfg::Target;
+    use crate::graph::lock::Locked;
+    use crate::graph::manifest::Manifest;
+
+    fn pkg(name: &str, edition: &str, resolver: Option<u8>, manifest: Manifest) -> Package {
+        Package {
+            locked: Locked {
+                name: name.to_owned(),
+                version: semver::Version::new(1, 0, 0),
+                source: None,
+                checksum: None,
+                dependencies: Vec::new(),
+            },
+            manifest: Manifest {
+                name: name.to_owned(),
+                edition: edition.to_owned(),
+                resolver,
+                ..manifest
+            },
+            resolved: BTreeMap::new(),
+            sysroot: false,
+        }
+    }
+
+    fn dep(key: &str, kind: Kind, default_features: bool, features: &[&str]) -> Dep {
+        Dep {
+            key: key.to_owned(),
+            package: key.to_owned(),
+            req: None,
+            path: None,
+            optional: false,
+            default_features,
+            features: features.iter().map(|s| (*s).to_owned()).collect(),
+            kind,
+            platform: None,
+        }
+    }
+
+    fn clap_packages(app_edition: &str, app_resolver: Option<u8>) -> Vec<Package> {
+        let mut builder = pkg("clap_builder", "2021", None, Manifest::default());
+        builder
+            .manifest
+            .features
+            .insert("default".to_owned(), Vec::new());
+        builder
+            .manifest
+            .features
+            .insert("cargo".to_owned(), Vec::new());
+
+        let mut clap = pkg("clap", "2021", None, Manifest::default());
+        clap.manifest
+            .features
+            .insert("default".to_owned(), Vec::new());
+        clap.manifest
+            .features
+            .insert("cargo".to_owned(), vec!["clap_builder/cargo".to_owned()]);
+        clap.manifest
+            .deps
+            .push(dep("clap_builder", Kind::Normal, true, &[]));
+        clap.resolved.insert("clap_builder".to_owned(), 2);
+
+        let mut app = pkg(
+            "app",
+            app_edition,
+            app_resolver,
+            Manifest {
+                build: Some(PathBuf::from("build.rs")),
+                ..Manifest::default()
+            },
+        );
+        app.manifest
+            .deps
+            .push(dep("clap", Kind::Normal, false, &["cargo"]));
+        app.manifest.deps.push(dep("clap", Kind::Build, true, &[]));
+        app.resolved.insert("clap".to_owned(), 1);
+
+        vec![app, clap, builder]
+    }
+
+    fn unit_features<'a>(graph: &'a Graph, package: usize, side: Side) -> &'a BTreeSet<String> {
+        &graph
+            .units
+            .iter()
+            .find(|u| u.package == package && u.side == side)
+            .expect("unit exists")
+            .features
+    }
+
+    fn test_targets() -> super::super::Targets {
+        let host = Target::of(&crate::host_target());
+        super::super::Targets {
+            target: host.clone(),
+            host,
+        }
+    }
+
+    #[test]
+    fn resolver_unifies_host_and_target_in_v1_and_isolates_in_v2() {
+        let targets = test_targets();
+
+        let pkgs_2018 = clap_packages("2018", None);
+        let g1 = resolve(&pkgs_2018, &targets, &[0], &[], (true, false, None))
+            .expect("resolve edition 2018");
+        assert!(unit_features(&g1, 1, Side::Host).contains("cargo"));
+        assert!(unit_features(&g1, 2, Side::Host).contains("cargo"));
+        assert!(unit_features(&g1, 1, Side::Target).contains("default"));
+
+        let pkgs_2021 = clap_packages("2021", None);
+        let g2 = resolve(&pkgs_2021, &targets, &[0], &[], (true, false, None))
+            .expect("resolve edition 2021");
+        assert!(unit_features(&g2, 1, Side::Target).contains("cargo"));
+        assert!(!unit_features(&g2, 1, Side::Host).contains("cargo"));
+        assert!(!unit_features(&g2, 2, Side::Host).contains("cargo"));
+
+        let ws_no_resolver = toml::Table::new();
+        let g_ws1 = resolve(
+            &pkgs_2021,
+            &targets,
+            &[0],
+            &[],
+            (true, false, Some(&ws_no_resolver)),
+        )
+        .expect("resolve default workspace");
+        assert!(unit_features(&g_ws1, 1, Side::Host).contains("cargo"));
+
+        let mut ws_v2 = toml::Table::new();
+        ws_v2.insert("resolver".to_owned(), toml::Value::String("2".to_owned()));
+        let g_ws2 = resolve(&pkgs_2021, &targets, &[0], &[], (true, false, Some(&ws_v2)))
+            .expect("resolve v2 workspace");
+        assert!(!unit_features(&g_ws2, 1, Side::Host).contains("cargo"));
+
+        let mut ws_v3 = toml::Table::new();
+        ws_v3.insert("resolver".to_owned(), toml::Value::String("3".to_owned()));
+        let g_ws3 = resolve(&pkgs_2021, &targets, &[0], &[], (true, false, Some(&ws_v3)))
+            .expect("resolve v3 workspace");
+        assert!(!unit_features(&g_ws3, 1, Side::Host).contains("cargo"));
+
+        let pkgs_explicit_v1 = clap_packages("2021", Some(1));
+        let g_pkg1 = resolve(&pkgs_explicit_v1, &targets, &[0], &[], (true, false, None))
+            .expect("resolve explicit resolver 1");
+        assert!(unit_features(&g_pkg1, 2, Side::Host).contains("cargo"));
+    }
 }

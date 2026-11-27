@@ -9,7 +9,7 @@ use crate::outline::source::Source;
 use crate::outline::tree::{Crate as Tree, File, Macro};
 
 use super::super::path::{Path, Paths, Requests};
-use super::super::{Binding, Def, ItemRef, ModRef, Names, Origin, Sym, plain};
+use super::super::{Binding, Def, ItemRef, ModRef, Names, Ns, Origin, Sym, plain};
 use super::paths_of;
 
 const PRELUDES: [(&str, &str); 4] = [
@@ -129,14 +129,15 @@ pub fn macro_at(
 pub fn macro_path(paths: &Paths<'_>, path: &Path<'_>, at: ModRef) -> Option<ItemRef> {
     let (last, prefix) = path.segments.split_last()?;
     let binding = if prefix.is_empty() {
-        let first = paths.first(*last, at, path);
-        let found = first.macros.or_else(|| paths.macro_use(*last));
+        let found = paths
+            .first_ns(*last, at, path, Ns::Macros)
+            .or_else(|| paths.macro_use(*last));
         if found.is_none()
             && let Some(Binding {
                 def: Def::Module(submod),
                 origin: Origin::Import | Origin::Glob,
                 ..
-            }) = first.types
+            }) = paths.first_ns(*last, at, path, Ns::Types)
         {
             paths.demand_macro_module(submod);
         }

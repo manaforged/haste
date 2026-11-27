@@ -588,8 +588,7 @@ fn load_filtered(
             targets,
             &members,
             features,
-            default_features,
-            all_features,
+            (default_features, all_features, workspace.as_ref()),
         )
     };
     let is_external = |pkg: &Package| pkg.locked.is_registry() || pkg.locked.git().is_some();
