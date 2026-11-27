@@ -3,6 +3,7 @@
 mod items;
 mod sysroot;
 
+pub(crate) use items::hash_crate_env;
 pub use items::{CrateHashes, file_key, layer_item_key, sysroot_item_key, sysroot_only_item_key};
 pub use sysroot::{sysroot_key, toolchain_key};
 

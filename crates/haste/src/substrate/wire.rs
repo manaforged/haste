@@ -1,7 +1,10 @@
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use haste_codegen::{Code, CodeUnwindDrop, RelocKind, Site, StencilReloc};
+
+use super::{bytes_to_path, path_to_bytes};
 
 const SITE_WIRE_LEN: usize = 12;
 const RELOC_WIRE_LEN: usize = 12;
@@ -195,6 +198,44 @@ pub(crate) fn read_u64(data: &[u8], at: usize) -> u64 {
     let mut bytes = [0u8; 8];
     bytes.copy_from_slice(&data[at..at + 8]);
     u64::from_le_bytes(bytes)
+}
+
+#[inline]
+pub(crate) fn read_i128(data: &[u8], at: usize) -> i128 {
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&data[at..at + 16]);
+    i128::from_le_bytes(bytes)
+}
+
+pub(super) fn read_bytes<'a>(data: &'a [u8], pos: &mut usize, len: usize) -> Option<&'a [u8]> {
+    let end = pos.checked_add(len)?;
+    let slice = data.get(*pos..end)?;
+    *pos = end;
+    Some(slice)
+}
+
+pub(super) fn read_len_bytes<'a>(data: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
+    let len = read_u32(read_bytes(data, pos, 4)?, 0) as usize;
+    read_bytes(data, pos, len)
+}
+
+pub(super) fn write_len_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Option<()> {
+    let len = u32::try_from(bytes.len()).ok()?;
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(bytes);
+    Some(())
+}
+
+pub(super) fn read_path(data: &[u8], pos: &mut usize) -> Option<PathBuf> {
+    bytes_to_path(read_len_bytes(data, pos)?)
+}
+
+pub(super) fn write_path(out: &mut Vec<u8>, path: &Path) -> Option<()> {
+    write_len_bytes(out, &path_to_bytes(path)?)
+}
+
+pub(super) fn read_utf8(data: &[u8], pos: &mut usize) -> Option<String> {
+    String::from_utf8(read_len_bytes(data, pos)?.to_vec()).ok()
 }
 
 const fn encode_reloc_kind(kind: RelocKind) -> u8 {

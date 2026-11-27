@@ -358,17 +358,6 @@ pub(crate) fn print_test_report(
     if failed == 0 { 0 } else { 101 }
 }
 
-pub(crate) fn lib_fn_items(
-    workspace: &graph::Workspace,
-    outline: &outline::Outline,
-) -> Vec<ItemRef> {
-    outline
-        .members(workspace)
-        .flat_map(|krate| crate_items(krate, &outline.crates[krate], true))
-        .map(|(item_ref, _, _, _)| item_ref)
-        .collect()
-}
-
 pub(crate) fn case_items(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<ItemRef> {
     member_fns(workspace, outline)
         .filter(|(_, _, file, item)| {

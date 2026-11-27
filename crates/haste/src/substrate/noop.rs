@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::hash::{Hash as _, Hasher as _};
 use std::path::{Path, PathBuf};
 
-use super::{bytes_to_path, path_to_bytes, read_u32, read_u64};
+use super::wire::{read_path, read_u32, read_u64, read_utf8, write_len_bytes, write_path};
 
 use rustc_hash::FxHasher;
 
@@ -151,29 +151,17 @@ fn compute_stamp(
     Some(hasher.finish())
 }
 
-fn read_bytes<'a>(data: &'a [u8], pos: &mut usize, len: usize) -> Option<&'a [u8]> {
-    let end = pos.checked_add(len)?;
-    let slice = data.get(*pos..end)?;
-    *pos = end;
-    Some(slice)
-}
-
 fn read_paths(data: &[u8], pos: &mut usize, count: usize) -> Option<Vec<PathBuf>> {
     let mut paths = Vec::with_capacity(count.min(4096));
     for _ in 0..count {
-        let len = read_u32(read_bytes(data, pos, 4)?, 0) as usize;
-        let bytes = read_bytes(data, pos, len)?;
-        paths.push(bytes_to_path(bytes)?);
+        paths.push(read_path(data, pos)?);
     }
     Some(paths)
 }
 
 fn write_paths(out: &mut Vec<u8>, paths: &[PathBuf]) -> Option<()> {
     for path in paths {
-        let bytes = path_to_bytes(path)?;
-        let len = u32::try_from(bytes.len()).ok()?;
-        out.extend_from_slice(&len.to_le_bytes());
-        out.extend_from_slice(&bytes);
+        write_path(out, path)?;
     }
     Some(())
 }
@@ -197,9 +185,7 @@ fn decode_stamp_file(data: &[u8]) -> Option<DecodedStamp> {
     let dirs = read_paths(data, &mut pos, dir_count)?;
     let mut envs = Vec::with_capacity(env_count.min(1024));
     for _ in 0..env_count {
-        let len = read_u32(read_bytes(data, &mut pos, 4)?, 0) as usize;
-        let bytes = read_bytes(data, &mut pos, len)?;
-        envs.push(String::from_utf8(bytes.to_vec()).ok()?);
+        envs.push(read_utf8(data, &mut pos)?);
     }
     (pos == data.len()).then_some((stamp, reached, paths, dirs, envs))
 }
@@ -225,10 +211,7 @@ fn encode_stamp_file(
     write_paths(&mut out, paths)?;
     write_paths(&mut out, dirs)?;
     for env in envs {
-        let bytes = env.as_bytes();
-        let len = u32::try_from(bytes.len()).ok()?;
-        out.extend_from_slice(&len.to_le_bytes());
-        out.extend_from_slice(bytes);
+        write_len_bytes(&mut out, env.as_bytes())?;
     }
     Some(out)
 }

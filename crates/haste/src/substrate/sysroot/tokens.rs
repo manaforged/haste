@@ -540,9 +540,19 @@ pub(super) fn write_marks(
     Some(())
 }
 
-pub(super) fn read_marks(cur: &mut Cursor<'_>, remap: &[u32]) -> Result<Vec<(u32, Mark)>> {
-    const CACHED_SCOPE_BIT: u32 = 1 << 31;
-    let map_scope = |s: u32| if s == 0 { 0 } else { s | CACHED_SCOPE_BIT };
+pub(super) fn read_marks(
+    cur: &mut Cursor<'_>,
+    remap: &[u32],
+    scope_bit: u32,
+) -> Result<Vec<(u32, Mark)>> {
+    const SYSROOT_SCOPE_BIT: u32 = 1 << 31;
+    let map_scope = |s: u32| {
+        if s == 0 || (s & SYSROOT_SCOPE_BIT) != 0 {
+            s
+        } else {
+            s | scope_bit
+        }
+    };
     let count = cur.count()?;
     let byte_len = cur.count()?;
     let data = cur.take(byte_len)?;

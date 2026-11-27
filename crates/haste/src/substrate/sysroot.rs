@@ -5,6 +5,7 @@ mod names;
 mod outline;
 pub(crate) mod tokens;
 mod wire;
+pub(super) use wire::{DecodeSpec, SnapshotSpec};
 
 use std::path::Path;
 use std::sync::Arc;
@@ -17,20 +18,22 @@ use crate::names::{Crate as NamesCrate, Symbols};
 use crate::outline::{Outline, Role};
 use crate::sema::impls::Index as ImplIndex;
 
-pub(crate) const SYSROOT_VERSION: u32 = 10;
+pub(crate) const SYSROOT_VERSION: u32 = 11;
 const SYSROOT_MAGIC: [u8; 8] = *b"HSTSYS01";
-const HEADER_LEN: usize = 32;
+pub(super) const HEADER_LEN: usize = 36;
 const KEPT_SYSROOTS: usize = 2;
 
+pub(super) type EnvReads = Vec<(String, Option<String>)>;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct CrateIdentity {
-    unit_name: String,
-    pkg_name: String,
-    pkg_version: String,
-    side_host: bool,
-    role: u8,
-    features: Vec<String>,
-    deps: Vec<(String, u32)>,
+pub(super) struct CrateIdentity {
+    pub unit_name: String,
+    pub pkg_name: String,
+    pub pkg_version: String,
+    pub side_host: bool,
+    pub role: u8,
+    pub features: Vec<String>,
+    pub deps: Vec<(String, u32)>,
 }
 
 const ROLES: [Role; 6] = [
@@ -42,14 +45,16 @@ const ROLES: [Role; 6] = [
     Role::Bench,
 ];
 
-fn role_tag(role: Role) -> u8 {
+pub(super) fn role_tag(role: Role) -> u8 {
     ROLES.iter().position(|&r| r == role).unwrap_or(0) as u8
 }
 
-fn sysroot_crate_order(workspace: &Workspace, outline: &Outline) -> Vec<usize> {
-    let mut crates: Vec<usize> = (0..outline.crates.len())
-        .filter(|&k| outline.is_sysroot(k as u32))
-        .collect();
+pub(super) fn crate_order(
+    workspace: &Workspace,
+    outline: &Outline,
+    include: impl Fn(usize) -> bool,
+) -> Vec<usize> {
+    let mut crates: Vec<usize> = (0..outline.crates.len()).filter(|&k| include(k)).collect();
     crates.sort_unstable_by(|&a, &b| {
         let ra = &outline.roots[a];
         let rb = &outline.roots[b];
@@ -75,7 +80,11 @@ fn sysroot_crate_order(workspace: &Workspace, outline: &Outline) -> Vec<usize> {
     crates
 }
 
-fn identity_of(
+pub(super) fn sysroot_crate_order(workspace: &Workspace, outline: &Outline) -> Vec<usize> {
+    crate_order(workspace, outline, |k| outline.is_sysroot(k as u32))
+}
+
+pub(super) fn identity_of(
     workspace: &Workspace,
     outline: &Outline,
     krate: usize,
@@ -99,26 +108,28 @@ fn identity_of(
     })
 }
 
-fn match_crates(
+pub(super) fn match_crate_list(
     identities: &[CrateIdentity],
     workspace: &Workspace,
     outline: &Outline,
-) -> Option<Vec<usize>> {
-    let local = sysroot_crate_order(workspace, outline);
+    local: &[usize],
+) -> bool {
     if local.len() != identities.len() {
-        return None;
+        return false;
     }
     let mut to_local = vec![None; outline.crates.len()];
     for (pos, &krate) in local.iter().enumerate() {
         to_local[krate] = Some(pos as u32);
     }
     for (pos, ident) in identities.iter().enumerate() {
-        let current = identity_of(workspace, outline, local[pos], &to_local)?;
+        let Some(current) = identity_of(workspace, outline, local[pos], &to_local) else {
+            return false;
+        };
         if &current != ident {
-            return None;
+            return false;
         }
     }
-    Some(local)
+    true
 }
 
 fn is_sysroot_cache(path: &Path) -> bool {
@@ -135,6 +146,25 @@ pub(crate) type CachedSysroot = (
     HashMap<u32, Arc<ImplIndex>>,
 );
 
+pub(super) fn apply_decoded_crates(
+    outline: &mut Outline,
+    crates: Vec<(usize, crate::outline::tree::Crate)>,
+    env_reads: Vec<EnvReads>,
+) {
+    for (idx, (krate, mut tree)) in crates.into_iter().enumerate() {
+        tree.env = std::mem::take(&mut outline.crates[krate].env);
+        if let Some(reads) = env_reads.get(idx)
+            && !reads.is_empty()
+        {
+            let mut guard = crate::sync::lock(&tree.env.env_reads);
+            for (name, val) in reads {
+                guard.entry(name.clone()).or_insert_with(|| val.clone());
+            }
+        }
+        outline.crates[krate] = tree;
+    }
+}
+
 /// Attempts to load cached settled sysroot crates into `outline` and return their `Symbols`, `Names`, and impl indices.
 pub(crate) fn try_load(
     workspace: &Workspace,
@@ -147,15 +177,21 @@ pub(crate) fn try_load(
     let key = super::sysroot_key(workspace, targets);
     let path = super::sysroot_cache_path(key);
     let backing = Arc::new(super::Backing::open(&path, HEADER_LEN).ok()?);
-    match wire::decode_sysroot(&backing, key, workspace, outline) {
-        Ok(Some((crates, symbols, names, heads))) => {
-            for (krate, mut tree) in crates {
-                tree.env = std::mem::take(&mut outline.crates[krate].env);
-                outline.crates[krate] = tree;
-            }
+    let sysroot_crates = sysroot_crate_order(workspace, outline);
+    let spec = wire::DecodeSpec {
+        magic: SYSROOT_MAGIC,
+        version: SYSROOT_VERSION,
+        key,
+        cached_crates: &sysroot_crates,
+        ref_crates: &sysroot_crates,
+        scope_bit: 1 << 31,
+    };
+    match wire::decode_snapshot(&backing, &spec, None, workspace, outline) {
+        Ok(Some((crates, Some(symbols), names, heads, env_reads))) => {
+            apply_decoded_crates(outline, crates, env_reads);
             Some((symbols, names, heads))
         }
-        Ok(None) | Err(_) => {
+        Ok(Some(_)) | Ok(None) | Err(_) => {
             drop(std::fs::remove_file(&path));
             None
         }
@@ -177,7 +213,16 @@ pub(crate) fn save(
     }
     let key = super::sysroot_key(workspace, targets);
     let path = super::sysroot_cache_path(key);
-    let (bytes, heads) = wire::encode_sysroot(key, workspace, compilation, &sysroot_crates)?;
+    let spec = wire::SnapshotSpec {
+        magic: SYSROOT_MAGIC,
+        version: SYSROOT_VERSION,
+        key,
+        cached_crates: &sysroot_crates,
+        ref_crates: &sysroot_crates,
+        env_reads: &[],
+    };
+    let (bytes, heads) = wire::encode_snapshot(&spec, workspace, compilation)?;
+    let heads = Arc::new(heads);
     if let Err(error) = super::backing::write_compressed(&path, &[&bytes]) {
         eprintln!("haste: cannot save sysroot cache: {error:#}");
         return Some(heads);
@@ -186,4 +231,22 @@ pub(crate) fn save(
         super::prune_stale(dir, &path, KEPT_SYSROOTS, is_sysroot_cache);
     }
     Some(heads)
+}
+
+pub(super) fn encode_snapshot(
+    spec: &wire::SnapshotSpec<'_>,
+    workspace: &Workspace,
+    compilation: &Compilation,
+) -> Option<(Vec<u8>, HashMap<u32, Arc<ImplIndex>>)> {
+    wire::encode_snapshot(spec, workspace, compilation)
+}
+
+pub(super) fn decode_snapshot(
+    backing: &Arc<super::Backing>,
+    spec: &wire::DecodeSpec<'_>,
+    existing_symbols: Option<&Symbols>,
+    workspace: &Workspace,
+    outline: &Outline,
+) -> anyhow::Result<Option<wire::DecodedSnapshot>> {
+    wire::decode_snapshot(backing, spec, existing_symbols, workspace, outline)
 }

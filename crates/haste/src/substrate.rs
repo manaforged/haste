@@ -2,8 +2,10 @@
 
 mod backing;
 mod consumers;
+pub(crate) mod deps_index;
 mod inline;
 mod keys;
+pub mod local;
 mod merge;
 pub mod noop;
 pub mod relocs;

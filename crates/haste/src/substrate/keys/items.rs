@@ -39,6 +39,42 @@ impl CrateHashes {
     }
 }
 
+pub(crate) fn hash_crate_env(
+    outline: &crate::outline::Outline,
+    idx: usize,
+    toolchain_hash: u64,
+    target_hash: u64,
+    hasher: &mut FxHasher,
+) {
+    toolchain_hash.hash(hasher);
+    target_hash.hash(hasher);
+    (crate::profile() == Profile::Release).hash(hasher);
+    if let (Some(krate), Some(root)) = (outline.crates.get(idx), outline.roots.get(idx)) {
+        krate.env.fixed.hash(hasher);
+        krate.env.release.hash(hasher);
+        krate.env.test.hash(hasher);
+        krate.env.overflow_checks().hash(hasher);
+        krate.env.debug_assertions().hash(hasher);
+        krate.env.profile_override.hash(hasher);
+        root.name.hash(hasher);
+        (root.role as u8).hash(hasher);
+        root.edition.hash(hasher);
+        krate.env.target.triple.hash(hasher);
+        krate.env.target.names.hash(hasher);
+        krate.env.target.pairs.hash(hasher);
+        krate.env.target.internal.hash(hasher);
+        if krate.env.fixed {
+            outline.pins.get(idx).copied().flatten().hash(hasher);
+        } else {
+            krate.env.features.hash(hasher);
+            krate.env.vars.hash(hasher);
+            if let Some(script) = &krate.env.script {
+                (&script.names, &script.pairs, &script.vars).hash(hasher);
+            }
+        }
+    }
+}
+
 fn hash_crate_rec(
     outline: &crate::outline::Outline,
     idx: usize,
@@ -55,58 +91,42 @@ fn hash_crate_rec(
     }
     state[idx] = 1;
     let mut hasher = FxHasher::default();
-    toolchain_hash.hash(&mut hasher);
-    target_hash.hash(&mut hasher);
-    (crate::profile() == Profile::Release).hash(&mut hasher);
-    if let (Some(krate), Some(root)) = (outline.crates.get(idx), outline.roots.get(idx)) {
-        krate.env.fixed.hash(&mut hasher);
-        krate.env.release.hash(&mut hasher);
-        krate.env.overflow_checks().hash(&mut hasher);
-        krate.env.debug_assertions().hash(&mut hasher);
-        root.name.hash(&mut hasher);
-        (root.role as u8).hash(&mut hasher);
-        krate.env.target.triple.hash(&mut hasher);
-        if krate.env.fixed {
-            outline.pins.get(idx).copied().flatten().hash(&mut hasher);
-        } else {
-            krate.env.features.hash(&mut hasher);
-            krate.env.vars.hash(&mut hasher);
-            if let Some(script) = &krate.env.script {
-                (&script.names, &script.pairs, &script.vars).hash(&mut hasher);
-            }
-            let base_dir = root.path.parent().unwrap_or(Path::new(""));
-            let mut files: Vec<(&Path, u64)> = krate
-                .files
-                .iter()
-                .filter(|f| !f.expanded)
-                .map(|f| {
-                    let rel = f
-                        .source
-                        .path
-                        .strip_prefix(base_dir)
-                        .unwrap_or(&f.source.path);
-                    let mut fh = FxHasher::default();
-                    f.source.text.hash(&mut fh);
-                    (rel, fh.finish())
-                })
-                .collect();
-            files.sort_unstable_by(|a, b| a.0.cmp(b.0));
-            files.hash(&mut hasher);
-            let mut deps: Vec<(&str, u64)> = outline
-                .deps
-                .get(idx)
-                .into_iter()
-                .flatten()
-                .map(|(name, dep)| {
-                    (
-                        name.as_str(),
-                        hash_crate_rec(outline, *dep, toolchain_hash, target_hash, hashes, state),
-                    )
-                })
-                .collect();
-            deps.sort_unstable_by(|a, b| a.0.cmp(b.0));
-            deps.hash(&mut hasher);
-        }
+    hash_crate_env(outline, idx, toolchain_hash, target_hash, &mut hasher);
+    if let (Some(krate), Some(root)) = (outline.crates.get(idx), outline.roots.get(idx))
+        && !krate.env.fixed
+    {
+        let base_dir = root.path.parent().unwrap_or(Path::new(""));
+        let mut files: Vec<(&Path, u64)> = krate
+            .files
+            .iter()
+            .filter(|f| !f.expanded)
+            .map(|f| {
+                let rel = f
+                    .source
+                    .path
+                    .strip_prefix(base_dir)
+                    .unwrap_or(&f.source.path);
+                let mut fh = FxHasher::default();
+                f.source.text.hash(&mut fh);
+                (rel, fh.finish())
+            })
+            .collect();
+        files.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        files.hash(&mut hasher);
+        let mut deps: Vec<(&str, u64)> = outline
+            .deps
+            .get(idx)
+            .into_iter()
+            .flatten()
+            .map(|(name, dep)| {
+                (
+                    name.as_str(),
+                    hash_crate_rec(outline, *dep, toolchain_hash, target_hash, hashes, state),
+                )
+            })
+            .collect();
+        deps.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        deps.hash(&mut hasher);
     }
     let h = hasher.finish();
     hashes[idx] = h;

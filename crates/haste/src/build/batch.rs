@@ -13,10 +13,11 @@ use crate::sema::reach::{Instance, Reached, reach_again, reach_anew};
 use crate::sema::{self, Cache, Edited};
 
 use super::substrate::{
-    SubstrateSlot, cache_with_substrate, export_pre_summaries, save_batch_substrate,
+    SubstrateSlot, cache_with_substrate, export_pre_summaries, load_local_check_crates,
+    prepare_local_check, save_batch_substrate,
 };
 use super::test_args::{
-    check_fn_items, map_tests, select_test_roots, test_label, validate_test_sigs,
+    check_fn_items, check_target, map_tests, select_test_roots, test_label, validate_test_sigs,
 };
 use super::{main_item, require_main};
 
@@ -60,11 +61,7 @@ impl BatchKind {
                 .collect(),
             BatchKind::LibCheck => check_fn_items(workspace, outline, None),
             BatchKind::MainCheck => {
-                let sel = crate::selection();
-                let target = (sel.bin.is_some() || sel.example.is_some())
-                    .then(|| main_item(workspace, outline).map(|m| m.krate as usize))
-                    .flatten();
-                check_fn_items(workspace, outline, target)
+                check_fn_items(workspace, outline, check_target(workspace, outline, true))
             }
             BatchKind::MainAot => main_items(workspace, outline),
         }
@@ -285,6 +282,75 @@ fn recompile(
     }
 }
 
+fn empty_batch(
+    kind: BatchKind,
+    store: Cache,
+    member_errors: Vec<String>,
+    reach_span: sema::census::Span,
+) -> Result<Batch> {
+    let reached = Reached::default();
+    let image = Image::create(&reached, crate::image::ImageMode::Check, (0, 0, 1))?;
+    Ok(Batch {
+        kind,
+        store: Some(store),
+        labels: Vec::new(),
+        roots: Vec::new(),
+        tests: Vec::new(),
+        reached,
+        image,
+        broken: HashMap::default(),
+        poly_failures: Vec::new(),
+        member_errors,
+        reach_span,
+        codegen_span: sema::census::Span::default(),
+    })
+}
+
+fn pick_roots(
+    cx: &mut sema::Context<'_>,
+    (kind, main): (BatchKind, Option<ItemRef>),
+    cases: &[ItemRef],
+    root_insts: &[Instance],
+    test_filters: &[String],
+) -> Vec<Instance> {
+    let mut out = match (kind, main) {
+        (BatchKind::MainAot, Some(main_ref)) => {
+            let mut roots: Vec<_> = sema::reach::main_roots(cx, main_ref).map_or_else(
+                |_| vec![(main_ref, sema::substs::Substs::EMPTY)],
+                Into::into,
+            );
+            if cases.len() > 1 {
+                roots.extend(
+                    cases[1..]
+                        .iter()
+                        .map(|&item| (item, sema::substs::Substs::EMPTY)),
+                );
+            }
+            roots
+        }
+        #[cfg(feature = "diff-harness")]
+        (BatchKind::Cases, _) => root_insts
+            .iter()
+            .copied()
+            .filter(|&(item, _)| sema::infer::is_case_sig(cx, item))
+            .collect(),
+        (BatchKind::Tests, _) => select_test_roots(cx, cases, test_filters).2,
+        (BatchKind::LibCheck | BatchKind::MainCheck, _) => root_insts
+            .iter()
+            .copied()
+            .filter(|&(item, _)| sema::infer::is_concrete_fn(cx, item))
+            .collect(),
+        _ => root_insts.to_vec(),
+    };
+    if kind.forces_unwind()
+        && crate::profile() == outline::tree::Profile::Release
+        && let Some(bounds) = cx.lang_item(sema::reach::PANIC_BOUNDS_CHECK)
+    {
+        out.push((bounds, sema::substs::Substs::EMPTY));
+    }
+    out
+}
+
 fn finish_batch(
     (kind, main): (BatchKind, Option<ItemRef>),
     (cases, mut reached): (&[ItemRef], Reached),
@@ -300,23 +366,7 @@ fn finish_batch(
     if kind == BatchKind::Tests {
         let member_errors = validate_test_sigs(&mut cx, cases);
         if !member_errors.is_empty() {
-            let store = cx.release().0;
-            let empty = Reached::default();
-            let image = Image::create(&empty, crate::image::ImageMode::Check, (0, 0, 1))?;
-            return Ok(Batch {
-                kind,
-                store: Some(store),
-                labels: Vec::new(),
-                roots: Vec::new(),
-                tests: Vec::new(),
-                reached: empty,
-                image,
-                broken: HashMap::default(),
-                poly_failures: Vec::new(),
-                member_errors,
-                reach_span,
-                codegen_span: sema::census::Span::default(),
-            });
+            return empty_batch(kind, cx.release().0, member_errors, reach_span);
         }
     }
     let codegen_clock = sema::census::Clock::now();
@@ -464,97 +514,84 @@ impl Batch {
     ) -> Result<Batch> {
         let mode = kind.mode();
         let reach_clock = sema::census::Clock::now();
+        let is_oneshot_check =
+            drop_finals && matches!(kind, BatchKind::LibCheck | BatchKind::MainCheck);
+        if is_oneshot_check {
+            load_local_check_crates(workspace, compilation, kind == BatchKind::MainCheck)?;
+        }
+        let (mut substrate, mut cache) =
+            cache_with_substrate(workspace, mode != crate::image::ImageMode::Check);
+        let local_check = is_oneshot_check
+            .then(|| {
+                prepare_local_check(
+                    workspace,
+                    &compilation.outline,
+                    kind == BatchKind::MainCheck,
+                    substrate.as_ref(),
+                )
+            })
+            .flatten();
+        if let Some(ref state) = local_check
+            && state.all_cached()
+        {
+            crate::substrate::save_fixed_files(
+                workspace,
+                crate::host_target().triple,
+                &compilation.outline,
+            );
+            return empty_batch(kind, cache, Vec::new(), reach_clock.elapsed());
+        }
         let (cases, root_insts) = if main.is_some() {
             (main_items(workspace, &compilation.outline), Vec::new())
+        } else if let Some(ref state) = local_check {
+            state.dirty_cases(&compilation.outline)
         } else {
             batch_roots(workspace, &compilation.outline, kind)
         };
-        let (mut substrate, mut cache) =
-            cache_with_substrate(workspace, mode != crate::image::ImageMode::Check);
         if matches!(kind, BatchKind::Tests | BatchKind::MainAot) {
-            let target = match kind {
-                BatchKind::MainAot => main.map(|m| m.krate as usize),
-                _ => None,
-            };
+            let target = (kind == BatchKind::MainAot)
+                .then(|| main.map(|m| m.krate as usize))
+                .flatten();
             let (checked_cache, member_errors) =
                 check_member_items(workspace, compilation, cache, target)?;
             cache = checked_cache;
             if !member_errors.is_empty() {
-                let reached = Reached::default();
-                let image = Image::create(&reached, crate::image::ImageMode::Check, (0, 0, 1))?;
-                return Ok(Batch {
-                    kind,
-                    store: Some(cache),
-                    labels: Vec::new(),
-                    roots: Vec::new(),
-                    tests: Vec::new(),
-                    reached,
-                    image,
-                    broken: HashMap::default(),
-                    poly_failures: Vec::new(),
-                    member_errors,
-                    reach_span: reach_clock.elapsed(),
-                    codegen_span: sema::census::Span::default(),
-                });
+                return empty_batch(kind, cache, member_errors, reach_clock.elapsed());
             }
         }
-        let mut batch = crate::macros::reach_resolved_with_cache(
-            compilation,
-            cache,
-            |cx| {
-                let mut out = match (kind, main) {
-                    (BatchKind::MainAot, Some(main_ref)) => {
-                        let mut roots: Vec<_> = sema::reach::main_roots(cx, main_ref).map_or_else(
-                            |_| vec![(main_ref, sema::substs::Substs::EMPTY)],
-                            Into::into,
-                        );
-                        if cases.len() > 1 {
-                            roots.extend(
-                                cases[1..]
-                                    .iter()
-                                    .map(|&item| (item, sema::substs::Substs::EMPTY)),
-                            );
-                        }
-                        roots
-                    }
-                    #[cfg(feature = "diff-harness")]
-                    (BatchKind::Cases, _) => root_insts
-                        .iter()
-                        .copied()
-                        .filter(|&(item, _)| sema::infer::is_case_sig(cx, item))
-                        .collect(),
-                    (BatchKind::Tests, _) => select_test_roots(cx, &cases, test_filters).2,
-                    (BatchKind::LibCheck | BatchKind::MainCheck, _) => root_insts
-                        .iter()
-                        .copied()
-                        .filter(|&(item, _)| sema::infer::is_concrete_fn(cx, item))
-                        .collect(),
-                    _ => root_insts.clone(),
-                };
-                if kind.forces_unwind()
-                    && crate::profile() == outline::tree::Profile::Release
-                    && let Some(bounds) = cx.lang_item(sema::reach::PANIC_BOUNDS_CHECK)
-                {
-                    out.push((bounds, sema::substs::Substs::EMPTY));
-                }
-                out
-            },
-            |cx, reached| {
-                finish_batch(
-                    (kind, main),
-                    (&cases, reached),
-                    (drop_finals, test_filters),
-                    substrate.take(),
-                    (cx, reach_clock),
-                )
-            },
-        )?;
-        if matches!(kind, BatchKind::LibCheck | BatchKind::MainCheck)
-            && let Some(store) = batch.store.take()
-        {
-            let (store, poly_failures) = check_poly_resolved(compilation, store, &cases)?;
-            batch.store = Some(store);
-            batch.poly_failures = poly_failures;
+        if let Some(ref state) = local_check {
+            state.set_fixed(&mut compilation.outline, true);
+        }
+        let run_result = (|| -> Result<Batch> {
+            let mut batch = crate::macros::reach_resolved_with_cache(
+                compilation,
+                cache,
+                |cx| pick_roots(cx, (kind, main), &cases, &root_insts, test_filters),
+                |cx, reached| {
+                    finish_batch(
+                        (kind, main),
+                        (&cases, reached),
+                        (drop_finals, test_filters),
+                        substrate.take(),
+                        (cx, reach_clock),
+                    )
+                },
+            )?;
+            if matches!(kind, BatchKind::LibCheck | BatchKind::MainCheck)
+                && let Some(store) = batch.store.take()
+            {
+                let (store, poly_failures) = check_poly_resolved(compilation, store, &cases)?;
+                batch.store = Some(store);
+                batch.poly_failures = poly_failures;
+            }
+            Ok(batch)
+        })();
+        if let Some(ref state) = local_check {
+            state.set_fixed(&mut compilation.outline, false);
+        }
+        let batch = run_result?;
+        if let Some(ref state) = local_check {
+            state.record_batch(&compilation.outline, &batch);
         }
         crate::substrate::save_fixed_files(
             workspace,
