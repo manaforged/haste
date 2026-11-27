@@ -750,7 +750,7 @@ impl Checker<'_, '_> {
         let call_depth = self.ty_max_ref_depth(call_ty);
         let clears_mut = !self.ty_holds_mut_ref(call_ty);
         for s in &mut expanded {
-            if self.is_param_local(s.target) {
+            if self.is_param_local(s.target) || self.is_closure_param(s.target) {
                 let target_ty = self.local_ty(s.target);
                 if target_ty != Ty::NONE {
                     let inner = match *self.cx.types.kind(target_ty) {

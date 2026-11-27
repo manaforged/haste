@@ -15,6 +15,7 @@ use crate::sema::infer::{By, Res};
 use crate::sema::ty::{Kind, Mut, Ty};
 
 use super::bind::push_loan;
+use super::checks::is_temp_target;
 use super::places::PlaceStep;
 use super::propagate::BorrowSource;
 use super::{Checker, Loan, State, prune_moved_loans};
@@ -27,6 +28,7 @@ pub(super) use lifetimes::{
     for_each_param_bound_list, lifetime_outlives, pred_matches_name, receiver_has_any_named,
     sig_return_named_lifetimes, sig_returns_only_static, sig_type_params, ty_shares_name,
 };
+use static_ty::non_env_sources;
 
 #[derive(Default)]
 pub(super) struct ArgListCtx<'a> {
@@ -409,7 +411,7 @@ impl Checker<'_, '_> {
                 &param_ids,
                 &arg_sources,
                 recv_borrow == Some(Mut::Mut),
-                sig.as_deref(),
+                (sig.as_deref(), fn_item),
                 state,
             )?;
             self.attach_closure_arg_param_loans(
@@ -606,6 +608,7 @@ impl Checker<'_, '_> {
                 self.is_iter_mod(it)
                     || self.item_in_std_mod(it, "option")
                     || self.item_in_std_mod(it, "result")
+                    || self.item_in_std_mod(it, "array")
             })
         {
             let origins = non_env_sources(recv);
@@ -728,7 +731,9 @@ impl Checker<'_, '_> {
                 }
                 let mut sources = self.expr_borrow_sources(arg, state);
                 if shared_reborrow {
-                    sources.iter_mut().for_each(|s| s.mutable = false);
+                    sources
+                        .iter_mut()
+                        .for_each(|s| s.mutable &= is_temp_target(s.target).is_some());
                 }
                 if effective_ref.is_none()
                     && let Some(local) = plain_local
@@ -792,8 +797,4 @@ impl Checker<'_, '_> {
         self.release_temp_holder(state, temp_id);
         res.map(|()| arg_sources)
     }
-}
-
-fn non_env_sources(srcs: &[BorrowSource]) -> Vec<BorrowSource> {
-    srcs.iter().filter(|s| !s.env_only).cloned().collect()
 }

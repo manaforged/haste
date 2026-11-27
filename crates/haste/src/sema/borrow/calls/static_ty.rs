@@ -10,7 +10,10 @@ use crate::sema::infer::Res;
 
 use super::super::Checker;
 use super::super::checks::resolve_ast_type_path;
-use super::lifetimes::{LT_STATIC, is_owned_container, is_prim_name, lifetime_is_static};
+use super::arg_refs::sig_param_idx;
+use super::lifetimes::{
+    LT_STATIC, for_each_param_bound_list, is_owned_container, is_prim_name, lifetime_is_static,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DynDefault {
@@ -409,4 +412,268 @@ impl Checker<'_, '_> {
         }
         false
     }
+
+    pub(in super::super) fn sig_ret_ast_is_provably_static(
+        &mut self,
+        fn_item: ItemRef,
+        sig: &Signature,
+        sig_src: &Source,
+        ret_ast: TyId,
+    ) -> bool {
+        !sig.is_async
+            && ast_ty_is_provably_static_in_item(self.cx, fn_item, sig, sig_src, ret_ast, &[])
+    }
+
+    pub(in super::super) fn for_iter_item_is_static(&mut self, iter: ExprId) -> bool {
+        let Some(local) = self.expr_plain_local(self.unwrap_parens(iter)) else {
+            return false;
+        };
+        if !self.is_param_local(local) {
+            return false;
+        }
+        let Some(pos) = self.typed.params.iter().position(|&p| p == local) else {
+            return false;
+        };
+        let Ok(sig) = self.cx.signature(self.item) else {
+            return false;
+        };
+        let Some(param_idx) = sig_param_idx(pos, sig.receiver.is_some()) else {
+            return false;
+        };
+        let Some(&(_, param_ty)) = sig.params.get(param_idx) else {
+            return false;
+        };
+        let mut item_tys = Vec::new();
+        for_each_param_bound_list(&sig, self.src, param_ty, |list| {
+            for &b_id in sig.body.list(list) {
+                let Bound::Trait { path, .. } = sig.body.bounds[b_id as usize] else {
+                    continue;
+                };
+                let Some(&last_seg) = sig.body.list(sig.body.path(path).segments).last() else {
+                    continue;
+                };
+                let seg = sig.body.segments[last_seg as usize];
+                if !matches!(plain(self.src.text(seg.name)), "IntoIterator" | "Iterator") {
+                    continue;
+                }
+                let Some(Args::Angle(args)) = seg.args else {
+                    continue;
+                };
+                for &a_id in sig.body.list(args) {
+                    if let GenericArg::Binding { name, ty, .. } = sig.body.args[a_id as usize]
+                        && plain(self.src.text(name)) == "Item"
+                    {
+                        item_tys.push(ty);
+                    }
+                }
+            }
+        });
+        if item_tys.is_empty() {
+            return false;
+        }
+        let static_names = self.static_param_names(&sig);
+        item_tys.into_iter().any(|item_ty| {
+            ast_ty_is_provably_static_in_item(
+                self.cx,
+                self.item,
+                &sig,
+                self.src,
+                item_ty,
+                &static_names,
+            )
+        })
+    }
+
+    fn static_param_names(&mut self, sig: &Signature) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut idx = 0u16;
+        if let Some(impl_ref) = self.cx.owner_impl(self.item) {
+            if let Ok(hdr) = self.cx.impl_header(impl_ref) {
+                let impl_src = &self.cx.impl_file(impl_ref).source;
+                for g in crate::sema::infer::scope::type_params(&hdr.generics) {
+                    if self.static_type_params.contains(&idx) {
+                        names.push(impl_src.text(g.name).to_owned());
+                    }
+                    idx += 1;
+                }
+            }
+        } else if let Some(trait_ref) = self.cx.owner_trait(self.item) {
+            idx += 1;
+            if let Ok(tg) = self.cx.trait_generics(trait_ref) {
+                let tsrc = &self.cx.file(trait_ref).source;
+                for g in crate::sema::infer::scope::type_params(&tg.1.params) {
+                    if self.static_type_params.contains(&idx) {
+                        names.push(tsrc.text(g.name).to_owned());
+                    }
+                    idx += 1;
+                }
+            }
+        }
+        for g in crate::sema::infer::scope::type_params(&sig.generics) {
+            if self.static_type_params.contains(&idx) {
+                names.push(self.src.text(g.name).to_owned());
+            }
+            idx += 1;
+        }
+        names
+    }
+}
+
+struct StaticAstCtx<'a> {
+    scope: ItemRef,
+    body: &'a Body,
+    src: &'a Source,
+    sig: Option<(&'a Signature, &'a Source)>,
+    static_names: &'a [String],
+}
+
+pub(super) fn ast_ty_is_provably_static_in_item(
+    cx: &mut crate::sema::Context<'_>,
+    scope: ItemRef,
+    sig: &Signature,
+    src: &Source,
+    ty: TyId,
+    static_names: &[String],
+) -> bool {
+    let ctx = StaticAstCtx {
+        scope,
+        body: &sig.body,
+        src,
+        sig: Some((sig, src)),
+        static_names,
+    };
+    ast_ty_is_provably_static_resolved(cx, &ctx, ty, DynDefault::InSig, 0)
+}
+
+fn ast_ty_is_provably_static_resolved(
+    cx: &mut crate::sema::Context<'_>,
+    ctx: &StaticAstCtx<'_>,
+    ty: TyId,
+    mode: DynDefault,
+    depth: u8,
+) -> bool {
+    if depth >= 8 {
+        return false;
+    }
+    if ast_ty_is_provably_static_in_mode(ctx.body, ctx.src, ctx.sig, ty, mode) {
+        return true;
+    }
+    let lt_static = |lt: &str| match ctx.sig {
+        Some((s, s_src)) => lifetime_is_static(s, s_src, lt),
+        None => lt == LT_STATIC,
+    };
+    match *ctx.body.ty(ty) {
+        AstTy::Ptr { ty: t, .. } => {
+            ast_ty_is_provably_static_resolved(cx, ctx, t, mode.enter_owned(), depth + 1)
+        }
+        AstTy::Paren(t) | AstTy::Slice(t) | AstTy::Array(t, _) | AstTy::Pat(t, _) => {
+            ast_ty_is_provably_static_resolved(cx, ctx, t, mode, depth + 1)
+        }
+        AstTy::Tuple(list) => ctx
+            .body
+            .list(list)
+            .iter()
+            .all(|&t| ast_ty_is_provably_static_resolved(cx, ctx, TyId(t), mode, depth + 1)),
+        AstTy::Ref {
+            lifetime: Some(lt),
+            ty: inner,
+            ..
+        } => {
+            lt_static(ctx.src.text(lt))
+                && ast_ty_is_provably_static_resolved(cx, ctx, inner, mode.enter_owned(), depth + 1)
+        }
+        AstTy::Path(path_id) => path_is_provably_static_resolved(cx, ctx, path_id, mode, depth),
+        _ => false,
+    }
+}
+
+fn path_is_provably_static_resolved(
+    cx: &mut crate::sema::Context<'_>,
+    ctx: &StaticAstCtx<'_>,
+    path_id: crate::body::PathId,
+    mode: DynDefault,
+    depth: u8,
+) -> bool {
+    let p = ctx.body.path(path_id);
+    let segs = ctx.body.list(p.segments);
+    if p.qself.is_some()
+        || segs.is_empty()
+        || segs[..segs.len() - 1]
+            .iter()
+            .any(|&s| ctx.body.segments[s as usize].args.is_some())
+    {
+        return false;
+    }
+    let seg = ctx.body.segments[segs[segs.len() - 1] as usize];
+    let name = plain(ctx.src.text(seg.name));
+    if segs.len() == 1 && seg.args.is_none() && ctx.static_names.iter().any(|s| s == name) {
+        return true;
+    }
+    let args_static =
+        |cx: &mut crate::sema::Context<'_>, args: Option<Args>, arg_mode: DynDefault| -> bool {
+            let lt_static = |lt: &str| match ctx.sig {
+                Some((s, s_src)) => lifetime_is_static(s, s_src, lt),
+                None => lt == LT_STATIC,
+            };
+            match args {
+                None => true,
+                Some(Args::Angle(list)) => {
+                    ctx.body
+                        .list(list)
+                        .iter()
+                        .all(|&a| match ctx.body.args[a as usize] {
+                            GenericArg::Ty(t) | GenericArg::Binding { ty: t, .. } => {
+                                ast_ty_is_provably_static_resolved(cx, ctx, t, arg_mode, depth + 1)
+                            }
+                            GenericArg::Lifetime(lt) => lt_static(ctx.src.text(lt)),
+                            GenericArg::Const(_) => true,
+                            GenericArg::Constraint { .. } => false,
+                        })
+                }
+                _ => false,
+            }
+        };
+    if is_owned_container(name) && seg.args.is_some() {
+        return args_static(cx, seg.args, mode.enter_owned());
+    }
+    let Some(resolved) = resolve_ast_type_path(cx, Some(ctx.scope), ctx.body, ctx.src, path_id)
+    else {
+        return false;
+    };
+    match cx.item(resolved).1.kind {
+        ItemKind::Type => {
+            let Ok(alias) = cx.alias_def(resolved) else {
+                return false;
+            };
+            if !alias.generics.1.params.is_empty() {
+                return false;
+            }
+            let alias_src = cx.item(resolved).0;
+            let alias_ctx = StaticAstCtx {
+                scope: resolved,
+                body: &alias.arena,
+                src: alias_src,
+                sig: None,
+                static_names: &[],
+            };
+            ast_ty_is_provably_static_resolved(cx, &alias_ctx, alias.ty, mode, depth + 1)
+        }
+        ItemKind::Struct | ItemKind::Enum | ItemKind::Union => {
+            let Ok(def) = cx.adt_def(resolved) else {
+                return false;
+            };
+            !def.generics
+                .params
+                .iter()
+                .any(|g| g.kind == GenericKind::Lifetime)
+                && args_static(cx, seg.args, mode.enter_owned())
+        }
+        _ => false,
+    }
+}
+
+pub(super) fn non_env_sources(
+    srcs: &[super::super::propagate::BorrowSource],
+) -> Vec<super::super::propagate::BorrowSource> {
+    srcs.iter().filter(|s| !s.env_only).cloned().collect()
 }

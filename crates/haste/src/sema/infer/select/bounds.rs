@@ -708,11 +708,15 @@ impl<'a> Infer<'_, 'a> {
     fn select_auto_impl(&mut self, of: ItemRef, ty: Ty) -> (bool, usize) {
         let saved_dep = std::mem::replace(&mut self.auto_dep, usize::MAX);
         let before = self.cycle_hits;
+        let asks_before = self.cx.asks.count();
         let picked = self.probe(|infer| infer.select(of, ty, &[]));
         let dep = std::mem::replace(&mut self.auto_dep, saved_dep);
         match picked {
             Ok(Some(_)) => (true, dep),
-            Ok(None) if self.cycle_hits == before => (false, usize::MAX),
+            Ok(None) if self.cycle_hits == before && self.cx.asks.count() == asks_before => {
+                (false, usize::MAX)
+            }
+            Ok(None) if self.cx.asks.count() != asks_before => (true, usize::MAX),
             Err(_) => {
                 self.cycle_hits += 1;
                 (true, 0)
@@ -729,6 +733,7 @@ impl<'a> Infer<'_, 'a> {
         args: super::super::super::substs::Substs,
         cacheable: bool,
     ) -> (bool, usize) {
+        let asks_before = self.cx.asks.count();
         let holders = self.holders(of, ty, &[]);
         if self.cx.negative_impl(of, Head::Adt(item), &holders) {
             if cacheable {
@@ -758,6 +763,7 @@ impl<'a> Infer<'_, 'a> {
             self.parts_auto_holds(of, ty)
         };
         self.auto_stack.pop();
-        self.finish_auto_node((of, ty), cacheable, my_depth, holds, dep)
+        let cache = cacheable && (holds || self.cx.asks.count() == asks_before);
+        self.finish_auto_node((of, ty), cache, my_depth, holds, dep)
     }
 }

@@ -52,7 +52,7 @@ impl Checker<'_, '_> {
                 &arg_ids[1..],
                 arg_sources.get(1..).unwrap_or(&[]),
                 recv_mut,
-                Some(sig),
+                (Some(sig), fn_item),
                 state,
             )?;
         }

@@ -595,11 +595,15 @@ impl Checker<'_, '_> {
             push_source_loans(&mut state.loans, Some(id), &iter_sources, Some(iter));
             Some(id)
         };
-        let item_sources: Vec<BorrowSource> = iter_sources
-            .iter()
-            .filter(|s| !s.env_only)
-            .cloned()
-            .collect();
+        let item_sources: Vec<BorrowSource> = if self.for_iter_item_is_static(iter) {
+            Vec::new()
+        } else {
+            iter_sources
+                .iter()
+                .filter(|s| !s.env_only)
+                .cloned()
+                .collect()
+        };
         self.check_loop(
             None,
             label,
