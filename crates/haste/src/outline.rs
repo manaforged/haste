@@ -212,43 +212,24 @@ impl Outline {
         Ok(())
     }
 
-    /// Reads `edited` crates and their dependents again, forgetting cached parsed sources only for `changed_paths` (and macro-expanded files if macros changed), loading in parallel.
-    pub(crate) fn reload_edited(
+    fn reload_masked(
         &mut self,
-        edited: &[u32],
+        mask: &[bool],
+        crates: &[usize],
         changed_paths: &[PathBuf],
-    ) -> Result<Vec<usize>> {
-        let mut seen = vec![false; self.deps.len()];
-        let crates = dependents_of(&self.users(), &mut seen, edited.iter().map(|&k| k as usize));
+    ) -> Result<()> {
         let mut forget: Vec<PathBuf> = changed_paths.to_vec();
-        let old_macros = collect_macro_defs(self, edited, changed_paths);
-        let mut macro_stale = edited.iter().any(|&k| self.roots[k as usize].proc_macro)
-            || old_macros.is_none()
-            || has_macro2(self, edited);
+        for &at in crates {
+            for file in &self.crates[at].files {
+                if !file.expanded {
+                    forget.push(file.source.path.clone());
+                }
+            }
+        }
         forget.sort();
         forget.dedup();
         self.cache.forget(&forget);
-        if !macro_stale
-            && let Some(old) = old_macros
-            && let Some(new) = read_macro_defs(&self.cache, changed_paths)
-        {
-            macro_stale = old != new;
-        } else if !macro_stale {
-            macro_stale = true;
-        }
-        if macro_stale {
-            for &at in &crates {
-                for file in &self.crates[at].files {
-                    if !file.expanded {
-                        forget.push(file.source.path.clone());
-                    }
-                }
-            }
-            forget.sort();
-            forget.dedup();
-            self.cache.forget(&forget);
-        }
-        for &at in &crates {
+        for &at in crates {
             let env = std::mem::take(&mut self.crates[at].env);
             self.crates[at] = Crate {
                 env,
@@ -256,10 +237,94 @@ impl Outline {
                 ..Crate::default()
             };
         }
-        self.procs.retain(|(run, _), _| !seen[run.krate as usize]);
-        self.load_selected(&seen)?;
+        self.procs.retain(|(run, _), _| !mask[run.krate as usize]);
+        self.load_selected(mask)?;
         self.retry_waiting()?;
-        Ok(crates)
+        Ok(())
+    }
+
+    /// Reads `edited` crates (and their dependents only when a proc-macro crate or unexpanded macro definition changed), loading in parallel.
+    pub(crate) fn reload_edited(
+        &mut self,
+        edited: &[u32],
+        changed_paths: &[PathBuf],
+    ) -> Result<Vec<usize>> {
+        let mut edited_crates: Vec<usize> = edited
+            .iter()
+            .map(|&k| k as usize)
+            .filter(|&k| k < self.crates.len())
+            .collect();
+        edited_crates.sort_unstable();
+        edited_crates.dedup();
+        if edited_crates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let any_proc = edited_crates.iter().any(|&k| self.roots[k].proc_macro);
+        if !any_proc {
+            let old_states: Vec<CrateMacroState> = edited_crates
+                .iter()
+                .map(|&k| crate_macro_state(&self.crates[k]))
+                .collect();
+            let mut edited_mask = vec![false; self.deps.len()];
+            for &at in &edited_crates {
+                edited_mask[at] = true;
+            }
+            self.reload_masked(&edited_mask, &edited_crates, changed_paths)?;
+            let unchanged = edited_crates.iter().zip(&old_states).all(|(&k, old)| {
+                let tree = &self.crates[k];
+                tree.errors.is_empty() && tree.missing.is_empty() && crate_macro_state(tree) == *old
+            });
+            if unchanged {
+                return Ok(edited_crates);
+            }
+            return self.reload_dependents_inner(&edited_crates, changed_paths, false);
+        }
+        self.reload_dependents_inner(&edited_crates, changed_paths, true)
+    }
+
+    /// Reloads transitive dependents of `edited` without re-parsing `edited` itself, returning all affected crates.
+    pub(crate) fn reload_dependents(
+        &mut self,
+        edited: &[u32],
+        changed_paths: &[PathBuf],
+    ) -> Result<Vec<usize>> {
+        let mut edited_crates: Vec<usize> = edited
+            .iter()
+            .map(|&k| k as usize)
+            .filter(|&k| k < self.crates.len())
+            .collect();
+        edited_crates.sort_unstable();
+        edited_crates.dedup();
+        if edited_crates.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.reload_dependents_inner(&edited_crates, changed_paths, false)
+    }
+
+    fn reload_dependents_inner(
+        &mut self,
+        edited_crates: &[usize],
+        changed_paths: &[PathBuf],
+        include_edited: bool,
+    ) -> Result<Vec<usize>> {
+        let mut seen = vec![false; self.deps.len()];
+        let all_crates = dependents_of(&self.users(), &mut seen, edited_crates.iter().copied());
+        if include_edited {
+            self.reload_masked(&seen, &all_crates, changed_paths)?;
+            return Ok(all_crates);
+        }
+        let mut dep_only = Vec::new();
+        for &at in &all_crates {
+            if edited_crates.binary_search(&at).is_ok() {
+                seen[at] = false;
+            } else {
+                dep_only.push(at);
+            }
+        }
+        if !dep_only.is_empty() {
+            self.reload_masked(&seen, &dep_only, &[])?;
+        }
+        Ok(all_crates)
     }
 
     /// Reads every module of crate `krate`, as a lookup over all of a crate's impls needs.
@@ -482,54 +547,50 @@ impl Outline {
     }
 }
 
-fn file_macro_defs(file: &tree::File) -> Vec<(String, String)> {
-    let mut defs = Vec::new();
-    for item in &file.items.items {
-        if matches!(item.kind, ItemKind::MacroRules | ItemKind::Macro) {
-            let name = item
-                .name
-                .map_or_else(String::new, |at| file.source.text(at).to_owned());
-            defs.push((name, file.source.span(item.start, item.end).to_owned()));
-        }
-    }
-    defs
+#[derive(PartialEq, Eq)]
+struct CrateMacroState {
+    macro_use: Vec<usize>,
+    exports: Vec<(String, usize, usize)>,
+    files: Vec<(PathBuf, bool, Vec<(String, bool, Vec<String>)>)>,
 }
 
-fn collect_macro_defs(
-    outline: &Outline,
-    edited: &[u32],
-    changed_paths: &[PathBuf],
-) -> Option<Vec<Vec<(String, String)>>> {
-    let mut out = Vec::with_capacity(changed_paths.len());
-    for path in changed_paths {
-        let found = edited.iter().find_map(|&k| {
-            outline.crates[k as usize]
-                .files
-                .iter()
-                .find(|f| !f.expanded && f.source.path == *path)
-        })?;
-        out.push(file_macro_defs(found));
-    }
-    Some(out)
-}
-
-fn read_macro_defs(cache: &Files, changed_paths: &[PathBuf]) -> Option<Vec<Vec<(String, String)>>> {
-    let mut out = Vec::with_capacity(changed_paths.len());
-    for path in changed_paths {
-        let file = cache.file(path).ok()?;
-        out.push(file_macro_defs(&file));
-    }
-    Some(out)
-}
-
-fn has_macro2(outline: &Outline, edited: &[u32]) -> bool {
-    edited.iter().any(|&k| {
-        outline.crates[k as usize].files.iter().any(|f| {
-            !f.expanded
-                && f.items
-                    .items
-                    .iter()
-                    .any(|item| item.kind == ItemKind::Macro)
+fn crate_macro_state(tree: &Crate) -> CrateMacroState {
+    let mut exports: Vec<(String, usize, usize)> = tree
+        .exports
+        .iter()
+        .filter(|(_, def)| !def.file.expanded)
+        .map(|(name, def)| (name.clone(), def.krate, def.rules.len()))
+        .collect();
+    exports.sort();
+    let mut files: Vec<(PathBuf, bool, Vec<(String, bool, Vec<String>)>)> = tree
+        .files
+        .iter()
+        .filter(|f| !f.expanded)
+        .map(|file| {
+            let has_macro_use = file.items.inner.contains(&item::Attr::MacroUse);
+            let mut defs = Vec::new();
+            for entry in &file.items.items {
+                if matches!(entry.kind, ItemKind::MacroRules | ItemKind::Macro) {
+                    let name = entry
+                        .name
+                        .map_or_else(String::new, |at| file.source.text(at).to_owned());
+                    let is_export = entry
+                        .attrs
+                        .iter()
+                        .any(|attr| matches!(attr, item::Attr::MacroExport(_)));
+                    let tokens = (entry.lead..entry.end)
+                        .map(|at| file.source.text(at).to_owned())
+                        .collect();
+                    defs.push((name, is_export, tokens));
+                }
+            }
+            (file.source.path.clone(), has_macro_use, defs)
         })
-    })
+        .collect();
+    files.sort();
+    CrateMacroState {
+        macro_use: tree.macro_use.clone(),
+        exports,
+        files,
+    }
 }

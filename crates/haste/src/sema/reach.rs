@@ -14,15 +14,17 @@ mod crate_check;
 pub(in crate::sema) mod filter;
 mod items;
 mod order;
+mod reload;
 mod unwind;
 mod wave;
 
 pub(super) use collect::run_scoped;
-pub use collect::{reach_again, reach_anew_in, reach_wave};
+pub use collect::{reach_again, reach_anew_in, reach_anew_scoped, reach_wave};
 pub use crate_check::check_poly_items;
 pub(crate) use items::lay_out;
 pub(crate) use items::typed_once;
 pub(super) use items::{infer_entry, is_inferring};
+pub use reload::{ReloadScope, dirty_poly_items, reload_invalidate, split_dirty_roots};
 pub(crate) use unwind::{foreign_dynamic_may_unwind, host_symbol_may_unwind};
 pub use wave::infer_quiet;
 
@@ -78,14 +80,17 @@ pub struct Reached {
     force_unwind: bool,
 }
 
-fn is_thread_spawn_name(name: &str, src: &crate::outline::source::Source) -> bool {
-    matches!(name, "spawn" | "spawn_unchecked" | "spawn_scoped" | "scope")
+fn is_std_unwind_entry(name: &str, src: &crate::outline::source::Source) -> bool {
+    let in_thread = matches!(name, "spawn" | "spawn_unchecked" | "spawn_scoped" | "scope")
         && src
             .path
             .parent()
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
-            == Some("thread")
+            == Some("thread");
+    let in_panic = matches!(name, "set_hook" | "update_hook")
+        && src.path.file_stem().and_then(|n| n.to_str()) == Some("panicking");
+    in_thread || in_panic
 }
 
 fn crate_unwind_flags(cx: &Context) -> Vec<u8> {
@@ -127,7 +132,7 @@ impl Reached {
                     let (src, entry) = cx.item(*item);
                     if entry
                         .name
-                        .is_some_and(|at| is_thread_spawn_name(src.text(at), src))
+                        .is_some_and(|at| is_std_unwind_entry(src.text(at), src))
                     {
                         self.catch_unwind_state
                             .store(CATCH_UNWIND_FOUND | (start + idx + 1), Ordering::Release);
@@ -146,7 +151,7 @@ impl Reached {
                     crate_flags.get(callee.krate as usize).copied().unwrap_or(0) & CRATE_STD != 0;
                 if entry.name.is_some_and(|at| {
                     let name = src.text(at);
-                    name == "catch_unwind" || (is_std && is_thread_spawn_name(name, src))
+                    name == "catch_unwind" || (is_std && is_std_unwind_entry(name, src))
                 }) {
                     self.catch_unwind_state
                         .store(CATCH_UNWIND_FOUND | (start + idx + 1), Ordering::Release);
@@ -417,6 +422,23 @@ impl Reached {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
+    /// Count of live (non-replaced) entries in `list`.
+    pub fn live_count(&self) -> usize {
+        self.states
+            .iter()
+            .filter(|&&state| state != ReachedEntry::Replaced)
+            .count()
+    }
+
+    /// Whether every live (non-replaced) entry in `list` succeeded.
+    #[cfg(test)]
+    pub fn all_live_ok(&self) -> bool {
+        self.list
+            .iter()
+            .enumerate()
+            .all(|(i, (_, r))| self.states[i] == ReachedEntry::Replaced || r.is_ok())
+    }
+
     pub(in crate::sema::reach) fn trim_replaced(&mut self) {
         let mut len = self.list.len();
         while len > 0 && self.states[len - 1] == ReachedEntry::Replaced {
@@ -557,4 +579,110 @@ pub fn main_roots(cx: &mut Context<'_>, main: ItemRef) -> anyhow::Result<[Instan
         (start, cx.types.intern_substs(&[ret])),
         (main, Substs::EMPTY),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::names::Names;
+    use crate::outline::{Outline, Root};
+    use crate::sema::Cache;
+
+    #[test]
+    fn has_catch_unwind_detects_std_panic_hooks() {
+        let std_src = "pub fn set_hook() {}\npub fn update_hook() {}\npub fn plain() {}\n";
+        let app_src = "pub fn entry() {}\n";
+        let std_parsed = crate::outline::source::Source::parse(
+            "library/std/src/panicking.rs".into(),
+            std_src.into(),
+        )
+        .expect("parse std");
+        let std_scanned = crate::outline::scan::scan(&std_parsed).expect("scan std");
+        let app_parsed =
+            crate::outline::source::Source::parse("src/main.rs".into(), app_src.into())
+                .expect("parse app");
+        let app_scanned = crate::outline::scan::scan(&app_parsed).expect("scan app");
+
+        let mut outline = Outline::file(
+            std::path::Path::new("library/std/src/lib.rs"),
+            crate::graph::cfg::Target::default(),
+        );
+        outline.roots[0].name = "std".to_owned();
+        outline.crates[0]
+            .files
+            .push(Arc::new(crate::outline::tree::File::new(
+                std_parsed,
+                std_scanned,
+                false,
+            )));
+        outline.roots.push(Root {
+            unit: 1,
+            name: "app".to_owned(),
+            path: "src/main.rs".into(),
+            role: crate::outline::Role::Bin,
+            edition: "2021".to_owned(),
+            proc_macro: false,
+        });
+        outline.crates.push(crate::outline::tree::Crate::default());
+        outline.crates[1]
+            .files
+            .push(Arc::new(crate::outline::tree::File::new(
+                app_parsed,
+                app_scanned,
+                false,
+            )));
+        outline.deps.push(vec![("std".to_owned(), 0)]);
+        outline.pins.push(None);
+
+        let names = Names::default();
+        let store = Cache::default();
+        let cx = Context::new(&outline, &names, store);
+
+        for (item_idx, expected) in [(0u32, true), (1u32, true), (2u32, false)] {
+            let mut reached = Reached::default();
+            let mut typed = Typed::default();
+            typed.drops.push(Res::Fn(
+                ItemRef {
+                    krate: 0,
+                    file: 0,
+                    item: item_idx,
+                },
+                Substs::EMPTY,
+            ));
+            reached.list.push((
+                (
+                    ItemRef {
+                        krate: 1,
+                        file: 0,
+                        item: 0,
+                    },
+                    Substs::EMPTY,
+                ),
+                Ok(Arc::new(typed)),
+            ));
+            assert_eq!(
+                reached.has_catch_unwind(&cx),
+                expected,
+                "callee idx {item_idx}"
+            );
+
+            let mut direct = Reached::default();
+            direct.list.push((
+                (
+                    ItemRef {
+                        krate: 0,
+                        file: 0,
+                        item: item_idx,
+                    },
+                    Substs::EMPTY,
+                ),
+                Ok(Arc::new(Typed::default())),
+            ));
+            assert_eq!(
+                direct.has_catch_unwind(&cx),
+                expected,
+                "direct idx {item_idx}"
+            );
+        }
+    }
 }

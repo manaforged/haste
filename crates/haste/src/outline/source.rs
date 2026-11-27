@@ -250,8 +250,10 @@ impl Source {
             else {
                 return false;
             };
-            let span = &first.text[f_start as usize..(l_start + (l_len & !JOINT)) as usize];
-            if !span.contains(word) {
+            let end_byte = (l_start + (l_len & !JOINT)) as usize;
+            if (f_start as usize) <= end_byte
+                && !first.text[f_start as usize..end_byte].contains(word)
+            {
                 return false;
             }
         }

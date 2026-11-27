@@ -45,12 +45,27 @@ pub(super) struct ReachFilter {
 }
 
 impl ReachFilter {
-    pub(super) fn forget_crates(&mut self, only_crates: Option<&[u32]>) {
+    pub(super) fn forget_crates(
+        &mut self,
+        only_crates: Option<&[u32]>,
+        dead_items: &HashSet<ItemRef>,
+    ) {
         match only_crates {
-            Some(crates) => self
-                .seen_fixed_poly
-                .retain(|item| !crates.contains(&item.krate)),
-            None => self.seen_fixed_poly.clear(),
+            Some(crates) => {
+                let keep =
+                    |item: &ItemRef| !crates.contains(&item.krate) && !dead_items.contains(item);
+                self.seen_fixed_poly.retain(keep);
+                if !self.seen_sealed_sysroot.is_empty() {
+                    self.seen_sealed_sysroot.retain(keep);
+                    self.seen_sealed_log
+                        .retain(|item| self.seen_sealed_sysroot.contains(item));
+                }
+            }
+            None => {
+                self.seen_fixed_poly.clear();
+                self.seen_sealed_sysroot.clear();
+                self.seen_sealed_log.clear();
+            }
         }
     }
 
