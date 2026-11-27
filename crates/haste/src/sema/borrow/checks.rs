@@ -445,12 +445,9 @@ impl Checker<'_, '_> {
             return self.check_expr(b, state, deref_base, outer_live, true, depth);
         };
         let args_vec = self.cx.types.substs(args).to_vec();
-        let Ok(field_tys) = super::super::infer::detached(self.cx, self.item, |infer| {
-            infer.adt_fields(adt_item, &args_vec)
-        }) else {
-            return self.check_expr(b, state, deref_base, outer_live, true, depth);
-        };
-        let pending_fields: Vec<(FieldKey, Ty)> = {
+        let field_tys =
+            super::super::infer::poly_field_types(self.cx, self.item, adt_item, &args_vec).ok();
+        let pending_fields: Vec<(FieldKey, Option<Ty>)> = {
             let Ok(def) = self.cx.adt_def(adt_item) else {
                 return self.check_expr(b, state, deref_base, outer_live, true, depth);
             };
@@ -479,10 +476,10 @@ impl Checker<'_, '_> {
                         return None;
                     }
                     let fty = field_tys
-                        .get(variant)
+                        .as_ref()
+                        .and_then(|all| all.get(variant))
                         .and_then(|fs| fs.get(idx))
-                        .copied()
-                        .unwrap_or(Ty::NONE);
+                        .copied();
                     Some((key, fty))
                 })
                 .collect()
@@ -494,7 +491,7 @@ impl Checker<'_, '_> {
         for (key, fty) in pending_fields {
             let mut steps = p.steps.clone();
             push_step(&mut steps, PlaceStep::Field(key));
-            if self.ty_is_copy(fty) {
+            if fty.is_some_and(|ty| self.ty_is_copy(ty)) {
                 self.check_can_read(p.local, &steps, state)?;
             } else {
                 if !drop_checked {

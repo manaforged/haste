@@ -153,7 +153,7 @@ impl super::super::Checker<'_, '_> {
                         _ => false,
                     }
         );
-        let can_peel = !mut_ret_from_mut
+        let can_peel = (!mut_ret_from_mut || self.is_mem_take(expr))
             && !borrows_owned_field
             && self.expr_plain_local(expr) != Some(src.target)
             && inner_ty.is_some_and(|inner| {

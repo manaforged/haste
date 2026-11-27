@@ -324,16 +324,26 @@ impl Checker<'_, '_> {
             }
             return Ok(());
         }
-        if matches!(*self.body.ty(ann_ty), AstTy::Ptr { .. }) && inv.is_empty() {
+        let is_ptr = matches!(*self.body.ty(ann_ty), AstTy::Ptr { .. });
+        if is_ptr && inv.is_empty() {
             return Ok(());
         }
         let req_static = full_static || inv.is_only_static();
         if !req_static && inv.named.is_empty() {
             return Ok(());
         }
-        let sources = self.expr_borrow_sources_let(init, state);
+        let source_expr = if is_ptr {
+            match *self.body.expr(self.unwrap_parens(init)) {
+                Expr::Ref { expr: inner, .. } => inner,
+                _ => init,
+            }
+        } else {
+            init
+        };
+        let source_unwrapped = self.unwrap_parens(source_expr);
+        let sources = self.expr_borrow_sources_let(source_expr, state);
         self.check_sources_fit_invariant_lts(Some(init), &sources, req_static, &inv.named)?;
-        if let Some(src_local) = self.expr_plain_local(unwrapped) {
+        if let Some(src_local) = self.expr_plain_local(source_unwrapped) {
             let peel = self.is_ref_ty(self.local_ty(src_local));
             self.check_local_place_invariant_fit(
                 Some(init),
@@ -343,7 +353,7 @@ impl Checker<'_, '_> {
                 &inv.named,
             )?;
         } else {
-            let src_var = self.expr_variance_lts(init);
+            let src_var = self.expr_variance_lts(source_expr);
             if !src_var.inv.is_empty() {
                 self.check_inv_against_req(Some(init), 0, &src_var.inv, req_static, &inv.named)?;
             }
