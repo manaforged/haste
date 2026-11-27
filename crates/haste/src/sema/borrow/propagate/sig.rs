@@ -600,7 +600,12 @@ impl<'a> Checker<'_, 'a> {
                     return Vec::new();
                 }
             }
-            let srcs = self.expr_borrow_sources_inner(recv, state, !recv_is_by_ref(sig), None);
+            let mut srcs = self.expr_borrow_sources_inner(recv, state, !recv_is_by_ref(sig), None);
+            if recv_is_by_ref(sig) {
+                srcs.retain(|s| {
+                    !(s.env_only && super::super::checks::is_temp_target(s.target).is_some())
+                });
+            }
             if ctx.flags.is_owned_copy_fn {
                 self.copied_recv_sources(ctx.expr, recv, srcs, state, true)
             } else {

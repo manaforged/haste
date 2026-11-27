@@ -27,8 +27,7 @@ impl Checker<'_, '_> {
     ) -> Result<()> {
         let block_depth = depth + 1;
         let saved_stmt_depth = self.stmt_depth;
-        let is_const = kind == BlockKind::Const;
-        let is_unsafe = kind == BlockKind::Unsafe;
+        let (is_const, is_unsafe) = (kind == BlockKind::Const, kind == BlockKind::Unsafe);
         if is_unsafe {
             self.unsafe_depth += 1;
         }
@@ -36,7 +35,6 @@ impl Checker<'_, '_> {
             self.check_const_block_locals(stmts, tail, block_depth)?;
             self.const_depth += 1;
         }
-        let update_stmt_depth = !matches!(kind, BlockKind::Expansion | BlockKind::Unsafe);
         if label.is_some() {
             self.breaks.push(BreakFrame {
                 label,
@@ -50,6 +48,7 @@ impl Checker<'_, '_> {
             });
         }
         let ids: Vec<u32> = self.body.list(stmts).to_vec();
+        let update_stmt_depth = !matches!(kind, BlockKind::Expansion | BlockKind::Unsafe);
         let (before_stmt, after_stmt, tail_live) = self.block_liveness(&ids, tail, outer_live);
         self.with_let_extend(None, |this| -> Result<()> {
             for (pos, &stmt_id) in ids.iter().enumerate() {
@@ -260,6 +259,7 @@ impl Checker<'_, '_> {
                     && is_temp_target(src.target).is_some()
                     && !self.temp_target_allowed(src.mutable))
                     || (value_used
+                        && is_temp_target(src.target) != Some(self.temp_scope_depth)
                         && self.escapes_depth(
                             src.target,
                             src.through_ref,

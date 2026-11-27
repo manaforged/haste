@@ -354,6 +354,7 @@ impl<'a> Infer<'_, 'a> {
 
     fn holders(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> Vec<u32> {
         let mut crates = vec![of.krate];
+        let mut has_open_arg = false;
         let mut stack: Vec<Ty> = std::iter::once(self_ty)
             .chain(args.iter().copied())
             .collect();
@@ -361,13 +362,27 @@ impl<'a> Infer<'_, 'a> {
             let kind = self.cx.types.kind(self.resolve(ty));
             let named = match kind {
                 Kind::Adt(item, _) | Kind::Dyn(item, ..) => Some(item.krate),
-                Kind::Var(_) => Some(self.home.krate),
+                Kind::Var(_) => {
+                    has_open_arg = true;
+                    Some(self.home.krate)
+                }
                 _ => None,
             };
             if let Some(krate) = named.filter(|krate| !crates.contains(krate)) {
                 crates.push(krate);
             }
             stack.extend(kind.children(&self.cx.types));
+        }
+        if has_open_arg && !args.is_empty() && !self.cx.outline.is_sysroot(of.krate) {
+            let of_krate = of.krate as usize;
+            for (krate, deps) in self.cx.outline.deps.iter().enumerate() {
+                if deps.iter().any(|&(_, dep)| dep == of_krate) {
+                    let k = krate as u32;
+                    if !crates.contains(&k) {
+                        crates.push(k);
+                    }
+                }
+            }
         }
         crates
     }
