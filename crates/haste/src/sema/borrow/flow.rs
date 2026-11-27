@@ -511,6 +511,7 @@ impl Checker<'_, '_> {
                 if !guard_else.diverged {
                     join_moved(&mut fallthrough_state, &guard_else);
                 }
+                prune_dead_loans(&mut arm_state, &guard_live);
                 if !arm_state.diverged {
                     self.bind_pat_moves(
                         arm.pat,

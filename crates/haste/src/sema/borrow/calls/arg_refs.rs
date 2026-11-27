@@ -711,23 +711,24 @@ impl super::super::Checker<'_, '_> {
         if param_ref.is_some() {
             return param_ref;
         }
-        let field_target = match self.typed.coercions.get(&arg)? {
-            Coercion::Field { target, .. } => Some(*target),
-            _ => None,
-        };
-        if let Some(target) = field_target
-            && let Some(m) = self.ptr_or_ref_mut(target)
+        let coercion = self.typed.coercions.get(&arg);
+        if let Some(Coercion::Field { target, .. }) = coercion
+            && let Some(m) = self.ptr_or_ref_mut(*target)
         {
             return Some(m);
+        }
+        if coercion.is_none() && ctx.ctor_res.is_none() && ctx.arg_tys.is_none() {
+            return None;
         }
         let expected_ty = ctx.arg_tys.and_then(|ts| ts.get(idx).copied()).or_else(|| {
             self.instantiated_arg_ty(ctx.call_expr, ctx.callee_ty, ctx.call_res, fn_offset, idx)
         });
-        Some(
-            expected_ty
-                .and_then(|t| self.ptr_or_ref_mut(t))
-                .unwrap_or(Mut::Mut),
-        )
+        let direct_mut = expected_ty.and_then(|t| self.ptr_or_ref_mut(t));
+        if coercion.is_some() {
+            Some(direct_mut.unwrap_or(Mut::Mut))
+        } else {
+            direct_mut
+        }
     }
 }
 

@@ -1,3 +1,4 @@
+mod closure_peel;
 mod sig;
 mod tuple;
 mod unwrap;

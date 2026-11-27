@@ -7,6 +7,8 @@ mod flow;
 mod liveness;
 mod places;
 mod propagate;
+#[cfg(test)]
+mod tests;
 
 use anyhow::Result;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};

@@ -680,7 +680,7 @@ impl Checker<'_, '_> {
             if !self.from_caller(s.target, s.through_ref) && !static_reborrow {
                 return Err(self.does_not_live_long_enough(site, s.target));
             }
-            let peel = s.steps.iter().any(|st| matches!(st, PlaceStep::Deref))
+            let peel = (s.origin_only || s.steps.iter().any(|st| matches!(st, PlaceStep::Deref)))
                 && matches!(
                     target_kind,
                     Kind::Ref(_, pointee) if self.ty_holds_non_dyn_borrow(pointee)

@@ -618,7 +618,7 @@ impl<'a> Checker<'_, 'a> {
         &mut self,
         call_expr: ExprId,
         recv: ExprId,
-        mut recv_sources: Vec<BorrowSource>,
+        recv_sources: Vec<BorrowSource>,
         state: &State,
         unwrap: bool,
     ) -> Vec<BorrowSource> {
@@ -647,15 +647,24 @@ impl<'a> Checker<'_, 'a> {
             }
         }
         if unwrap {
-            let out = unwrap_container_loans(recv_sources, state, |s| {
-                container_targets.contains(&s.target)
-            });
+            let out = self.unwrap_container_loans_deep(recv_sources, state, &container_targets);
             let recv_is_mut_ref = self.is_mut_ref_ty(self.expr_ty(recv));
             self.finish_unwrapped_copied_sources(call_ty, recv_is_mut_ref, root, out, state)
         } else {
             let call_depth = self.ty_max_ref_depth(call_ty);
-            for s in &mut recv_sources {
+            let mut out = Vec::with_capacity(recv_sources.len());
+            for mut s in recv_sources {
                 if container_targets.contains(&s.target) {
+                    if super::super::checks::is_temp_target(s.target).is_none()
+                        && !self.is_param_local(s.target)
+                        && !self.is_closure_param(s.target)
+                        && state.loans.iter().any(|l| l.holder == Some(s.target))
+                    {
+                        for l in state.loans.iter().filter(|l| l.holder == Some(s.target)) {
+                            out.push(BorrowSource::from_loan(l));
+                        }
+                        continue;
+                    }
                     s.env_only = true;
                     if self.is_param_local(s.target)
                         && self.param_inner_is_static(s.target)
@@ -665,8 +674,9 @@ impl<'a> Checker<'_, 'a> {
                         s.origin_only = true;
                     }
                 }
+                out.push(s);
             }
-            recv_sources
+            super::dedup_sources(out)
         }
     }
 
