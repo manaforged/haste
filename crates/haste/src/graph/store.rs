@@ -114,6 +114,70 @@ pub(crate) fn file_stamp(path: &Path) -> FileStamp {
     Some(meta_stamp(&meta))
 }
 
+/// Computes [`file_stamp`] for each path in `paths` in parallel when `paths.len() >= 64`.
+pub(crate) fn file_stamps(paths: &[PathBuf]) -> Vec<FileStamp> {
+    let workers = crate::jobs().clamp(1, 8);
+    if paths.len() < 64 || workers <= 1 {
+        return paths.iter().map(|p| file_stamp(p)).collect();
+    }
+    let chunk = paths.len().div_ceil(workers);
+    crate::sync::scope(|scope| {
+        let handles: Vec<_> = paths
+            .chunks(chunk)
+            .map(|slice| {
+                scope.spawn(move || slice.iter().map(|p| file_stamp(p)).collect::<Vec<_>>())
+            })
+            .collect();
+        let mut out = Vec::with_capacity(paths.len());
+        for handle in handles {
+            match handle.join() {
+                Ok(part) => out.extend(part),
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        }
+        out
+    })
+}
+
+/// Returns whether every `(path, expected)` pair matches [`file_stamp`] on disk.
+pub(crate) fn stamps_match(watched: &[(PathBuf, FileStamp)], parallel: bool) -> bool {
+    let check = |slice: &[(PathBuf, FileStamp)]| {
+        slice
+            .iter()
+            .all(|(path, expected)| file_stamp(path) == *expected)
+    };
+    let workers = crate::jobs().clamp(1, 8);
+    if !parallel || watched.len() < 64 || workers <= 1 {
+        return check(watched);
+    }
+    let chunk = watched.len().div_ceil(workers);
+    crate::sync::scope(|scope| {
+        let handles: Vec<_> = watched
+            .chunks(chunk)
+            .map(|slice| scope.spawn(move || check(slice)))
+            .collect();
+        let mut ok = true;
+        for handle in handles {
+            match handle.join() {
+                Ok(res) => ok &= res,
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        }
+        ok
+    })
+}
+
+/// Computes a domain-separated keyed hash of an environment variable value so plaintext values stay off disk.
+pub(crate) fn hash_env_val(magic: &[u8; 8], name: &str, val: &str) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = rustc_hash::FxHasher::default();
+    magic.hash(&mut hasher);
+    name.hash(&mut hasher);
+    0xffu8.hash(&mut hasher);
+    val.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// The size and modification time of this program, whose changes make what the store kept stale.
 pub(crate) fn program() -> FileStamp {
     static PROGRAM: std::sync::OnceLock<FileStamp> = std::sync::OnceLock::new();

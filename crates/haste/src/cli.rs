@@ -625,10 +625,7 @@ pub(crate) fn load_workspace(
     root: &std::path::Path,
     targets: &Targets,
 ) -> Result<graph::Workspace> {
-    let mut workspace = graph::load(root, targets, &crate::selection())?;
-    workspace.merge(graph::load_sysroot(&graph::library()?, targets)?);
-    crate::scripts::settle(&mut workspace, targets)?;
-    Ok(workspace)
+    graph::snapshot::load_or_build(root, targets)
 }
 
 fn report(

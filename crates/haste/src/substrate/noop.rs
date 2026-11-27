@@ -44,7 +44,7 @@ fn stamp_path(root: &Path, out: Option<&Path>) -> PathBuf {
     stamp_path_for(root, out, &crate::config::Config::current())
 }
 
-fn target_dirs(workspace: &crate::graph::Workspace) -> Vec<PathBuf> {
+pub(crate) fn target_dirs(workspace: &crate::graph::Workspace) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     for &member in &workspace.graph.members {
         if let Some(pkg) = workspace.packages.get(member) {
@@ -58,7 +58,7 @@ fn target_dirs(workspace: &crate::graph::Workspace) -> Vec<PathBuf> {
     dirs
 }
 
-fn target_root_files(workspace: &crate::graph::Workspace) -> Vec<PathBuf> {
+pub(crate) fn target_root_files(workspace: &crate::graph::Workspace) -> Vec<PathBuf> {
     let mut files = Vec::new();
     for pkg in workspace.packages.iter().filter(|pkg| pkg.local()) {
         for rel in ROOT_FILES {
@@ -76,7 +76,7 @@ fn target_root_files(workspace: &crate::graph::Workspace) -> Vec<PathBuf> {
     files
 }
 
-fn hash_target_dir(dir: &Path, hasher: &mut FxHasher) {
+pub(crate) fn hash_target_dir(dir: &Path, hasher: &mut FxHasher) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         (dir, false).hash(hasher);
         return;
@@ -137,8 +137,9 @@ fn compute_stamp(
         None => false.hash(&mut hasher),
     }
     paths.len().hash(&mut hasher);
-    for path in paths {
-        (path, crate::graph::store::file_stamp(path)).hash(&mut hasher);
+    let stamps = crate::graph::store::file_stamps(paths);
+    for (path, stamp) in paths.iter().zip(stamps) {
+        (path, stamp).hash(&mut hasher);
     }
     dirs.len().hash(&mut hasher);
     for dir in dirs {
