@@ -100,8 +100,8 @@ fn decode_sym_chunk(chunk: &SymChunk<'_>, syms: &Symbols) -> Result<Vec<Sym>> {
 }
 
 pub(super) fn chunk_scope_ranges(table: &ScopeTable<'_>) -> Vec<(usize, usize, usize)> {
-    const TARGET_BYTES: usize = 8 * 1024;
-    const MAX_SCOPES: usize = 64;
+    const TARGET_BYTES: usize = 32 * 1024;
+    const MAX_SCOPES: usize = 256;
     let mut chunks = Vec::new();
     let mut chunk_start = 0usize;
     let mut chunk_base_off = 0usize;
@@ -142,9 +142,10 @@ pub(super) enum DagTask {
         base_id: Option<u32>,
         weight: usize,
     },
-    Macro {
+    FileBatch {
         item_idx: usize,
-        mac_idx: usize,
+        start: usize,
+        end: usize,
         weight: usize,
     },
     Textuals {
@@ -187,7 +188,7 @@ impl DagTask {
         match *self {
             DagTask::SymChunk { weight, .. }
             | DagTask::File { weight, .. }
-            | DagTask::Macro { weight, .. }
+            | DagTask::FileBatch { weight, .. }
             | DagTask::Textuals { weight, .. }
             | DagTask::Impls { weight, .. }
             | DagTask::Outline { weight, .. }
@@ -196,20 +197,29 @@ impl DagTask {
             | DagTask::ScopeChunk { weight, .. } => weight,
         }
     }
+
+    #[inline]
+    pub(super) fn priority_key(&self) -> (u8, u32, usize) {
+        match *self {
+            DagTask::SymChunk {
+                item_idx, weight, ..
+            } => (1, u32::MAX - (item_idx as u32), weight),
+            _ => (0, 0, self.weight()),
+        }
+    }
 }
 
 pub(super) struct ItemState<'a> {
     pub sec: WireSections<'a>,
     pub file_slots: Vec<OnceLock<Arc<File>>>,
     pub all_files: OnceLock<Vec<Arc<File>>>,
+    pub leaf_files: Vec<usize>,
     pub file_children: Vec<Vec<(usize, usize)>>,
-    pub file_macros: Vec<Vec<(usize, usize)>>,
+    pub file_macros: Vec<Vec<usize>>,
     pub files_rem: AtomicUsize,
     pub macro_slots: Vec<OnceLock<Arc<Macro>>>,
     pub all_macros: OnceLock<Vec<Arc<Macro>>>,
-    pub macros_rem: AtomicUsize,
     pub textual_slot: OnceLock<Vec<Arc<Textual>>>,
-    pub outline_deps: AtomicUsize,
     pub sym_chunks: Vec<SymChunk<'a>>,
     pub sym_chunk_slots: Vec<Mutex<Option<Vec<Sym>>>>,
     pub sym_rem: AtomicUsize,
@@ -248,6 +258,87 @@ fn push_unlocked(ctx: &DagCtx<'_, '_>, tasks: impl IntoIterator<Item = DagTask>)
     }
 }
 
+fn decode_file_and_macros(
+    state: &ItemState<'_>,
+    input: &BatchInput<'_>,
+    file_idx: usize,
+    base: Option<Arc<File>>,
+) -> Result<()> {
+    let (file_off, slice, _) = state.sec.file_slices[file_idx];
+    let mut freader = Reader::new(slice);
+    let file = read_file(
+        &mut freader,
+        slice.len(),
+        input.backing,
+        file_off,
+        base,
+        input.remap,
+        input.scope_bit,
+    )?;
+    if !freader.is_empty() {
+        bail!("trailing bytes in snapshot file");
+    }
+    let file_arc = Arc::new(file);
+    let _ = state.file_slots[file_idx].set(Arc::clone(&file_arc));
+    for &mac_idx in &state.file_macros[file_idx] {
+        let slice = state.sec.macro_slices[mac_idx];
+        let mut mreader = Reader::new(slice);
+        let _file_id = mreader.u32()?;
+        let krate = *input
+            .remap
+            .get(mreader.u32()? as usize)
+            .context("macro crate out of bounds")? as usize;
+        let rules = read_rules(&mut mreader, input.remap)?;
+        if !mreader.is_empty() {
+            bail!("trailing bytes in snapshot macro");
+        }
+        let _ = state.macro_slots[mac_idx].set(Arc::new(Macro {
+            file: Arc::clone(&file_arc),
+            rules,
+            krate,
+        }));
+    }
+    Ok(())
+}
+
+fn finish_file_work(
+    ctx: &DagCtx<'_, '_>,
+    state: &ItemState<'_>,
+    item_idx: usize,
+    done_count: usize,
+) -> Result<()> {
+    if state.files_rem.fetch_sub(done_count, Ordering::AcqRel) != done_count {
+        return Ok(());
+    }
+    let mut files = Vec::with_capacity(state.file_slots.len());
+    for slot in &state.file_slots {
+        files.push(Arc::clone(slot.get().context("missing decoded file slot")?));
+    }
+    let _ = state.all_files.set(files);
+    let mut macros = Vec::with_capacity(state.macro_slots.len());
+    for slot in &state.macro_slots {
+        macros.push(Arc::clone(
+            slot.get().context("missing decoded macro slot")?,
+        ));
+    }
+    let _ = state.all_macros.set(macros);
+    if state.sec.textual_raw.is_empty() {
+        let _ = state.textual_slot.set(Vec::new());
+        if !state.outline_tasks.is_empty() {
+            push_unlocked(ctx, state.outline_tasks.iter().copied());
+        }
+    } else {
+        push_unlocked(
+            ctx,
+            std::iter::once(DagTask::Textuals {
+                item_idx,
+                weight: state.sec.textual_raw.len() * 24,
+            }),
+        );
+    }
+    Ok(())
+}
+
 fn run_dag_task(ctx: &DagCtx<'_, '_>, task: DagTask) -> Result<()> {
     match task {
         DagTask::SymChunk {
@@ -282,7 +373,6 @@ fn run_dag_task(ctx: &DagCtx<'_, '_>, task: DagTask) -> Result<()> {
         } => {
             let state = &ctx.states[item_idx];
             let input = &ctx.inputs[item_idx];
-            let (file_off, slice, _) = state.sec.file_slices[file_idx];
             let base = match base_id {
                 Some(id) => Some(Arc::clone(
                     state.file_slots[id as usize]
@@ -291,44 +381,10 @@ fn run_dag_task(ctx: &DagCtx<'_, '_>, task: DagTask) -> Result<()> {
                 )),
                 None => None,
             };
-            let mut freader = Reader::new(slice);
-            let file = read_file(
-                &mut freader,
-                slice.len(),
-                input.backing,
-                file_off,
-                base,
-                input.remap,
-                input.scope_bit,
-            )?;
-            if !freader.is_empty() {
-                bail!("trailing bytes in snapshot file");
-            }
-            let _ = state.file_slots[file_idx].set(Arc::new(file));
+            decode_file_and_macros(state, input, file_idx, base)?;
             let children = &state.file_children[file_idx];
-            let macros = &state.file_macros[file_idx];
-            let last_file = state.files_rem.fetch_sub(1, Ordering::AcqRel) == 1;
-            let unlock_outlines = if last_file {
-                let mut files = Vec::with_capacity(state.file_slots.len());
-                for slot in &state.file_slots {
-                    files.push(Arc::clone(slot.get().context("missing decoded file slot")?));
-                }
-                let _ = state.all_files.set(files);
-                !state.outline_tasks.is_empty()
-                    && state.outline_deps.fetch_sub(1, Ordering::AcqRel) == 1
-            } else {
-                false
-            };
-            if !children.is_empty() || !macros.is_empty() || unlock_outlines {
-                let mut unlocked = Vec::with_capacity(
-                    children.len()
-                        + macros.len()
-                        + if unlock_outlines {
-                            state.outline_tasks.len()
-                        } else {
-                            0
-                        },
-                );
+            if !children.is_empty() {
+                let mut unlocked = Vec::with_capacity(children.len());
                 for &(child_idx, weight) in children {
                     unlocked.push(DagTask::File {
                         item_idx,
@@ -337,75 +393,30 @@ fn run_dag_task(ctx: &DagCtx<'_, '_>, task: DagTask) -> Result<()> {
                         weight,
                     });
                 }
-                for &(mac_idx, weight) in macros {
-                    unlocked.push(DagTask::Macro {
-                        item_idx,
-                        mac_idx,
-                        weight,
-                    });
-                }
-                if unlock_outlines {
-                    unlocked.extend(state.outline_tasks.iter().copied());
-                }
                 unlocked.sort_unstable_by_key(|t| t.weight());
                 push_unlocked(ctx, unlocked);
             }
+            finish_file_work(ctx, state, item_idx, 1)?;
         }
-        DagTask::Macro {
-            item_idx, mac_idx, ..
+        DagTask::FileBatch {
+            item_idx,
+            start,
+            end,
+            ..
         } => {
             let state = &ctx.states[item_idx];
             let input = &ctx.inputs[item_idx];
-            let slice = state.sec.macro_slices[mac_idx];
-            let mut mreader = Reader::new(slice);
-            let file = Arc::clone(
-                state.file_slots[mreader.u32()? as usize]
-                    .get()
-                    .context("macro file out of bounds")?,
-            );
-            let krate = *input
-                .remap
-                .get(mreader.u32()? as usize)
-                .context("macro crate out of bounds")? as usize;
-            let rules = read_rules(&mut mreader, input.remap)?;
-            if !mreader.is_empty() {
-                bail!("trailing bytes in snapshot macro");
+            for &file_idx in &state.leaf_files[start..end] {
+                decode_file_and_macros(state, input, file_idx, None)?;
             }
-            let _ = state.macro_slots[mac_idx].set(Arc::new(Macro { file, rules, krate }));
-            if state.macros_rem.fetch_sub(1, Ordering::AcqRel) == 1 {
-                let mut macros = Vec::with_capacity(state.macro_slots.len());
-                for slot in &state.macro_slots {
-                    macros.push(Arc::clone(
-                        slot.get().context("missing decoded macro slot")?,
-                    ));
-                }
-                let _ = state.all_macros.set(macros);
-                if state.sec.textual_raw.is_empty() {
-                    let _ = state.textual_slot.set(Vec::new());
-                    if !state.outline_tasks.is_empty()
-                        && state.outline_deps.fetch_sub(1, Ordering::AcqRel) == 1
-                    {
-                        push_unlocked(ctx, state.outline_tasks.iter().copied());
-                    }
-                } else {
-                    push_unlocked(
-                        ctx,
-                        std::iter::once(DagTask::Textuals {
-                            item_idx,
-                            weight: state.sec.textual_raw.len() * 24,
-                        }),
-                    );
-                }
-            }
+            finish_file_work(ctx, state, item_idx, end - start)?;
         }
         DagTask::Textuals { item_idx, .. } => {
             let state = &ctx.states[item_idx];
             let macros = state.all_macros.get().context("missing decoded macros")?;
             let textuals = decode_textuals(&state.sec.textual_raw, macros)?;
             let _ = state.textual_slot.set(textuals);
-            if !state.outline_tasks.is_empty()
-                && state.outline_deps.fetch_sub(1, Ordering::AcqRel) == 1
-            {
+            if !state.outline_tasks.is_empty() {
                 push_unlocked(ctx, state.outline_tasks.iter().copied());
             }
         }

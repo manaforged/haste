@@ -153,6 +153,15 @@ pub(in super::super) fn encode_snapshot(
     workspace: &Workspace,
     compilation: &Compilation,
 ) -> Option<(Vec<u8>, HashMap<u32, Arc<ImplIndex>>)> {
+    encode_snapshot_with(spec, workspace, compilation, false)
+}
+
+pub(in super::super) fn encode_snapshot_with(
+    spec: &SnapshotSpec<'_>,
+    workspace: &Workspace,
+    compilation: &Compilation,
+    inline_text: bool,
+) -> Option<(Vec<u8>, HashMap<u32, Arc<ImplIndex>>)> {
     if spec.ref_crates.get(..spec.cached_crates.len()) != Some(spec.cached_crates) {
         return None;
     }
@@ -187,7 +196,7 @@ pub(in super::super) fn encode_snapshot(
     let mut files_blob = Vec::new();
     let mut file_table = Vec::with_capacity(tables.files.len() * 8);
     for file in &tables.files {
-        write_file(&mut files_blob, file, &tables.to_local)?;
+        write_file(&mut files_blob, file, &tables.to_local, inline_text)?;
         let end = u32::try_from(files_blob.len()).ok()?;
         let base_id = file
             .source
@@ -341,10 +350,15 @@ fn disk_text_tail(file: &File) -> Option<&str> {
     Some(&src.text[disk_len..])
 }
 
-fn write_file(out: &mut Vec<u8>, file: &Arc<File>, to_local: &[Option<u32>]) -> Option<()> {
+fn write_file(
+    out: &mut Vec<u8>,
+    file: &Arc<File>,
+    to_local: &[Option<u32>],
+    inline_text: bool,
+) -> Option<()> {
     let src = &file.source;
     write_path(out, &src.path)?;
-    if let Some(tail) = disk_text_tail(file) {
+    if !inline_text && let Some(tail) = disk_text_tail(file) {
         out.push(1);
         write_usize(out, src.text.len())?;
         write_str(out, tail)?;

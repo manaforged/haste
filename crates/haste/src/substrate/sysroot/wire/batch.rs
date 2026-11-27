@@ -87,6 +87,7 @@ fn decode_batch_sections<'a>(
             }
         }
         let mut file_macros = vec![Vec::new(); file_count];
+        let mut file_mac_weights = vec![0usize; file_count];
         for (mac_idx, &slice) in sec.macro_slices.iter().enumerate() {
             if slice.len() < 4 {
                 bail!("unexpected eof");
@@ -95,7 +96,8 @@ fn decode_batch_sections<'a>(
             if file_id >= file_count {
                 bail!("macro file out of bounds");
             }
-            file_macros[file_id].push((mac_idx, slice.len()));
+            file_macros[file_id].push(mac_idx);
+            file_mac_weights[file_id] += slice.len();
         }
 
         let item_sym_chunks = std::mem::take(&mut all_sym_chunks[item_idx]);
@@ -114,13 +116,44 @@ fn decode_batch_sections<'a>(
             }
         }
 
-        for (file_idx, weight) in depth0_files {
-            initial.push(DagTask::File {
+        let mut leaf_files = Vec::new();
+        let mut batch_start = 0usize;
+        let mut batch_weight = 0usize;
+        let mut file_batch_tasks = 0usize;
+        for (file_idx, slice_len) in depth0_files {
+            let weight = slice_len + file_mac_weights[file_idx];
+            if file_children[file_idx].is_empty() {
+                leaf_files.push(file_idx);
+                batch_weight += weight;
+                let batch_len = leaf_files.len() - batch_start;
+                if batch_weight >= 16 * 1024 || batch_len >= 16 {
+                    initial.push(DagTask::FileBatch {
+                        item_idx,
+                        start: batch_start,
+                        end: leaf_files.len(),
+                        weight: batch_weight,
+                    });
+                    batch_start = leaf_files.len();
+                    batch_weight = 0;
+                    file_batch_tasks += 1;
+                }
+            } else {
+                initial.push(DagTask::File {
+                    item_idx,
+                    file_idx,
+                    base_id: None,
+                    weight,
+                });
+            }
+        }
+        if batch_start < leaf_files.len() {
+            initial.push(DagTask::FileBatch {
                 item_idx,
-                file_idx,
-                base_id: None,
-                weight,
+                start: batch_start,
+                end: leaf_files.len(),
+                weight: batch_weight,
             });
+            file_batch_tasks += 1;
         }
         for (pos, &slice) in sec.impl_slices.iter().enumerate() {
             initial.push(DagTask::Impls {
@@ -131,24 +164,9 @@ fn decode_batch_sections<'a>(
         }
 
         let all_files = OnceLock::new();
-        if file_count == 0 {
-            let _ = all_files.set(Vec::new());
-        }
         let all_macros = OnceLock::new();
-        if macro_count == 0 {
-            let _ = all_macros.set(Vec::new());
-        }
         let textual_slot = OnceLock::new();
         let has_textuals = !sec.textual_raw.is_empty();
-        if !has_textuals {
-            let _ = textual_slot.set(Vec::new());
-        } else if macro_count == 0 {
-            initial.push(DagTask::Textuals {
-                item_idx,
-                weight: sec.textual_raw.len() * 24,
-            });
-        }
-
         let mut outline_tasks: Vec<DagTask> = sec
             .outline_slices
             .iter()
@@ -160,11 +178,18 @@ fn decode_batch_sections<'a>(
             })
             .collect();
         outline_tasks.sort_unstable_by_key(|t| t.weight());
-
-        let outline_deps =
-            usize::from(file_count > 0) + usize::from(macro_count > 0 || has_textuals);
-        if outline_deps == 0 {
-            initial.extend(outline_tasks.iter().copied());
+        if file_count == 0 {
+            let _ = all_files.set(Vec::new());
+            let _ = all_macros.set(Vec::new());
+            if !has_textuals {
+                let _ = textual_slot.set(Vec::new());
+                initial.extend(outline_tasks.iter().copied());
+            } else {
+                initial.push(DagTask::Textuals {
+                    item_idx,
+                    weight: sec.textual_raw.len() * 24,
+                });
+            }
         }
 
         let mut name_tables = Vec::with_capacity(sec.name_slices.len());
@@ -174,7 +199,7 @@ fn decode_batch_sections<'a>(
             let mut nreader = Reader::new(slice);
             let table = split_names_crate_scopes(&mut nreader)?;
             let body_slice = &slice[slice.len() - nreader.len()..];
-            if table.total_bytes >= 8 * 1024 && table.count >= 2 && crate::jobs() > 1 {
+            if table.total_bytes >= 24 * 1024 && table.count >= 2 && crate::jobs() > 1 {
                 let ranges = chunk_scope_ranges(&table);
                 scope_chunks.push((0..ranges.len()).map(|_| OnceLock::new()).collect());
                 for (cidx, (start, end, weight)) in ranges.into_iter().enumerate() {
@@ -209,9 +234,10 @@ fn decode_batch_sections<'a>(
             pending_names.clear();
         }
 
+        let individual_file_tasks = file_count - leaf_files.len();
         total_tasks += sym_chunk_count
-            + file_count
-            + macro_count
+            + individual_file_tasks
+            + file_batch_tasks
             + usize::from(has_textuals)
             + crate_count * 2
             + name_task_count;
@@ -220,14 +246,13 @@ fn decode_batch_sections<'a>(
             sec,
             file_slots: (0..file_count).map(|_| OnceLock::new()).collect(),
             all_files,
+            leaf_files,
             file_children,
             file_macros,
             files_rem: AtomicUsize::new(file_count),
             macro_slots: (0..macro_count).map(|_| OnceLock::new()).collect(),
             all_macros,
-            macros_rem: AtomicUsize::new(macro_count),
             textual_slot,
-            outline_deps: AtomicUsize::new(outline_deps),
             sym_chunks: item_sym_chunks,
             sym_chunk_slots,
             sym_rem: AtomicUsize::new(sym_chunk_count),
@@ -242,7 +267,7 @@ fn decode_batch_sections<'a>(
         });
     }
 
-    initial.sort_unstable_by(|a, b| b.weight().cmp(&a.weight()));
+    initial.sort_unstable_by(|a, b| b.priority_key().cmp(&a.priority_key()));
     let ctx = DagCtx {
         inputs: &inputs,
         states,
@@ -344,17 +369,34 @@ pub(crate) fn decode_prepared_batch(
         .iter_mut()
         .map(|item| std::mem::take(&mut item.env_reads))
         .collect();
-    let mut sections = Vec::with_capacity(items.len());
-    for item in &items {
-        let data = item.backing.as_slice();
-        let mut sreader = Reader::new(&data[item.sections_off..]);
-        sections.push(read_sections(
-            &mut sreader,
-            data.len(),
-            item.cached_crates.len(),
-            item.magic,
-        )?);
-    }
+    let sections = if items.len() > 1 && crate::jobs() > 1 {
+        let refs: Vec<&PreparedWire> = items.iter().collect();
+        crate::sync::parallel_map(refs, |item| {
+            let data = item.backing.as_slice();
+            let mut sreader = Reader::new(&data[item.sections_off..]);
+            read_sections(
+                &mut sreader,
+                data.len(),
+                item.cached_crates.len(),
+                item.magic,
+            )
+        })
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?
+    } else {
+        let mut sections = Vec::with_capacity(items.len());
+        for item in &items {
+            let data = item.backing.as_slice();
+            let mut sreader = Reader::new(&data[item.sections_off..]);
+            sections.push(read_sections(
+                &mut sreader,
+                data.len(),
+                item.cached_crates.len(),
+                item.magic,
+            )?);
+        }
+        sections
+    };
     let inputs: Vec<BatchInput<'_>> = items
         .iter()
         .zip(env_reads_all)
