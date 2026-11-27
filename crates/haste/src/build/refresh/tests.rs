@@ -481,3 +481,108 @@ fn refresh_handles_coordinated_two_file_item_and_body_edits() {
         "sequential b -> a edit left stale errors"
     );
 }
+
+#[test]
+fn watch_reloader_accumulates_pending_edits_across_failed_reloads() {
+    let dir = fresh_dir();
+    let src_dir = write_single_pkg(
+        &dir.0,
+        "watch_pending_pkg",
+        &[
+            (
+                "main.rs",
+                "mod a;\nmod b;\nfn main() {\n    std::process::exit(a::val() * 10 + b::val());\n}\n",
+            ),
+            ("a.rs", "pub fn val() -> i32 {\n    1\n}\n"),
+            ("b.rs", "pub fn val() -> i32 {\n    4\n}\n"),
+        ],
+    );
+    let a_rs = src_dir.join("a.rs");
+    let b_rs = src_dir.join("b.rs");
+
+    let targets = host_targets();
+    let sel = crate::Selection {
+        locked: true,
+        offline: true,
+        ..crate::selection()
+    };
+    let ws = load_workspace(&dir.0, &targets, &sel);
+    let mut build = Build::load_oneshot(&ws, &targets).expect("load build");
+    let main = super::super::main_item(&ws, &build.compilation.outline).expect("main item");
+    let file_slot = |name: &str| -> (u32, u32) {
+        let idx = build.compilation.outline.crates[main.krate as usize]
+            .files
+            .iter()
+            .position(|file| file.source.path.file_name().is_some_and(|f| f == name))
+            .expect("source file slot");
+        (main.krate, idx as u32)
+    };
+    let a_slot = file_slot("a.rs");
+    let b_slot = file_slot("b.rs");
+
+    let mut reloader = super::super::watch::WatchReloader::new(&ws, &build.compilation.outline);
+    #[cfg(unix)]
+    let mut program =
+        crate::image::Program::new(&mut build.compilation, crate::sema::Cache::default(), main)
+            .expect("create jit program");
+    #[cfg(unix)]
+    assert_eq!(
+        program
+            .run(&mut build.compilation, &[])
+            .expect("initial run"),
+        14
+    );
+
+    std::fs::write(
+        &b_rs,
+        "pub fn val() -> i32 {\n    let _: i32 = \"broken\";\n    4\n}\n",
+    )
+    .expect("break b.rs");
+    assert!(matches!(
+        reloader.step(&ws, &mut build.compilation, main),
+        Err(crate::image::ReloadError::Compile(_))
+    ));
+    #[cfg(unix)]
+    assert_eq!(
+        program
+            .run(&mut build.compilation, &[])
+            .expect("still serving old code on failed B"),
+        14
+    );
+
+    std::fs::write(&a_rs, "pub fn val() -> i32 {\n    2\n}\n").expect("edit a.rs to 2");
+    assert!(matches!(
+        reloader.step(&ws, &mut build.compilation, main),
+        Err(crate::image::ReloadError::Compile(_))
+    ));
+    #[cfg(unix)]
+    assert_eq!(
+        program
+            .run(&mut build.compilation, &[])
+            .expect("still serving old code while B broken"),
+        14
+    );
+
+    std::fs::write(&b_rs, "pub fn val() -> i32 {\n    5\n}\n").expect("fix b.rs to 5");
+    let stale = reloader
+        .step(&ws, &mut build.compilation, main)
+        .ok()
+        .expect("reload succeeds after B fixed");
+    assert!(
+        stale.contains(&a_slot) && stale.contains(&b_slot),
+        "expected both a.rs and b.rs in pending stale list, got {stale:?}"
+    );
+    #[cfg(unix)]
+    {
+        program.forget(
+            &build.compilation.outline,
+            crate::sema::Edited::Files(&stale),
+        );
+        assert_eq!(
+            program
+                .run(&mut build.compilation, &[])
+                .expect("post-fix run must serve 2 5"),
+            25
+        );
+    }
+}

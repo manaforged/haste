@@ -228,65 +228,6 @@ pub(super) fn pre_stamps(workspace: &graph::Workspace) -> HashMap<PathBuf, Stamp
     .collect()
 }
 
-fn collect_edits(
-    workspace: &graph::Workspace,
-    stamps: &mut [Watch],
-    outline: &mut outline::Outline,
-) -> Result<(Vec<(u32, u32)>, Vec<u32>)> {
-    let (mut stale, mut crates) = (Vec::new(), Vec::new());
-    for watch in stamps {
-        let now = stamp(&watch.path);
-        if now == watch.stamp {
-            continue;
-        }
-        if now.is_none() {
-            anyhow::bail!("watched file removed: {}", watch.path.display());
-        }
-        watch.stamp = now;
-        let edit = match &watch.by {
-            Some(by) => outline.reexpand(by)?,
-            None => outline.reread(&watch.path)?,
-        };
-        match edit {
-            Edit::Same => {}
-            Edit::Bodies(slots)
-                if slots
-                    .iter()
-                    .any(|&(krate, _)| expands(workspace, outline, krate)) =>
-            {
-                crates.extend(slots.iter().map(|&(krate, _)| krate))
-            }
-            Edit::Bodies(slots) => stale.extend(slots),
-            Edit::Items(edited) => crates.extend(edited),
-        }
-    }
-    Ok((stale, crates))
-}
-
-/// The `(crate, file)` slots whose function bodies changed in the files of `stamps`, which `outline` now holds, or why the edit needs a restart.
-pub(super) fn body_edits(
-    workspace: &graph::Workspace,
-    stamps: &mut [Watch],
-    outline: &mut outline::Outline,
-) -> Result<Vec<(u32, u32)>, String> {
-    match collect_edits(workspace, stamps, outline) {
-        Ok((stale, crates)) if crates.is_empty() => Ok(stale),
-        Ok((_, mut crates)) => {
-            crates.sort_unstable();
-            crates.dedup();
-            let names: Vec<&str> = crates
-                .iter()
-                .map(|&krate| outline.roots[krate as usize].name.as_str())
-                .collect();
-            Err(format!(
-                "more than function bodies changed in {}",
-                names.join(", ")
-            ))
-        }
-        Err(error) => Err(format!("{error:#}")),
-    }
-}
-
 /// Whether crate `krate` is a procedural macro crate or a dependency of one, whose bodies decide the code of the crates that call those macros.
 fn expands(workspace: &graph::Workspace, outline: &outline::Outline, krate: u32) -> bool {
     outline
@@ -448,20 +389,81 @@ pub(super) fn sync_included_stamps(
     }
 }
 
-pub(super) fn run_watched(
-    workspace: &graph::Workspace,
-    compilation: &mut crate::macros::Compilation,
-    cache: crate::sema::Cache,
-    main: crate::names::ItemRef,
-    args: &[String],
-) -> Result<i32> {
-    let mut watched = stamps(workspace, &compilation.outline);
-    let files = paths(&watched);
-    let mut reread = |compilation: &mut crate::macros::Compilation| {
-        let stale = body_edits(workspace, &mut watched, &mut compilation.outline)
-            .map_err(crate::image::ReloadError::Restart)?;
-        if stale.is_empty() {
-            return Ok(stale);
+pub(super) struct WatchReloader {
+    watched: Vec<Watch>,
+    pending: Vec<(u32, u32)>,
+}
+
+impl WatchReloader {
+    pub(super) fn new(workspace: &graph::Workspace, outline: &outline::Outline) -> Self {
+        Self {
+            watched: stamps(workspace, outline),
+            pending: Vec::new(),
+        }
+    }
+
+    pub(super) fn paths(&self) -> Vec<PathBuf> {
+        paths(&self.watched)
+    }
+
+    pub(super) fn step(
+        &mut self,
+        workspace: &graph::Workspace,
+        compilation: &mut crate::macros::Compilation,
+        main: crate::names::ItemRef,
+    ) -> std::result::Result<Vec<(u32, u32)>, crate::image::ReloadError> {
+        let mut restart = Vec::new();
+        for watch in &mut self.watched {
+            let now = stamp(&watch.path);
+            if now == watch.stamp {
+                continue;
+            }
+            if now.is_none() {
+                return Err(crate::image::ReloadError::Restart(format!(
+                    "watched file removed: {}",
+                    watch.path.display()
+                )));
+            }
+            let edit = match &watch.by {
+                Some(by) => compilation.outline.reexpand(by),
+                None => compilation.outline.reread(&watch.path),
+            }
+            .map_err(|error| crate::image::ReloadError::Restart(format!("{error:#}")))?;
+            match edit {
+                Edit::Same => watch.stamp = now,
+                Edit::Bodies(slots)
+                    if slots
+                        .iter()
+                        .any(|&(krate, _)| expands(workspace, &compilation.outline, krate)) =>
+                {
+                    restart.extend(slots.iter().map(|&(krate, _)| krate));
+                    watch.stamp = now;
+                }
+                Edit::Bodies(slots) => {
+                    for slot in slots {
+                        if !self.pending.contains(&slot) {
+                            self.pending.push(slot);
+                        }
+                    }
+                    watch.stamp = now;
+                }
+                Edit::Items(edited) => restart.extend(edited),
+            }
+        }
+        if !restart.is_empty() {
+            restart.sort_unstable();
+            restart.dedup();
+            let names: Vec<&str> = restart
+                .iter()
+                .map(|&krate| compilation.outline.roots[krate as usize].name.as_str())
+                .collect();
+            return Err(crate::image::ReloadError::Restart(format!(
+                "more than function bodies changed in {}",
+                names.join(", ")
+            )));
+        }
+        if self.pending.is_empty() {
+            return Ok(Vec::new());
         }
         let syntax_errors = compilation.outline.local_errors(workspace);
         if !syntax_errors.is_empty() {
@@ -485,8 +487,22 @@ pub(super) fn run_watched(
                 "compile error in edited file".to_owned(),
             ));
         }
-        Ok(stale)
-    };
+        sync_included_stamps(workspace, &mut self.watched, &compilation.outline);
+        Ok(std::mem::take(&mut self.pending))
+    }
+}
+
+pub(super) fn run_watched(
+    workspace: &graph::Workspace,
+    compilation: &mut crate::macros::Compilation,
+    cache: crate::sema::Cache,
+    main: crate::names::ItemRef,
+    args: &[String],
+) -> Result<i32> {
+    let mut reloader = WatchReloader::new(workspace, &compilation.outline);
+    let files = reloader.paths();
+    let mut reread =
+        |compilation: &mut crate::macros::Compilation| reloader.step(workspace, compilation, main);
     let mut program = crate::image::Program::new(compilation, cache, main)?;
     let status = program.run_watched(compilation, args, (files, &mut reread));
     std::mem::forget(program);
