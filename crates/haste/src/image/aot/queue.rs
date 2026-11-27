@@ -219,6 +219,5 @@ pub(in crate::image) fn collect_warm_callees(
             }
         }
     }
-    out.reverse();
     out
 }

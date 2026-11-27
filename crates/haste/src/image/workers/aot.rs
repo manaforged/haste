@@ -44,6 +44,13 @@ impl Image {
         let cfg = DictConfig::from_env();
         image.pass.stencils.cfg = cfg;
         image.persist_inline(cfg);
+        let aot_cache = (!cfg.verify)
+            .then(|| crate::image::aot::cache::AotCache::open(cx, reached, roots, cfg))
+            .flatten()
+            .map(Arc::new);
+        if let Some(aot) = image.aot() {
+            lock(aot).cache = aot_cache.clone();
+        }
         let plan = (cfg, !cfg.verify && cfg.min_fanout > 1);
         let (claimed, seed) = seed_aot_roots(reached, roots);
         let mut broken = FxHashMap::default();
@@ -103,10 +110,21 @@ impl Image {
                 cx.in_parallel = was_parallel;
             }
         }
-        if let Some(aot) = image.aot() {
+        let cache_to_flush = if let Some(aot) = image.aot() {
             let mut state = lock(aot);
             state.frontier = None;
             state.stencils.clear();
+            state.cache.take()
+        } else {
+            None
+        };
+        drop(aot_cache);
+        if let Some(cache) = cache_to_flush
+            && let Ok(cache) = Arc::try_unwrap(cache)
+            && let Some(aot) = image.aot()
+        {
+            let state = lock(aot);
+            cache.flush(&state, cx, reached, broken.is_empty());
         }
         image.bodies.reset();
         image.pass.stencils.clear();
@@ -168,11 +186,13 @@ impl Image {
         queue: &AotQueue,
         plan: Plan,
     ) -> WorkerOutput {
+        let cache = self.aot_cache();
+        let has_bundle = cache.as_ref().is_some_and(|c| c.has_loaded_bundle());
         let mut out = WorkerBatch::new(plan.0);
         while let Some(item) = queue.pop() {
             match item {
                 AotWork::Compile(batch, _guard) => {
-                    if self.allow_inline() && queue.want_warm() {
+                    if self.allow_inline() && !has_bundle && queue.want_warm() {
                         queue.push_warm(collect_warm_callees(&cx, reached, queue, &batch));
                     }
                     let mut batch_errors = Vec::new();
@@ -184,6 +204,9 @@ impl Image {
                     }
                 }
                 AotWork::Warm(idx) => {
+                    if let Some(cache) = &cache {
+                        cache.note_warm();
+                    }
                     lower::warm_inline(&mut cx, reached, self, idx);
                     let _ = cx.take_deferred_evals();
                     self.bodies.trim_transient();

@@ -51,29 +51,19 @@ impl Image {
         pass: &mut Pass,
     ) -> Vec<(usize, String)> {
         let mut errors = Vec::new();
-        let mut order: Vec<(ItemRef, FootprintId)> = Vec::new();
-        let mut by_fp: FxHashMap<(ItemRef, FootprintId), Vec<usize>> = FxHashMap::default();
-        let footprint_clock = std::time::Instant::now();
-        for &index in work {
-            let item = reached.list[index].0.0;
-            let footprint = match lower::eval_footprint(cx, reached, self, index) {
-                Ok(fp) => fp,
-                Err(err) => {
-                    errors.push((index, item_err(cx, item, &err)));
-                    continue;
-                }
-            };
-            by_fp
-                .entry((item, footprint))
-                .or_insert_with(|| {
-                    order.push((item, footprint));
-                    Vec::new()
-                })
-                .push(index);
-        }
-        clock(Tally::FootprintUs, footprint_clock);
-        let mut verify_hits = Vec::new();
         let aot_fast = self.backend.is_aot() && !cfg.verify;
+        let has_bundle = aot_fast && self.aot_cache().is_some_and(|c| c.has_loaded_bundle());
+        let remaining = if aot_fast {
+            self.drain_aot_cache_hits(cx, reached, work, pass)
+        } else {
+            work.to_vec()
+        };
+        if remaining.is_empty() {
+            return errors;
+        }
+        let (order, mut by_fp) =
+            self.partition_work(cx, reached, &remaining, has_bundle, &mut errors);
+        let mut verify_hits = Vec::new();
         for (item, footprint) in order {
             let Some(indices) = by_fp.remove(&(item, footprint)) else {
                 continue;
@@ -127,14 +117,20 @@ impl Image {
                 rest,
                 indices: &indices,
             };
-            let lookup_clock = std::time::Instant::now();
-            let frozen = self.try_frozen_partitioned(
-                &mut PartitionCx { cx, reached },
-                group_meta,
-                cfg,
-                pass,
-            );
-            clock(Tally::LookupUs, lookup_clock);
+            let skip_frozen = footprint == FootprintId(((rep as u128) << 1) | 1);
+            let frozen = if skip_frozen {
+                false
+            } else {
+                let lookup_clock = std::time::Instant::now();
+                let hit = self.try_frozen_partitioned(
+                    &mut PartitionCx { cx, reached },
+                    group_meta,
+                    cfg,
+                    pass,
+                );
+                clock(Tally::LookupUs, lookup_clock);
+                hit
+            };
             if frozen {
                 continue;
             }
@@ -156,6 +152,7 @@ impl Image {
                 aot_fast,
                 &mut errors,
             );
+            let leader_plan = Arc::clone(&out.reloc_plan);
             let mut group = GroupWork {
                 item,
                 footprint,
@@ -164,6 +161,12 @@ impl Image {
             };
             if let Err(err) = self.compile_group(cx, reached, &mut group, cfg, record_cache, pass) {
                 errors.extend(group.all_indices().map(|idx| (idx, err.clone())));
+            } else {
+                let plan = self
+                    .cached_aot_template(item, footprint)
+                    .map(|c| Arc::clone(c.reloc_plan()))
+                    .unwrap_or(leader_plan);
+                self.record_aot_inlined_indices(cx, reached, &plan, &indices);
             }
             drop(group);
             self.bodies.trim_transient();
@@ -194,6 +197,7 @@ impl Image {
             return errors;
         }
         self.commit_aot_groups(&evaluated, cached, 0, pass);
+        self.record_aot_inlined_evals(env.cx, env.reached, cached.reloc_plan(), &evaluated);
         errors
     }
 
@@ -390,6 +394,7 @@ impl Image {
             return true;
         }
         self.commit_aot_groups(&evaluated, &cached, dict_len, pass);
+        self.record_aot_inlined_evals(env.cx, env.reached, cached.reloc_plan(), &evaluated);
         self.cache_aot_template(env.cx, env.reached, group.cache_key(), cached);
         true
     }
@@ -468,6 +473,7 @@ impl Image {
             evaluated.push((inst.leader, &inst.followers, relocs));
         }
         let body = AotCode::from_code(&code);
+        self.record_aot_inlined_groups(cx, reached, &reloc_plan, &evaluated);
         for (leader, followers, relocs) in evaluated {
             self.register_aot_relocs(&relocs);
             self.record_aot(
@@ -628,5 +634,72 @@ impl Image {
             };
             (key, inst)
         }
+    }
+
+    fn partition_work(
+        &self,
+        cx: &mut Context<'_>,
+        reached: &Reached,
+        remaining: &[usize],
+        has_bundle: bool,
+        errors: &mut Vec<(usize, String)>,
+    ) -> (
+        Vec<(ItemRef, FootprintId)>,
+        FxHashMap<(ItemRef, FootprintId), Vec<usize>>,
+    ) {
+        let mut order: Vec<(ItemRef, FootprintId)> = Vec::new();
+        let mut by_fp: FxHashMap<(ItemRef, FootprintId), Vec<usize>> = FxHashMap::default();
+        let need_fp: Vec<usize> = if has_bundle {
+            let mut item_order: Vec<ItemRef> = Vec::new();
+            let mut by_item: FxHashMap<ItemRef, Vec<usize>> = FxHashMap::default();
+            for &index in remaining {
+                let item = reached.list[index].0.0;
+                by_item
+                    .entry(item)
+                    .or_insert_with(|| {
+                        item_order.push(item);
+                        Vec::new()
+                    })
+                    .push(index);
+            }
+            let mut rest = Vec::new();
+            for item in item_order {
+                let Some(indices) = by_item.remove(&item) else {
+                    continue;
+                };
+                if indices.len() == 1 {
+                    let fp = FootprintId(((indices[0] as u128) << 1) | 1);
+                    order.push((item, fp));
+                    by_fp.insert((item, fp), indices);
+                } else {
+                    rest.extend(indices);
+                }
+            }
+            rest
+        } else {
+            remaining.to_vec()
+        };
+        if !need_fp.is_empty() {
+            let footprint_clock = std::time::Instant::now();
+            for index in need_fp {
+                let item = reached.list[index].0.0;
+                let footprint = match lower::eval_footprint(cx, reached, self, index) {
+                    Ok(fp) => fp,
+                    Err(err) => {
+                        errors.push((index, item_err(cx, item, &err)));
+                        continue;
+                    }
+                };
+                by_fp
+                    .entry((item, footprint))
+                    .or_insert_with(|| {
+                        order.push((item, footprint));
+                        Vec::new()
+                    })
+                    .push(index);
+            }
+            clock(Tally::FootprintUs, footprint_clock);
+        }
+        (order, by_fp)
     }
 }
