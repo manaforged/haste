@@ -366,7 +366,7 @@ impl Infer<'_, '_> {
         self.named_value(pat, (found, res), ty, mode)
     }
 
-    fn is_const(&self, res: &Res) -> bool {
+    pub(super) fn is_const(&self, res: &Res) -> bool {
         matches!(res, Res::Fn(item, _) if self.cx.item(*item).1.kind == ItemKind::Const)
     }
 
@@ -548,7 +548,7 @@ impl Infer<'_, '_> {
         Ok(())
     }
 
-    fn named_pat(&mut self, name: u32) -> Result<Option<(Ty, Res)>> {
+    pub(super) fn named_pat(&mut self, name: u32) -> Result<Option<(Ty, Res)>> {
         let sym = self.cx.names.symbols.intern(plain(self.src.text(name)));
         let found = self.value_def(&[sym], false, None).ok();
         let (item, variant) = match found {
