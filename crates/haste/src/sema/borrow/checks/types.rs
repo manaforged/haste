@@ -447,48 +447,10 @@ impl Checker<'_, '_> {
                     || self.is_non_promotable_temp(a)
                     || self.is_non_promotable_temp(b)
             }
-            Expr::Call(callee, args) => {
-                let is_ctor = matches!(self.typed.res.get(&callee), Some(Res::Ctor(..)))
-                    || matches!(self.typed.res.get(&expr), Some(Res::Ctor(..)));
-                if !is_ctor {
-                    let is_const = matches!(
-                        self.typed.res.get(&callee).or_else(|| self.typed.res.get(&expr)),
-                        Some(Res::Fn(item, _)) if self.is_const_fn(*item)
-                    );
-                    if !is_const {
-                        return true;
-                    }
-                    let ty = self.expr_ty(expr);
-                    if !self.is_const_or_static_item()
-                        && ty != Ty::NONE
-                        && !is_copy_ty(self.cx, self.item, self.typed, ty)
-                    {
-                        return true;
-                    }
-                }
-                body.list(args)
-                    .iter()
-                    .any(|&a| self.is_non_promotable_temp(ExprId(a)))
-            }
+            Expr::Call(callee, args) => self.call_is_non_promotable(expr, callee, args),
             Expr::Method {
                 receiver, params, ..
-            } => {
-                let is_const = matches!(
-                    self.typed.res.get(&expr),
-                    Some(Res::Fn(item, _)) if self.is_const_fn(*item)
-                );
-                let ty = self.expr_ty(expr);
-                let non_copy = !self.is_const_or_static_item()
-                    && ty != Ty::NONE
-                    && !is_copy_ty(self.cx, self.item, self.typed, ty);
-                !is_const
-                    || non_copy
-                    || self.is_non_promotable_temp(receiver)
-                    || body
-                        .list(params)
-                        .iter()
-                        .any(|&a| self.is_non_promotable_temp(ExprId(a)))
-            }
+            } => self.method_is_non_promotable(expr, receiver, params),
             Expr::Await(_) | Expr::Try(_) => true,
             Expr::Block {
                 kind, stmts, tail, ..
@@ -504,26 +466,7 @@ impl Checker<'_, '_> {
                     || base.is_some_and(|b| self.is_non_promotable_temp(b))
             }
             Expr::Repeat(a, _) => self.is_non_promotable_temp(a),
-            Expr::Index(a, b) => {
-                let a_ty = self.expr_ty(a);
-                let full_range = matches!(
-                    *body.expr(self.unwrap_parens(b)),
-                    Expr::Range {
-                        from: None,
-                        to: None,
-                        ..
-                    }
-                ) && a_ty != Ty::NONE
-                    && matches!(self.cx.types.kind(a_ty), Kind::Array(..) | Kind::Slice(..));
-                if full_range {
-                    self.is_non_promotable_temp(a)
-                } else {
-                    !self.is_const_or_static_item()
-                        || self.typed.operators.contains_key(&expr)
-                        || self.is_non_promotable_temp(a)
-                        || self.is_non_promotable_temp(b)
-                }
-            }
+            Expr::Index(a, b) => self.index_is_non_promotable(expr, a, b),
             Expr::If(_, t, e) => {
                 !self.is_const_or_static_item()
                     || self.is_non_promotable_temp(t)
@@ -540,6 +483,81 @@ impl Checker<'_, '_> {
                 !self.is_const_or_static_item()
             }
             _ => false,
+        }
+    }
+
+    fn call_is_non_promotable(
+        &mut self,
+        expr: ExprId,
+        callee: ExprId,
+        args: crate::body::List,
+    ) -> bool {
+        let is_ctor = matches!(self.typed.res.get(&callee), Some(Res::Ctor(..)))
+            || matches!(self.typed.res.get(&expr), Some(Res::Ctor(..)));
+        if !is_ctor {
+            let is_const = matches!(
+                self.typed.res.get(&callee).or_else(|| self.typed.res.get(&expr)),
+                Some(Res::Fn(item, _)) if self.is_const_fn(*item)
+            );
+            if !is_const {
+                return true;
+            }
+            let ty = self.expr_ty(expr);
+            if !self.is_const_or_static_item()
+                && ty != Ty::NONE
+                && !is_copy_ty(self.cx, self.item, self.typed, ty)
+            {
+                return true;
+            }
+        }
+        let body = self.body;
+        body.list(args)
+            .iter()
+            .any(|&a| self.is_non_promotable_temp(ExprId(a)))
+    }
+
+    fn method_is_non_promotable(
+        &mut self,
+        expr: ExprId,
+        receiver: ExprId,
+        params: crate::body::List,
+    ) -> bool {
+        let is_const = matches!(
+            self.typed.res.get(&expr),
+            Some(Res::Fn(item, _)) if self.is_const_fn(*item)
+        );
+        let ty = self.expr_ty(expr);
+        let non_copy = !self.is_const_or_static_item()
+            && ty != Ty::NONE
+            && !is_copy_ty(self.cx, self.item, self.typed, ty);
+        let body = self.body;
+        !is_const
+            || non_copy
+            || self.is_non_promotable_temp(receiver)
+            || body
+                .list(params)
+                .iter()
+                .any(|&a| self.is_non_promotable_temp(ExprId(a)))
+    }
+
+    fn index_is_non_promotable(&mut self, expr: ExprId, a: ExprId, b: ExprId) -> bool {
+        let a_ty = self.expr_ty(a);
+        let full_range = matches!(
+            *self.body.expr(self.unwrap_parens(b)),
+            Expr::Range {
+                from: None,
+                to: None,
+                ..
+            }
+        ) && a_ty != Ty::NONE
+            && matches!(self.cx.types.kind(a_ty), Kind::Array(..) | Kind::Slice(..));
+        if full_range {
+            self.is_non_promotable_temp(a)
+        } else {
+            !self.is_const_or_static_item()
+                || self.typed.operators.contains_key(&expr)
+                || self.is_non_promotable_temp(a)
+                || self.is_non_promotable_temp(b)
         }
     }
 
