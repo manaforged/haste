@@ -2,6 +2,7 @@
 
 mod codec;
 
+use std::collections::BTreeSet;
 use std::hash::{Hash as _, Hasher as _};
 use std::path::{Path, PathBuf};
 
@@ -14,8 +15,9 @@ use crate::substrate::Backing;
 use crate::substrate::noop::{hash_target_dir, target_dirs, target_root_files};
 
 use codec::{
-    read_opt_bool, read_package, read_path, read_strs, read_unit, write_opt_bool, write_package,
-    write_path, write_strs, write_unit,
+    read_env_hashes, read_file_stamps, read_opt_bool, read_opt_path, read_package, read_path,
+    read_strs, read_unit, write_env_hashes, write_file_stamps, write_opt_bool, write_opt_path,
+    write_package, write_path, write_strs, write_unit,
 };
 
 use super::manifest::ProfileOverride;
@@ -159,84 +161,20 @@ fn collect_static_lib_paths(pkg_dir: &Path, out: &Output, paths: &mut Vec<PathBu
 }
 
 struct WatchedGraph {
-    files: Vec<(PathBuf, FileStamp)>,
-    envs: Vec<(String, Option<u64>)>,
+    struct_files: Vec<(PathBuf, FileStamp)>,
+    struct_envs: Vec<(String, Option<u64>)>,
     dirs: Vec<PathBuf>,
     root_files: Vec<PathBuf>,
     dirs_hash: u64,
+    library: Option<PathBuf>,
+    script_files: Vec<(PathBuf, FileStamp)>,
+    script_envs: Vec<(String, Option<u64>)>,
 }
 
-fn collect_watched(
-    workspace: &Workspace,
-    manifest_root: &Path,
-    library: Option<&Path>,
-) -> WatchedGraph {
-    let mut paths = super::manifest_paths(workspace, manifest_root);
-    let root_files = target_root_files(workspace);
-    if let Some(settings) = rustup_settings_path() {
-        paths.push(settings);
-    }
-    if let Some(lib) = library {
-        let sysroot = lib.join("sysroot");
-        paths.push(sysroot.join(MANIFEST_FILE));
-        paths.push(sysroot.join(LOCK_FILE));
-    }
-    let top = super::workspace_root(manifest_root).unwrap_or_else(|_| manifest_root.to_owned());
-    for pkg in &workspace.packages {
-        if pkg.sysroot {
-            paths.push(pkg.manifest.dir.join(MANIFEST_FILE));
-            if let Some(build) = &pkg.manifest.build {
-                paths.push(build.clone());
-            }
-        } else if pkg.local() {
-            paths.push(pkg.manifest.dir.join("build.rs"));
-            for anc in pkg.manifest.dir.ancestors() {
-                let candidate = anc.join(MANIFEST_FILE);
-                if candidate.is_file() {
-                    paths.push(candidate);
-                }
-                if anc == top {
-                    break;
-                }
-            }
-        }
-    }
-    let (script_walked, script_vars) = store::watched_stamps(workspace);
-    paths.extend(script_walked.into_iter().map(|(p, _, _)| p));
-
-    let mut env_names: Vec<String> = STATIC_ENV_VARS.iter().map(|&s| s.to_owned()).collect();
-    env_names.extend(script_vars.into_iter().map(|(k, _)| k));
-    env_names.extend(workspace.config_env.iter().map(|(k, _, _)| k.clone()));
-
-    let mut extra_walked = Vec::new();
-    for (unit, entry) in workspace.graph.units.iter().enumerate() {
-        let pkg = &workspace.packages[entry.package];
-        if pkg.manifest.build.is_some() {
-            let sdir = store::dir(workspace, unit);
-            paths.push(sdir.join("stamp"));
-            paths.push(sdir.join("output"));
-            paths.push(sdir.join("failed"));
-            paths.push(sdir.join("out"));
-        }
-        if let Some(out) = &entry.script {
-            env_names.extend(out.watched_vars.iter().cloned());
-            for rel in &out.watched {
-                let watched_path = pkg.manifest.dir.join(rel);
-                paths.push(watched_path.clone());
-                store::walk(&watched_path, &mut extra_walked);
-            }
-            collect_static_lib_paths(&pkg.manifest.dir, out, &mut paths);
-        }
-    }
-    paths.extend(extra_walked.into_iter().map(|(p, _, _)| p));
-    paths.sort();
-    paths.dedup();
-    let stamps = store::file_stamps(&paths);
-    let watched_files: Vec<(PathBuf, FileStamp)> = paths.into_iter().zip(stamps).collect();
-
-    env_names.sort();
-    env_names.dedup();
-    let watched_envs: Vec<(String, Option<u64>)> = env_names
+fn hash_env_names(mut names: Vec<String>) -> Vec<(String, Option<u64>)> {
+    names.sort();
+    names.dedup();
+    names
         .into_iter()
         .map(|name| {
             let hash = crate::process_env_var(&name)
@@ -244,24 +182,125 @@ fn collect_watched(
                 .map(|v| store::hash_env_val(&WS_MAGIC, &name, v));
             (name, hash)
         })
+        .collect()
+}
+
+fn envs_match(envs: &[(String, Option<u64>)]) -> bool {
+    envs.iter().all(|(name, expected)| {
+        crate::process_env_var(name)
+            .as_deref()
+            .map(|v| store::hash_env_val(&WS_MAGIC, name, v))
+            == *expected
+    })
+}
+
+fn collect_watched(
+    workspace: &Workspace,
+    manifest_root: &Path,
+    library: Option<&Path>,
+) -> WatchedGraph {
+    let mut build_files = BTreeSet::new();
+    for pkg in &workspace.packages {
+        if let Some(build) = &pkg.manifest.build {
+            build_files.insert(build.clone());
+        }
+    }
+
+    let mut struct_paths: Vec<PathBuf> = super::manifest_paths(workspace, manifest_root)
+        .into_iter()
+        .filter(|path| !build_files.contains(path))
         .collect();
+    let root_files = target_root_files(workspace);
+    if let Some(settings) = rustup_settings_path() {
+        struct_paths.push(settings);
+    }
+    if let Some(lib) = library {
+        let sysroot = lib.join("sysroot");
+        struct_paths.push(sysroot.join(MANIFEST_FILE));
+        struct_paths.push(sysroot.join(LOCK_FILE));
+    }
+    let top = super::workspace_root(manifest_root).unwrap_or_else(|_| manifest_root.to_owned());
+    let mut script_paths: Vec<PathBuf> = build_files.into_iter().collect();
+    for pkg in &workspace.packages {
+        if pkg.sysroot {
+            struct_paths.push(pkg.manifest.dir.join(MANIFEST_FILE));
+        } else if pkg.local() {
+            for anc in pkg.manifest.dir.ancestors() {
+                let candidate = anc.join(MANIFEST_FILE);
+                if candidate.is_file() {
+                    struct_paths.push(candidate);
+                }
+                if anc == top {
+                    break;
+                }
+            }
+        }
+    }
+    struct_paths.sort();
+    struct_paths.dedup();
+    let struct_stamps = store::file_stamps(&struct_paths);
+    let struct_files: Vec<(PathBuf, FileStamp)> =
+        struct_paths.into_iter().zip(struct_stamps).collect();
+
+    let (script_walked, script_vars) = store::watched_stamps(workspace);
+    script_paths.extend(script_walked.into_iter().map(|(p, _, _)| p));
+
+    let mut struct_env_names: Vec<String> = STATIC_ENV_VARS.iter().map(|&s| s.to_owned()).collect();
+    struct_env_names.extend(workspace.config_env.iter().map(|(k, _, _)| k.clone()));
+
+    let mut script_env_names: Vec<String> = script_vars.into_iter().map(|(k, _)| k).collect();
+    let mut extra_walked = Vec::new();
+    for (unit, entry) in workspace.graph.units.iter().enumerate() {
+        let pkg = &workspace.packages[entry.package];
+        if pkg.manifest.build.is_some() {
+            let sdir = store::dir(workspace, unit);
+            script_paths.push(sdir.join("stamp"));
+            script_paths.push(sdir.join("output"));
+            script_paths.push(sdir.join("failed"));
+            script_paths.push(sdir.join("out"));
+        }
+        if let Some(out) = &entry.script {
+            script_env_names.extend(out.watched_vars.iter().cloned());
+            for rel in &out.watched {
+                let watched_path = pkg.manifest.dir.join(rel);
+                script_paths.push(watched_path.clone());
+                store::walk(&watched_path, &mut extra_walked);
+            }
+            collect_static_lib_paths(&pkg.manifest.dir, out, &mut script_paths);
+        }
+    }
+    script_paths.extend(extra_walked.into_iter().map(|(p, _, _)| p));
+    script_paths.sort();
+    script_paths.dedup();
+    let script_stamps = store::file_stamps(&script_paths);
+    let script_files: Vec<(PathBuf, FileStamp)> =
+        script_paths.into_iter().zip(script_stamps).collect();
 
     let dirs = target_dirs(workspace);
     let dirs_hash = hash_target_dirs(&dirs, &root_files);
     WatchedGraph {
-        files: watched_files,
-        envs: watched_envs,
+        struct_files,
+        struct_envs: hash_env_names(struct_env_names),
         dirs,
         root_files,
         dirs_hash,
+        library: library.map(Path::to_path_buf),
+        script_files,
+        script_envs: hash_env_names(script_env_names),
     }
+}
+
+enum SnapshotState {
+    Miss,
+    Hit(Workspace),
+    ScriptsStale(Workspace, Option<PathBuf>),
 }
 
 fn encode_snapshot(key: u64, watched: &WatchedGraph, workspace: &Workspace) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(
         HEADER_LEN
-            + watched.files.len() * 80
-            + watched.envs.len() * 32
+            + (watched.struct_files.len() + watched.script_files.len()) * 80
+            + (watched.struct_envs.len() + watched.script_envs.len()) * 32
             + workspace.packages.len() * 512,
     );
     out.extend_from_slice(&WS_MAGIC);
@@ -269,29 +308,8 @@ fn encode_snapshot(key: u64, watched: &WatchedGraph, workspace: &Workspace) -> O
     write_u64(&mut out, key);
     write_u64(&mut out, 0);
 
-    write_u32(&mut out, u32::try_from(watched.files.len()).ok()?);
-    for (path, stamp) in &watched.files {
-        write_path(&mut out, path)?;
-        match stamp {
-            Some((len, nanos)) => {
-                out.push(1);
-                write_u64(&mut out, *len);
-                out.extend_from_slice(&nanos.to_le_bytes());
-            }
-            None => out.push(0),
-        }
-    }
-    write_u32(&mut out, u32::try_from(watched.envs.len()).ok()?);
-    for (name, val) in &watched.envs {
-        write_str(&mut out, name)?;
-        match val {
-            Some(hash) => {
-                out.push(1);
-                write_u64(&mut out, *hash);
-            }
-            None => out.push(0),
-        }
-    }
+    write_file_stamps(&mut out, &watched.struct_files)?;
+    write_env_hashes(&mut out, &watched.struct_envs)?;
     write_u32(&mut out, u32::try_from(watched.dirs.len()).ok()?);
     for dir in &watched.dirs {
         write_path(&mut out, dir)?;
@@ -301,6 +319,10 @@ fn encode_snapshot(key: u64, watched: &WatchedGraph, workspace: &Workspace) -> O
         write_path(&mut out, file)?;
     }
     write_u64(&mut out, watched.dirs_hash);
+
+    write_opt_path(&mut out, watched.library.as_deref())?;
+    write_file_stamps(&mut out, &watched.script_files)?;
+    write_env_hashes(&mut out, &watched.script_envs)?;
 
     write_strs(&mut out, &workspace.rustflags)?;
     write_u32(&mut out, u32::try_from(workspace.config_env.len()).ok()?);
@@ -332,10 +354,10 @@ fn encode_snapshot(key: u64, watched: &WatchedGraph, workspace: &Workspace) -> O
     Some(out)
 }
 
-fn decode_snapshot(path: &Path, expected_key: u64) -> Result<Option<Workspace>> {
+fn decode_snapshot(path: &Path, expected_key: u64) -> Result<SnapshotState> {
     let backing = match Backing::open(path, HEADER_LEN + WS_MAGIC.len()) {
         Ok(b) => b,
-        Err(_) => return Ok(None),
+        Err(_) => return Ok(SnapshotState::Miss),
     };
     let data = backing.as_slice();
     if data.len() < HEADER_LEN + WS_MAGIC.len()
@@ -347,34 +369,14 @@ fn decode_snapshot(path: &Path, expected_key: u64) -> Result<Option<Workspace>> 
     let mut cur = Cursor::new(&data[..data.len() - 8]);
     cur.take(8)?;
     if cur.u32()? != WS_VERSION || cur.u64()? != expected_key {
-        return Ok(None);
+        return Ok(SnapshotState::Miss);
     }
     if cur.u64()? != data.len() as u64 {
         bail!("workspace snapshot length mismatch");
     }
 
-    let file_count = cur.count()?;
-    let mut watched_files = Vec::with_capacity(file_count.min(4096));
-    for _ in 0..file_count {
-        let p = read_path(&mut cur)?;
-        let stamp = match cur.u8()? {
-            0 => None,
-            1 => Some((cur.u64()?, cur.u128()? as i128)),
-            _ => bail!("invalid file stamp tag"),
-        };
-        watched_files.push((p, stamp));
-    }
-    let env_count = cur.count()?;
-    let mut watched_envs = Vec::with_capacity(env_count.min(512));
-    for _ in 0..env_count {
-        let name = read_str(&mut cur)?.to_owned();
-        let hash = match cur.u8()? {
-            0 => None,
-            1 => Some(cur.u64()?),
-            _ => bail!("invalid env hash tag"),
-        };
-        watched_envs.push((name, hash));
-    }
+    let struct_files = read_file_stamps(&mut cur)?;
+    let struct_envs = read_env_hashes(&mut cur)?;
     let dir_count = cur.count()?;
     let mut dirs = Vec::with_capacity(dir_count.min(256));
     for _ in 0..dir_count {
@@ -387,18 +389,17 @@ fn decode_snapshot(path: &Path, expected_key: u64) -> Result<Option<Workspace>> 
     }
     let dirs_hash = cur.u64()?;
 
-    let envs_ok = watched_envs.iter().all(|(name, expected)| {
-        crate::process_env_var(name)
-            .as_deref()
-            .map(|v| store::hash_env_val(&WS_MAGIC, name, v))
-            == *expected
-    });
-    if !envs_ok
+    if !envs_match(&struct_envs)
         || hash_target_dirs(&dirs, &root_files) != dirs_hash
-        || !store::stamps_match(&watched_files, true)
+        || !store::stamps_match(&struct_files, true)
     {
-        return Ok(None);
+        return Ok(SnapshotState::Miss);
     }
+
+    let library = read_opt_path(&mut cur)?;
+    let script_files = read_file_stamps(&mut cur)?;
+    let script_envs = read_env_hashes(&mut cur)?;
+    let scripts_ok = envs_match(&script_envs) && store::stamps_match(&script_files, true);
 
     let rustflags = read_strs(&mut cur)?;
     let cfg_env_len = cur.count()?;
@@ -435,14 +436,19 @@ fn decode_snapshot(path: &Path, expected_key: u64) -> Result<Option<Workspace>> 
     if cur.pos != data.len() - 8 {
         bail!("trailing bytes in workspace snapshot");
     }
-    Ok(Some(Workspace {
+    let workspace = Workspace {
         packages,
         graph: Graph { units, members },
         rustflags,
         config_env,
         profile_dev,
         profile_release,
-    }))
+    };
+    if scripts_ok {
+        Ok(SnapshotState::Hit(workspace))
+    } else {
+        Ok(SnapshotState::ScriptsStale(workspace, library))
+    }
 }
 
 fn prune_stale(dir: &Path, keep: &Path, max_others: usize) {
@@ -495,8 +501,20 @@ pub(crate) fn load_or_build(root: &Path, targets: &Targets) -> Result<Workspace>
     let path = cache_path(key);
     if path.is_file() {
         match decode_snapshot(&path, key) {
-            Ok(Some(workspace)) => return Ok(workspace),
-            Ok(None) => {}
+            Ok(SnapshotState::Hit(workspace)) => return Ok(workspace),
+            Ok(SnapshotState::ScriptsStale(mut workspace, library)) => {
+                for unit in &mut workspace.graph.units {
+                    unit.script = None;
+                }
+                crate::scripts::settle(&mut workspace, targets)?;
+                let lib = match library {
+                    Some(p) => Some(p),
+                    None => super::library().ok(),
+                };
+                save_snapshot(key, &workspace, &manifest_root, lib.as_deref());
+                return Ok(workspace);
+            }
+            Ok(SnapshotState::Miss) => {}
             Err(_) => drop(std::fs::remove_file(&path)),
         }
     }

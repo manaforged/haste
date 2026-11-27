@@ -144,8 +144,20 @@ pub(super) fn watch_paths(
     workspace: &graph::Workspace,
     outline: &outline::Outline,
 ) -> Vec<PathBuf> {
-    let (mut sources, included) =
-        collect_sources_and_included(workspace, outline, local_source_paths(workspace));
+    let local: Vec<usize> = (0..outline.roots.len())
+        .filter(|&krate| outline.package(workspace, krate).local())
+        .collect();
+    let mut sources = local_source_paths(workspace);
+    for &krate in &local {
+        for file in &outline.crates[krate].files {
+            if !file.source.path.starts_with("/haste/") {
+                sources.push(file.source.path.clone());
+            }
+        }
+    }
+    sources.sort();
+    sources.dedup();
+    let included = collect_included(&local, outline);
     sources.reserve(included.len());
     sources.extend(included.into_iter().map(|(path, _)| path));
     sources
@@ -180,11 +192,17 @@ fn local_source_paths(workspace: &graph::Workspace) -> Vec<PathBuf> {
             continue;
         };
         for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                out.push(path);
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            let name = entry.file_name();
+            if ft.is_dir() || (ft.is_symlink() && dir.join(&name).is_dir()) {
+                stack.push(dir.join(name));
+            } else if std::path::Path::new(&name)
+                .extension()
+                .is_some_and(|e| e == "rs")
+            {
+                out.push(dir.join(name));
             }
         }
     }
@@ -241,19 +259,6 @@ fn collect_edits(
             Edit::Bodies(slots) => stale.extend(slots),
             Edit::Items(edited) => crates.extend(edited),
         }
-    }
-    Ok((stale, crates))
-}
-
-/// Returns body-only `(crate, file)` edits from `stamps`, failing on missing files or item/macro edits so callers trigger a full reload without growing `reached`.
-pub(super) fn edits(
-    workspace: &graph::Workspace,
-    stamps: &mut [Watch],
-    outline: &mut outline::Outline,
-) -> Result<(Vec<(u32, u32)>, Vec<u32>)> {
-    let (stale, crates) = collect_edits(workspace, stamps, outline)?;
-    if !crates.is_empty() {
-        anyhow::bail!("non-body edits require full build reload");
     }
     Ok((stale, crates))
 }

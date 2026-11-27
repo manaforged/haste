@@ -102,19 +102,23 @@ fn snapshot_round_trips_and_rejects_secret_leak_or_key_mismatch() {
     let env_arc = Arc::new(env_map);
 
     with_graph_env(&home, false, || {
+        let lib_dir = root.join("fake-lib");
         crate::with_client_env(Some(env_arc.clone()), || {
             let key = snapshot_key(&root, &targets, &Config::current());
-            save_snapshot(key, &ws, &root, None);
+            save_snapshot(key, &ws, &root, Some(&lib_dir));
             let path = cache_path(key);
             let raw = std::fs::read(&path).expect("read .ws");
             assert!(
                 !raw.windows(secret.len()).any(|w| w == secret.as_bytes()),
                 "plaintext env value leaked into .ws snapshot"
             );
-            assert!(decode_snapshot(&path, key ^ 1).expect("decode").is_none());
-            let loaded = decode_snapshot(&path, key)
-                .expect("decode")
-                .expect("snapshot hit");
+            assert!(matches!(
+                decode_snapshot(&path, key ^ 1).expect("decode"),
+                SnapshotState::Miss
+            ));
+            let SnapshotState::Hit(loaded) = decode_snapshot(&path, key).expect("decode") else {
+                panic!("expected snapshot hit");
+            };
             assert_eq!(loaded.unit_lines(), ws.unit_lines());
             assert_eq!(loaded.packages.len(), ws.packages.len());
             assert_eq!(loaded.graph.units[0].script, ws.graph.units[0].script);
@@ -123,11 +127,10 @@ fn snapshot_round_trips_and_rejects_secret_leak_or_key_mismatch() {
         let other_env = Arc::new(HashMap::default());
         crate::with_client_env(Some(other_env), || {
             let key = snapshot_key(&root, &targets, &Config::current());
-            assert!(
-                decode_snapshot(&cache_path(key), key)
-                    .expect("decode")
-                    .is_none()
-            );
+            assert!(matches!(
+                decode_snapshot(&cache_path(key), key).expect("decode"),
+                SnapshotState::ScriptsStale(_, Some(ref p)) if p == &lib_dir
+            ));
         });
     });
 
@@ -166,7 +169,10 @@ fn snapshot_invalidates_on_manifest_lockfile_target_and_watched_changes() {
         let path = cache_path(key);
         let save_and_check = || {
             save_snapshot(key, &ws, &root, None);
-            assert!(decode_snapshot(&path, key).expect("decode").is_some());
+            assert!(matches!(
+                decode_snapshot(&path, key).expect("decode"),
+                SnapshotState::Hit(_)
+            ));
         };
 
         save_and_check();
@@ -175,7 +181,10 @@ fn snapshot_invalidates_on_manifest_lockfile_target_and_watched_changes() {
             "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
         )
         .expect("edit manifest");
-        assert!(decode_snapshot(&path, key).expect("decode").is_none());
+        assert!(matches!(
+            decode_snapshot(&path, key).expect("decode"),
+            SnapshotState::Miss
+        ));
 
         save_and_check();
         std::fs::write(
@@ -183,28 +192,109 @@ fn snapshot_invalidates_on_manifest_lockfile_target_and_watched_changes() {
             "version = 4\n[[package]]\nname = \"demo\"\nversion = \"0.1.1\"\n",
         )
         .expect("edit lock");
-        assert!(decode_snapshot(&path, key).expect("decode").is_none());
+        assert!(matches!(
+            decode_snapshot(&path, key).expect("decode"),
+            SnapshotState::Miss
+        ));
 
         save_and_check();
         std::fs::write(root.join("watched_data.txt"), "data_v2").expect("edit watched");
-        assert!(decode_snapshot(&path, key).expect("decode").is_none());
+        assert!(matches!(
+            decode_snapshot(&path, key).expect("decode"),
+            SnapshotState::ScriptsStale(_, None)
+        ));
 
         save_and_check();
         std::fs::write(root.join("native_dir/libdemo_native.a"), "archive_v2").expect("edit lib");
-        assert!(decode_snapshot(&path, key).expect("decode").is_none());
+        assert!(matches!(
+            decode_snapshot(&path, key).expect("decode"),
+            SnapshotState::ScriptsStale(_, None)
+        ));
 
         save_and_check();
         std::fs::write(root.join("src/lib.rs"), "pub fn f() -> usize { 42 }\n").expect("edit lib");
-        assert!(decode_snapshot(&path, key).expect("decode").is_some());
+        assert!(matches!(
+            decode_snapshot(&path, key).expect("decode"),
+            SnapshotState::Hit(_)
+        ));
 
         save_and_check();
         std::fs::create_dir_all(root.join("src/bin")).expect("mkdir bin");
         std::fs::write(root.join("src/bin/extra.rs"), "fn main() {}\n").expect("add bin");
-        assert!(decode_snapshot(&path, key).expect("decode").is_none());
+        assert!(matches!(
+            decode_snapshot(&path, key).expect("decode"),
+            SnapshotState::Miss
+        ));
 
         save_and_check();
         std::fs::remove_file(root.join("src/lib.rs")).expect("rm lib");
-        assert!(decode_snapshot(&path, key).expect("decode").is_none());
+        assert!(matches!(
+            decode_snapshot(&path, key).expect("decode"),
+            SnapshotState::Miss
+        ));
+    });
+    drop(std::fs::remove_dir_all(&root));
+    drop(std::fs::remove_dir_all(&home));
+}
+
+#[test]
+fn two_tier_preserves_structure_when_build_script_watches_source_file() {
+    let root = temp_dir("tier-ws");
+    let home = temp_dir("tier-home");
+    write_files(
+        &root,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            (
+                "Cargo.lock",
+                "version = 4\n[[package]]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+            ),
+            (
+                "build.rs",
+                "fn main() { println!(\"cargo:rerun-if-changed=src/main.rs\"); }\n",
+            ),
+            ("src/main.rs", "fn main() {}\n"),
+        ],
+    );
+    let targets = test_targets();
+    let mut ws = super::super::load(&root, &targets, &Default::default()).expect("load ws");
+    let mut out = Output::default();
+    out.watched.push("src/main.rs".to_owned());
+    ws.graph.units[0].script = Some(Arc::new(out));
+
+    with_graph_env(&home, false, || {
+        let key = snapshot_key(&root, &targets, &Config::current());
+        let path = cache_path(key);
+        let lib_dir = root.join("sysroot-lib");
+
+        save_snapshot(key, &ws, &root, Some(&lib_dir));
+        assert!(matches!(
+            decode_snapshot(&path, key).expect("decode"),
+            SnapshotState::Hit(_)
+        ));
+
+        std::fs::write(root.join("src/main.rs"), "fn main() { let _ = 1; }\n").expect("edit main");
+        assert!(matches!(
+            decode_snapshot(&path, key).expect("decode"),
+            SnapshotState::ScriptsStale(_, Some(ref p)) if p == &lib_dir
+        ));
+
+        save_snapshot(key, &ws, &root, Some(&lib_dir));
+        std::fs::write(root.join("build.rs"), "fn main() { let _ = 2; }\n").expect("edit build.rs");
+        assert!(matches!(
+            decode_snapshot(&path, key).expect("decode"),
+            SnapshotState::ScriptsStale(_, Some(ref p)) if p == &lib_dir
+        ));
+
+        save_snapshot(key, &ws, &root, Some(&lib_dir));
+        std::fs::remove_file(root.join("build.rs")).expect("rm build.rs");
+        assert!(matches!(
+            decode_snapshot(&path, key).expect("decode"),
+            SnapshotState::Miss
+        ));
     });
     drop(std::fs::remove_dir_all(&root));
     drop(std::fs::remove_dir_all(&home));

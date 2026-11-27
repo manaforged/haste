@@ -58,7 +58,7 @@ fn read_opt_str(cur: &mut Cursor<'_>) -> Result<Option<String>> {
     }
 }
 
-fn write_opt_path(out: &mut Vec<u8>, val: Option<&Path>) -> Option<()> {
+pub(super) fn write_opt_path(out: &mut Vec<u8>, val: Option<&Path>) -> Option<()> {
     match val {
         Some(p) => {
             out.push(1);
@@ -69,12 +69,78 @@ fn write_opt_path(out: &mut Vec<u8>, val: Option<&Path>) -> Option<()> {
     Some(())
 }
 
-fn read_opt_path(cur: &mut Cursor<'_>) -> Result<Option<PathBuf>> {
+pub(super) fn read_opt_path(cur: &mut Cursor<'_>) -> Result<Option<PathBuf>> {
     match cur.u8()? {
         0 => Ok(None),
         1 => Ok(Some(read_path(cur)?)),
         _ => bail!("invalid option path tag"),
     }
+}
+
+pub(super) fn write_file_stamps(
+    out: &mut Vec<u8>,
+    files: &[(PathBuf, Option<(u64, i128)>)],
+) -> Option<()> {
+    write_u32(out, u32::try_from(files.len()).ok()?);
+    for (path, stamp) in files {
+        write_path(out, path)?;
+        match stamp {
+            Some((len, nanos)) => {
+                out.push(1);
+                out.extend_from_slice(&len.to_le_bytes());
+                out.extend_from_slice(&nanos.to_le_bytes());
+            }
+            None => out.push(0),
+        }
+    }
+    Some(())
+}
+
+pub(super) fn read_file_stamps(
+    cur: &mut Cursor<'_>,
+) -> Result<Vec<(PathBuf, Option<(u64, i128)>)>> {
+    let count = cur.count()?;
+    let mut out = Vec::with_capacity(count.min(4096));
+    for _ in 0..count {
+        let path = read_path(cur)?;
+        let stamp = match cur.u8()? {
+            0 => None,
+            1 => Some((cur.u64()?, cur.u128()? as i128)),
+            _ => bail!("invalid file stamp tag"),
+        };
+        out.push((path, stamp));
+    }
+    Ok(out)
+}
+
+pub(super) fn write_env_hashes(out: &mut Vec<u8>, envs: &[(String, Option<u64>)]) -> Option<()> {
+    write_u32(out, u32::try_from(envs.len()).ok()?);
+    for (name, val) in envs {
+        write_str(out, name)?;
+        match val {
+            Some(hash) => {
+                out.push(1);
+                out.extend_from_slice(&hash.to_le_bytes());
+            }
+            None => out.push(0),
+        }
+    }
+    Some(())
+}
+
+pub(super) fn read_env_hashes(cur: &mut Cursor<'_>) -> Result<Vec<(String, Option<u64>)>> {
+    let count = cur.count()?;
+    let mut out = Vec::with_capacity(count.min(512));
+    for _ in 0..count {
+        let name = read_str(cur)?.to_owned();
+        let hash = match cur.u8()? {
+            0 => None,
+            1 => Some(cur.u64()?),
+            _ => bail!("invalid env hash tag"),
+        };
+        out.push((name, hash));
+    }
+    Ok(out)
 }
 
 pub(super) fn write_strs(out: &mut Vec<u8>, items: &[String]) -> Option<()> {
