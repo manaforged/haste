@@ -156,7 +156,8 @@ pub(crate) fn test_items(
     let sel = crate::selection();
     member_fns(workspace, outline)
         .filter(|(item_ref, tree, file, item)| {
-            test_target_selected(outline, item_ref.krate as usize, &sel)
+            tree.env.test
+                && test_target_selected(outline, item_ref.krate as usize, &sel)
                 && is_test_fn(tree, file, item)
         })
         .map(|(item_ref, tree, file, item)| {

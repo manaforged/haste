@@ -60,6 +60,21 @@ pub fn load(outline: &Outline) -> Result<()> {
     load_selected(outline, None)
 }
 
+fn archive_key(path: &Path) -> String {
+    let stamp = std::fs::metadata(path).ok().map(|meta| {
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_nanos());
+        (meta.len(), mtime)
+    });
+    match stamp {
+        Some((len, mtime)) => format!("{}@{len}:{mtime}", path.display()),
+        None => path.display().to_string(),
+    }
+}
+
 /// Loads the libraries linked by the selected crates in `outline` (or every crate when `selected` is `None`).
 pub fn load_selected(outline: &Outline, selected: Option<&[bool]>) -> Result<()> {
     let mut libraries = libraries(outline, selected)?;
@@ -68,7 +83,7 @@ pub fn load_selected(outline: &Outline, selected: Option<&[bool]>) -> Result<()>
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     libraries
         .archives
-        .retain(|archive| !loaded.libraries.contains(&archive.display().to_string()));
+        .retain(|archive| !loaded.libraries.contains(&archive_key(archive)));
     libraries
         .dynamic
         .retain(|(_, name)| !loaded.libraries.contains(name));
@@ -82,7 +97,12 @@ pub fn load_selected(outline: &Outline, selected: Option<&[bool]>) -> Result<()>
         )
     })?;
     loaded.symbols.get_or_insert_default().extend(symbols);
-    loaded.libraries.extend(libraries.names());
+    loaded
+        .libraries
+        .extend(libraries.archives.iter().map(|a| archive_key(a)));
+    loaded
+        .libraries
+        .extend(libraries.dynamic.iter().map(|(_, name)| name.clone()));
     Ok(())
 }
 

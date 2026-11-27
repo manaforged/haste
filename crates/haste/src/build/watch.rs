@@ -69,10 +69,10 @@ fn local_source_paths(workspace: &graph::Workspace) -> Vec<PathBuf> {
             .manifest
             .lib
             .iter()
-            .chain(pkg.manifest.bins.iter().map(|(_, p)| p))
-            .chain(pkg.manifest.examples.iter().map(|(_, p)| p))
-            .chain(pkg.manifest.tests.iter().map(|(_, p)| p))
-            .chain(pkg.manifest.benches.iter().map(|(_, p)| p));
+            .chain(pkg.manifest.bins.iter().map(|t| &t.path))
+            .chain(pkg.manifest.examples.iter().map(|t| &t.path))
+            .chain(pkg.manifest.tests.iter().map(|t| &t.path))
+            .chain(pkg.manifest.benches.iter().map(|t| &t.path));
         for path in roots {
             if path.is_file() {
                 out.push(path.clone());

@@ -8,8 +8,8 @@ Follow the canonical install and prerequisites instructions in [README.md#instal
 
 ## Daily commands
 
-- `haste build [PATH]` / `haste check [PATH]` — one-shot check (`check` is an alias for `build`; re-checks local crate with dep summaries on disk; `120–122 ms` single-line edit on bundled `tests/diff`, or `2.35 s` median leaf/public-type edit on an unbundled 340-crate workspace vs `1.95 s` / `2.21 s` `cargo check`).
-- `haste build --daemon [PATH]` — Unix resident daemon (`7.1–7.3 ms` single-line edit on bundled `tests/diff`; on an unbundled 340-crate workspace: `22.3 ms` median leaf edit / `87x` vs `1.95 s` `cargo check`, `3.00 s` cross-crate public-type edit vs `2.21 s` `cargo check`, `4.65 s` cold start; `900 s` idle timeout).
+- `haste build [PATH]` / `haste check [PATH]` — one-shot check (`check` is an alias for `build`; re-checks local crate with dep summaries on disk; `81.8–130 ms` single-line edit on bundled `tests/diff`, or `2.35 s` median leaf/public-type edit on an unbundled 340-crate workspace vs `1.95 s` / `2.21 s` `cargo check`).
+- `haste build --daemon [PATH]` — Unix resident daemon (`7.1–8.4 ms` single-line edit on bundled `tests/diff`; on an unbundled 340-crate workspace: `22.3 ms` median leaf edit / `87x` vs `1.95 s` `cargo check`, `3.00 s` cross-crate public-type edit vs `2.21 s` `cargo check`, `4.65 s` cold start; `900 s` idle timeout).
 - `haste::Compiler` (library API) — retains configuration, loads a fresh build per `check`/`test`/`emit` call (no resident daemon; do not assume daemon edit latency).
 - `haste run [PATH] [-- ARGS...]` — check and run in memory via JIT (Unix; add `--watch` to hot-reload changed functions in place).
 - `haste test [PATH] [-- FILTER...]` — check and run `#[test]` and `#[tokio::test]` suites in memory (Unix). Always put `--` before test filters (`haste test -- my_test` or `haste test -- --list`); a bare positional argument is treated as `PATH`.

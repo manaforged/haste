@@ -149,17 +149,17 @@ fn target_from_manifest(manifest: &Manifest, file: Option<&str>) -> JsonTarget {
         .replace('-', "_");
     let file_path = file.map(Path::new);
     let matched = file_path.and_then(|fp| {
-        if let Some((name, path)) = manifest.tests.iter().find(|(_, p)| same_path(p, fp)) {
-            return Some((Role::Test, name.clone(), path.clone()));
+        if let Some(t) = manifest.tests.iter().find(|t| same_path(&t.path, fp)) {
+            return Some((Role::Test, t.name.clone(), t.path.clone()));
         }
-        if let Some((name, path)) = manifest.bins.iter().find(|(_, p)| same_path(p, fp)) {
-            return Some((Role::Bin, name.clone(), path.clone()));
+        if let Some(t) = manifest.bins.iter().find(|t| same_path(&t.path, fp)) {
+            return Some((Role::Bin, t.name.clone(), t.path.clone()));
         }
-        if let Some((name, path)) = manifest.examples.iter().find(|(_, p)| same_path(p, fp)) {
-            return Some((Role::Example, name.clone(), path.clone()));
+        if let Some(t) = manifest.examples.iter().find(|t| same_path(&t.path, fp)) {
+            return Some((Role::Example, t.name.clone(), t.path.clone()));
         }
-        if let Some((name, path)) = manifest.benches.iter().find(|(_, p)| same_path(p, fp)) {
-            return Some((Role::Bench, name.clone(), path.clone()));
+        if let Some(t) = manifest.benches.iter().find(|t| same_path(&t.path, fp)) {
+            return Some((Role::Bench, t.name.clone(), t.path.clone()));
         }
         if let Some(path) = manifest.build.as_ref().filter(|p| same_path(p, fp)) {
             return Some((Role::Script, "build_script_build".to_owned(), path.clone()));
@@ -172,8 +172,8 @@ fn target_from_manifest(manifest: &Manifest, file: Option<&str>) -> JsonTarget {
     let (role, name, src_path) = matched.unwrap_or_else(|| {
         if let Some(path) = &manifest.lib {
             (Role::Lib, lib_name, path.clone())
-        } else if let Some((name, path)) = manifest.bins.first() {
-            (Role::Bin, name.clone(), path.clone())
+        } else if let Some(t) = manifest.bins.first() {
+            (Role::Bin, t.name.clone(), t.path.clone())
         } else {
             (
                 Role::Lib,

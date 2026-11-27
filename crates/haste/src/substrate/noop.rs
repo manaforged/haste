@@ -10,7 +10,7 @@ use rustc_hash::FxHasher;
 
 const NOOP_MAGIC: [u8; 8] = *b"HSTNOP02";
 const HEADER_LEN: usize = 36;
-const TARGET_DIRS: [&str; 4] = ["src", "src/bin", "tests", "examples"];
+const TARGET_DIRS: [&str; 5] = ["src", "src/bin", "tests", "examples", "benches"];
 const ROOT_FILES: [&str; 3] = ["src/lib.rs", "src/main.rs", "build.rs"];
 
 /// Returns whether the CLI no-op fast path is active for this `build` invocation.
@@ -66,10 +66,10 @@ fn target_root_files(workspace: &crate::graph::Workspace) -> Vec<PathBuf> {
         }
         files.extend(pkg.manifest.lib.iter().cloned());
         files.extend(pkg.manifest.build.iter().cloned());
-        files.extend(pkg.manifest.bins.iter().map(|(_, path)| path.clone()));
-        files.extend(pkg.manifest.examples.iter().map(|(_, path)| path.clone()));
-        files.extend(pkg.manifest.tests.iter().map(|(_, path)| path.clone()));
-        files.extend(pkg.manifest.benches.iter().map(|(_, path)| path.clone()));
+        files.extend(pkg.manifest.bins.iter().map(|t| t.path.clone()));
+        files.extend(pkg.manifest.examples.iter().map(|t| t.path.clone()));
+        files.extend(pkg.manifest.tests.iter().map(|t| t.path.clone()));
+        files.extend(pkg.manifest.benches.iter().map(|t| t.path.clone()));
     }
     files.sort();
     files.dedup();

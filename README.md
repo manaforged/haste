@@ -2,7 +2,7 @@
 
 haste is a standalone Rust compiler, in-memory JIT runner, and zero-linker AOT builder with no LLVM in the compiler binary and no per-project `target/` directory (cached artifacts live under `~/.cache/haste`).
 
-- **Sub-10 ms incremental edit checks:** `8.4–9.0 ms` on single-line edits with `--daemon` (`6.2x–7.4x` faster than one-shot `cargo check`); unchanged no-ops exit in `0.7–2.3 ms`.
+- **Sub-10 ms incremental edit checks:** `7.1–8.4 ms` on single-line edits with `--daemon` on bundled `tests/diff` (`8.8x–19.5x` vs `cargo check`); unchanged no-ops exit in `0.5–2.4 ms`.
 - **In-memory execution, tests, and live hot-reload (Unix):** run binaries (`haste run`), unit/integration and `#[tokio::test]` suites (`haste test`), or patch edited functions into a running process (`haste run --watch`).
 - **Zero-linker cross-compilation:** emit native ELF, Mach-O, and PE32+ executables directly for pure-Rust crates (`haste --release build --target ... -o`), with `--release` compute kernels matching or beating `rustc -O3` (`0.68x–1.05x`). See [Limits](#limits) for C archive, debug-info, and trap caveats.
 - **Built for fast local dev loops; keep `rustc` in CI:** experimental (`version = "0.0.0"`, no tagged release yet). See [Crate compatibility](#crate-compatibility), [Limits](#limits), and [ARCHITECTURE.md](ARCHITECTURE.md).
@@ -44,8 +44,8 @@ If a workspace has no `Cargo.lock`, `haste` runs `cargo generate-lockfile` autom
 
 `haste` has three distinct execution models with different incremental latency:
 
-1. **One-shot CLI (`haste build`):** runs a fresh process per invocation, re-checks the local crate, and caches only dependency summaries on disk. On the bundled `tests/diff` fixture (`144` functions), single-line edits take `120–122 ms` (`1.0x–2.0x` vs `cargo check`) and unchanged no-ops take `0.6–2.8 ms`. On an unbundled 340-crate workspace (macOS ARM64, 6 CPUs), leaf edits take `2.35 s` median (`2.33–2.49 s`) and public-type edits take `2.35 s` (`2.33–2.40 s`), compared to `1.95 s` (leaf) and `2.21 s` (public-type) for `cargo check`.
-2. **Resident daemon (`haste build --daemon`, Unix):** keeps workspace and dependency state warm in a background `haste serve` process (`900 s` idle timeout, configurable via `HASTE_SERVE_IDLE_SECS`). On the bundled `tests/diff` fixture, single-line edits take `7.1–7.3 ms` (`16.1x–23.5x` vs `cargo check`). On the unbundled 340-crate workspace, daemon cold start takes `4.65 s`, leaf edits drop to `22.3 ms` median (`22.1–37.3 ms`, `87x` faster than `cargo check` at `1.95 s`), while cross-crate public-type edits take `3.00 s` (`2.94–3.09 s`, slower than `cargo check` at `2.21 s`). Plain `haste` commands never spawn a daemon, though they reuse an already-running daemon for the same workspace unless `HASTE_NO_DAEMON=1` is set.
+1. **One-shot CLI (`haste build`):** runs a fresh process per invocation, re-checks the local crate, and caches only dependency summaries on disk. On the bundled `tests/diff` fixture (`144` functions), single-line edits take `81.8–130 ms` (`0.6x–1.7x` vs `cargo check`) and unchanged no-ops take `0.5–2.4 ms`. On an unbundled 340-crate workspace (macOS ARM64, 6 CPUs), leaf edits take `2.35 s` median (`2.33–2.49 s`) and public-type edits take `2.35 s` (`2.33–2.40 s`), compared to `1.95 s` (leaf) and `2.21 s` (public-type) for `cargo check`.
+2. **Resident daemon (`haste build --daemon`, Unix):** keeps workspace and dependency state warm in a background `haste serve` process (`900 s` idle timeout, configurable via `HASTE_SERVE_IDLE_SECS`). On the bundled `tests/diff` fixture, single-line edits take `7.1–8.4 ms` (`8.8x–19.5x` vs `cargo check`). On the unbundled 340-crate workspace, daemon cold start takes `4.65 s`, leaf edits drop to `22.3 ms` median (`22.1–37.3 ms`, `87x` faster than `cargo check` at `1.95 s`), while cross-crate public-type edits take `3.00 s` (`2.94–3.09 s`, slower than `cargo check` at `2.21 s`). Plain `haste` commands never spawn a daemon, though they reuse an already-running daemon for the same workspace unless `HASTE_NO_DAEMON=1` is set.
 3. **Embeddable library (`haste::Compiler`):** retains configuration across calls, but loads a fresh build on every `check`, `test`, or `emit` call. It does not run a resident daemon, so embedders should not assume `--daemon` edit latency.
 
 Inspect or stop background daemons with `serve status` and `serve stop` (`PATH` is optional):
@@ -76,22 +76,26 @@ Run `bash scripts/bench.sh` to reproduce build-speed and AOT runtime numbers on 
 
 ### Build speed (`tests/diff`, bundled 144-function fixture, `HASTE_BENCH_COLD=1`)
 
-Resident-daemon edits (`--daemon`) compare a warm background `haste serve` process against one-shot `cargo check`. `Empty HASTE_HOME` includes one-time stdlib indexing (`852–987 ms` for `haste build` vs `295–479 ms` for `cargo check`); once stdlib is indexed, the first build of a new project drops to `81.5–121 ms` (`2.4x–5.9x` faster than `cargo check`).
+Resident-daemon edits (`--daemon`) compare a warm background `haste serve` process against one-shot `cargo check` (using `rustup which cargo` so PATH shims do not skew the baseline). `Empty HASTE_HOME` includes one-time stdlib indexing (`915–966 ms` for `haste build` vs `200–249 ms` for `cargo check`); once stdlib is indexed, the first build of a new project drops to `82.0–136 ms` (`1.5x–3.0x` faster than `cargo check`).
 
 | Benchmark | Platform | haste | cargo | Speedup |
 | --- | --- | ---: | ---: | ---: |
-| Single-line edit (`haste build --daemon` vs `cargo check`) | macOS ARM64 (`rustc 1.98.1`) | 7.1 ms | 167 ms | 23.5x |
-| Single-line edit (`haste build` vs `cargo check`) | macOS ARM64 (`rustc 1.98.1`) | 120 ms | 234 ms | 2.0x |
-| Single-line edit (`haste build -o` vs `cargo build`) | macOS ARM64 (`rustc 1.98.1`) | 233 ms | 403 ms | 1.7x |
-| Unchanged no-op (`haste build` vs `cargo check`) | macOS ARM64 (`rustc 1.98.1`) | 2.8 ms | 106 ms | 37.6x |
-| Empty `HASTE_HOME` (`haste build` vs `cargo check`) | macOS ARM64 (`rustc 1.98.1`) | 987 ms | 479 ms | 0.5x |
-| First project build, stdlib indexed (`haste build` vs `cargo check`) | macOS ARM64 (`rustc 1.98.1`) | 81.5 ms | 479 ms | 5.9x |
-| Single-line edit (`haste build --daemon` vs `cargo check`) | Linux x86-64 (`rustc 1.99.1`) | 7.3 ms | 118 ms | 16.1x |
-| Single-line edit (`haste build` vs `cargo check`) | Linux x86-64 (`rustc 1.99.1`) | 122 ms | 121 ms | 1.0x |
-| Single-line edit (`haste build -o` vs `cargo build`) | Linux x86-64 (`rustc 1.99.1`) | 290 ms | 182 ms | 0.6x |
-| Unchanged no-op (`haste build` vs `cargo check`) | Linux x86-64 (`rustc 1.99.1`) | 0.6 ms | 70.0 ms | 121.9x |
-| Empty `HASTE_HOME` (`haste build` vs `cargo check`) | Linux x86-64 (`rustc 1.99.1`) | 852 ms | 295 ms | 0.3x |
-| First project build, stdlib indexed (`haste build` vs `cargo check`) | Linux x86-64 (`rustc 1.99.1`) | 121 ms | 295 ms | 2.4x |
+| Single-line edit (`haste build --daemon` vs `cargo check`) | macOS ARM64 (`rustc 1.98.1`) | 7.1 ms | 139 ms | 19.5x |
+| Single-line edit (`haste build` vs `cargo check`) | macOS ARM64 (`rustc 1.98.1`) | 81.8 ms | 140 ms | 1.7x |
+| Single-line edit (`haste build -o` vs `cargo build`) | macOS ARM64 (`rustc 1.98.1`) | 198 ms | 269 ms | 1.4x |
+| Unchanged no-op (`haste build` vs `cargo check`) | macOS ARM64 (`rustc 1.98.1`) | 2.4 ms | 81.3 ms | 34.3x |
+| Empty `HASTE_HOME` (`haste build` vs `cargo check`) | macOS ARM64 (`rustc 1.98.1`) | 915 ms | 249 ms | 0.3x |
+| Empty `HASTE_HOME` (`haste build -o` vs `cargo build`) | macOS ARM64 (`rustc 1.98.1`) | 768 ms | 550 ms | 0.7x |
+| First project build, stdlib indexed (`haste build` vs `cargo check`) | macOS ARM64 (`rustc 1.98.1`) | 82.0 ms | 249 ms | 3.0x |
+| First project build, stdlib indexed (`haste build -o` vs `cargo build`) | macOS ARM64 (`rustc 1.98.1`) | 258 ms | 550 ms | 2.1x |
+| Single-line edit (`haste build --daemon` vs `cargo check`) | Linux x86-64 (`rustc 1.99.1`) | 8.4 ms | 73.3 ms | 8.8x |
+| Single-line edit (`haste build` vs `cargo check`) | Linux x86-64 (`rustc 1.99.1`) | 130 ms | 80.4 ms | 0.6x |
+| Single-line edit (`haste build -o` vs `cargo build`) | Linux x86-64 (`rustc 1.99.1`) | 307 ms | 145 ms | 0.5x |
+| Unchanged no-op (`haste build` vs `cargo check`) | Linux x86-64 (`rustc 1.99.1`) | 0.5 ms | 27.4 ms | 52.1x |
+| Empty `HASTE_HOME` (`haste build` vs `cargo check`) | Linux x86-64 (`rustc 1.99.1`) | 966 ms | 200 ms | 0.2x |
+| Empty `HASTE_HOME` (`haste build -o` vs `cargo build`) | Linux x86-64 (`rustc 1.99.1`) | 1.4 s | 534 ms | 0.4x |
+| First project build, stdlib indexed (`haste build` vs `cargo check`) | Linux x86-64 (`rustc 1.99.1`) | 136 ms | 200 ms | 1.5x |
+| First project build, stdlib indexed (`haste build -o` vs `cargo build`) | Linux x86-64 (`rustc 1.99.1`) | 575 ms | 534 ms | 0.9x |
 
 On a larger private multi-crate workspace (not bundled; `340` crates, `45` build scripts, `17,521` functions, macOS ARM64, 6 CPUs):
 
