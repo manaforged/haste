@@ -481,18 +481,66 @@ fn resolver_of(table: &Table) -> Option<u8> {
     }
 }
 
+fn is_glob_pattern(pattern: &str) -> bool {
+    pattern.bytes().any(|b| matches!(b, b'*' | b'?' | b'['))
+}
+
+fn match_char_class(p: &[char], pi: usize, ch: char) -> Option<(usize, bool)> {
+    let mut i = pi + 1;
+    let negated = matches!(p.get(i), Some('!' | '^'));
+    if negated {
+        i += 1;
+    }
+    let start = i;
+    let mut matched = false;
+    while i < p.len() {
+        if p[i] == ']' && i > start {
+            return Some((i + 1, if negated { !matched } else { matched }));
+        }
+        if i + 2 < p.len() && p[i + 1] == '-' && p[i + 2] != ']' {
+            if ch >= p[i] && ch <= p[i + 2] {
+                matched = true;
+            }
+            i += 3;
+        } else {
+            if ch == p[i] {
+                matched = true;
+            }
+            i += 1;
+        }
+    }
+    None
+}
+
 fn wildcard_match(pattern: &str, text: &str) -> bool {
-    let (p, t) = (pattern.as_bytes(), text.as_bytes());
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
     let (mut pi, mut ti) = (0usize, 0usize);
     let (mut star, mut match_ti) = (None, 0usize);
     while ti < t.len() {
-        if pi < p.len() && p[pi] == t[ti] {
-            pi += 1;
-            ti += 1;
-        } else if pi < p.len() && p[pi] == b'*' {
+        if pi < p.len() && p[pi] == '*' {
             star = Some(pi);
             match_ti = ti;
             pi += 1;
+            continue;
+        }
+        let step = if pi < p.len() && p[pi] == '?' {
+            Some(pi + 1)
+        } else if pi < p.len() && p[pi] == '[' {
+            match match_char_class(&p, pi, t[ti]) {
+                Some((next_pi, true)) => Some(next_pi),
+                Some((_, false)) => None,
+                None if t[ti] == '[' => Some(pi + 1),
+                None => None,
+            }
+        } else if pi < p.len() && p[pi] == t[ti] {
+            Some(pi + 1)
+        } else {
+            None
+        };
+        if let Some(next_pi) = step {
+            pi = next_pi;
+            ti += 1;
         } else if let Some(s) = star {
             pi = s + 1;
             match_ti += 1;
@@ -501,15 +549,40 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
             return false;
         }
     }
-    while pi < p.len() && p[pi] == b'*' {
+    while pi < p.len() && p[pi] == '*' {
         pi += 1;
     }
     pi == p.len()
 }
 
+fn advance_pattern_segment(dirs: Vec<PathBuf>, seg: &str) -> Vec<PathBuf> {
+    let mut next = Vec::new();
+    if is_glob_pattern(seg) {
+        for dir in dirs {
+            for sub in super::cache::subdirs(&dir).unwrap_or_default() {
+                if sub
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|name| wildcard_match(seg, name))
+                {
+                    next.push(sub);
+                }
+            }
+        }
+    } else {
+        for dir in dirs {
+            let candidate = dir.join(seg);
+            if candidate.is_dir() {
+                next.push(candidate);
+            }
+        }
+    }
+    next
+}
+
 fn expand_pattern(top: &Path, pattern: &str) -> Vec<PathBuf> {
     let trimmed = pattern.trim_end_matches('/');
-    if !trimmed.contains('*') {
+    if !is_glob_pattern(trimmed) {
         let path = if trimmed.is_empty() || trimmed == "." {
             top.to_owned()
         } else {
@@ -522,28 +595,7 @@ fn expand_pattern(top: &Path, pattern: &str) -> Vec<PathBuf> {
         if seg.is_empty() || seg == "." {
             continue;
         }
-        let mut next = Vec::new();
-        if seg.contains('*') {
-            for dir in dirs {
-                for sub in super::cache::subdirs(&dir).unwrap_or_default() {
-                    if sub
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|name| wildcard_match(seg, name))
-                    {
-                        next.push(sub);
-                    }
-                }
-            }
-        } else {
-            for dir in dirs {
-                let candidate = dir.join(seg);
-                if candidate.is_dir() {
-                    next.push(candidate);
-                }
-            }
-        }
-        dirs = next;
+        dirs = advance_pattern_segment(dirs, seg);
     }
     dirs
 }
@@ -578,7 +630,7 @@ pub(crate) fn workspace_member_dirs(
         .filter_map(Value::as_str);
     let mut out = Vec::new();
     for member in listed {
-        let is_glob = member.contains('*');
+        let is_glob = is_glob_pattern(member);
         for dir in expand_pattern(top, member) {
             if is_glob && !dir.join(super::MANIFEST_FILE).is_file() {
                 continue;
@@ -591,12 +643,12 @@ pub(crate) fn workspace_member_dirs(
     out
 }
 
-/// Parent directories of workspace `members` / `default-members` glob entries.
+/// Parent and intermediate directories of workspace `members` / `default-members` glob entries.
 pub(crate) fn member_glob_dirs(top: &Path) -> Vec<PathBuf> {
     let Ok(Some(ws)) = workspace_of(top) else {
         return Vec::new();
     };
-    let mut dirs = Vec::new();
+    let mut watched = Vec::new();
     for key in ["members", "default-members"] {
         let listed = ws
             .get(key)
@@ -606,19 +658,28 @@ pub(crate) fn member_glob_dirs(top: &Path) -> Vec<PathBuf> {
             .filter_map(toml::Value::as_str);
         for member in listed {
             let trimmed = member.trim_end_matches('/');
-            if !trimmed.contains('*') {
+            if !is_glob_pattern(trimmed) {
                 continue;
             }
-            let parents = match trimmed.rsplit_once('/') {
-                Some((prefix, _)) => expand_pattern(top, prefix),
-                None => vec![top.to_owned()],
-            };
-            dirs.extend(parents.into_iter().filter(|dir| dir.is_dir()));
+            let mut dirs = vec![top.to_owned()];
+            let mut seen_glob = false;
+            for seg in trimmed.split('/') {
+                if seg.is_empty() || seg == "." {
+                    continue;
+                }
+                if is_glob_pattern(seg) {
+                    seen_glob = true;
+                }
+                if seen_glob {
+                    watched.extend(dirs.iter().filter(|dir| dir.is_dir()).cloned());
+                }
+                dirs = advance_pattern_segment(dirs, seg);
+            }
         }
     }
-    dirs.sort();
-    dirs.dedup();
-    dirs
+    watched.sort();
+    watched.dedup();
+    watched
 }
 
 fn package_uses_resolver_v2(manifest: &Manifest) -> bool {

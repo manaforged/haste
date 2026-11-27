@@ -30,7 +30,7 @@ fn workspace_members_globs_and_exclude_work() {
         top.join("Cargo.toml"),
         concat!(
             "[workspace]\n",
-            "members = [\"crates/*/\", \"nested/*/*\", \"prefixed/foo-*\", \"top-*\"]\n",
+            "members = [\"crates/*/\", \"nested/*/*\", \"groups/*/crates/*\", \"class/[ab]\", \"q/item-?\", \"prefixed/foo-*\", \"top-*\"]\n",
             "exclude = [\"crates/ignored\", \"nested/grp/skip-*\", \"top-excluded\"]\n",
         ),
     )
@@ -42,6 +42,12 @@ fn workspace_members_globs_and_exclude_work() {
     write_member(&top, "crates/ignored", "ignored", "2021");
     write_member(&top, "nested/grp/ok", "nested-ok", "2021");
     write_member(&top, "nested/grp/skip-me", "nested-skip", "2021");
+    write_member(&top, "groups/a/crates/first", "group-first", "2021");
+    write_member(&top, "class/a", "class-a", "2021");
+    write_member(&top, "class/b", "class-b", "2021");
+    write_member(&top, "class/c", "class-c", "2021");
+    write_member(&top, "q/item-1", "q-1", "2021");
+    write_member(&top, "q/item-10", "q-10", "2021");
     write_member(&top, "prefixed/foo-one", "foo-one", "2021");
     write_member(&top, "prefixed/bar-two", "bar-two", "2021");
 
@@ -54,6 +60,10 @@ fn workspace_members_globs_and_exclude_work() {
         top.join("top-keep"),
         top.join("crates/kept"),
         top.join("nested/grp/ok"),
+        top.join("groups/a/crates/first"),
+        top.join("class/a"),
+        top.join("class/b"),
+        top.join("q/item-1"),
         top.join("prefixed/foo-one"),
     ]
     .into_iter()
@@ -68,7 +78,13 @@ fn workspace_members_globs_and_exclude_work() {
     for expected_parent in [
         top.clone(),
         top.join("crates"),
+        top.join("nested"),
         top.join("nested/grp"),
+        top.join("groups"),
+        top.join("groups/a"),
+        top.join("groups/a/crates"),
+        top.join("class"),
+        top.join("q"),
         top.join("prefixed"),
     ] {
         assert!(

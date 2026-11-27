@@ -14,7 +14,7 @@ use crate::graph::store::{FileStamp, file_stamp, hash_env_val, write_new_bytes};
 use rustc_hash::FxHasher;
 
 const NOOP_MAGIC: [u8; 8] = *b"HSTNOP03";
-const NOOP_VERSION: u32 = 3;
+const NOOP_VERSION: u32 = 4;
 const HEADER_LEN: usize = 52;
 const TARGET_DIRS: [&str; 5] = ["src", "src/bin", "tests", "examples", "benches"];
 const ROOT_FILES: [&str; 3] = ["src/lib.rs", "src/main.rs", "build.rs"];
@@ -105,6 +105,9 @@ pub(crate) fn hash_target_dir(dir: &Path, hasher: &mut FxHasher) {
             found.push(name);
         } else if ft.is_dir() || (ft.is_symlink() && dir.join(&name).is_dir()) {
             let sub = dir.join(&name);
+            let mut dir_tag = name.clone();
+            dir_tag.push("/");
+            found.push(dir_tag);
             if sub.join("main.rs").is_file() {
                 let mut joined = name.clone();
                 joined.push("/main.rs");
