@@ -288,7 +288,10 @@ impl Infer<'_, '_> {
                     self.unify(ty, to)?;
                     return Ok(Some(Coercion::Deref(steps, self.resolve(to))));
                 }
-                if fallback.is_none() && self.trial_unify(ty, to) {
+                if fallback.is_none()
+                    && !matches!(self.cx.types.kind(to), Kind::Var(_))
+                    && self.trial_unify(ty, to)
+                {
                     fallback = Some((steps.clone(), ty));
                 }
             }
