@@ -14,7 +14,7 @@ use crate::graph::store::{FileStamp, file_stamp, hash_env_val, write_new_bytes};
 use rustc_hash::FxHasher;
 
 const NOOP_MAGIC: [u8; 8] = *b"HSTNOP03";
-const NOOP_VERSION: u32 = 2;
+const NOOP_VERSION: u32 = 3;
 const HEADER_LEN: usize = 52;
 const TARGET_DIRS: [&str; 5] = ["src", "src/bin", "tests", "examples", "benches"];
 const ROOT_FILES: [&str; 3] = ["src/lib.rs", "src/main.rs", "build.rs"];
@@ -150,9 +150,19 @@ fn compute_meta_hash(root: &Path, out: Option<&Path>) -> Option<u64> {
     NOOP_VERSION.hash(&mut hasher);
     super::target_hash(&target).hash(&mut hasher);
     cfg.hash_cache_key(&mut hasher);
-    std::env::var_os("CARGO_HOME").hash(&mut hasher);
-    crate::process_env_var("RUSTFLAGS").hash(&mut hasher);
-    crate::process_env_var("CARGO_ENCODED_RUSTFLAGS").hash(&mut hasher);
+    for name in [
+        "CARGO_HOME",
+        "RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "RUSTC",
+        "RUSTUP_TOOLCHAIN",
+        "RUSTUP_HOME",
+        "CARGO",
+        "CC",
+        "CFLAGS",
+    ] {
+        crate::process_env_var(name).hash(&mut hasher);
+    }
     root.hash(&mut hasher);
     match out {
         Some(out_path) => {
@@ -409,9 +419,20 @@ pub fn record(
     let Some(meta_hash) = compute_meta_hash(&croot, aout.as_deref()) else {
         return;
     };
-    let manifests = crate::graph::manifest_paths(workspace, &croot);
+    let mut manifests = crate::graph::manifest_paths(workspace, &croot);
+    if let Some(settings) = crate::graph::snapshot::rustup_settings_path() {
+        manifests.push(settings);
+    }
     let roots = target_root_files(workspace);
     let (watched_files, watched_vars) = crate::graph::store::watched_stamps(workspace);
+
+    let mut static_lib_paths = Vec::new();
+    for entry in &workspace.graph.units {
+        if let Some(out) = &entry.script {
+            let pkg_dir = &workspace.packages[entry.package].manifest.dir;
+            crate::graph::snapshot::collect_static_lib_paths(pkg_dir, out, &mut static_lib_paths);
+        }
+    }
 
     let mut priority: Vec<&Path> = manifests
         .iter()
@@ -426,6 +447,7 @@ pub fn record(
         .iter()
         .map(PathBuf::as_path)
         .chain(watched_files.iter().map(|(p, _, _)| p.as_path()))
+        .chain(static_lib_paths.iter().map(PathBuf::as_path))
         .filter(|p| priority.binary_search(p).is_err())
         .collect();
     rest.sort_unstable();
@@ -597,6 +619,110 @@ mod tests {
             std::fs::write(&root_rs, "fn main() { let _ = 1; }\n").expect("edit root");
             assert_eq!(try_hit_at(&stamp_file, &tmp, None), None);
         });
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    #[test]
+    fn noop_tracks_toolchain_envs_rustup_settings_and_static_libs() {
+        let base_meta = |vars: &[(&str, &str)]| {
+            let map: rustc_hash::FxHashMap<String, String> = vars
+                .iter()
+                .map(|&(k, v)| (k.to_owned(), v.to_owned()))
+                .collect();
+            crate::with_client_env(Some(std::sync::Arc::new(map)), || {
+                compute_meta_hash(Path::new("/tmp/sample-ws"), None)
+            })
+            .expect("meta_hash")
+        };
+        let baseline = base_meta(&[]);
+        for var in [
+            "RUSTC",
+            "RUSTUP_TOOLCHAIN",
+            "RUSTUP_HOME",
+            "CARGO",
+            "CC",
+            "CFLAGS",
+        ] {
+            assert_ne!(
+                baseline,
+                base_meta(&[(var, "custom_val")]),
+                "{var} must affect noop meta_hash"
+            );
+        }
+
+        let _guard = crate::sync::lock(&crate::substrate::TEST_HOME_LOCK);
+        let prev_home = std::env::var_os("HASTE_HOME");
+        let seq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let tmp = std::env::temp_dir().join(format!("haste-noop-s-{}-{seq}", std::process::id()));
+        let home = tmp.join("haste_home");
+        let rustup = tmp.join("rustup");
+        let ws_dir = tmp.join("ws");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        std::fs::create_dir_all(&rustup).expect("mkdir rustup");
+        std::fs::create_dir_all(ws_dir.join("src")).expect("mkdir src");
+        std::fs::create_dir_all(ws_dir.join("native")).expect("mkdir native");
+        std::fs::write(
+            rustup.join("settings.toml"),
+            "default_toolchain = \"stable\"\n",
+        )
+        .expect("write settings");
+        std::fs::write(ws_dir.join("native/libdemo.a"), b"arch1").expect("write libdemo.a");
+        std::fs::write(
+            ws_dir.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("write Cargo.toml");
+        std::fs::write(
+            ws_dir.join("Cargo.lock"),
+            "version = 4\n[[package]]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write Cargo.lock");
+        std::fs::write(ws_dir.join("src/main.rs"), "fn main() {}\n").expect("write main.rs");
+
+        // SAFETY: serialized by `TEST_HOME_LOCK` within unit tests.
+        unsafe {
+            std::env::set_var("HASTE_HOME", &home);
+        }
+        let host = crate::graph::cfg::Target::of(&crate::host_target());
+        let targets = crate::graph::Targets {
+            target: host.clone(),
+            host,
+        };
+        let mut ws = crate::graph::load(&ws_dir, &targets, &Default::default()).expect("load ws");
+        ws.graph.units[0].script = Some(std::sync::Arc::new(crate::graph::script::Output::parse(
+            "cargo:rustc-link-search=native=native\ncargo:rustc-link-lib=static=demo\n",
+        )));
+        let env_map = std::sync::Arc::new(rustc_hash::FxHashMap::from_iter([(
+            "RUSTUP_HOME".to_owned(),
+            rustup.to_string_lossy().into_owned(),
+        )]));
+        crate::with_client_env(Some(env_map), || {
+            record(&ws_dir, &ws, &[], &[], None, 1);
+            assert_eq!(try_hit(&ws_dir, None), Some(1));
+
+            std::fs::write(ws_dir.join("native/libdemo.a"), b"arch2_modified")
+                .expect("edit libdemo.a");
+            assert_eq!(try_hit(&ws_dir, None), None);
+
+            record(&ws_dir, &ws, &[], &[], None, 1);
+            assert_eq!(try_hit(&ws_dir, None), Some(1));
+
+            std::fs::write(
+                rustup.join("settings.toml"),
+                "default_toolchain = \"nightly\"\n",
+            )
+            .expect("edit settings.toml");
+            assert_eq!(try_hit(&ws_dir, None), None);
+        });
+        // SAFETY: serialized by `TEST_HOME_LOCK` within unit tests.
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HASTE_HOME", v),
+                None => std::env::remove_var("HASTE_HOME"),
+            }
+        }
         drop(std::fs::remove_dir_all(&tmp));
     }
 }

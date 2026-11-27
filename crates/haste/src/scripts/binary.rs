@@ -22,8 +22,10 @@ const EXECUTABLE: &str = "script";
 const KEY: &str = "script.key";
 const FAST: &str = "script.fast";
 const FAST_MAGIC: [u8; 8] = *b"HSTSCR01";
-const FAST_VERSION: u32 = 1;
-const FAST_HEADER_LEN: usize = 24;
+const FAST_VERSION: u32 = 2;
+pub(super) const KEY_MAGIC: [u8; 8] = *b"HSTKEY01";
+pub(super) const KEY_VERSION: u32 = 1;
+const WATCH_HEADER_LEN: usize = 28;
 
 /// What the store holds for a script whose crate hashes to its key: its executable, the mark that it does not compile ahead of time, or nothing.
 pub(super) enum Kept {
@@ -56,33 +58,9 @@ pub(super) fn fast_kept(
     if !executable.is_file() {
         return None;
     }
-    let backing = Backing::open(&dir.join(FAST), FAST_HEADER_LEN).ok()?;
-    let data = backing.as_slice();
-    if data.len() < FAST_HEADER_LEN
-        || data[0..8] != FAST_MAGIC
-        || read_u32(data, 8) != FAST_VERSION
-        || read_u64(data, 12) != fast_meta_hash(workspace, targets, unit)
-    {
-        return None;
-    }
-    let file_count = read_u32(data, 20) as usize;
-    let mut pos = FAST_HEADER_LEN;
-    for _ in 0..file_count {
-        let len = read_u32(read_bytes(data, &mut pos, 4)?, 0) as usize;
-        let raw_path = read_bytes(data, &mut pos, len)?;
-        let expected = match *read_bytes(data, &mut pos, 1)?.first()? {
-            0 => None,
-            1 => {
-                let raw = read_bytes(data, &mut pos, 24)?;
-                Some((read_u64(raw, 0), read_i128(raw, 8)))
-            }
-            _ => return None,
-        };
-        if !stamp_matches_raw(raw_path, expected) {
-            return None;
-        }
-    }
-    (pos == data.len()).then_some(executable)
+    let expected = fast_meta_hash(workspace, targets, unit);
+    validate_watch_manifest(&dir.join(FAST), FAST_MAGIC, FAST_VERSION, expected)
+        .then_some(executable)
 }
 
 /// Computes the pre-outline metadata key for `unit`'s compiled build script under the active `Config` and host `targets`.
@@ -161,31 +139,42 @@ pub(super) fn fast_meta_hash(workspace: &Workspace, targets: &Targets, unit: usi
     hasher.finish()
 }
 
-/// Writes `script.fast` for `unit` given `meta_hash` and the exact source paths read while compiling its crate closure.
+/// Writes `script.fast` for `unit` given `meta_hash`, the exact source/included paths, and compile-time env reads.
 pub(super) fn write_fast_manifest(
     dir: &Path,
     meta_hash: u64,
     paths: &[PathBuf],
+    envs: &[(String, Option<u64>)],
 ) -> std::io::Result<()> {
-    let stamps = store::file_stamps(paths);
-    let Some(bytes) = encode_fast_manifest(meta_hash, paths, &stamps) else {
+    let Some(bytes) = encode_watch_manifest(FAST_MAGIC, FAST_VERSION, meta_hash, paths, envs)
+    else {
         return Ok(());
     };
     store::write_new_bytes(&dir.join(FAST), &bytes)
 }
 
-fn encode_fast_manifest(
-    meta_hash: u64,
+#[cfg(test)]
+pub(super) fn hash_fast_env(name: &str, val: &str) -> u64 {
+    store::hash_env_val(&FAST_MAGIC, name, val)
+}
+
+pub(super) fn encode_watch_manifest(
+    magic: [u8; 8],
+    version: u32,
+    key: u64,
     paths: &[PathBuf],
-    stamps: &[store::FileStamp],
+    envs: &[(String, Option<u64>)],
 ) -> Option<Vec<u8>> {
-    let count = u32::try_from(paths.len()).ok()?;
-    let mut out = Vec::with_capacity(FAST_HEADER_LEN + paths.len() * 88);
-    out.extend_from_slice(&FAST_MAGIC);
-    out.extend_from_slice(&FAST_VERSION.to_le_bytes());
-    out.extend_from_slice(&meta_hash.to_le_bytes());
-    out.extend_from_slice(&count.to_le_bytes());
-    for (path, &stamp) in paths.iter().zip(stamps) {
+    let file_count = u32::try_from(paths.len()).ok()?;
+    let env_count = u32::try_from(envs.len()).ok()?;
+    let stamps = store::file_stamps(paths);
+    let mut out = Vec::with_capacity(WATCH_HEADER_LEN + paths.len() * 88 + envs.len() * 32);
+    out.extend_from_slice(&magic);
+    out.extend_from_slice(&version.to_le_bytes());
+    out.extend_from_slice(&key.to_le_bytes());
+    out.extend_from_slice(&file_count.to_le_bytes());
+    out.extend_from_slice(&env_count.to_le_bytes());
+    for (path, stamp) in paths.iter().zip(stamps) {
         write_path_ref(&mut out, path)?;
         match stamp {
             Some((len, nanos)) => {
@@ -196,34 +185,154 @@ fn encode_fast_manifest(
             None => out.push(0),
         }
     }
+    for (name, val) in envs {
+        let bytes = name.as_bytes();
+        let len = u32::try_from(bytes.len()).ok()?;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(bytes);
+        match val {
+            Some(hash) => {
+                out.push(1);
+                out.extend_from_slice(&hash.to_le_bytes());
+            }
+            None => out.push(0),
+        }
+    }
     Some(out)
 }
 
-fn collect_closure_files(outline: &Outline, krate: usize) -> Vec<PathBuf> {
+pub(super) fn validate_watch_manifest(
+    manifest_path: &Path,
+    magic: [u8; 8],
+    version: u32,
+    expected_key: u64,
+) -> bool {
+    let Ok(backing) = Backing::open(manifest_path, WATCH_HEADER_LEN) else {
+        return false;
+    };
+    let data = backing.as_slice();
+    if data.len() < WATCH_HEADER_LEN
+        || data[0..8] != magic
+        || read_u32(data, 8) != version
+        || read_u64(data, 12) != expected_key
+    {
+        return false;
+    }
+    let file_count = read_u32(data, 20) as usize;
+    let env_count = read_u32(data, 24) as usize;
+    let mut pos = WATCH_HEADER_LEN;
+    for _ in 0..file_count {
+        let Some(raw_len) = read_bytes(data, &mut pos, 4) else {
+            return false;
+        };
+        let len = read_u32(raw_len, 0) as usize;
+        let Some(raw_path) = read_bytes(data, &mut pos, len) else {
+            return false;
+        };
+        let Some(present) = read_bytes(data, &mut pos, 1).and_then(|b| b.first().copied()) else {
+            return false;
+        };
+        let expected = match present {
+            0 => None,
+            1 => {
+                let Some(raw) = read_bytes(data, &mut pos, 24) else {
+                    return false;
+                };
+                Some((read_u64(raw, 0), read_i128(raw, 8)))
+            }
+            _ => return false,
+        };
+        if !stamp_matches_raw(raw_path, expected) {
+            return false;
+        }
+    }
+    for _ in 0..env_count {
+        let Some(raw_len) = read_bytes(data, &mut pos, 4) else {
+            return false;
+        };
+        let len = read_u32(raw_len, 0) as usize;
+        let Some(raw_name) = read_bytes(data, &mut pos, len) else {
+            return false;
+        };
+        let Ok(name) = std::str::from_utf8(raw_name) else {
+            return false;
+        };
+        let Some(present) = read_bytes(data, &mut pos, 1).and_then(|b| b.first().copied()) else {
+            return false;
+        };
+        let expected = match present {
+            0 => None,
+            1 => {
+                let Some(raw) = read_bytes(data, &mut pos, 8) else {
+                    return false;
+                };
+                Some(read_u64(raw, 0))
+            }
+            _ => return false,
+        };
+        let actual = crate::process_env_var(name)
+            .as_deref()
+            .map(|v| store::hash_env_val(&magic, name, v));
+        if actual != expected {
+            return false;
+        }
+    }
+    pos == data.len()
+}
+
+fn closure_crates(outline: &Outline, krate: usize) -> Vec<usize> {
     let mut seen = vec![false; outline.crates.len()];
     let mut stack = vec![krate];
-    let mut paths = Vec::new();
+    let mut found = Vec::new();
     while let Some(at) = stack.pop() {
         if std::mem::replace(&mut seen[at], true) {
             continue;
         }
+        found.push(at);
+        stack.extend(outline.deps[at].iter().map(|(_, dep)| *dep));
+    }
+    found
+}
+
+fn collect_closure_files(outline: &Outline, krate: usize, include_sources: bool) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for at in closure_crates(outline, krate) {
         if let Some(tree) = outline.crates.get(at)
             && !tree.env.fixed
         {
-            for entry in &tree.files {
-                if !entry.expanded {
-                    paths.push(entry.source.path.clone());
+            if include_sources {
+                for entry in &tree.files {
+                    if !entry.expanded {
+                        paths.push(entry.source.path.clone());
+                    }
                 }
             }
             for (inc, _) in outline.included(at) {
                 paths.push(inc);
             }
         }
-        stack.extend(outline.deps[at].iter().map(|(_, dep)| *dep));
     }
     paths.sort();
     paths.dedup();
     paths
+}
+
+fn collect_closure_envs(
+    outline: &Outline,
+    krate: usize,
+    magic: &[u8; 8],
+) -> Vec<(String, Option<u64>)> {
+    let mut merged = std::collections::BTreeMap::new();
+    for at in closure_crates(outline, krate) {
+        if let Some(tree) = outline.crates.get(at) {
+            let reads = crate::sync::lock(&tree.env.env_reads);
+            for (name, val) in reads.iter() {
+                let hashed = val.as_deref().map(|v| store::hash_env_val(magic, name, v));
+                merged.insert(name.clone(), hashed);
+            }
+        }
+    }
+    merged.into_iter().collect()
 }
 
 /// The key of each script unit's executable: the hash of its crate and of every crate that crate reaches, under this toolchain, target, profile and compiler.
@@ -281,10 +390,10 @@ impl Binaries {
     /// What the store holds for the script of `unit` under its key; the caller holds the unit's lock.
     pub(super) fn kept(&self, workspace: &Workspace, unit: usize) -> Kept {
         let dir = self.unit_dir(workspace, unit);
-        let Some(key) = self.keys.get(&unit) else {
+        let Some(&key) = self.keys.get(&unit) else {
             return Kept::Missing;
         };
-        if std::fs::read_to_string(dir.join(KEY)).ok().as_deref() != Some(key_text(*key).as_str()) {
+        if !validate_watch_manifest(&dir.join(KEY), KEY_MAGIC, KEY_VERSION, key) {
             return Kept::Missing;
         }
         let executable = dir.join(EXECUTABLE);
@@ -369,12 +478,18 @@ impl Binaries {
                 let meta = crate::with_config(Arc::clone(&self.outer_cfg), || {
                     fast_meta_hash(workspace, &self.outer_targets, unit)
                 });
-                let files = collect_closure_files(&compilation.outline, krate);
-                drop(write_fast_manifest(&dir, meta, &files));
+                let files = collect_closure_files(&compilation.outline, krate, true);
+                let fast_envs = collect_closure_envs(&compilation.outline, krate, &FAST_MAGIC);
+                drop(write_fast_manifest(&dir, meta, &files, &fast_envs));
             }
             Err(_) => store::remove(&staged)?,
         }
-        store::write_new(&dir.join(KEY), key_text(key))
+        let included = collect_closure_files(&compilation.outline, krate, false);
+        let key_envs = collect_closure_envs(&compilation.outline, krate, &KEY_MAGIC);
+        match encode_watch_manifest(KEY_MAGIC, KEY_VERSION, key, &included, &key_envs) {
+            Some(bytes) => store::write_new_bytes(&dir.join(KEY), &bytes),
+            None => Ok(()),
+        }
     }
 }
 
@@ -502,22 +617,12 @@ pub(super) fn exec_capture(
 
 /// The hash of crate `krate` and of every crate it reaches in `outline`, since a fixed crate's hash leaves out its build dependencies.
 fn closure_key(outline: &Outline, hashes: &CrateHashes, krate: usize) -> u64 {
-    let mut seen = vec![false; outline.crates.len()];
-    let mut stack = vec![krate];
-    let mut found = Vec::new();
-    while let Some(at) = stack.pop() {
-        if std::mem::replace(&mut seen[at], true) {
-            continue;
-        }
-        found.push(hashes.get(at));
-        stack.extend(outline.deps[at].iter().map(|(_, dep)| *dep));
-    }
+    let mut found: Vec<Option<u64>> = closure_crates(outline, krate)
+        .into_iter()
+        .map(|at| hashes.get(at))
+        .collect();
     found.sort_unstable();
     rustc_hash::FxBuildHasher.hash_one((hashes.get(krate), found))
-}
-
-fn key_text(key: u64) -> String {
-    format!("{key:016x}")
 }
 
 fn read_bytes<'a>(data: &'a [u8], pos: &mut usize, len: usize) -> Option<&'a [u8]> {

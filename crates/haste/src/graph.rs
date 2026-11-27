@@ -11,8 +11,10 @@ pub mod script;
 pub(crate) mod snapshot;
 pub mod store;
 mod sync;
+#[cfg(test)]
+mod tests;
 
-use cache::{SourceCatalog, patch_paths, source_dir, subdirs};
+use cache::{SourceCatalog, patch_paths, source_dir};
 use lock::Locked;
 use manifest::{Kind, Manifest};
 use sync::{lockfile_dirty, missing_root_in_lock, sync_lockfile};
@@ -103,22 +105,7 @@ fn owning_workspace(dir: &Path) -> Result<Option<(PathBuf, toml::Table)>> {
 }
 
 fn member_dirs(top: &Path, workspace: Option<&toml::Table>, key: &str) -> Vec<PathBuf> {
-    let listed = workspace
-        .and_then(|ws| ws.get(key))
-        .and_then(toml::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(toml::Value::as_str);
-    listed
-        .flat_map(|member| match member.strip_suffix("/*") {
-            Some(parent) => subdirs(&top.join(parent))
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|dir| dir.join(MANIFEST_FILE).is_file())
-                .collect(),
-            None => vec![top.join(member)],
-        })
-        .collect()
+    manifest::workspace_member_dirs(top, workspace, key)
 }
 
 fn run_cargo(manifest_dir: &Path, args: &[&str]) -> Result<()> {

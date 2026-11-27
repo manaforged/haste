@@ -481,7 +481,117 @@ fn resolver_of(table: &Table) -> Option<u8> {
     }
 }
 
-/// Parent directories of workspace `members` / `default-members` glob entries (`/*`).
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    let (p, t) = (pattern.as_bytes(), text.as_bytes());
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star, mut match_ti) = (None, 0usize);
+    while ti < t.len() {
+        if pi < p.len() && p[pi] == t[ti] {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == b'*' {
+            star = Some(pi);
+            match_ti = ti;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            match_ti += 1;
+            ti = match_ti;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+fn expand_pattern(top: &Path, pattern: &str) -> Vec<PathBuf> {
+    let trimmed = pattern.trim_end_matches('/');
+    if !trimmed.contains('*') {
+        let path = if trimmed.is_empty() || trimmed == "." {
+            top.to_owned()
+        } else {
+            top.join(trimmed)
+        };
+        return vec![path];
+    }
+    let mut dirs = vec![top.to_owned()];
+    for seg in trimmed.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        let mut next = Vec::new();
+        if seg.contains('*') {
+            for dir in dirs {
+                for sub in super::cache::subdirs(&dir).unwrap_or_default() {
+                    if sub
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|name| wildcard_match(seg, name))
+                    {
+                        next.push(sub);
+                    }
+                }
+            }
+        } else {
+            for dir in dirs {
+                let candidate = dir.join(seg);
+                if candidate.is_dir() {
+                    next.push(candidate);
+                }
+            }
+        }
+        dirs = next;
+    }
+    dirs
+}
+
+/// Workspace member directories listed under `key`, honoring globs and `[workspace].exclude`.
+pub(crate) fn workspace_member_dirs(
+    top: &Path,
+    workspace: Option<&Table>,
+    key: &str,
+) -> Vec<PathBuf> {
+    let top_norm = normalize(top);
+    let excluded: Vec<PathBuf> = workspace
+        .and_then(|ws| ws.get("exclude"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .flat_map(|pat| expand_pattern(top, pat))
+        .map(|dir| normalize(&dir))
+        .collect();
+    let is_excluded = |dir: &Path| {
+        let norm = normalize(dir);
+        excluded
+            .iter()
+            .any(|ex| norm == *ex || (*ex != top_norm && norm.starts_with(ex)))
+    };
+    let listed = workspace
+        .and_then(|ws| ws.get(key))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str);
+    let mut out = Vec::new();
+    for member in listed {
+        let is_glob = member.contains('*');
+        for dir in expand_pattern(top, member) {
+            if is_glob && !dir.join(super::MANIFEST_FILE).is_file() {
+                continue;
+            }
+            if !is_excluded(&dir) && !out.contains(&dir) {
+                out.push(dir);
+            }
+        }
+    }
+    out
+}
+
+/// Parent directories of workspace `members` / `default-members` glob entries.
 pub(crate) fn member_glob_dirs(top: &Path) -> Vec<PathBuf> {
     let Ok(Some(ws)) = workspace_of(top) else {
         return Vec::new();
@@ -495,9 +605,15 @@ pub(crate) fn member_glob_dirs(top: &Path) -> Vec<PathBuf> {
             .flatten()
             .filter_map(toml::Value::as_str);
         for member in listed {
-            if let Some(parent) = member.strip_suffix("/*") {
-                dirs.push(top.join(parent));
+            let trimmed = member.trim_end_matches('/');
+            if !trimmed.contains('*') {
+                continue;
             }
+            let parents = match trimmed.rsplit_once('/') {
+                Some((prefix, _)) => expand_pattern(top, prefix),
+                None => vec![top.to_owned()],
+            };
+            dirs.extend(parents.into_iter().filter(|dir| dir.is_dir()));
         }
     }
     dirs.sort();
@@ -528,10 +644,16 @@ pub(super) fn uses_resolver_v2(
             return matches!(r, 2 | 3);
         }
         let top_norm = normalize(top);
-        return packages
+        if let Some(root) = packages
             .iter()
             .find(|p| !p.locked.is_registry() && normalize(&p.manifest.dir) == top_norm)
-            .is_some_and(|root| package_uses_resolver_v2(&root.manifest));
+        {
+            return package_uses_resolver_v2(&root.manifest);
+        }
+        if let Ok(root_manifest) = read(&top_norm, Some(ws)) {
+            return package_uses_resolver_v2(&root_manifest);
+        }
+        return false;
     }
     let Some(&member) = members.first() else {
         return true;

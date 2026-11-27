@@ -111,9 +111,13 @@ fn member_fns<'a>(
         .flat_map(move |krate| crate_fns(krate, &outline.crates[krate]))
 }
 
+fn target_name_matches(root_name: &str, selected: &str) -> bool {
+    root_name == selected || root_name.replace('-', "_") == selected.replace('-', "_")
+}
+
 fn test_target_selected(outline: &outline::Outline, krate: usize, sel: &crate::Selection) -> bool {
-    let test_name = sel.test.as_deref().map(|n| n.replace('-', "_"));
-    let bin_name = sel.bin.as_deref().map(|n| n.replace('-', "_"));
+    let test_name = sel.test.as_deref();
+    let bin_name = sel.bin.as_deref();
     if !(sel.lib || sel.bins || test_name.is_some() || bin_name.is_some()) {
         return true;
     }
@@ -126,11 +130,10 @@ fn test_target_selected(outline: &outline::Outline, krate: usize, sel: &crate::S
     (sel.lib && is_lib_root)
         || (sel.bins && root.role == outline::Role::Bin)
         || bin_name
-            .as_deref()
-            .is_some_and(|n| root.role == outline::Role::Bin && root.name == n)
-        || test_name
-            .as_deref()
-            .is_some_and(|n| root.role == outline::Role::Test && !is_lib_root && root.name == n)
+            .is_some_and(|n| root.role == outline::Role::Bin && target_name_matches(&root.name, n))
+        || test_name.is_some_and(|n| {
+            root.role == outline::Role::Test && !is_lib_root && target_name_matches(&root.name, n)
+        })
 }
 
 fn is_test_fn(
@@ -705,4 +708,65 @@ fn report(
         std::mem::forget(workspace);
     }
     Ok(status)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_outline() -> outline::Outline {
+        outline::Outline {
+            roots: vec![
+                outline::Root {
+                    unit: 0,
+                    name: "my-bin".to_owned(),
+                    path: std::path::PathBuf::from("src/bin/my-bin.rs"),
+                    role: outline::Role::Bin,
+                    edition: "2021".to_owned(),
+                    proc_macro: false,
+                },
+                outline::Root {
+                    unit: 0,
+                    name: "my-test".to_owned(),
+                    path: std::path::PathBuf::from("tests/my-test.rs"),
+                    role: outline::Role::Test,
+                    edition: "2021".to_owned(),
+                    proc_macro: false,
+                },
+            ],
+            crates: Vec::new(),
+            deps: Vec::new(),
+            cache: outline::tree::Files::default(),
+            procs: rustc_hash::FxHashMap::default(),
+            pins: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_target_selected_matches_hyphenated_bin_and_test_names() {
+        let outline = test_outline();
+        let by_bin_hyphen = crate::Selection {
+            bin: Some("my-bin".to_owned()),
+            ..crate::Selection::default()
+        };
+        let by_bin_under = crate::Selection {
+            bin: Some("my_bin".to_owned()),
+            ..crate::Selection::default()
+        };
+        assert!(test_target_selected(&outline, 0, &by_bin_hyphen));
+        assert!(test_target_selected(&outline, 0, &by_bin_under));
+        assert!(!test_target_selected(&outline, 1, &by_bin_hyphen));
+
+        let by_test_hyphen = crate::Selection {
+            test: Some("my-test".to_owned()),
+            ..crate::Selection::default()
+        };
+        let by_test_under = crate::Selection {
+            test: Some("my_test".to_owned()),
+            ..crate::Selection::default()
+        };
+        assert!(test_target_selected(&outline, 1, &by_test_hyphen));
+        assert!(test_target_selected(&outline, 1, &by_test_under));
+        assert!(!test_target_selected(&outline, 0, &by_test_hyphen));
+    }
 }

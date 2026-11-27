@@ -1,11 +1,11 @@
 # haste
 
-haste is an experimental Rust compiler, in-memory JIT runner, and pure-Rust zero-linker AOT builder with no LLVM in the compiler binary and no per-project `target/` directory (cached artifacts live under `~/.cache/haste`).
+haste is an experimental Rust compiler, in-memory JIT runner, and pure-Rust zero-linker AOT builder with no LLVM in the compiler binary (shared build artifacts live under `~/.cache/haste` instead of per-project `target/` directories).
 
 - **Live hot-reload in a running process (Unix):** edit a function in [`examples/live-server`](examples/live-server/src/main.rs), save, and hit the same TCP server again — same PID, updated response in under 100 ms (`haste run --watch examples/live-server`).
 - **In-memory execution and tests (Unix):** run binaries (`haste run`) and `#[test]` / `#[tokio::test]` suites (`haste test`) without invoking an external linker.
 - **Sub-10 ms resident-daemon edits on bundled `tests/diff`:** `7.1–8.4 ms` on single-line edits with `--daemon` (`8.8x–19.5x` vs `cargo check`); unchanged no-ops exit in `0.5–2.4 ms`.
-- **Pure-Rust zero-linker AOT & cross-compilation:** emit native ELF, Mach-O, and PE32+ executables directly for pure-Rust crates (`haste --release build --target ... -o`), with `--release` compute kernels at `0.68x–1.05x` of `rustc -O3` across 5 benchmarks. See [Limits](#limits) for C archive, debug-info, and trap caveats.
+- **Pure-Rust zero-linker AOT & cross-compilation:** emit native ELF, Mach-O, and experimental PE32+ executables directly for pure-Rust crates (`haste --release build --target ... -o`; Windows is AOT-only — no JIT, daemon, hot-reload, or PDBs). On 5 compute microbenchmarks, `--release` output runs at `0.68x–1.05x` of `rustc -O3`. See [Limits](#limits) for C archive, debug-info, and trap caveats.
 - **Built for fast local dev loops; keep `rustc` in CI:** experimental (`version = "0.0.0"`, no tagged release yet). See [Crate compatibility](#crate-compatibility), [Limits](#limits), and [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Install and quickstart
