@@ -506,6 +506,7 @@ fn pe_idata_maps_explicit_link_libraries_without_guessing_case() {
 
 #[test]
 fn pe_end_to_end_compiler_emit_routes_std_and_explicit_link_attributes() {
+    let _home = crate::sync::lock(&crate::substrate::TEST_HOME_LOCK);
     let base = std::env::current_exe()
         .expect("current test exe")
         .parent()
