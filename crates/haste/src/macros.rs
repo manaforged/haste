@@ -1,6 +1,8 @@
 //! Procedural macros in the image: the calls that name resolution binds are built into one image with haste's `proc_macro` crate, run in a forked child, and their output read back into the outline.
 
 mod expand;
+#[cfg(test)]
+mod tests;
 
 use anyhow::Result;
 use rustc_hash::FxHashMap as HashMap;
@@ -478,9 +480,25 @@ pub fn load(compilation: &mut Compilation, asks: Requests) -> Result<Answer> {
             .procs
             .extend(procs.iter().cloned().zip(outputs));
     }
+    let mut unsettled = false;
+    for krate in asks
+        .names
+        .borrow()
+        .iter()
+        .map(|(at, _)| at.krate as usize)
+        .chain(asks.scopes.borrow().iter().map(|at| at.krate as usize))
+    {
+        if let Some(entry) = compilation.names.crates.get_mut(krate)
+            && entry.settled
+            && entry.pending.iter().any(|p| p.stamp.is_none())
+        {
+            entry.settled = false;
+            unsettled = true;
+        }
+    }
     let more = compilation.names.load(&mut compilation.outline, asks)?;
     let expanded = expand_bound(compilation)?;
-    Ok(match (more, expanded, procs.is_empty()) {
+    Ok(match (more || unsettled, expanded, procs.is_empty()) {
         (true, _, _) | (false, true, _) => Answer::Names,
         (false, false, false) => Answer::Bodies,
         (false, false, true) => Answer::Nothing,
