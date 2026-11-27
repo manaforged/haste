@@ -242,20 +242,19 @@ enum PairKind {
     IntStore(Size),
     FloatLoad(Size),
     FloatStore(Size),
+    VectorLoad,
+    VectorStore,
 }
 
 impl PairKind {
     fn step(self) -> i32 {
-        if matches!(
-            self,
+        match self {
             Self::IntLoad(Size::W)
-                | Self::IntStore(Size::W)
-                | Self::FloatLoad(Size::W)
-                | Self::FloatStore(Size::W)
-        ) {
-            4
-        } else {
-            8
+            | Self::IntStore(Size::W)
+            | Self::FloatLoad(Size::W)
+            | Self::FloatStore(Size::W) => 4,
+            Self::VectorLoad | Self::VectorStore => 16,
+            _ => 8,
         }
     }
 }

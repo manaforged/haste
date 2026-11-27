@@ -12,7 +12,7 @@ mod vconst;
 use super::asm::{Alu, ExtOp, Reg, Shift};
 use crate::alloc::{Location, Plan};
 use crate::ir::{Binary, Convert, Function, Inst, Op, Type, Unary, Value};
-pub(super) use alu::ext_swapped;
+pub(super) use alu::{ext_swapped, select_step_parts};
 pub(super) use bfi::bfi_parts;
 pub(super) use bits::{
     Bfx, bfx_parts, conv_bfx_parts, extr_parts, single_bit_mask, unwrap_elided_tst,
@@ -516,6 +516,7 @@ pub(super) fn fuse(func: &Function, plan: &mut Plan<Reg>, lse: bool) {
     bits::fuse_tst(func, plan, (&uses, &pos_of));
     fuse_fits(func, plan, (&uses, &pos_of));
     ccmp::fuse_ccmp(func, plan, (&uses, &pos_of));
+    alu::fuse_select_add(func, plan, (&uses, &pos_of));
     mem::fuse_atomic_addrs(func, plan, lse, (&uses, &pos_of));
     mem::fuse_store_ireduce(func, plan, &uses);
 }

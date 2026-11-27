@@ -25,7 +25,7 @@ impl Asm {
         if matches!(kind, PairKind::IntLoad(_)) {
             return r1 != r2 && r1 != ZR.0 && r2 != ZR.0 && (base == SP || prev_reg != base.0);
         }
-        !(matches!(kind, PairKind::FloatLoad(_)) && r1 == r2)
+        !(matches!(kind, PairKind::FloatLoad(_) | PairKind::VectorLoad) && r1 == r2)
     }
 
     fn pair_match(
@@ -71,6 +71,8 @@ impl Asm {
                     0x6D00_0000
                 }
             }
+            PairKind::VectorLoad => 0xAD40_0000,
+            PairKind::VectorStore => 0xAD00_0000,
         }
     }
 
@@ -174,6 +176,16 @@ impl Asm {
     }
 
     fn vpair(bytes: u32, reg: u8, load: bool) -> Option<(PairKind, u8)> {
+        if bytes == 16 {
+            return Some((
+                if load {
+                    PairKind::VectorLoad
+                } else {
+                    PairKind::VectorStore
+                },
+                reg,
+            ));
+        }
         let size = match bytes {
             4 => Size::W,
             8 => Size::X,
@@ -368,5 +380,82 @@ impl Asm {
         self.clobber_anchor(a);
         self.clobber_anchor(b);
         self.clobber_anchor(base);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Asm, Mem, Reg, Vreg};
+    use crate::ir::{Lane, Type};
+    use crate::{AbiParam, CallConv, Effort, Function, FunctionBuilder, Signature, Target};
+
+    fn words(bytes: &[u8]) -> Vec<u32> {
+        bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    #[test]
+    fn vload_and_vstore_pair_merge_into_q_ldp_stp() {
+        let mut asm = Asm::default();
+        asm.vload(16, Vreg(4), Mem::new(Reg(1), 0));
+        asm.vload(16, Vreg(5), Mem::new(Reg(1), 16));
+        let load_words = words(&asm.finish().expect("vload pair finishes"));
+        assert_eq!(load_words.len(), 1);
+        assert_eq!(load_words[0] & 0xFFC0_0000, 0xAD40_0000);
+
+        let mut asm = Asm::default();
+        asm.vstore(16, Mem::new(Reg(2), 48), Vreg(6));
+        asm.vstore(16, Mem::new(Reg(2), 32), Vreg(7));
+        let store_words = words(&asm.finish().expect("vstore pair finishes"));
+        assert_eq!(store_words.len(), 1);
+        assert_eq!(store_words[0] & 0xFFC0_0000, 0xAD00_0000);
+
+        let mut asm = Asm::default();
+        asm.vload(16, Vreg(4), Mem::new(Reg(1), 0));
+        asm.vload(16, Vreg(4), Mem::new(Reg(1), 16));
+        let dup_words = words(&asm.finish().expect("duplicate dst vload finishes"));
+        assert_eq!(dup_words.len(), 2);
+    }
+
+    #[test]
+    fn consecutive_i8x16_loads_compile_to_ldp_q() {
+        let mut target = *Target::find("aarch64-apple-darwin").expect("arm64 darwin target");
+        target.effort = Effort::Full;
+        let vty = Type::Vec {
+            lane: Lane::I8,
+            count: 16,
+        };
+        let mut sig = Signature::new(CallConv::Internal);
+        sig.params.push(AbiParam::new(Type::I64));
+        sig.returns.push(AbiParam::new(vty));
+        let mut func = Function::new(sig);
+        {
+            let mut b = FunctionBuilder::new(&mut func);
+            let entry = b.create_block();
+            b.append_block_params_for_function_params(entry);
+            let p = b.block_params(entry).to_vec();
+            b.switch_to_block(entry);
+            let v0 = b.ins().load(vty, p[0], 0);
+            let v1 = b.ins().load(vty, p[0], 16);
+            let v2 = b.ins().load(vty, p[0], 32);
+            let v3 = b.ins().load(vty, p[0], 48);
+            let s0 = b.ins().iadd(v0, v1);
+            let s1 = b.ins().iadd(v2, v3);
+            let sum = b.ins().iadd(s0, s1);
+            b.ins().return_(&[sum]);
+        }
+        let code =
+            super::super::super::compile(&func, &target).expect("arm64 vector pair compiles");
+        let code_words = words(code.bytes());
+        assert_eq!(
+            code_words
+                .iter()
+                .filter(|&&w| (w & 0xFFC0_0000) == 0xAD40_0000)
+                .count(),
+            2,
+            "expected two q-register ldp instructions in {code_words:#x?}"
+        );
     }
 }

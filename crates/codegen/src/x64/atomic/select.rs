@@ -2,7 +2,7 @@ use crate::alloc::Location;
 use crate::frame::Ext;
 use crate::ir::{Binary, Convert, IntCC, Op, Type, Value};
 use crate::x64::asm::{Alu, Cond, Mem, Reg, Size};
-use crate::x64::float::{X0, X1};
+use crate::x64::float::{X0, X1, X2};
 use crate::x64::location::LEAF;
 use crate::x64::{Emit, int};
 
@@ -303,21 +303,7 @@ impl Emit<'_> {
         let mut cond = if flip { orig_cond.invert() } else { orig_cond };
         let ty = self.ty(x);
         if ty.in_float_register() {
-            let dst = self.fdst(result);
-            let (mut x, mut y) = (x, y);
-            if self.xmm_of(x) == Some(dst) {
-                (x, y) = (y, x);
-                cond = cond.invert();
-            }
-            let done = self.asm.label();
-            self.flags = Some((condition, orig_cond));
-            self.fget(dst, y);
-            self.asm.jcc(cond.invert(), done);
-            self.fget(dst, x);
-            self.asm.bind(done);
-            self.clobber_reg(Reg::Rax);
-            self.spills.clear_fspill();
-            self.fput(result, dst);
+            self.float_select((condition, orig_cond), cond, (x, y), (ty, result));
             return;
         }
         if ty == Type::I128 {
@@ -347,6 +333,53 @@ impl Emit<'_> {
         self.asm.cmov(cond, dst, source);
         self.clobber_reg(dst);
         self.put(result, dst);
+    }
+
+    fn float_select(
+        &mut self,
+        root: (Value, Cond),
+        mut cond: Cond,
+        (mut x, mut y): (Value, Value),
+        (ty, result): (Type, Value),
+    ) {
+        let dst = self.xmm_of(result).unwrap_or(X2);
+        if self.xmm_of(x) == Some(dst) {
+            (x, y) = (y, x);
+            cond = cond.invert();
+        }
+        self.flags = Some(root);
+        self.asm.setcc(cond.invert(), Reg::Rax);
+        self.asm.load(Size::B, Reg::Rax, Reg::Rax);
+        self.asm.lea(Reg::Rax, Mem::new(Reg::Rax, -1));
+        self.asm.movq_in(X0, Reg::Rax);
+        if self.features.avx {
+            let sy = self.xmm_of(y).unwrap_or_else(|| {
+                self.fget(dst, y);
+                dst
+            });
+            let sx = self.fin(x, X1);
+            let opcode = if ty == Type::F64 { 0x4B } else { 0x4A };
+            self.asm
+                .vex_xmm_imm(0b00011, 0b01, opcode, (dst, sy), sx, X0.0 << 4);
+        } else if self.features.sse41 {
+            self.fget(dst, y);
+            let sx = self.fin(x, X1);
+            let opcode = if ty == Type::F64 { 0x15 } else { 0x14 };
+            self.asm.sse(&[0x66], &[0x0F, 0x38, opcode], dst.0, sx);
+        } else {
+            let sx = self.fin(x, X1);
+            if sx != X1 {
+                self.asm.movaps(X1, sx);
+            }
+            self.fget(dst, y);
+            self.asm.sse(&[0x66], &[0x0F, 0x54], X1.0, X0);
+            self.asm.sse(&[0x66], &[0x0F, 0x55], X0.0, dst);
+            self.asm.movaps(dst, X0);
+            self.asm.sse(&[0x66], &[0x0F, 0x56], dst.0, X1);
+        }
+        self.clobber_reg(Reg::Rax);
+        self.clobber_xmms(&[X0, X1, dst]);
+        self.fput(result, dst);
     }
 
     fn select_const_pair(
@@ -439,5 +472,102 @@ impl Emit<'_> {
     fn emit_setcc_byte(&mut self, cond: Cond, dst: Reg) {
         self.asm.setcc(cond, dst);
         self.asm.load(Size::B, dst, dst);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::compile;
+    use super::super::super::features::Features;
+    use crate::Effort;
+    use crate::ir::{AbiParam, CallConv, Function, IntCC, Signature, Type};
+    use crate::{FunctionBuilder, Target};
+
+    fn x64_full() -> Target {
+        let mut target = *Target::find("x86_64-unknown-linux-gnu").expect("x64 linux target");
+        target.effort = Effort::Full;
+        target
+    }
+
+    #[test]
+    fn float_select_is_branchless_for_f64_and_f32() {
+        let target = x64_full();
+        let features = Features::for_target(&target);
+        for (ty, avx_opc, sse41_opc) in [(Type::F64, 0x4B_u8, 0x15_u8), (Type::F32, 0x4A, 0x14)] {
+            let mut sig = Signature::new(CallConv::Internal);
+            sig.params = vec![
+                AbiParam::new(Type::I64),
+                AbiParam::new(ty),
+                AbiParam::new(ty),
+            ];
+            sig.returns = vec![AbiParam::new(ty)];
+            let mut func = Function::new(sig);
+            {
+                let mut b = FunctionBuilder::new(&mut func);
+                let entry = b.create_block();
+                b.append_block_params_for_function_params(entry);
+                let p = b.block_params(entry).to_vec();
+                b.switch_to_block(entry);
+                let cmp = b.ins().icmp_imm(IntCC::Equal, p[0], 0);
+                let sel = b.ins().select(cmp, p[1], p[2]);
+                b.ins().return_(&[sel]);
+            }
+            let code = compile(&func, &target).expect("x64 float select compiles");
+            let bytes = code.bytes();
+            assert!(
+                bytes.windows(4).any(|w| w == [0x48, 0x8D, 0x40, 0xFF]),
+                "expected lea rax, [rax - 1] mask build in {bytes:02x?}"
+            );
+            if features.avx {
+                assert!(
+                    bytes.contains(&0xC4) && bytes.contains(&avx_opc),
+                    "expected vblendv opcode {avx_opc:#x} in {bytes:02x?}"
+                );
+            } else if features.sse41 {
+                assert!(
+                    bytes.windows(4).any(|w| w == [0x66, 0x0F, 0x38, sse41_opc]),
+                    "expected blendv opcode {sse41_opc:#x} in {bytes:02x?}"
+                );
+            } else {
+                assert!(
+                    bytes.windows(3).any(|w| w == [0x66, 0x0F, 0x54])
+                        && bytes.windows(3).any(|w| w == [0x66, 0x0F, 0x55])
+                        && bytes.windows(3).any(|w| w == [0x66, 0x0F, 0x56]),
+                    "expected SSE2 andpd/andnpd/orpd in {bytes:02x?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn float_select_preserves_flags_for_second_consumer() {
+        let target = x64_full();
+        let mut sig = Signature::new(CallConv::Internal);
+        sig.params = vec![
+            AbiParam::new(Type::I64),
+            AbiParam::new(Type::F64),
+            AbiParam::new(Type::F64),
+            AbiParam::new(Type::I64),
+            AbiParam::new(Type::I64),
+        ];
+        sig.returns = vec![AbiParam::new(Type::F64), AbiParam::new(Type::I64)];
+        let mut func = Function::new(sig);
+        {
+            let mut b = FunctionBuilder::new(&mut func);
+            let entry = b.create_block();
+            b.append_block_params_for_function_params(entry);
+            let p = b.block_params(entry).to_vec();
+            b.switch_to_block(entry);
+            let cmp = b.ins().icmp_imm(IntCC::Equal, p[0], 0);
+            let fsel = b.ins().select(cmp, p[1], p[2]);
+            let isel = b.ins().select(cmp, p[3], p[4]);
+            b.ins().return_(&[fsel, isel]);
+        }
+        let code = compile(&func, &target).expect("x64 shared-flag float select compiles");
+        assert!(
+            code.bytes()
+                .windows(4)
+                .any(|w| w == [0x48, 0x8D, 0x40, 0xFF])
+        );
     }
 }

@@ -264,6 +264,16 @@ pub(in super::super) fn cinc_operand(
     }
 }
 
+fn is_elided_select(
+    func: &Function,
+    plan: &Plan<Reg>,
+    val: Value,
+    def: &dyn Fn(Value) -> Option<Inst>,
+) -> bool {
+    plan.elided[val.index()]
+        && def(val).is_some_and(|inst| matches!(func.insts[inst.index()].op, Op::Select(..)))
+}
+
 pub(in super::super) fn preserves_flags(
     func: &Function,
     plan: &Plan<Reg>,
@@ -292,6 +302,8 @@ pub(in super::super) fn preserves_flags(
                     Binary::Iadd | Binary::Isub => {
                         cinc_operand(func, plan, x, def).is_none()
                             && cinc_operand(func, plan, y, def).is_none()
+                            && !is_elided_select(func, plan, x, def)
+                            && !is_elided_select(func, plan, y, def)
                     }
                     Binary::Imul
                     | Binary::Bxor

@@ -64,7 +64,7 @@ impl Emit<'_> {
             )
     }
 
-    fn select_cond(&mut self, condition: Value) -> Cond {
+    pub(in crate::arm64) fn select_cond(&mut self, condition: Value) -> Cond {
         if let Some((val, c)) = self.flags
             && val == condition
         {
