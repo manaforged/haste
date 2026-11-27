@@ -1,9 +1,9 @@
 use anyhow::{Context as _, Result, bail};
 
 use crate::outline::rules::{Meta, Op, Piece, Rule};
-use crate::sema::summary::codec::{Cursor, write_u32, write_u32s};
+use crate::sema::summary::codec::{write_u32, write_u32s};
 
-use super::{read_frag, read_opt_u32, read_u32s_map, write_frag, write_opt_u32, write_usize};
+use super::{Reader, write_frag, write_opt_u32, write_usize};
 
 const OP_KINDS: [Op; 3] = [Op::Many, Op::Some, Op::Maybe];
 
@@ -21,14 +21,14 @@ pub(in super::super) fn write_rules(
     Some(())
 }
 
-pub(in super::super) fn read_rules(cur: &mut Cursor<'_>, remap: &[u32]) -> Result<Vec<Rule>> {
-    let count = cur.count()?;
+pub(in super::super) fn read_rules(reader: &mut Reader<'_>, remap: &[u32]) -> Result<Vec<Rule>> {
+    let count = reader.count()?;
     let mut rules = Vec::with_capacity(count);
     for _ in 0..count {
         rules.push(Rule {
-            matcher: read_pieces(cur, remap)?,
-            body: read_pieces(cur, remap)?,
-            slots: cur.u32()? as usize,
+            matcher: read_pieces(reader, remap)?,
+            body: read_pieces(reader, remap)?,
+            slots: reader.u32()? as usize,
         });
     }
     Ok(rules)
@@ -91,44 +91,47 @@ fn write_pieces(out: &mut Vec<u8>, pieces: &[Piece], to_local: &[Option<u32>]) -
     Some(())
 }
 
-fn read_pieces(cur: &mut Cursor<'_>, remap: &[u32]) -> Result<Vec<Piece>> {
-    let count = cur.count()?;
+fn read_pieces(reader: &mut Reader<'_>, remap: &[u32]) -> Result<Vec<Piece>> {
+    let count = reader.count()?;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
     let mut pieces = Vec::with_capacity(count);
     for _ in 0..count {
-        pieces.push(match cur.u8()? {
-            0 => Piece::Token(cur.u32()?),
-            1 => Piece::Group(cur.u32()?, read_pieces(cur, remap)?),
+        pieces.push(match reader.u8()? {
+            0 => Piece::Token(reader.u32()?),
+            1 => Piece::Group(reader.u32()?, read_pieces(reader, remap)?),
             2 => {
-                let at = cur.u32()?;
-                let frag = if cur.u8()? != 0 {
-                    Some(read_frag(cur)?)
+                let at = reader.u32()?;
+                let frag = if reader.u8()? != 0 {
+                    Some(super::read_frag(reader)?)
                 } else {
                     None
                 };
-                let slot = read_opt_u32(cur)?;
+                let slot = reader.opt_u32()?;
                 Piece::Var(at, frag, slot)
             }
             3 => {
-                let mapped = match read_opt_u32(cur)? {
+                let mapped = match reader.opt_u32()? {
                     Some(k) => Some(*remap.get(k as usize).context("macro crate out of bounds")?),
                     None => None,
                 };
                 Piece::Crate(mapped)
             }
             4 => Piece::CratePath,
-            5 => Piece::Meta(read_meta(cur)?),
+            5 => Piece::Meta(read_meta(reader)?),
             6 => {
-                let inner = read_pieces(cur, remap)?;
-                let sep = if cur.u8()? != 0 {
-                    Some((cur.u32()?, cur.u32()?))
+                let inner = read_pieces(reader, remap)?;
+                let sep = if reader.u8()? != 0 {
+                    Some((reader.u32()?, reader.u32()?))
                 } else {
                     None
                 };
                 let op = OP_KINDS
-                    .get(cur.u8()? as usize)
+                    .get(reader.u8()? as usize)
                     .copied()
                     .context("invalid repeat op")?;
-                let slots = read_u32s_map(cur, |v| v)?.into_boxed_slice();
+                let slots = reader.u32s_map(|v| v)?.into_boxed_slice();
                 Piece::Repeat(inner, sep, op, slots)
             }
             _ => bail!("invalid piece tag"),
@@ -167,17 +170,17 @@ fn write_meta(out: &mut Vec<u8>, meta: &Meta) -> Option<()> {
     Some(())
 }
 
-fn read_meta(cur: &mut Cursor<'_>) -> Result<Meta> {
-    Ok(match cur.u8()? {
-        0 => Meta::Ignore(read_opt_u32(cur)?),
-        1 => Meta::Index(cur.u32()? as usize),
-        2 => Meta::Len(cur.u32()? as usize),
-        3 => Meta::Count(read_opt_u32(cur)?),
+fn read_meta(reader: &mut Reader<'_>) -> Result<Meta> {
+    Ok(match reader.u8()? {
+        0 => Meta::Ignore(reader.opt_u32()?),
+        1 => Meta::Index(reader.u32()? as usize),
+        2 => Meta::Len(reader.u32()? as usize),
+        3 => Meta::Count(reader.opt_u32()?),
         4 => {
-            let count = cur.count()?;
+            let count = reader.count()?;
             let mut parts = Vec::with_capacity(count);
             for _ in 0..count {
-                parts.push((read_opt_u32(cur)?, cur.u32()?));
+                parts.push((reader.opt_u32()?, reader.u32()?));
             }
             Meta::Concat(parts)
         }

@@ -429,7 +429,6 @@ pub(crate) fn save(
 mod tests {
     use super::*;
     use crate::outline::Role;
-    use crate::sema::summary::codec::Cursor;
 
     fn temp_dir(tag: &str) -> PathBuf {
         let seq = std::time::SystemTime::now()
@@ -584,9 +583,8 @@ mod tests {
             ),
         ];
         super::super::sysroot::tokens::write_marks(&mut out, &marks, &[Some(0)]).expect("write");
-        let mut cur = Cursor::new(&out);
-        let decoded = super::super::sysroot::tokens::read_marks(&mut cur, &[0], LOCAL_SCOPE_BIT)
-            .expect("read");
+        let decoded =
+            super::super::sysroot::tokens::read_marks(&out, &[0], LOCAL_SCOPE_BIT).expect("read");
         assert_eq!(
             decoded[0].1,
             Mark::Scope {

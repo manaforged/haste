@@ -6,11 +6,11 @@ use rustc_hash::FxHashMap as HashMap;
 use crate::macros::Compilation;
 use crate::names::{ItemRef, PRIMITIVES};
 use crate::sema::impls::{Head, ImplRef, Index, TraitBucket};
-use crate::sema::summary::codec::{Cursor, write_u32};
+use crate::sema::summary::codec::write_u32;
 use crate::sema::ty::Mut;
 use crate::sema::{Cache, Context};
 
-use super::tokens::{read_u32s_map, u32_le, write_usize};
+use super::tokens::{Reader, write_usize};
 use super::wire::Tables;
 
 pub(super) fn build_module_heads(
@@ -37,14 +37,15 @@ fn write_item_ref(out: &mut Vec<u8>, item: ItemRef, tables: &Tables<'_>) -> Opti
     Some(())
 }
 
-fn read_item_ref(cur: &mut Cursor<'_>, remap: &[u32]) -> Result<ItemRef> {
-    let b = cur.take(12)?;
-    let local = u32_le(b, 0) as usize;
+#[inline(always)]
+fn read_item_ref(reader: &mut Reader<'_>, remap: &[u32]) -> Result<ItemRef> {
+    let [k0, k1, k2, k3, f0, f1, f2, f3, i0, i1, i2, i3] = reader.take_array::<12>()?;
+    let local = u32::from_le_bytes([k0, k1, k2, k3]) as usize;
     let krate = *remap.get(local).context("impl item crate out of bounds")?;
     Ok(ItemRef {
         krate,
-        file: u32_le(b, 4),
-        item: u32_le(b, 8),
+        file: u32::from_le_bytes([f0, f1, f2, f3]),
+        item: u32::from_le_bytes([i0, i1, i2, i3]),
     })
 }
 
@@ -74,15 +75,16 @@ fn write_head(out: &mut Vec<u8>, head: Head, tables: &Tables<'_>) -> Option<()> 
     Some(())
 }
 
-fn read_head(cur: &mut Cursor<'_>, remap: &[u32]) -> Result<Head> {
-    Ok(match cur.u8()? {
+#[inline(always)]
+fn read_head(reader: &mut Reader<'_>, remap: &[u32]) -> Result<Head> {
+    Ok(match reader.u8()? {
         0 => Head::Prim(
             PRIMITIVES
-                .get(cur.u8()? as usize)
+                .get(reader.u8()? as usize)
                 .map(|&(_, p)| p)
                 .context("invalid impl head primitive")?,
         ),
-        1 => Head::Adt(read_item_ref(cur, remap)?),
+        1 => Head::Adt(read_item_ref(reader, remap)?),
         2 => Head::Ref(Mut::Not),
         3 => Head::Ref(Mut::Mut),
         4 => Head::Ptr(Mut::Not),
@@ -91,7 +93,7 @@ fn read_head(cur: &mut Cursor<'_>, remap: &[u32]) -> Result<Head> {
         7 => Head::Array,
         8 => Head::Tuple,
         9 => Head::Never,
-        10 => Head::Dyn(read_item_ref(cur, remap)?),
+        10 => Head::Dyn(read_item_ref(reader, remap)?),
         _ => bail!("invalid impl head tag"),
     })
 }
@@ -114,8 +116,9 @@ fn write_impl_refs(out: &mut Vec<u8>, refs: &[ImplRef], krate: u32) -> Option<()
     Some(())
 }
 
-fn read_impl_refs(cur: &mut Cursor<'_>, krate: u32) -> Result<Vec<ImplRef>> {
-    read_u32s_map(cur, |index| ImplRef::Module { krate, index })
+#[inline(always)]
+fn read_impl_refs(reader: &mut Reader<'_>, krate: u32) -> Result<Vec<ImplRef>> {
+    reader.u32s_map(|index| ImplRef::Module { krate, index })
 }
 
 fn encode_index(out: &mut Vec<u8>, index: &Index, krate: u32, tables: &Tables<'_>) -> Option<()> {
@@ -167,33 +170,33 @@ pub(super) fn write_impl_index(
 }
 
 pub(super) fn read_impl_index(
-    cur: &mut Cursor<'_>,
+    reader: &mut Reader<'_>,
     krate: u32,
     remap: &[u32],
 ) -> Result<Option<Arc<Index>>> {
-    match cur.u8()? {
+    match reader.u8()? {
         0 => return Ok(None),
         1 => {}
         _ => bail!("invalid impl index presence tag"),
     }
-    let inherent_len = cur.count()?;
+    let inherent_len = reader.count()?;
     let mut inherent = HashMap::with_capacity_and_hasher(inherent_len, Default::default());
     for _ in 0..inherent_len {
-        let head = read_head(cur, remap)?;
-        let refs = read_impl_refs(cur, krate)?;
+        let head = read_head(reader, remap)?;
+        let refs = read_impl_refs(reader, krate)?;
         inherent.insert(head, refs);
     }
-    let traits_len = cur.count()?;
+    let traits_len = reader.count()?;
     let mut traits = HashMap::with_capacity_and_hasher(traits_len, Default::default());
     for _ in 0..traits_len {
-        let of = read_item_ref(cur, remap)?;
-        let all = read_impl_refs(cur, krate)?;
-        let blanket = read_impl_refs(cur, krate)?;
-        let by_head_len = cur.count()?;
+        let of = read_item_ref(reader, remap)?;
+        let all = read_impl_refs(reader, krate)?;
+        let blanket = read_impl_refs(reader, krate)?;
+        let by_head_len = reader.count()?;
         let mut by_head = HashMap::with_capacity_and_hasher(by_head_len, Default::default());
         for _ in 0..by_head_len {
-            let head = read_head(cur, remap)?;
-            let refs = read_impl_refs(cur, krate)?;
+            let head = read_head(reader, remap)?;
+            let refs = read_impl_refs(reader, krate)?;
             by_head.insert(head, refs);
         }
         traits.insert(
@@ -205,14 +208,14 @@ pub(super) fn read_impl_index(
             },
         );
     }
-    let negative_len = cur.count()?;
+    let negative_len = reader.count()?;
     let mut negative = HashMap::with_capacity_and_hasher(negative_len, Default::default());
     for _ in 0..negative_len {
-        let of = read_item_ref(cur, remap)?;
-        let heads_len = cur.count()?;
+        let of = read_item_ref(reader, remap)?;
+        let heads_len = reader.count()?;
         let mut heads = Vec::with_capacity(heads_len);
         for _ in 0..heads_len {
-            heads.push(read_head(cur, remap)?);
+            heads.push(read_head(reader, remap)?);
         }
         negative.insert(of, heads);
     }

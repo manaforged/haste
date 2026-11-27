@@ -7,11 +7,11 @@ use crate::outline::tree::{
     Crate as OutlineCrate, Decl, File, Held, Impl, Macro, MemberBlock, Module, State, Textual,
     Waiting,
 };
-use crate::sema::summary::codec::{Cursor, write_u32};
+use crate::sema::summary::codec::write_u32;
 
 use super::tokens::{
-    read_opt_u32, read_path, read_paths, read_str, read_u32s_map, read_vis, u32_le, write_opt_u32,
-    write_path, write_paths, write_str, write_usize, write_vis,
+    Reader, read_vis, u32_le, write_opt_u32, write_path, write_paths, write_str, write_usize,
+    write_vis,
 };
 use super::wire::{Tables, opt_u32_le};
 
@@ -24,6 +24,7 @@ fn write_waiting<'a>(out: &mut Vec<u8>, w: &'a Waiting, tables: &mut Tables<'a>)
     Some(())
 }
 
+#[inline(always)]
 fn decode_waiting(b: &[u8], files: &[Arc<File>], textuals: &[Arc<Textual>]) -> Result<Waiting> {
     let file = Arc::clone(
         files
@@ -73,16 +74,19 @@ fn write_impls(out: &mut Vec<u8>, impls: &[Impl]) -> Option<()> {
     Some(())
 }
 
-fn read_impls(cur: &mut Cursor<'_>) -> Result<Vec<Impl>> {
-    let count = cur.count()?;
+fn read_impls(reader: &mut Reader<'_>) -> Result<Vec<Impl>> {
+    let count = reader.count()?;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
     let mut impls = Vec::with_capacity(count);
     for _ in 0..count {
-        let b = cur.take(12)?;
-        let parts = read_u32s_map(cur, |v| v as usize)?;
+        let b = reader.take_array::<12>()?;
+        let parts = reader.u32s_map(|v| v as usize)?;
         impls.push(Impl {
-            file: u32_le(b, 0) as usize,
-            at: u32_le(b, 4),
-            module: u32_le(b, 8) as usize,
+            file: u32_le(&b, 0) as usize,
+            at: u32_le(&b, 4),
+            module: u32_le(&b, 8) as usize,
             parts,
         });
     }
@@ -98,12 +102,15 @@ fn write_local_krates(out: &mut Vec<u8>, krates: &[usize], tables: &Tables<'_>) 
 }
 
 fn read_remapped_krates(
-    cur: &mut Cursor<'_>,
+    reader: &mut Reader<'_>,
     remap: &[u32],
     err: &'static str,
 ) -> Result<Vec<usize>> {
-    let count = cur.count()?;
-    let bytes = cur.take(count.checked_mul(4).context("crate list overflow")?)?;
+    let count = reader.count()?;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let bytes = reader.take(count.checked_mul(4).context("crate list overflow")?)?;
     let mut out = Vec::with_capacity(count);
     for c in bytes.chunks_exact(4) {
         out.push(*remap.get(u32_le(c, 0) as usize).context(err)? as usize);
@@ -296,9 +303,12 @@ pub(super) fn write_outline_crate<'a>(
     Some(())
 }
 
-fn read_crate_files(cur: &mut Cursor<'_>, files: &[Arc<File>]) -> Result<Vec<Arc<File>>> {
-    let file_count = cur.count()?;
-    let file_bytes = cur.take(file_count.checked_mul(4).context("crate files overflow")?)?;
+fn read_crate_files(reader: &mut Reader<'_>, files: &[Arc<File>]) -> Result<Vec<Arc<File>>> {
+    let file_count = reader.count()?;
+    if file_count == 0 {
+        return Ok(Vec::new());
+    }
+    let file_bytes = reader.take(file_count.checked_mul(4).context("crate files overflow")?)?;
     let mut crate_files = Vec::with_capacity(file_count);
     for c in file_bytes.chunks_exact(4) {
         crate_files.push(Arc::clone(
@@ -310,31 +320,31 @@ fn read_crate_files(cur: &mut Cursor<'_>, files: &[Arc<File>]) -> Result<Vec<Arc
     Ok(crate_files)
 }
 
-fn read_module(cur: &mut Cursor<'_>, textuals: &[Arc<Textual>]) -> Result<Module> {
-    let b = cur.take(12)?;
-    let file = opt_u32_le(b, 0).map_or(usize::MAX, |v| v as usize);
-    let item = opt_u32_le(b, 4);
-    let parent = opt_u32_le(b, 8).map(|v| v as usize);
-    let name = read_str(cur)?.to_owned();
-    let dir = read_path(cur)?;
-    let parts = read_u32s_map(cur, |v| v as usize)?;
-    let vis = read_vis(cur)?;
-    let macro_use = cur.u8()? != 0;
-    let state = match cur.u8()? {
+fn read_module(reader: &mut Reader<'_>, textuals: &[Arc<Textual>]) -> Result<Module> {
+    let b = reader.take_array::<12>()?;
+    let file = opt_u32_le(&b, 0).map_or(usize::MAX, |v| v as usize);
+    let item = opt_u32_le(&b, 4);
+    let parent = opt_u32_le(&b, 8).map(|v| v as usize);
+    let name = reader.str()?.to_owned();
+    let dir = reader.path()?;
+    let parts = reader.u32s_map(|v| v as usize)?;
+    let vis = read_vis(reader)?;
+    let macro_use = reader.u8()? != 0;
+    let state = match reader.u8()? {
         0 => State::Declared(Decl::Inline {
-            file: cur.u32()? as usize,
-            at: cur.u32()?,
+            file: reader.u32()? as usize,
+            at: reader.u32()?,
         }),
         1 => State::Declared(Decl::File {
-            candidates: read_paths(cur)?,
-            by_attr: cur.u8()? != 0,
+            candidates: reader.paths()?,
+            by_attr: reader.u8()? != 0,
         }),
         2 => State::Loaded,
         3 => State::Missing,
         4 => State::Gated,
         _ => bail!("invalid module state tag"),
     };
-    let textual = match read_opt_u32(cur)? {
+    let textual = match reader.opt_u32()? {
         Some(id) => Some(Arc::clone(
             textuals
                 .get(id as usize)
@@ -356,35 +366,44 @@ fn read_module(cur: &mut Cursor<'_>, textuals: &[Arc<Textual>]) -> Result<Module
     })
 }
 
-fn read_modules(cur: &mut Cursor<'_>, textuals: &[Arc<Textual>]) -> Result<Vec<Module>> {
-    let mod_count = cur.count()?;
+fn read_modules(reader: &mut Reader<'_>, textuals: &[Arc<Textual>]) -> Result<Vec<Module>> {
+    let mod_count = reader.count()?;
+    if mod_count == 0 {
+        return Ok(Vec::new());
+    }
     let mut modules = Vec::with_capacity(mod_count);
     for _ in 0..mod_count {
-        modules.push(read_module(cur, textuals)?);
+        modules.push(read_module(reader, textuals)?);
     }
     Ok(modules)
 }
 
-fn read_strings(cur: &mut Cursor<'_>) -> Result<Vec<String>> {
-    let len = cur.count()?;
+fn read_strings(reader: &mut Reader<'_>) -> Result<Vec<String>> {
+    let len = reader.count()?;
+    if len == 0 {
+        return Ok(Vec::new());
+    }
     let mut items = Vec::with_capacity(len);
     for _ in 0..len {
-        items.push(read_str(cur)?.to_owned());
+        items.push(reader.str()?.to_owned());
     }
     Ok(items)
 }
 
 fn read_exports(
-    cur: &mut Cursor<'_>,
+    reader: &mut Reader<'_>,
     macros: &[Arc<Macro>],
 ) -> Result<HashMap<String, Arc<Macro>>> {
-    let export_len = cur.count()?;
+    let export_len = reader.count()?;
+    if export_len == 0 {
+        return Ok(HashMap::default());
+    }
     let mut exports = HashMap::with_capacity_and_hasher(export_len, Default::default());
     for _ in 0..export_len {
-        let name = read_str(cur)?.to_owned();
+        let name = reader.str()?.to_owned();
         let mac = Arc::clone(
             macros
-                .get(cur.u32()? as usize)
+                .get(reader.u32()? as usize)
                 .context("export macro out of bounds")?,
         );
         exports.insert(name, mac);
@@ -393,11 +412,14 @@ fn read_exports(
 }
 
 fn read_defined(
-    cur: &mut Cursor<'_>,
+    reader: &mut Reader<'_>,
     macros: &[Arc<Macro>],
 ) -> Result<HashMap<(u32, u32), Arc<Macro>>> {
-    let def_len = cur.count()?;
-    let def_bytes = cur.take(def_len.checked_mul(12).context("defined macros overflow")?)?;
+    let def_len = reader.count()?;
+    if def_len == 0 {
+        return Ok(HashMap::default());
+    }
+    let def_bytes = reader.take(def_len.checked_mul(12).context("defined macros overflow")?)?;
     let mut defined = HashMap::with_capacity_and_hasher(def_len, Default::default());
     for c in def_bytes.chunks_exact(12) {
         let key = (u32_le(c, 0), u32_le(c, 4));
@@ -411,9 +433,12 @@ fn read_defined(
     Ok(defined)
 }
 
-fn read_impl_bodies(cur: &mut Cursor<'_>) -> Result<Vec<(usize, u32)>> {
-    let body_len = cur.count()?;
-    let body_bytes = cur.take(body_len.checked_mul(8).context("impl bodies overflow")?)?;
+fn read_impl_bodies(reader: &mut Reader<'_>) -> Result<Vec<(usize, u32)>> {
+    let body_len = reader.count()?;
+    if body_len == 0 {
+        return Ok(Vec::new());
+    }
+    let body_bytes = reader.take(body_len.checked_mul(8).context("impl bodies overflow")?)?;
     Ok(body_bytes
         .chunks_exact(8)
         .map(|c| (u32_le(c, 0) as usize, u32_le(c, 4)))
@@ -421,12 +446,15 @@ fn read_impl_bodies(cur: &mut Cursor<'_>) -> Result<Vec<(usize, u32)>> {
 }
 
 fn read_members(
-    cur: &mut Cursor<'_>,
+    reader: &mut Reader<'_>,
     files: &[Arc<File>],
     textuals: &[Arc<Textual>],
 ) -> Result<Vec<(MemberBlock, Waiting)>> {
-    let member_len = cur.count()?;
-    let member_bytes = cur.take(member_len.checked_mul(21).context("members overflow")?)?;
+    let member_len = reader.count()?;
+    if member_len == 0 {
+        return Ok(Vec::new());
+    }
+    let member_bytes = reader.take(member_len.checked_mul(21).context("members overflow")?)?;
     let mut members = Vec::with_capacity(member_len);
     for c in member_bytes.chunks_exact(21) {
         let idx = u32_le(c, 1) as usize;
@@ -440,9 +468,12 @@ fn read_members(
     Ok(members)
 }
 
-fn read_consumed(cur: &mut Cursor<'_>) -> Result<HashSet<(u32, u32)>> {
-    let consumed_len = cur.count()?;
-    let consumed_bytes = cur.take(consumed_len.checked_mul(8).context("consumed overflow")?)?;
+fn read_consumed(reader: &mut Reader<'_>) -> Result<HashSet<(u32, u32)>> {
+    let consumed_len = reader.count()?;
+    if consumed_len == 0 {
+        return Ok(HashSet::default());
+    }
+    let consumed_bytes = reader.take(consumed_len.checked_mul(8).context("consumed overflow")?)?;
     let mut consumed = HashSet::with_capacity_and_hasher(consumed_len, Default::default());
     for c in consumed_bytes.chunks_exact(8) {
         consumed.insert((u32_le(c, 0), u32_le(c, 4)));
@@ -451,32 +482,32 @@ fn read_consumed(cur: &mut Cursor<'_>) -> Result<HashSet<(u32, u32)>> {
 }
 
 pub(super) fn read_outline_crate(
-    cur: &mut Cursor<'_>,
+    reader: &mut Reader<'_>,
     files: &[Arc<File>],
     macros: &[Arc<Macro>],
     textuals: &[Arc<Textual>],
     remap: &[u32],
 ) -> Result<OutlineCrate> {
-    let crate_files = read_crate_files(cur, files)?;
-    let modules = read_modules(cur, textuals)?;
-    let missing = read_paths(cur)?;
-    let gated = read_paths(cur)?;
-    let errors = read_strings(cur)?;
-    let exports = read_exports(cur, macros)?;
-    let defined = read_defined(cur, macros)?;
-    let deferred = read_waitings(cur, files, textuals)?;
-    let impls = read_impls(cur)?;
-    let traits = read_impls(cur)?;
-    let impl_bodies = read_impl_bodies(cur)?;
-    let members = read_members(cur, files, textuals)?;
-    let fallback = read_remapped_krates(cur, remap, "fallback crate out of bounds")?;
-    let foreign = read_waitings(cur, files, textuals)?;
-    let global_asm = read_waitings(cur, files, textuals)?;
-    let derived = read_helds(cur, files)?;
-    let attributed = read_helds(cur, files)?;
-    let consumed = read_consumed(cur)?;
-    let macro_use = read_remapped_krates(cur, remap, "macro_use crate out of bounds")?;
-    let expansions = cur.u32()? as usize;
+    let crate_files = read_crate_files(reader, files)?;
+    let modules = read_modules(reader, textuals)?;
+    let missing = reader.paths()?;
+    let gated = reader.paths()?;
+    let errors = read_strings(reader)?;
+    let exports = read_exports(reader, macros)?;
+    let defined = read_defined(reader, macros)?;
+    let deferred = read_waitings(reader, files, textuals)?;
+    let impls = read_impls(reader)?;
+    let traits = read_impls(reader)?;
+    let impl_bodies = read_impl_bodies(reader)?;
+    let members = read_members(reader, files, textuals)?;
+    let fallback = read_remapped_krates(reader, remap, "fallback crate out of bounds")?;
+    let foreign = read_waitings(reader, files, textuals)?;
+    let global_asm = read_waitings(reader, files, textuals)?;
+    let derived = read_helds(reader, files)?;
+    let attributed = read_helds(reader, files)?;
+    let consumed = read_consumed(reader)?;
+    let macro_use = read_remapped_krates(reader, remap, "macro_use crate out of bounds")?;
+    let expansions = reader.u32()? as usize;
     Ok(OutlineCrate {
         env: Default::default(),
         files: crate_files,
@@ -504,12 +535,15 @@ pub(super) fn read_outline_crate(
 }
 
 fn read_waitings(
-    cur: &mut Cursor<'_>,
+    reader: &mut Reader<'_>,
     files: &[Arc<File>],
     textuals: &[Arc<Textual>],
 ) -> Result<Vec<Waiting>> {
-    let count = cur.count()?;
-    let bytes = cur.take(count.checked_mul(16).context("waitings overflow")?)?;
+    let count = reader.count()?;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let bytes = reader.take(count.checked_mul(16).context("waitings overflow")?)?;
     let mut out = Vec::with_capacity(count);
     for c in bytes.chunks_exact(16) {
         out.push(decode_waiting(c, files, textuals)?);
@@ -517,9 +551,12 @@ fn read_waitings(
     Ok(out)
 }
 
-fn read_helds(cur: &mut Cursor<'_>, files: &[Arc<File>]) -> Result<Vec<Held>> {
-    let count = cur.count()?;
-    let bytes = cur.take(count.checked_mul(20).context("helds overflow")?)?;
+fn read_helds(reader: &mut Reader<'_>, files: &[Arc<File>]) -> Result<Vec<Held>> {
+    let count = reader.count()?;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let bytes = reader.take(count.checked_mul(20).context("helds overflow")?)?;
     let mut out = Vec::with_capacity(count);
     for c in bytes.chunks_exact(20) {
         let file = Arc::clone(

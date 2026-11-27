@@ -1,4 +1,5 @@
 mod batch;
+mod dag;
 mod decode;
 
 use std::sync::Arc;

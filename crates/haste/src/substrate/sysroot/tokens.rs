@@ -9,7 +9,7 @@ use rustc_lexer::{Base, DocStyle, LiteralKind, TokenKind};
 use crate::outline::item::Vis;
 use crate::outline::rules::Frag;
 use crate::outline::source::{Mark, Origins, Token};
-use crate::sema::summary::codec::{Cursor, write_u32};
+use crate::sema::summary::codec::write_u32;
 pub(super) use crate::sema::summary::codec::{read_str, write_str};
 use crate::substrate::{bytes_to_path, path_to_bytes};
 
@@ -76,23 +76,112 @@ const SIMPLE_TOKENS: [TokenKind; 38] = [
 
 pub(super) use crate::substrate::read_u32 as u32_le;
 
-pub(super) fn read_u32s_map<T>(
-    cur: &mut Cursor<'_>,
-    mut f: impl FnMut(u32) -> T,
-) -> Result<Vec<T>> {
-    let count = cur.count()?;
-    let byte_len = count.checked_mul(4).context("u32 slice overflow")?;
-    let bytes = cur.take(byte_len)?;
-    Ok(bytes.chunks_exact(4).map(|c| f(u32_le(c, 0))).collect())
-}
+pub(super) struct Reader<'a>(&'a [u8]);
 
-pub(super) fn read_paths(cur: &mut Cursor<'_>) -> Result<Vec<PathBuf>> {
-    let count = cur.count()?;
-    let mut paths = Vec::with_capacity(count);
-    for _ in 0..count {
-        paths.push(read_path(cur)?);
+impl<'a> Reader<'a> {
+    #[inline(always)]
+    pub(super) fn new(data: &'a [u8]) -> Self {
+        Self(data)
     }
-    Ok(paths)
+
+    #[inline(always)]
+    pub(super) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[inline(always)]
+    pub(super) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[inline(always)]
+    pub(super) fn take_array<const N: usize>(&mut self) -> Result<[u8; N]> {
+        let (head, tail) = self.0.split_first_chunk::<N>().context("unexpected eof")?;
+        self.0 = tail;
+        Ok(*head)
+    }
+
+    #[inline(always)]
+    pub(super) fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        let (head, tail) = self.0.split_at_checked(n).context("unexpected eof")?;
+        self.0 = tail;
+        Ok(head)
+    }
+
+    #[inline(always)]
+    pub(super) fn u8(&mut self) -> Result<u8> {
+        let (&b, tail) = self.0.split_first().context("unexpected eof")?;
+        self.0 = tail;
+        Ok(b)
+    }
+
+    #[inline(always)]
+    pub(super) fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_le_bytes(self.take_array::<4>()?))
+    }
+
+    #[inline(always)]
+    pub(super) fn u64(&mut self) -> Result<u64> {
+        Ok(u64::from_le_bytes(self.take_array::<8>()?))
+    }
+
+    #[inline(always)]
+    pub(super) fn opt_u32(&mut self) -> Result<Option<u32>> {
+        let v = self.u32()?;
+        Ok((v != u32::MAX).then_some(v))
+    }
+
+    #[inline(always)]
+    pub(super) fn count(&mut self) -> Result<usize> {
+        let n = self.u32()? as usize;
+        if n > self.0.len() {
+            bail!("count exceeds remaining bytes");
+        }
+        Ok(n)
+    }
+
+    #[inline(always)]
+    pub(super) fn str(&mut self) -> Result<&'a str> {
+        let len = self.count()?;
+        let bytes = self.take(len)?;
+        std::str::from_utf8(bytes).context("invalid utf-8")
+    }
+
+    #[inline(always)]
+    pub(super) fn path(&mut self) -> Result<PathBuf> {
+        let len = self.count()?;
+        if len == 0 {
+            return Ok(PathBuf::new());
+        }
+        bytes_to_path(self.take(len)?).context("invalid path bytes")
+    }
+
+    #[inline(always)]
+    pub(super) fn paths(&mut self) -> Result<Vec<PathBuf>> {
+        let count = self.count()?;
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let mut paths = Vec::with_capacity(count);
+        for _ in 0..count {
+            paths.push(self.path()?);
+        }
+        Ok(paths)
+    }
+
+    #[inline(always)]
+    pub(super) fn u32s_map<T>(&mut self, mut f: impl FnMut(u32) -> T) -> Result<Vec<T>> {
+        let count = self.count()?;
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let byte_len = count.checked_mul(4).context("u32 slice overflow")?;
+        let bytes = self.take(byte_len)?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|c| f(u32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+            .collect())
+    }
 }
 
 pub(super) fn write_paths(out: &mut Vec<u8>, paths: &[PathBuf]) -> Option<()> {
@@ -110,18 +199,8 @@ pub(super) fn write_path(out: &mut Vec<u8>, path: &std::path::Path) -> Option<()
     Some(())
 }
 
-pub(super) fn read_path(cur: &mut Cursor<'_>) -> Result<PathBuf> {
-    let len = cur.count()?;
-    bytes_to_path(cur.take(len)?).context("invalid path bytes")
-}
-
 pub(super) fn write_opt_u32(out: &mut Vec<u8>, val: Option<u32>) {
     write_u32(out, val.unwrap_or(u32::MAX));
-}
-
-pub(super) fn read_opt_u32(cur: &mut Cursor<'_>) -> Result<Option<u32>> {
-    let v = cur.u32()?;
-    Ok((v != u32::MAX).then_some(v))
 }
 
 pub(super) fn write_usize(out: &mut Vec<u8>, val: usize) -> Option<()> {
@@ -129,6 +208,7 @@ pub(super) fn write_usize(out: &mut Vec<u8>, val: usize) -> Option<()> {
     Some(())
 }
 
+#[inline(always)]
 pub(super) fn vis_tag(vis: Vis) -> (u8, u32) {
     match vis {
         Vis::Private => (0, 0),
@@ -140,6 +220,7 @@ pub(super) fn vis_tag(vis: Vis) -> (u8, u32) {
     }
 }
 
+#[inline(always)]
 pub(super) fn vis_from_tag(tag: u8, at: u32) -> Result<Vis> {
     Ok(match tag {
         0 => Vis::Private,
@@ -372,21 +453,9 @@ fn write_varint(out: &mut Vec<u8>, mut val: u32) {
     out.push(val as u8);
 }
 
-#[inline]
-fn read_varint(cur: &mut Cursor<'_>) -> Result<u32> {
-    let mut val = 0u32;
-    let mut shift = 0u32;
-    loop {
-        let byte = cur.u8()?;
-        val |= u32::from(byte & 0x7f) << shift;
-        if byte < 0x80 {
-            return Ok(val);
-        }
-        shift += 7;
-        if shift >= 35 {
-            bail!("varint overflow");
-        }
-    }
+#[inline(always)]
+fn read_varint(reader: &mut Reader<'_>) -> Result<u32> {
+    read_varint_slice(&mut reader.0)
 }
 
 pub(super) fn write_compact_tokens(out: &mut Vec<u8>, tokens: &[Token]) -> Option<()> {
@@ -426,12 +495,12 @@ pub(super) fn write_compact_tokens(out: &mut Vec<u8>, tokens: &[Token]) -> Optio
 
 /// Decodes `count` compact variable-length tokens from `bytes` and restores delimiter pairs.
 pub(crate) fn decode_compact_tokens(bytes: &[u8], count: usize) -> Result<Vec<Token>> {
-    let mut cur = Cursor::new(bytes);
+    let mut reader = Reader::new(bytes);
     let mut tokens = Vec::with_capacity(count);
     let mut prev_end = 0u32;
     let mut prev_joint = true;
     for idx in 0..count {
-        let header = cur.u8()?;
+        let header = reader.u8()?;
         let tag = (header & 0x3f) as usize;
         let joint = header & 0x40 != 0;
         let non_default_start = header & 0x80 != 0;
@@ -439,26 +508,26 @@ pub(crate) fn decode_compact_tokens(bytes: &[u8], count: usize) -> Result<Vec<To
             SIMPLE_TOKENS[tag]
         } else {
             let payload =
-                u16::try_from(read_varint(&mut cur)?).context("token payload overflow")?;
+                u16::try_from(read_varint(&mut reader)?).context("token payload overflow")?;
             let extra = if tag >= 42 {
-                read_varint(&mut cur)?
+                read_varint(&mut reader)?
             } else {
                 u32::MAX
             };
             decode_complex_token(tag, payload, extra)?
         };
         let start = if non_default_start {
-            read_varint(&mut cur)?
+            read_varint(&mut reader)?
         } else {
             prev_end.wrapping_add(u32::from(!prev_joint && idx > 0))
         };
-        let len = read_varint(&mut cur)?;
+        let len = read_varint(&mut reader)?;
         let raw_len = len | (u32::from(joint) << 31);
         tokens.push(Token::from_raw(kind, start, raw_len, u32::MAX));
         prev_end = start.wrapping_add(len);
         prev_joint = joint;
     }
-    if cur.pos != bytes.len() {
+    if !reader.is_empty() {
         bail!("trailing bytes in compact token stream");
     }
     crate::outline::source::pair_up_tokens(&mut tokens, std::path::Path::new("<sysroot>"))?;
@@ -469,6 +538,7 @@ pub(super) fn frag_tag(frag: Frag) -> u8 {
     FRAG_KINDS.iter().position(|&f| f == frag).unwrap_or(0) as u8
 }
 
+#[inline(always)]
 pub(super) fn frag_from_tag(tag: u8) -> Result<Frag> {
     FRAG_KINDS
         .get(tag as usize)
@@ -480,8 +550,9 @@ pub(super) fn write_frag(out: &mut Vec<u8>, frag: Frag) {
     out.push(frag_tag(frag));
 }
 
-fn read_frag(cur: &mut Cursor<'_>) -> Result<Frag> {
-    frag_from_tag(cur.u8()?)
+#[inline(always)]
+pub(super) fn read_frag(reader: &mut Reader<'_>) -> Result<Frag> {
+    frag_from_tag(reader.u8()?)
 }
 
 pub(in crate::substrate) fn write_marks(
@@ -540,20 +611,21 @@ pub(in crate::substrate) fn write_marks(
     Some(())
 }
 
-#[inline]
-fn read_varint_bytes(data: &[u8], pos: &mut usize) -> Result<u32> {
-    let b0 = *data.get(*pos).context("unexpected eof")?;
-    *pos += 1;
+#[inline(always)]
+fn read_varint_slice(data: &mut &[u8]) -> Result<u32> {
+    let (&b0, mut rest) = data.split_first().context("unexpected eof")?;
     if b0 < 0x80 {
+        *data = rest;
         return Ok(u32::from(b0));
     }
     let mut val = u32::from(b0 & 0x7f);
     let mut shift = 7u32;
     loop {
-        let byte = *data.get(*pos).context("unexpected eof")?;
-        *pos += 1;
+        let (&byte, next) = rest.split_first().context("unexpected eof")?;
+        rest = next;
         val |= u32::from(byte & 0x7f) << shift;
         if byte < 0x80 {
+            *data = rest;
             return Ok(val);
         }
         shift += 7;
@@ -563,8 +635,9 @@ fn read_varint_bytes(data: &[u8], pos: &mut usize) -> Result<u32> {
     }
 }
 
-pub(in crate::substrate) fn read_marks(
-    cur: &mut Cursor<'_>,
+fn decode_marks_body(
+    count: usize,
+    mut rem: &[u8],
     remap: &[u32],
     scope_bit: u32,
 ) -> Result<Vec<(u32, Mark)>> {
@@ -576,34 +649,36 @@ pub(in crate::substrate) fn read_marks(
             s | scope_bit
         }
     };
-    let count = cur.count()?;
-    let byte_len = cur.count()?;
-    let data = cur.take(byte_len)?;
-    let mut pos = 0usize;
+    if count == 0 {
+        if !rem.is_empty() {
+            bail!("trailing bytes in sysroot marks");
+        }
+        return Ok(Vec::new());
+    }
     let mut marks = Vec::with_capacity(count);
     let mut prev_at = 0u32;
     let mut prev_mark: Option<Mark> = None;
     for _ in 0..count {
-        let tag = *data.get(pos).context("unexpected eof")?;
-        pos += 1;
-        let at = prev_at.wrapping_add(read_varint_bytes(data, &mut pos)?);
+        let (&tag, next) = rem.split_first().context("unexpected eof")?;
+        rem = next;
+        let at = prev_at.wrapping_add(read_varint_slice(&mut rem)?);
         let mark = match tag {
             3 => prev_mark.context("repeat mark without previous mark")?,
             0 => Mark::Crate(
                 *remap
-                    .get(read_varint_bytes(data, &mut pos)? as usize)
+                    .get(read_varint_slice(&mut rem)? as usize)
                     .context("mark crate out of bounds")?,
             ),
             1 => Mark::Home {
                 krate: *remap
-                    .get(read_varint_bytes(data, &mut pos)? as usize)
+                    .get(read_varint_slice(&mut rem)? as usize)
                     .context("mark home crate out of bounds")?,
-                file: read_varint_bytes(data, &mut pos)?,
-                item: read_varint_bytes(data, &mut pos)?,
+                file: read_varint_slice(&mut rem)?,
+                item: read_varint_slice(&mut rem)?,
             },
             2 => Mark::Scope {
-                id: map_scope(read_varint_bytes(data, &mut pos)?),
-                parent: map_scope(read_varint_bytes(data, &mut pos)?),
+                id: map_scope(read_varint_slice(&mut rem)?),
+                parent: map_scope(read_varint_slice(&mut rem)?),
             },
             _ => bail!("invalid mark tag"),
         };
@@ -611,10 +686,31 @@ pub(in crate::substrate) fn read_marks(
         prev_mark = Some(mark);
         marks.push((at, mark));
     }
-    if pos != data.len() {
+    if !rem.is_empty() {
         bail!("trailing bytes in sysroot marks");
     }
     Ok(marks)
+}
+
+pub(super) fn read_marks_reader(
+    reader: &mut Reader<'_>,
+    remap: &[u32],
+    scope_bit: u32,
+) -> Result<Vec<(u32, Mark)>> {
+    let count = reader.count()?;
+    let byte_len = reader.count()?;
+    let data = reader.take(byte_len)?;
+    decode_marks_body(count, data, remap, scope_bit)
+}
+
+#[cfg(test)]
+pub(in crate::substrate) fn read_marks(
+    data: &[u8],
+    remap: &[u32],
+    scope_bit: u32,
+) -> Result<Vec<(u32, Mark)>> {
+    let mut reader = Reader::new(data);
+    read_marks_reader(&mut reader, remap, scope_bit)
 }
 
 pub(super) fn write_origins(out: &mut Vec<u8>, origins: &Origins) -> Option<()> {
@@ -632,16 +728,21 @@ pub(super) fn write_origins(out: &mut Vec<u8>, origins: &Origins) -> Option<()> 
     Some(())
 }
 
-pub(super) fn read_origins(cur: &mut Cursor<'_>) -> Result<Origins> {
-    Ok(match cur.u8()? {
+pub(super) fn read_origins(reader: &mut Reader<'_>) -> Result<Origins> {
+    Ok(match reader.u8()? {
         0 => Origins::Read,
         1 => {
-            let count = cur.count()?;
-            let bytes = cur.take(count.checked_mul(8).context("origins overflow")?)?;
+            let count = reader.count()?;
+            let bytes = reader.take(count.checked_mul(8).context("origins overflow")?)?;
             Origins::Copied(
                 bytes
                     .chunks_exact(8)
-                    .map(|c| (u32_le(c, 0), u32_le(c, 4)))
+                    .map(|c| {
+                        (
+                            u32::from_le_bytes([c[0], c[1], c[2], c[3]]),
+                            u32::from_le_bytes([c[4], c[5], c[6], c[7]]),
+                        )
+                    })
                     .collect(),
             )
         }
@@ -657,8 +758,9 @@ pub(super) fn write_vis(out: &mut Vec<u8>, vis: Vis) {
     }
 }
 
-pub(super) fn read_vis(cur: &mut Cursor<'_>) -> Result<Vis> {
-    let tag = cur.u8()?;
-    let at = if tag == 5 { cur.u32()? } else { 0 };
+#[inline(always)]
+pub(super) fn read_vis(reader: &mut Reader<'_>) -> Result<Vis> {
+    let tag = reader.u8()?;
+    let at = if tag == 5 { reader.u32()? } else { 0 };
     vis_from_tag(tag, at)
 }
