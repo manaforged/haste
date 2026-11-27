@@ -354,64 +354,27 @@ fn runtime_unwind_abort_and_lazy_jit_close_fds() {
         haste,
         "extern-c-panic",
         "extern_c_panic",
-        r#"
-use std::panic::catch_unwind;
-extern "C" fn cb() { panic!("in C abi"); }
-fn main() {
-    println!("before");
-    let r = catch_unwind(|| cb());
-    println!("survived {}", r.is_err());
-}
-"#,
+        "use std::panic::catch_unwind;\nextern \"C\" fn cb() { panic!(\"in C abi\"); }\nfn main() {\n    println!(\"before\");\n    let r = catch_unwind(|| cb());\n    println!(\"survived {}\", r.is_err());\n}\n",
     );
     assert_aborts_jit_and_aot(
         haste,
         "double-panic",
         "double_panic",
-        r#"
-use std::panic::catch_unwind;
-struct Bomb;
-impl Drop for Bomb { fn drop(&mut self) { panic!("second"); } }
-fn main() {
-    println!("before");
-    let r = catch_unwind(|| { let _b = Bomb; panic!("first"); });
-    println!("survived {}", r.is_err());
-}
-"#,
+        "use std::panic::catch_unwind;\nstruct Bomb;\nimpl Drop for Bomb { fn drop(&mut self) { panic!(\"second\"); } }\nfn main() {\n    println!(\"before\");\n    let r = catch_unwind(|| { let _b = Bomb; panic!(\"first\"); });\n    println!(\"survived {}\", r.is_err());\n}\n",
     );
 
     assert_aborts_jit_and_aot(
         haste,
         "extern-c-tls-panic",
         "extern_c_tls_panic",
-        r#"
-use std::panic::catch_unwind;
-thread_local! { static TL: u64 = panic!("tls init in extern C"); }
-#[inline(never)] fn slow() -> u64 { std::hint::black_box(7) }
-extern "C" fn cb(flag: bool) -> u64 {
-    let x = TL.with(|v| *v);
-    if flag { x + slow() } else { x }
-}
-fn main() {
-    println!("before");
-    let r = catch_unwind(|| cb(std::hint::black_box(false)));
-    println!("survived {}", r.is_err());
-}
-"#,
+        "use std::panic::catch_unwind;\nthread_local! { static TL: u64 = panic!(\"tls init in extern C\"); }\n#[inline(never)] fn slow() -> u64 { std::hint::black_box(7) }\nextern \"C\" fn cb(flag: bool) -> u64 {\n    let x = TL.with(|v| *v);\n    if flag { x + slow() } else { x }\n}\nfn main() {\n    println!(\"before\");\n    let r = catch_unwind(|| cb(std::hint::black_box(false)));\n    println!(\"survived {}\", r.is_err());\n}\n",
     );
 
     let cunwind = FixtureDir::write_crate(
         "haste-rt",
         "extern-cunwind-ok",
         "extern_cunwind_ok",
-        r#"
-use std::panic::catch_unwind;
-extern "C-unwind" fn cb() { panic!("in C-unwind"); }
-fn main() {
-    let r = catch_unwind(|| cb());
-    println!("caught {}", r.is_err());
-}
-"#,
+        "use std::panic::catch_unwind;\nextern \"C-unwind\" fn cb() { panic!(\"in C-unwind\"); }\nfn main() {\n    let r = catch_unwind(|| cb());\n    println!(\"caught {}\", r.is_err());\n}\n",
     );
     let cu_jit = Command::new(haste)
         .args(["run"])
@@ -432,20 +395,7 @@ fn main() {
         "haste-rt",
         "dict-drop-rest",
         "dict_drop_rest",
-        r#"
-struct D(u32);
-impl Drop for D {
-    fn drop(&mut self) {
-        println!("drop {}", self.0);
-        if self.0 == 0 { panic!("d0"); }
-    }
-}
-fn run_arr<T>(a: [T; 3]) { drop(a); }
-fn main() {
-    let r = std::panic::catch_unwind(|| run_arr([D(0), D(1), D(2)]));
-    println!("caught {}", r.is_err());
-}
-"#,
+        "struct D(u32);\nimpl Drop for D {\n    fn drop(&mut self) {\n        println!(\"drop {}\", self.0);\n        if self.0 == 0 { panic!(\"d0\"); }\n    }\n}\nfn run_arr<T>(a: [T; 3]) { drop(a); }\nfn main() {\n    let r = std::panic::catch_unwind(|| run_arr([D(0), D(1), D(2)]));\n    println!(\"caught {}\", r.is_err());\n}\n",
     );
     let dd_out = Command::new(haste)
         .env("HASTE_DICT_MIN_BYTES", "0")
@@ -471,18 +421,7 @@ fn main() {
         "haste-rt",
         "close-fds",
         "close_fds",
-        r#"
-extern "C" { fn close(fd: i32) -> i32; }
-#[inline(never)] fn late(x: u32) -> u32 { x + 1 }
-fn main() {
-    let mut fd = 3;
-    while fd < 256 {
-        unsafe { close(fd); }
-        fd += 1;
-    }
-    println!("{}", late(41));
-}
-"#,
+        "extern \"C\" { fn close(fd: i32) -> i32; }\n#[inline(never)] fn late(x: u32) -> u32 { x + 1 }\nfn main() {\n    let mut fd = 3;\n    while fd < 256 {\n        unsafe { close(fd); }\n        fd += 1;\n    }\n    println!(\"{}\", late(41));\n}\n",
     );
     let out = Command::new(haste)
         .args(["run"])
@@ -790,4 +729,49 @@ fn env_macro_change_invalidates_oneshot_and_daemon_executables() {
             .arg(dir.path())
             .output();
     }
+}
+
+#[test]
+fn session_checks_incrementally_across_edits_error_and_recovery() {
+    let missing = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("haste-session-missing-{}", std::process::id()));
+    let missing_err = Compiler::new()
+        .session(&missing)
+        .err()
+        .expect("missing workspace must fail session");
+    assert_eq!(missing_err.kind(), ErrorKind::Io);
+
+    let valid_src = "fn helper() -> i32 { 40 }\nfn main() { println!(\"session-ok:{}\", helper() + 2); }\n#[test]\nfn session_math() { assert_eq!(helper() + 2, 42); }\n";
+    let broken_src = "fn helper() -> i32 { \"bad\" }\nfn main() { println!(\"session-ok:{}\", helper() + 2); }\n#[test]\nfn session_math() { assert_eq!(helper() + 2, 42); }\n";
+    let dir = FixtureDir::write_crate("api-session", "incr", "api_session_incr", valid_src);
+    let main_rs = dir.path().join("src/main.rs");
+
+    let compiler = Compiler::builder().jobs(1).build().expect("valid compiler");
+    let mut session = compiler.session(dir.path()).expect("open session");
+    session.check().expect("initial session check succeeds");
+
+    std::fs::write(&main_rs, broken_src).expect("write type error edit");
+    let err = session
+        .check()
+        .expect_err("session check must catch newly introduced type error");
+    assert_eq!(err.kind(), ErrorKind::Compile);
+    let msg = err.to_string();
+    assert!(
+        msg.contains("error[type]:") && msg.contains("src/main.rs:"),
+        "expected formatted diagnostic with source location, got:\n{msg}"
+    );
+
+    std::fs::write(&main_rs, valid_src).expect("write fixed source");
+    session.check().expect("recovered session check succeeds");
+    assert_eq!(session.run(&[]).expect("session run succeeds"), 0);
+    assert_eq!(session.test(&[]).expect("session test succeeds"), 0);
+
+    let bin = dir
+        .path()
+        .join(format!("api_session_out{}", std::env::consts::EXE_SUFFIX));
+    session.emit(&bin).expect("session emit succeeds");
+    let out = Command::new(&bin).output().expect("run emitted binary");
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "session-ok:42");
+    session.check().expect("session check after emit succeeds");
 }
