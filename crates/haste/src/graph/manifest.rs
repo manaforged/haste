@@ -62,6 +62,13 @@ impl TargetSpec {
     }
 }
 
+/// Profile overrides parsed from `[profile.dev]` or `[profile.release]`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ProfileOverride {
+    pub debug_assertions: Option<bool>,
+    pub overflow_checks: Option<bool>,
+}
+
 /// The parts of a `Cargo.toml` that the graph needs.
 #[derive(Clone, Debug, Default)]
 pub struct Manifest {
@@ -71,6 +78,7 @@ pub struct Manifest {
     pub edition: String,
     pub meta: PackageMeta,
     pub links: Option<String>,
+    pub default_run: Option<String>,
     pub build: Option<PathBuf>,
     pub lib: Option<PathBuf>,
     pub lib_name: Option<String>,
@@ -402,6 +410,31 @@ pub fn workspace_of(dir: &Path) -> Result<Option<Table>> {
     Ok(Some(workspace))
 }
 
+/// Reads `[profile.dev]` and `[profile.release]` overrides from `dir/Cargo.toml`, if present.
+pub fn profiles_of(dir: &Path) -> (ProfileOverride, ProfileOverride) {
+    let parse = |table: &Table, name: &str| {
+        let Some(prof) = table
+            .get("profile")
+            .and_then(Value::as_table)
+            .and_then(|p| p.get(name))
+            .and_then(Value::as_table)
+        else {
+            return ProfileOverride::default();
+        };
+        ProfileOverride {
+            debug_assertions: flag(prof, &["debug-assertions", "debug_assertions"]),
+            overflow_checks: flag(prof, &["overflow-checks", "overflow_checks"]),
+        }
+    };
+    let Ok(text_of) = std::fs::read_to_string(dir.join(super::MANIFEST_FILE)) else {
+        return Default::default();
+    };
+    let Ok(root) = toml::from_str::<Table>(&text_of) else {
+        return Default::default();
+    };
+    (parse(&root, "dev"), parse(&root, "release"))
+}
+
 fn inherited_value<'a>(
     package: &'a Table,
     workspace: Option<&'a Table>,
@@ -480,6 +513,7 @@ fn manifest_of(dir: &Path, root: &Table, workspace: Option<&Table>) -> Result<Ma
         edition: edition_of(package, workspace),
         meta: package_meta(package, workspace),
         links: text(package, "links").map(str::to_owned),
+        default_run: text(package, "default-run").map(str::to_owned),
         build: build_script(dir, package),
         lib,
         lib_name: root

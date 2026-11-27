@@ -71,12 +71,26 @@ fn require_main(workspace: &graph::Workspace, outline: &outline::Outline) -> Res
             .filter(|&k| outline.roots[k].role == outline::Role::Bin && outline.main(k).is_some())
             .collect();
         if bins.len() > 1 {
+            let default_matches: Vec<usize> = bins
+                .iter()
+                .copied()
+                .filter(|&k| {
+                    let pkg =
+                        &workspace.packages[workspace.graph.units[outline.roots[k].unit].package];
+                    pkg.manifest.default_run.as_deref() == Some(outline.roots[k].name.as_str())
+                })
+                .collect();
+            if default_matches.len() == 1 {
+                return outline
+                    .main(default_matches[0])
+                    .ok_or_else(missing_target_error);
+            }
             let names: Vec<&str> = bins
                 .iter()
                 .map(|&k| outline.roots[k].name.as_str())
                 .collect();
             bail!(
-                "multiple binary targets found ({}); pass `-p <PKG>` or `--bin <NAME>`",
+                "multiple binary targets found ({}); pass `-p <PKG>`, `--bin <NAME>`, or set `default-run` in Cargo.toml",
                 names.join(", ")
             );
         }
@@ -205,8 +219,58 @@ impl Build {
             if kind == BatchKind::Tests {
                 let starts: Vec<Option<usize>> = batch.tests.iter().map(|(_, s)| *s).collect();
                 batch.tests = map_tests(&batch.roots, &batch.reached, &starts, discovered);
+                self.materialize_test_bins(workspace, &batch.tests)?;
             }
             self.cases = Some(batch);
+        }
+        Ok(())
+    }
+
+    fn materialize_test_bins(
+        &mut self,
+        workspace: &graph::Workspace,
+        tests: &[(crate::cli::TestItem, Option<usize>)],
+    ) -> Result<()> {
+        let mut to_emit: Vec<(ItemRef, std::path::PathBuf)> = Vec::new();
+        let mut seen = rustc_hash::FxHashSet::default();
+        for (meta, _) in tests {
+            let krate = meta.item.krate as usize;
+            if self.compilation.outline.roots[krate].role != outline::Role::Test {
+                continue;
+            }
+            let test_unit = self.compilation.outline.roots[krate].unit;
+            let test_pkg = workspace.graph.units[test_unit].package;
+            for (k, v) in &self.compilation.outline.crates[krate].env.vars {
+                let Some(bin_name) = k.strip_prefix("CARGO_BIN_EXE_") else {
+                    continue;
+                };
+                let exe = std::path::PathBuf::from(v);
+                if !seen.insert(exe.clone()) {
+                    continue;
+                }
+                let bin_krate = self.compilation.outline.roots.iter().position(|r| {
+                    r.role == outline::Role::Bin
+                        && r.name == bin_name
+                        && workspace.graph.units[r.unit].package == test_pkg
+                });
+                if let Some(bk) = bin_krate
+                    && let Some(main_fn) = self.compilation.outline.main(bk)
+                {
+                    to_emit.push((main_fn, exe));
+                }
+            }
+        }
+        for (main_fn, exe) in to_emit {
+            if let Some(parent) = exe.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut bin_batch = Batch::rooted(
+                workspace,
+                &mut self.compilation,
+                (BatchKind::MainAot, Some(main_fn)),
+                (true, &[]),
+            )?;
+            bin_batch.write_aot(&self.compilation, &exe)?;
         }
         Ok(())
     }

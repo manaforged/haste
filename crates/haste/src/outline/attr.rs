@@ -375,6 +375,7 @@ mod tests {
             release: false,
             fixed: false,
             test: false,
+            profile_override: Default::default(),
             env_reads: Default::default(),
         };
         link_name(&src, &items.items[0].attrs, &env)

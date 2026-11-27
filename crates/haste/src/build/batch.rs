@@ -446,16 +446,7 @@ impl Batch {
         test_filters: &[String],
     ) -> Result<Batch> {
         let main = (kind == BatchKind::MainAot)
-            .then(|| {
-                let sel = crate::selection();
-                if sel.bin.is_some() || sel.example.is_some() {
-                    require_main(workspace, &compilation.outline)
-                } else {
-                    main_item(workspace, &compilation.outline).context(
-                        "no binary or example target to emit (pass --bin NAME or --example NAME)",
-                    )
-                }
-            })
+            .then(|| require_main(workspace, &compilation.outline))
             .transpose()?;
         Self::rooted(
             workspace,

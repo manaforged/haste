@@ -62,6 +62,7 @@ fn hash_crate_rec(
         krate.env.fixed.hash(&mut hasher);
         krate.env.release.hash(&mut hasher);
         krate.env.overflow_checks().hash(&mut hasher);
+        krate.env.debug_assertions().hash(&mut hasher);
         root.name.hash(&mut hasher);
         (root.role as u8).hash(&mut hasher);
         krate.env.target.triple.hash(&mut hasher);

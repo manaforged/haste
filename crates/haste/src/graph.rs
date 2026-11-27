@@ -76,6 +76,8 @@ pub struct Workspace {
     pub graph: Graph,
     pub(crate) rustflags: Vec<String>,
     pub(crate) config_env: Vec<(String, String, bool)>,
+    pub(crate) profile_dev: manifest::ProfileOverride,
+    pub(crate) profile_release: manifest::ProfileOverride,
 }
 
 pub(crate) const MANIFEST_FILE: &str = "Cargo.toml";
@@ -642,11 +644,14 @@ fn load_filtered(
     } else {
         (Vec::new(), Vec::new())
     };
+    let (profile_dev, profile_release) = manifest::profiles_of(&top);
     Ok(Workspace {
         packages,
         graph,
         rustflags,
         config_env,
+        profile_dev,
+        profile_release,
     })
 }
 

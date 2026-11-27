@@ -502,6 +502,8 @@ mod tests {
                 "--cfg=my_kv=\"abc\"".to_owned(),
             ],
             config_env: Vec::new(),
+            profile_dev: Default::default(),
+            profile_release: Default::default(),
         };
         let cross_targets = Targets {
             target: cfg::Target::of(cross),

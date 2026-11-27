@@ -359,6 +359,13 @@ fn unit_pin(workspace: &Workspace, unit: usize, extra: &[u64], memo: &mut [Optio
         .script
         .as_deref()
         .map(crate::graph::script::Output::key_parts);
+    let profile_override = if workspace.packages[entry.package].sysroot {
+        Default::default()
+    } else if crate::profile() == super::tree::Profile::Release {
+        workspace.profile_release
+    } else {
+        workspace.profile_dev
+    };
     let hash = rustc_hash::FxBuildHasher.hash_one((
         &locked.name,
         locked.version.to_string(),
@@ -366,6 +373,7 @@ fn unit_pin(workspace: &Workspace, unit: usize, extra: &[u64], memo: &mut [Optio
         &entry.features,
         entry.side == crate::graph::Side::Host,
         cfgs,
+        profile_override,
         extra,
         deps,
     ));
@@ -419,7 +427,27 @@ fn root_crate(workspace: &Workspace, targets: &Targets, root: &Root, test: bool)
             ));
         }
         vars.push(("CARGO_TARGET_TMPDIR".to_owned(), tmp.display().to_string()));
+        let bin_dir = tmp.join("bin");
+        for bin in workspace.packages[unit.package]
+            .manifest
+            .bins
+            .iter()
+            .filter(|b| b.enabled(&unit.features))
+        {
+            let exe = bin_dir.join(format!("{}{}", bin.name, std::env::consts::EXE_SUFFIX));
+            vars.push((
+                format!("CARGO_BIN_EXE_{}", bin.name),
+                exe.display().to_string(),
+            ));
+        }
     }
+    let profile_override = if workspace.packages[unit.package].sysroot {
+        Default::default()
+    } else if crate::profile() == super::tree::Profile::Release {
+        workspace.profile_release
+    } else {
+        workspace.profile_dev
+    };
     let env = Env {
         target: targets.of(side).clone(),
         features: unit.features.clone(),
@@ -429,6 +457,7 @@ fn root_crate(workspace: &Workspace, targets: &Targets, root: &Root, test: bool)
         release: workspace.packages[unit.package].sysroot,
         fixed: !workspace.packages[unit.package].local(),
         test,
+        profile_override,
         env_reads: Default::default(),
     };
     Crate {
