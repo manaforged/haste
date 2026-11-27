@@ -12,7 +12,10 @@ use crate::sema::ty::Ty;
 
 use super::SummaryKind;
 use super::codec::{Encoder, encode_prim, write_opt, write_str, write_u32, write_u64, write_u128};
-use super::warm::WarmFilter;
+use super::warm::{
+    WARM_DEF_SHARDS, WARM_HDR_SHARDS, WARM_NON_SHARD_SECTIONS, WARM_SECTIONS, WARM_SUM_SHARDS,
+    WarmFilter,
+};
 use super::warm_abi::{write_impl_index, write_impl_ref, write_layout, write_repr_options};
 use super::warm_body::write_body;
 use super::warm_expr::{write_opt_u32, write_slice};
@@ -246,8 +249,9 @@ pub(super) fn encode_payload(
     let mut allow = |_: &Outline, item: ItemRef| filter.item(item).then_some(0);
     let mut enc = Encoder::new_raw(outline, &store.types, &mut allow);
     let mut syms = SymPool::new();
+    let mut prelude = Vec::new();
+    let mut secs: [Vec<u8>; WARM_SECTIONS] = std::array::from_fn(|_| Vec::new());
     let memo = RefCell::new(HashMap::default());
-    let mut body = Vec::new();
     let ok_ty = |t: Ty| filter.ty(&store.types, t, &mut memo.borrow_mut());
     let ok_s = |s| filter.substs(&store.types, s, &mut memo.borrow_mut());
 
@@ -266,7 +270,7 @@ pub(super) fn encode_payload(
             })
             .collect(),
     };
-    write_slice(&mut body, &file_entries, |o, &(key, k, f)| {
+    write_slice(&mut prelude, &file_entries, |o, &(key, k, f)| {
         write_u64(o, key);
         write_u32(o, k);
         write_u32(o, f);
@@ -279,7 +283,7 @@ pub(super) fn encode_payload(
             .map(|(&item, name)| (item, name.as_ref().to_owned()))
             .collect()
     });
-    write_opt(&mut body, langs.as_ref(), |o, entries| {
+    write_opt(&mut prelude, langs.as_ref(), |o, entries| {
         write_table_entries(o, entries, |(item, name), b| {
             write_u32(b, enc.item_id(*item)?);
             write_str(b, name)
@@ -290,13 +294,14 @@ pub(super) fn encode_payload(
     let prims: Option<Vec<u32>> = super::super::read_lock(&store.lookups.state.primitives)
         .as_ref()
         .map(|p| p.iter().copied().filter(|&k| filter.krate(k)).collect());
-    write_opt(&mut body, prims.as_ref(), |o, p| {
+    write_opt(&mut prelude, prims.as_ref(), |o, p| {
         write_slice(o, p, |o2, v| write_u32(o2, *v));
         Some(())
     })?;
 
-    let modules = snap_table(&store.lookups.modules, |&k, _| filter.krate(k));
-    write_slice(&mut body, &modules, |o, (k, map)| {
+    let lk = &store.lookups;
+    let modules = snap_table(&lk.modules, |&k, _| filter.krate(k));
+    write_slice(&mut secs[0], &modules, |o, (k, map)| {
         write_u32(o, *k);
         write_u32(o, map.len() as u32);
         for (&(a, b), &v) in map.iter() {
@@ -306,8 +311,8 @@ pub(super) fn encode_payload(
         }
     });
 
-    let owners = snap_table(&store.lookups.owners, |&k, _| filter.krate(k));
-    write_slice(&mut body, &owners, |o, (k, map)| {
+    let owners = snap_table(&lk.owners, |&k, _| filter.krate(k));
+    write_slice(&mut secs[0], &owners, |o, (k, map)| {
         write_u32(o, *k);
         write_u32(o, map.len() as u32);
         for (&(a, b), &v) in map.iter() {
@@ -317,10 +322,63 @@ pub(super) fn encode_payload(
         }
     });
 
-    let heads = snap_table(&store.lookups.heads, |h, idx| {
-        filter.holder(*h) && idx.complete()
+    let scope_traits = snap_table(&lk.scope_traits, |&m, _| filter.mod_ref(m));
+    write_table_entries(&mut secs[0], &scope_traits, |(m, items), b| {
+        write_mod_ref(b, *m);
+        write_u32(b, items.len() as u32);
+        for &item in items.iter() {
+            write_u32(b, enc.item_id(item)?);
+        }
+        Some(())
     });
-    write_table_entries(&mut body, &heads, |(h, idx), b| {
+
+    let trait_autos = snap_table(&lk.trait_autos, |k, _| filter.item(*k));
+    write_table_entries(&mut secs[0], &trait_autos, |(k, v), b| {
+        write_u32(b, enc.item_id(*k)?);
+        b.push(u8::from(*v));
+        Some(())
+    });
+
+    let type_defs = snap_table(&lk.type_defs, |&(sc, _), &def| {
+        filter.mod_ref(sc.0)
+            && sc.1.is_none_or(|i| filter.item(i))
+            && sc.2.is_none_or(|i| filter.item(i))
+            && filter.def(&def)
+    });
+    let mut seg_buf = Vec::new();
+    let def_base = WARM_NON_SHARD_SECTIONS;
+    let def_chunk = type_defs.len().div_ceil(WARM_DEF_SHARDS).max(1);
+    for shard in 0..WARM_DEF_SHARDS {
+        let start = (shard * def_chunk).min(type_defs.len());
+        let end = ((shard + 1) * def_chunk).min(type_defs.len());
+        write_table_entries(
+            &mut secs[def_base + shard],
+            &type_defs[start..end],
+            |((sc, seg), def), b| {
+                write_mod_ref(b, sc.0);
+                write_opt(b, sc.1.as_ref(), |o, i| {
+                    write_u32(o, enc.item_id(*i)?);
+                    Some(())
+                })?;
+                write_opt(b, sc.2.as_ref(), |o, i| {
+                    write_u32(o, enc.item_id(*i)?);
+                    Some(())
+                })?;
+                b.push(sc.3);
+                write_opt_u32(b, sc.4);
+                seg_buf.clear();
+                seg.push_syms(&mut seg_buf);
+                write_u32(b, seg_buf.len() as u32);
+                for &s in &seg_buf {
+                    write_u32(b, syms.id(s));
+                }
+                write_def(&mut enc, b, *def)
+            },
+        );
+    }
+
+    let heads = snap_table(&lk.heads, |h, idx| filter.holder(*h) && idx.complete());
+    write_table_entries(&mut secs[1], &heads, |(h, idx), b| {
         match *h {
             Holder::Crate(k) => {
                 b.push(0);
@@ -335,117 +393,106 @@ pub(super) fn encode_payload(
     });
 
     let sigs = snap_table(&store.signatures, |k, _| filter.item(*k));
-    write_table_entries(&mut body, &sigs, |(k, s), b| {
+    write_table_entries(&mut secs[2], &sigs, |(k, s), b| {
         write_u32(b, enc.item_id(*k)?);
         write_signature(b, s);
         Some(())
     });
 
     let adts = snap_table(&store.adts, |k, _| filter.item(*k));
-    write_table_entries(&mut body, &adts, |(k, a), b| {
+    write_table_entries(&mut secs[3], &adts, |(k, a), b| {
         write_u32(b, enc.item_id(*k)?);
         write_adt_def(b, a);
         Some(())
     });
 
-    let layouts = snap_table(&store.layouts, |&t, l| {
-        !matches!(l.variants, Variants::Multiple { .. }) && ok_ty(t)
-    });
-    write_table_entries(&mut body, &layouts, |(t, l), b| {
-        write_u32(b, enc.ty_id(*t)?);
-        write_layout(b, l)
-    });
-
-    let tails = snap_table(&store.tails, |&t, &v| ok_ty(t) && ok_ty(v));
-    write_table_entries(&mut body, &tails, |(t, v), b| {
-        write_u32(b, enc.ty_id(*t)?);
-        write_u32(b, enc.ty_id(*v)?);
-        Some(())
-    });
-
-    let headers = snap_table(&store.headers, |k, _| filter.impl_ref(*k));
-    write_table_entries(&mut body, &headers, |(k, h), b| {
-        write_impl_ref(b, *k, &mut |i| enc.item_id(i))?;
-        write_impl_header(b, h);
-        Some(())
-    });
-
-    let evals = snap_table(&store.evaluated, |&(i, s), _| filter.item(i) && ok_s(s));
-    write_table_entries(&mut body, &evals, |((i, s), v), b| {
-        write_u32(b, enc.item_id(*i)?);
-        enc.write_substs(b, *s)?;
-        write_u128(b, *v);
-        Some(())
-    });
-
-    let lk = &store.lookups;
-    let trait_defs = snap_table(&lk.trait_defs, |k, _| filter.item(*k));
-    write_table_entries(&mut body, &trait_defs, |(k, tg), b| {
-        write_u32(b, enc.item_id(*k)?);
-        write_body(b, &tg.0);
-        write_generics(b, &tg.1);
-        Some(())
-    });
-
     let discrs = snap_table(&lk.discriminants, |k, _| filter.item(*k));
-    write_table_entries(&mut body, &discrs, |(k, d), b| {
+    write_table_entries(&mut secs[3], &discrs, |(k, d), b| {
         write_u32(b, enc.item_id(*k)?);
         write_slice(b, d, |o, v| write_u128(o, *v as u128));
         Some(())
     });
 
     let reprs = snap_table(&lk.reprs, |k, _| filter.item(*k));
-    write_table_entries(&mut body, &reprs, |(k, r), b| {
+    write_table_entries(&mut secs[3], &reprs, |(k, r), b| {
         write_u32(b, enc.item_id(*k)?);
         write_repr_options(b, r);
         Some(())
     });
 
     let attrs = snap_table(&lk.attrs, |k, _| filter.item(*k));
-    write_table_entries(&mut body, &attrs, |(k, a), b| {
+    write_table_entries(&mut secs[3], &attrs, |(k, a), b| {
         write_u32(b, enc.item_id(*k)?);
         write_slice(b, a.as_slice(), |o, v| write_u32(o, *v));
         Some(())
     });
 
-    let drops = snap_table(&lk.drops, |&t, _| ok_ty(t));
-    write_table_entries(&mut body, &drops, |(t, v), b| {
-        write_u32(b, enc.ty_id(*t)?);
+    let trait_defs = snap_table(&lk.trait_defs, |k, _| filter.item(*k));
+    write_table_entries(&mut secs[3], &trait_defs, |(k, tg), b| {
+        write_u32(b, enc.item_id(*k)?);
+        write_body(b, &tg.0);
+        write_generics(b, &tg.1);
+        Some(())
+    });
+
+    let verdicts = snap_table(&lk.verdicts, |k, _| filter.item(*k));
+    write_table_entries(&mut secs[3], &verdicts, |(k, _), b| {
+        write_u32(b, enc.item_id(*k)?);
+        Some(())
+    });
+
+    let headers = snap_table(&store.headers, |k, _| filter.impl_ref(*k));
+    let hdr_base = def_base + WARM_DEF_SHARDS;
+    let hdr_chunk = headers.len().div_ceil(WARM_HDR_SHARDS).max(1);
+    for shard in 0..WARM_HDR_SHARDS {
+        let start = (shard * hdr_chunk).min(headers.len());
+        let end = ((shard + 1) * hdr_chunk).min(headers.len());
+        write_table_entries(
+            &mut secs[hdr_base + shard],
+            &headers[start..end],
+            |(k, h), b| {
+                write_impl_ref(b, *k, &mut |i| enc.item_id(i))?;
+                write_impl_header(b, h);
+                Some(())
+            },
+        );
+    }
+
+    let impl_traits = snap_table(&lk.impl_traits, |k, v| {
+        filter.impl_ref(*k) && v.is_none_or(|i| filter.item(i))
+    });
+    write_table_entries(&mut secs[4], &impl_traits, |(k, v), b| {
+        write_impl_ref(b, *k, &mut |i| enc.item_id(i))?;
+        write_opt(b, v.as_ref(), |o, i| {
+            write_u32(o, enc.item_id(*i)?);
+            Some(())
+        })
+    });
+
+    let checked_impls = snap_flight(&lk.checked_impls, |k, _| filter.impl_ref(*k));
+    write_table_entries(&mut secs[4], &checked_impls, |(k, v), b| {
+        write_impl_ref(b, *k, &mut |i| enc.item_id(i))?;
         b.push(u8::from(*v));
         Some(())
     });
 
-    let own_drops = snap_table(&lk.own_drops, |&t, _| ok_ty(t));
-    write_table_entries(&mut body, &own_drops, |(t, v), b| {
+    let layouts = snap_table(&store.layouts, |&t, l| {
+        !matches!(l.variants, Variants::Multiple { .. }) && ok_ty(t)
+    });
+    write_table_entries(&mut secs[5], &layouts, |(t, l), b| {
         write_u32(b, enc.ty_id(*t)?);
-        b.push(u8::from(*v));
-        Some(())
+        write_layout(b, l)
     });
 
-    let unpins = snap_table(&lk.unpins, |&t, _| ok_ty(t));
-    write_table_entries(&mut body, &unpins, |(t, (ok, d)), b| {
+    let tails = snap_table(&store.tails, |&t, &v| ok_ty(t) && ok_ty(v));
+    write_table_entries(&mut secs[5], &tails, |(t, v), b| {
         write_u32(b, enc.ty_id(*t)?);
-        b.push(u8::from(*ok));
-        write_u32(b, *d);
+        write_u32(b, enc.ty_id(*v)?);
         Some(())
-    });
-
-    let freezes = snap_table(&lk.freezes, |&t, _| ok_ty(t));
-    write_table_entries(&mut body, &freezes, |(t, (ok, d)), b| {
-        write_u32(b, enc.ty_id(*t)?);
-        b.push(u8::from(*ok));
-        write_u32(b, *d);
-        Some(())
-    });
-
-    let glues = snap_table(&lk.glues, |&t, _| ok_ty(t));
-    write_table_entries(&mut body, &glues, |(t, r), b| {
-        write_u32(b, enc.ty_id(*t)?);
-        write_opt(b, r.as_ref(), |o, res| enc.write_res(o, res))
     });
 
     let fields = snap_table(&lk.fields, |&t, _| ok_ty(t));
-    write_table_entries(&mut body, &fields, |(t, f), b| {
+    write_table_entries(&mut secs[5], &fields, |(t, f), b| {
         write_u32(b, enc.ty_id(*t)?);
         write_fields(&mut enc, b, f)
     });
@@ -454,7 +501,7 @@ pub(super) fn encode_payload(
         Form::Adt(i) | Form::Fn(i) => filter.item(i),
         Form::Impl(b) => filter.impl_ref(b),
     });
-    write_table_entries(&mut body, &forms, |((f, arity), val), b| {
+    write_table_entries(&mut secs[5], &forms, |((f, arity), val), b| {
         match *f {
             Form::Adt(i) => {
                 b.push(0);
@@ -473,76 +520,13 @@ pub(super) fn encode_payload(
         write_opt(b, val.as_ref(), |o, fld| write_fields(&mut enc, o, fld))
     });
 
-    let futures = snap_table(&lk.futures, |&t, &v| ok_ty(t) && ok_ty(v));
-    write_table_entries(&mut body, &futures, |(t, v), b| {
-        write_u32(b, enc.ty_id(*t)?);
-        write_u32(b, enc.ty_id(*v)?);
-        Some(())
-    });
-
-    let scope_traits = snap_table(&lk.scope_traits, |&m, _| filter.mod_ref(m));
-    write_table_entries(&mut body, &scope_traits, |(m, items), b| {
-        write_mod_ref(b, *m);
-        write_u32(b, items.len() as u32);
-        for &item in items.iter() {
-            write_u32(b, enc.item_id(item)?);
-        }
-        Some(())
-    });
-
-    let trait_autos = snap_table(&lk.trait_autos, |k, _| filter.item(*k));
-    write_table_entries(&mut body, &trait_autos, |(k, v), b| {
-        write_u32(b, enc.item_id(*k)?);
-        b.push(u8::from(*v));
-        Some(())
-    });
-
-    let type_defs = snap_table(&lk.type_defs, |&(sc, _), &def| {
-        filter.mod_ref(sc.0)
-            && sc.1.is_none_or(|i| filter.item(i))
-            && sc.2.is_none_or(|i| filter.item(i))
-            && filter.def(&def)
-    });
-    let mut seg_buf = Vec::new();
-    write_table_entries(&mut body, &type_defs, |((sc, seg), def), b| {
-        write_mod_ref(b, sc.0);
-        write_opt(b, sc.1.as_ref(), |o, i| {
-            write_u32(o, enc.item_id(*i)?);
-            Some(())
-        })?;
-        write_opt(b, sc.2.as_ref(), |o, i| {
-            write_u32(o, enc.item_id(*i)?);
-            Some(())
-        })?;
-        b.push(sc.3);
-        write_opt_u32(b, sc.4);
-        seg_buf.clear();
-        seg.push_syms(&mut seg_buf);
-        write_u32(b, seg_buf.len() as u32);
-        for &s in &seg_buf {
-            write_u32(b, syms.id(s));
-        }
-        write_def(&mut enc, b, *def)
-    });
-
-    let impl_traits = snap_table(&lk.impl_traits, |k, v| {
-        filter.impl_ref(*k) && v.is_none_or(|i| filter.item(i))
-    });
-    write_table_entries(&mut body, &impl_traits, |(k, v), b| {
-        write_impl_ref(b, *k, &mut |i| enc.item_id(i))?;
-        write_opt(b, v.as_ref(), |o, i| {
-            write_u32(o, enc.item_id(*i)?);
-            Some(())
-        })
-    });
-
     let selections = snap_table(&lk.selections, |&(tr, ty, s), v| {
         filter.item(tr)
             && ok_ty(ty)
             && ok_s(s)
             && v.is_none_or(|(bl, ss)| filter.impl_ref(bl) && ok_s(ss))
     });
-    write_table_entries(&mut body, &selections, |((tr, ty, s), val), b| {
+    write_table_entries(&mut secs[6], &selections, |((tr, ty, s), val), b| {
         write_u32(b, enc.item_id(*tr)?);
         write_u32(b, enc.ty_id(*ty)?);
         enc.write_substs(b, *s)?;
@@ -552,25 +536,61 @@ pub(super) fn encode_payload(
         })
     });
 
-    let auto_traits = snap_table(&lk.auto_traits, |&(tr, ty), _| filter.item(tr) && ok_ty(ty));
-    write_table_entries(&mut body, &auto_traits, |((tr, ty), v), b| {
-        write_u32(b, enc.item_id(*tr)?);
-        write_u32(b, enc.ty_id(*ty)?);
+    let evals = snap_table(&store.evaluated, |&(i, s), _| filter.item(i) && ok_s(s));
+    write_table_entries(&mut secs[7], &evals, |((i, s), v), b| {
+        write_u32(b, enc.item_id(*i)?);
+        enc.write_substs(b, *s)?;
+        write_u128(b, *v);
+        Some(())
+    });
+
+    let drops = snap_table(&lk.drops, |&t, _| ok_ty(t));
+    write_table_entries(&mut secs[7], &drops, |(t, v), b| {
+        write_u32(b, enc.ty_id(*t)?);
         b.push(u8::from(*v));
         Some(())
     });
 
-    let checked_impls = snap_flight(&lk.checked_impls, |k, _| filter.impl_ref(*k));
-    write_table_entries(&mut body, &checked_impls, |(k, v), b| {
-        write_impl_ref(b, *k, &mut |i| enc.item_id(i))?;
+    let own_drops = snap_table(&lk.own_drops, |&t, _| ok_ty(t));
+    write_table_entries(&mut secs[7], &own_drops, |(t, v), b| {
+        write_u32(b, enc.ty_id(*t)?);
         b.push(u8::from(*v));
+        Some(())
+    });
+
+    let unpins = snap_table(&lk.unpins, |&t, _| ok_ty(t));
+    write_table_entries(&mut secs[7], &unpins, |(t, (ok, d)), b| {
+        write_u32(b, enc.ty_id(*t)?);
+        b.push(u8::from(*ok));
+        write_u32(b, *d);
+        Some(())
+    });
+
+    let freezes = snap_table(&lk.freezes, |&t, _| ok_ty(t));
+    write_table_entries(&mut secs[7], &freezes, |(t, (ok, d)), b| {
+        write_u32(b, enc.ty_id(*t)?);
+        b.push(u8::from(*ok));
+        write_u32(b, *d);
+        Some(())
+    });
+
+    let glues = snap_table(&lk.glues, |&t, _| ok_ty(t));
+    write_table_entries(&mut secs[7], &glues, |(t, r), b| {
+        write_u32(b, enc.ty_id(*t)?);
+        write_opt(b, r.as_ref(), |o, res| enc.write_res(o, res))
+    });
+
+    let futures = snap_table(&lk.futures, |&t, &v| ok_ty(t) && ok_ty(v));
+    write_table_entries(&mut secs[7], &futures, |(t, v), b| {
+        write_u32(b, enc.ty_id(*t)?);
+        write_u32(b, enc.ty_id(*v)?);
         Some(())
     });
 
     let reveals = snap_flight(&lk.reveals, |&(i, s), &t| {
         filter.item(i) && ok_s(s) && ok_ty(t)
     });
-    write_table_entries(&mut body, &reveals, |((i, s), t), b| {
+    write_table_entries(&mut secs[7], &reveals, |((i, s), t), b| {
         write_u32(b, enc.item_id(*i)?);
         enc.write_substs(b, *s)?;
         write_u32(b, enc.ty_id(*t)?);
@@ -580,7 +600,7 @@ pub(super) fn encode_payload(
     let provisional_rets = snap_table(&lk.provisional_rets, |&(i, s), &t| {
         filter.item(i) && ok_s(s) && ok_ty(t)
     });
-    write_table_entries(&mut body, &provisional_rets, |((i, s), t), b| {
+    write_table_entries(&mut secs[7], &provisional_rets, |((i, s), t), b| {
         write_u32(b, enc.item_id(*i)?);
         enc.write_substs(b, *s)?;
         write_u32(b, enc.ty_id(*t)?);
@@ -591,7 +611,7 @@ pub(super) fn encode_payload(
         filter.item(tr) && ok_ty(ty) && ok_s(a1) && ok_s(a2) && v.is_none_or(&ok_ty)
     });
     write_table_entries(
-        &mut body,
+        &mut secs[7],
         &projections,
         |((tr, ty, a1, sym, a2), val), b| {
             write_u32(b, enc.item_id(*tr)?);
@@ -607,7 +627,7 @@ pub(super) fn encode_payload(
     );
 
     let trait_calls = snap_table(&lk.trait_calls, |&(m, s), _| filter.item(m) && ok_s(s));
-    write_table_entries(&mut body, &trait_calls, |((m, s), res), b| {
+    write_table_entries(&mut secs[7], &trait_calls, |((m, s), res), b| {
         write_u32(b, enc.item_id(*m)?);
         enc.write_substs(b, *s)?;
         enc.write_res(b, res)
@@ -617,7 +637,7 @@ pub(super) fn encode_payload(
         filter.item(tr) && ok_ty(ty) && ok_s(a1) && filter.item(assoc) && ok_s(a2) && ok_ty(val)
     });
     write_table_entries(
-        &mut body,
+        &mut secs[7],
         &assoc_types,
         |((tr, ty, a1, assoc, a2), val), b| {
             write_u32(b, enc.item_id(*tr)?);
@@ -630,33 +650,48 @@ pub(super) fn encode_payload(
         },
     );
 
-    let verdicts = snap_table(&lk.verdicts, |k, _| filter.item(*k));
-    write_table_entries(&mut body, &verdicts, |(k, _), b| {
-        write_u32(b, enc.item_id(*k)?);
+    let auto_traits = snap_table(&lk.auto_traits, |&(tr, ty), _| filter.item(tr) && ok_ty(ty));
+    write_table_entries(&mut secs[7], &auto_traits, |((tr, ty), v), b| {
+        write_u32(b, enc.item_id(*tr)?);
+        write_u32(b, enc.ty_id(*ty)?);
+        b.push(u8::from(*v));
         Some(())
     });
 
     let summaries = snap_flight(&lk.summaries, |k, v| {
         filter.item(*k) && !matches!(v, SummaryKind::Error(_))
     });
-    write_table_entries(&mut body, &summaries, |(k, kind), b| {
-        write_u32(b, enc.item_id(*k)?);
-        match kind {
-            SummaryKind::Poly(s) => {
-                b.push(0);
-                enc.write_summary(b, s)?;
-            }
-            SummaryKind::MonomorphicHints(_) | SummaryKind::MonomorphicFallback => {
-                b.push(1);
-                enc.write_verdict(b, kind)?;
-            }
-            SummaryKind::Error(_) => return None,
-        }
-        Some(())
-    });
+    let sum_base = hdr_base + WARM_HDR_SHARDS;
+    let sum_chunk = summaries.len().div_ceil(WARM_SUM_SHARDS).max(1);
+    for shard in 0..WARM_SUM_SHARDS {
+        let start = (shard * sum_chunk).min(summaries.len());
+        let end = ((shard + 1) * sum_chunk).min(summaries.len());
+        write_table_entries(
+            &mut secs[sum_base + shard],
+            &summaries[start..end],
+            |(k, kind), b| {
+                write_u32(b, enc.item_id(*k)?);
+                match kind {
+                    SummaryKind::Poly(s) => {
+                        b.push(0);
+                        enc.write_summary(b, s)?;
+                    }
+                    SummaryKind::MonomorphicHints(_) | SummaryKind::MonomorphicFallback => {
+                        b.push(1);
+                        enc.write_verdict(b, kind)?;
+                    }
+                    SummaryKind::Error(_) => return None,
+                }
+                Some(())
+            },
+        );
+    }
 
     let (items, tys) = enc.finish_raw();
-    let mut out = Vec::with_capacity(items.len() * 12 + tys.bytes().len() + body.len() + 64);
+    let total_sec_bytes: usize = secs.iter().map(Vec::len).sum();
+    let mut out = Vec::with_capacity(
+        items.len() * 12 + tys.bytes().len() + prelude.len() + total_sec_bytes + 256,
+    );
     write_slice(&mut out, &items, |o, i| {
         write_u32(o, i.krate);
         write_u32(o, i.file);
@@ -665,6 +700,17 @@ pub(super) fn encode_payload(
     write_u32(&mut out, tys.count());
     out.extend_from_slice(tys.bytes());
     syms.write(&mut out, symbols)?;
-    out.extend_from_slice(&body);
+    out.extend_from_slice(&prelude);
+    write_u32(&mut out, WARM_SECTIONS as u32);
+    let mut offset = 0u32;
+    for sec in &secs {
+        let len = u32::try_from(sec.len()).ok()?;
+        write_u32(&mut out, offset);
+        write_u32(&mut out, len);
+        offset = offset.checked_add(len)?;
+    }
+    for sec in &secs {
+        out.extend_from_slice(sec);
+    }
     Some((out, items))
 }

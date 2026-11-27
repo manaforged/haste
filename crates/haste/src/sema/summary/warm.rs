@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, bail};
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet, FxHasher};
+use rustc_hash::{FxHashMap as HashMap, FxHasher};
 
 use crate::body::sig::ImplHeader;
 use crate::names::{Def, ItemRef, ModRef, Names};
@@ -20,9 +20,20 @@ use super::warm_encode::{count_fixed_entries, encode_payload};
 use super::warm_expr::write_slice;
 
 const WARM_MAGIC: [u8; 8] = *b"HSTWRM01";
-const WARM_VERSION: u32 = 3;
+const WARM_VERSION: u32 = 5;
 pub(crate) const WARM_MIN_LEN: usize = 28;
+pub(super) const WARM_DEF_SHARDS: usize = 4;
+pub(super) const WARM_HDR_SHARDS: usize = 8;
+pub(super) const WARM_SUM_SHARDS: usize = 4;
+pub(super) const WARM_NON_SHARD_SECTIONS: usize = 8;
+pub(super) const WARM_SECTIONS: usize =
+    WARM_NON_SHARD_SECTIONS + WARM_DEF_SHARDS + WARM_HDR_SHARDS + WARM_SUM_SHARDS;
 const MAX_WARM_PAYLOAD_BYTES: usize = 128 * 1024 * 1024;
+
+fn debug_warm() -> bool {
+    crate::env_flag("HASTE_DEBUG_WARM")
+        || std::env::var_os("HASTE_DEBUG").is_some_and(|v| v == "warm" || v == "1")
+}
 const ROLES: [Role; 6] = [
     Role::Lib,
     Role::Bin,
@@ -71,6 +82,17 @@ pub(super) struct WarmCounts {
     pub fixed_entries: u32,
 }
 
+#[derive(Default)]
+pub(in crate::sema) struct WarmTimings {
+    pub payload_bytes: usize,
+    pub item_count: usize,
+    pub ty_count: usize,
+    pub sym_count: usize,
+    pub prelude_us: u64,
+    pub sections_us: u64,
+    pub section_bytes: [u32; WARM_SECTIONS],
+}
+
 pub(in crate::sema) struct WarmFlights {
     pub reveals: Vec<(crate::sema::reach::Instance, Ty)>,
     pub checked_impls: Vec<(ImplRef, bool)>,
@@ -80,6 +102,7 @@ pub(in crate::sema) struct WarmFlights {
     pub body_forms: Vec<((Form, usize), Option<Fields>)>,
     pub body_impl_traits: Vec<(ImplRef, Option<ItemRef>)>,
     pub body_selections: Vec<((ItemRef, Ty, Substs), Option<(ImplRef, Substs)>)>,
+    pub timings: WarmTimings,
 }
 
 enum WarmSource {
@@ -451,150 +474,8 @@ pub(in crate::sema) fn warm_preload(
     Some(flights)
 }
 
-fn collect_impl_owners(r: ImplRef, owners: &mut HashSet<ItemRef>) {
-    if let ImplRef::Body(item) = r
-        && let Some((outer, _)) = item.outer()
-    {
-        owners.insert(outer.body_owner());
-    }
-}
-
-fn collect_index_owners(holder: Holder, idx: &ImplIndex, owners: &mut HashSet<ItemRef>) {
-    if let Holder::Body(root) = holder {
-        owners.insert(root.body_owner());
-    }
-    for &r in idx.inherent.values().flatten() {
-        collect_impl_owners(r, owners);
-    }
-    for b in idx.traits.values() {
-        for &r in b
-            .all
-            .iter()
-            .chain(&b.blanket)
-            .chain(b.by_head.values().flatten())
-        {
-            collect_impl_owners(r, owners);
-        }
-    }
-}
-
-fn impl_ref_ready(cx: &crate::sema::Context<'_>, r: ImplRef) -> bool {
-    match r {
-        ImplRef::Module { .. } => true,
-        ImplRef::Body(item) => match item.outer() {
-            Some((outer, at)) => cx
-                .expansion(outer)
-                .is_some_and(|exp| (at as usize) < exp.file.items.items.len()),
-            None => {
-                (item.item as usize)
-                    < cx.outline.crates[item.krate as usize].files[item.file as usize]
-                        .items
-                        .items
-                        .len()
-            }
-        },
-    }
-}
-
-fn impl_index_ready(cx: &crate::sema::Context<'_>, holder: Holder, idx: &ImplIndex) -> bool {
-    if let Holder::Body(root) = holder
-        && !impl_ref_ready(cx, ImplRef::Body(root))
-    {
-        return false;
-    }
-    idx.inherent
-        .values()
-        .flatten()
-        .all(|&r| impl_ref_ready(cx, r))
-        && idx.traits.values().all(|b| {
-            b.all
-                .iter()
-                .chain(&b.blanket)
-                .chain(b.by_head.values().flatten())
-                .all(|&r| impl_ref_ready(cx, r))
-        })
-}
-
-/// Inserts preloaded `Flight` entries (`reveals`, `checked_impls`, `summaries`, and body-item caches) onto `cx`.
-pub(in crate::sema) fn warm_populate_flights(
-    cx: &mut crate::sema::Context<'_>,
-    flights: WarmFlights,
-) {
-    let mut owners = HashSet::default();
-    for (holder, idx) in &flights.body_heads {
-        collect_index_owners(*holder, idx, &mut owners);
-    }
-    for &(r, _) in &flights.body_headers {
-        collect_impl_owners(r, &mut owners);
-    }
-    for &((form, _), _) in &flights.body_forms {
-        if let Form::Impl(r) = form {
-            collect_impl_owners(r, &mut owners);
-        }
-    }
-    for &(r, _) in &flights.body_impl_traits {
-        collect_impl_owners(r, &mut owners);
-    }
-    for &(_, val) in &flights.body_selections {
-        if let Some((r, _)) = val {
-            collect_impl_owners(r, &mut owners);
-        }
-    }
-    for &(r, _) in &flights.checked_impls {
-        collect_impl_owners(r, &mut owners);
-    }
-    for owner in owners {
-        if cx.expansion(owner).is_none() {
-            let _ = cx.parse_body(owner);
-        }
-    }
-
-    let lk = &cx.store().lookups;
-    for (holder, idx) in flights.body_heads {
-        if impl_index_ready(cx, holder, &idx) {
-            lk.heads.insert(holder, idx);
-        }
-    }
-    for (r, hdr) in flights.body_headers {
-        if impl_ref_ready(cx, r) {
-            cx.store().headers.insert(r, hdr);
-        }
-    }
-    for (key, fields) in flights.body_forms {
-        if !matches!(key.0, Form::Impl(r) if !impl_ref_ready(cx, r)) {
-            lk.forms.insert(key, fields);
-        }
-    }
-    for (r, tr) in flights.body_impl_traits {
-        if impl_ref_ready(cx, r) {
-            lk.impl_traits.insert(r, tr);
-        }
-    }
-    for (key, val) in flights.body_selections {
-        if val.is_none_or(|(r, _)| impl_ref_ready(cx, r)) {
-            lk.selections.insert(key, val);
-        }
-    }
-    let reveals = lk.reveals.clone();
-    for (inst, ty) in flights.reveals {
-        let _ = reveals.run_cached(cx, inst, |_| Ok(ty), |_| Ok(Ty::NONE));
-    }
-    let checked = cx.store().lookups.checked_impls.clone();
-    for (block, val) in flights.checked_impls {
-        if impl_ref_ready(cx, block) {
-            let _ = checked.run_cached(cx, block, |_| Ok(val), |_| Ok(false));
-        }
-    }
-    let summaries = cx.store().lookups.summaries.clone();
-    for (item, kind) in flights.summaries {
-        let _ = summaries.run_cached(
-            cx,
-            item,
-            |_| Ok(kind.clone()),
-            |_| Ok(SummaryKind::MonomorphicFallback),
-        );
-    }
-}
+mod flights;
+pub(in crate::sema) use flights::warm_populate_flights;
 
 /// Saves newly populated settled-fixed entries to the one-shot check snapshot when entries grew since load.
 pub(crate) fn save_warm_if_grown(cx: &crate::sema::Context<'_>) {

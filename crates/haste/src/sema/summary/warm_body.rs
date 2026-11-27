@@ -221,127 +221,199 @@ fn read_stmt(cur: &mut Cursor<'_>) -> Result<Stmt> {
 }
 
 pub(super) fn write_body(out: &mut Vec<u8>, body: &Body) {
-    write_slice(out, &body.exprs, write_expr);
-    write_slice(out, &body.expr_starts, |o, v| write_u32(o, *v));
-    write_slice(out, &body.expr_ends, |o, v| write_u32(o, *v));
-    write_slice(out, &body.pats, write_pat);
-    write_slice(out, &body.pat_spans, |o, &(a, b)| {
-        write_u32(o, a);
-        write_u32(o, b);
-    });
-    write_slice(out, &body.tys, write_syntax_ty);
-    write_slice(out, &body.paths, |o, p| {
-        let _ = write_opt(o, p.qself.as_ref(), |o2, &(t, tr)| {
-            write_u32(o2, t.0);
-            write_opt_u32(o2, tr.map(|x| x.0));
-            Some(())
+    let flags: u32 = ((u32::from(!body.exprs.is_empty())) << 0)
+        | ((u32::from(!body.expr_starts.is_empty())) << 1)
+        | ((u32::from(!body.expr_ends.is_empty())) << 2)
+        | ((u32::from(!body.pats.is_empty())) << 3)
+        | ((u32::from(!body.pat_spans.is_empty())) << 4)
+        | ((u32::from(!body.tys.is_empty())) << 5)
+        | ((u32::from(!body.paths.is_empty())) << 6)
+        | ((u32::from(!body.stmts.is_empty())) << 7)
+        | ((u32::from(!body.segments.is_empty())) << 8)
+        | ((u32::from(!body.args.is_empty())) << 9)
+        | ((u32::from(!body.bounds.is_empty())) << 10)
+        | ((u32::from(!body.arms.is_empty())) << 11)
+        | ((u32::from(!body.fields.is_empty())) << 12)
+        | ((u32::from(!body.field_pats.is_empty())) << 13)
+        | ((u32::from(!body.params.is_empty())) << 14)
+        | ((u32::from(!body.ids.is_empty())) << 15)
+        | ((u32::from(!body.attrs.is_empty())) << 16)
+        | ((u32::from(!body.fn_params.is_empty())) << 17)
+        | ((u32::from(body.root.is_some())) << 18);
+    write_u32(out, flags);
+    if flags & (1 << 0) != 0 {
+        write_slice(out, &body.exprs, write_expr);
+    }
+    if flags & (1 << 1) != 0 {
+        write_slice(out, &body.expr_starts, |o, v| write_u32(o, *v));
+    }
+    if flags & (1 << 2) != 0 {
+        write_slice(out, &body.expr_ends, |o, v| write_u32(o, *v));
+    }
+    if flags & (1 << 3) != 0 {
+        write_slice(out, &body.pats, write_pat);
+    }
+    if flags & (1 << 4) != 0 {
+        write_slice(out, &body.pat_spans, |o, &(a, b)| {
+            write_u32(o, a);
+            write_u32(o, b);
         });
-        o.push(u8::from(p.global));
-        write_u32(o, p.start);
-        write_list(o, p.segments);
-    });
-    write_slice(out, &body.stmts, write_stmt);
-    write_slice(out, &body.segments, |o, s| {
-        write_u32(o, s.name);
-        write_args(o, s.args);
-    });
-    write_slice(out, &body.args, |o, a| match *a {
-        GenericArg::Ty(t) => {
-            o.push(0);
-            write_u32(o, t.0);
-        }
-        GenericArg::Lifetime(l) => {
-            o.push(1);
-            write_u32(o, l);
-        }
-        GenericArg::Const(e) => {
-            o.push(2);
-            write_u32(o, e.0);
-        }
-        GenericArg::Binding { name, args, ty } => {
-            o.push(3);
-            write_u32(o, name);
-            write_args(o, args);
-            write_u32(o, ty.0);
-        }
-        GenericArg::Constraint { name, bounds } => {
-            o.push(4);
-            write_u32(o, name);
-            write_list(o, bounds);
-        }
-    });
-    write_slice(out, &body.bounds, |o, b| match *b {
-        Bound::Trait {
-            path,
-            maybe,
-            constness,
-        } => {
-            o.push(0);
-            write_u32(o, path.0);
-            o.push(u8::from(maybe) | (u8::from(constness) << 1));
-        }
-        Bound::Lifetime(l) => {
-            o.push(1);
-            write_u32(o, l);
-        }
-        Bound::Use(u) => {
-            o.push(2);
-            write_u32(o, u);
-        }
-    });
-    write_slice(out, &body.arms, |o, a| {
-        write_u32(o, a.pat.0);
-        write_opt_u32(o, a.guard.map(|g| g.0));
-        write_u32(o, a.body.0);
-    });
-    write_slice(out, &body.fields, |o, f| {
-        write_u32(o, f.name);
-        write_u32(o, f.value.0);
-    });
-    write_slice(out, &body.field_pats, |o, f| {
-        write_u32(o, f.name);
-        write_u32(o, f.pat.0);
-    });
-    write_slice(out, &body.params, |o, p| {
-        write_u32(o, p.pat.0);
-        write_opt_u32(o, p.ty.map(|t| t.0));
-    });
-    write_slice(out, &body.ids, |o, v| write_u32(o, *v));
-    write_slice(out, &body.attrs, |o, &(node, a, b)| {
-        match node {
-            Node::Stmt(x) => {
+    }
+    if flags & (1 << 5) != 0 {
+        write_slice(out, &body.tys, write_syntax_ty);
+    }
+    if flags & (1 << 6) != 0 {
+        write_slice(out, &body.paths, |o, p| {
+            let _ = write_opt(o, p.qself.as_ref(), |o2, &(t, tr)| {
+                write_u32(o2, t.0);
+                write_opt_u32(o2, tr.map(|x| x.0));
+                Some(())
+            });
+            o.push(u8::from(p.global));
+            write_u32(o, p.start);
+            write_list(o, p.segments);
+        });
+    }
+    if flags & (1 << 7) != 0 {
+        write_slice(out, &body.stmts, write_stmt);
+    }
+    if flags & (1 << 8) != 0 {
+        write_slice(out, &body.segments, |o, s| {
+            write_u32(o, s.name);
+            write_args(o, s.args);
+        });
+    }
+    if flags & (1 << 9) != 0 {
+        write_slice(out, &body.args, |o, a| match *a {
+            GenericArg::Ty(t) => {
                 o.push(0);
-                write_u32(o, x);
+                write_u32(o, t.0);
             }
-            Node::Arm(x) => {
+            GenericArg::Lifetime(l) => {
                 o.push(1);
-                write_u32(o, x);
+                write_u32(o, l);
             }
-            Node::Field(x) => {
+            GenericArg::Const(e) => {
                 o.push(2);
-                write_u32(o, x);
+                write_u32(o, e.0);
             }
-            Node::Expr(x) => {
+            GenericArg::Binding { name, args, ty } => {
                 o.push(3);
-                write_u32(o, x.0);
+                write_u32(o, name);
+                write_args(o, args);
+                write_u32(o, ty.0);
             }
-        }
-        write_u32(o, a);
-        write_u32(o, b);
-    });
-    write_opt_u32(out, body.root.map(|r| r.0));
-    write_slice(out, &body.fn_params, |o, p| write_u32(o, p.0));
+            GenericArg::Constraint { name, bounds } => {
+                o.push(4);
+                write_u32(o, name);
+                write_list(o, bounds);
+            }
+        });
+    }
+    if flags & (1 << 10) != 0 {
+        write_slice(out, &body.bounds, |o, b| match *b {
+            Bound::Trait {
+                path,
+                maybe,
+                constness,
+            } => {
+                o.push(0);
+                write_u32(o, path.0);
+                o.push(u8::from(maybe) | (u8::from(constness) << 1));
+            }
+            Bound::Lifetime(l) => {
+                o.push(1);
+                write_u32(o, l);
+            }
+            Bound::Use(u) => {
+                o.push(2);
+                write_u32(o, u);
+            }
+        });
+    }
+    if flags & (1 << 11) != 0 {
+        write_slice(out, &body.arms, |o, a| {
+            write_u32(o, a.pat.0);
+            write_opt_u32(o, a.guard.map(|g| g.0));
+            write_u32(o, a.body.0);
+        });
+    }
+    if flags & (1 << 12) != 0 {
+        write_slice(out, &body.fields, |o, f| {
+            write_u32(o, f.name);
+            write_u32(o, f.value.0);
+        });
+    }
+    if flags & (1 << 13) != 0 {
+        write_slice(out, &body.field_pats, |o, f| {
+            write_u32(o, f.name);
+            write_u32(o, f.pat.0);
+        });
+    }
+    if flags & (1 << 14) != 0 {
+        write_slice(out, &body.params, |o, p| {
+            write_u32(o, p.pat.0);
+            write_opt_u32(o, p.ty.map(|t| t.0));
+        });
+    }
+    if flags & (1 << 15) != 0 {
+        write_slice(out, &body.ids, |o, v| write_u32(o, *v));
+    }
+    if flags & (1 << 16) != 0 {
+        write_slice(out, &body.attrs, |o, &(node, a, b)| {
+            match node {
+                Node::Stmt(x) => {
+                    o.push(0);
+                    write_u32(o, x);
+                }
+                Node::Arm(x) => {
+                    o.push(1);
+                    write_u32(o, x);
+                }
+                Node::Field(x) => {
+                    o.push(2);
+                    write_u32(o, x);
+                }
+                Node::Expr(x) => {
+                    o.push(3);
+                    write_u32(o, x.0);
+                }
+            }
+            write_u32(o, a);
+            write_u32(o, b);
+        });
+    }
+    if let Some(root) = body.root {
+        write_u32(out, root.0);
+    }
+    if flags & (1 << 17) != 0 {
+        write_slice(out, &body.fn_params, |o, p| write_u32(o, p.0));
+    }
+}
+
+fn opt_vec<T>(
+    cur: &mut Cursor<'_>,
+    flags: u32,
+    bit: u32,
+    f: impl FnMut(&mut Cursor<'_>) -> Result<T>,
+) -> Result<Vec<T>> {
+    if flags & (1 << bit) != 0 {
+        read_vec(cur, f)
+    } else {
+        Ok(Vec::new())
+    }
 }
 
 pub(super) fn read_body(cur: &mut Cursor<'_>) -> Result<Body> {
+    let flags = cur.u32()?;
     Ok(Body {
-        exprs: read_vec(cur, read_expr)?,
-        expr_starts: read_vec(cur, |c| c.u32())?,
-        expr_ends: read_vec(cur, |c| c.u32())?,
-        pats: read_vec(cur, read_pat)?,
-        pat_spans: read_vec(cur, |c| Ok((c.u32()?, c.u32()?)))?,
-        tys: read_vec(cur, read_syntax_ty)?,
-        paths: read_vec(cur, |c| {
+        exprs: opt_vec(cur, flags, 0, read_expr)?,
+        expr_starts: opt_vec(cur, flags, 1, |c| c.u32())?,
+        expr_ends: opt_vec(cur, flags, 2, |c| c.u32())?,
+        pats: opt_vec(cur, flags, 3, read_pat)?,
+        pat_spans: opt_vec(cur, flags, 4, |c| Ok((c.u32()?, c.u32()?)))?,
+        tys: opt_vec(cur, flags, 5, read_syntax_ty)?,
+        paths: opt_vec(cur, flags, 6, |c| {
             Ok(Path {
                 qself: read_opt(c, |c2| Ok((TyId(c2.u32()?), read_opt_u32(c2)?.map(PathId))))?,
                 global: c.u8()? != 0,
@@ -349,14 +421,14 @@ pub(super) fn read_body(cur: &mut Cursor<'_>) -> Result<Body> {
                 segments: read_list(c)?,
             })
         })?,
-        stmts: read_vec(cur, read_stmt)?,
-        segments: read_vec(cur, |c| {
+        stmts: opt_vec(cur, flags, 7, read_stmt)?,
+        segments: opt_vec(cur, flags, 8, |c| {
             Ok(Segment {
                 name: c.u32()?,
                 args: read_args(c)?,
             })
         })?,
-        args: read_vec(cur, |c| {
+        args: opt_vec(cur, flags, 9, |c| {
             Ok(match c.u8()? {
                 0 => GenericArg::Ty(TyId(c.u32()?)),
                 1 => GenericArg::Lifetime(c.u32()?),
@@ -373,15 +445,15 @@ pub(super) fn read_body(cur: &mut Cursor<'_>) -> Result<Body> {
                 _ => bail!("invalid generic arg tag"),
             })
         })?,
-        bounds: read_vec(cur, |c| {
+        bounds: opt_vec(cur, flags, 10, |c| {
             Ok(match c.u8()? {
                 0 => {
                     let path = PathId(c.u32()?);
-                    let flags = c.u8()?;
+                    let f = c.u8()?;
                     Bound::Trait {
                         path,
-                        maybe: flags & 1 != 0,
-                        constness: flags & 2 != 0,
+                        maybe: f & 1 != 0,
+                        constness: f & 2 != 0,
                     }
                 }
                 1 => Bound::Lifetime(c.u32()?),
@@ -389,33 +461,33 @@ pub(super) fn read_body(cur: &mut Cursor<'_>) -> Result<Body> {
                 _ => bail!("invalid bound tag"),
             })
         })?,
-        arms: read_vec(cur, |c| {
+        arms: opt_vec(cur, flags, 11, |c| {
             Ok(Arm {
                 pat: PatId(c.u32()?),
                 guard: read_opt_u32(c)?.map(ExprId),
                 body: ExprId(c.u32()?),
             })
         })?,
-        fields: read_vec(cur, |c| {
+        fields: opt_vec(cur, flags, 12, |c| {
             Ok(FieldInit {
                 name: c.u32()?,
                 value: ExprId(c.u32()?),
             })
         })?,
-        field_pats: read_vec(cur, |c| {
+        field_pats: opt_vec(cur, flags, 13, |c| {
             Ok(FieldPat {
                 name: c.u32()?,
                 pat: PatId(c.u32()?),
             })
         })?,
-        params: read_vec(cur, |c| {
+        params: opt_vec(cur, flags, 14, |c| {
             Ok(Param {
                 pat: PatId(c.u32()?),
                 ty: read_opt_u32(c)?.map(TyId),
             })
         })?,
-        ids: read_vec(cur, |c| c.u32())?,
-        attrs: read_vec(cur, |c| {
+        ids: opt_vec(cur, flags, 15, |c| c.u32())?,
+        attrs: opt_vec(cur, flags, 16, |c| {
             let node = match c.u8()? {
                 0 => Node::Stmt(c.u32()?),
                 1 => Node::Arm(c.u32()?),
@@ -425,8 +497,10 @@ pub(super) fn read_body(cur: &mut Cursor<'_>) -> Result<Body> {
             };
             Ok((node, c.u32()?, c.u32()?))
         })?,
-        root: read_opt_u32(cur)?.map(ExprId),
-        fn_params: read_vec(cur, |c| c.u32().map(PatId))?,
+        root: (flags & (1 << 18) != 0)
+            .then(|| cur.u32().map(ExprId))
+            .transpose()?,
+        fn_params: opt_vec(cur, flags, 17, |c| c.u32().map(PatId))?,
         syms: OnceLock::new(),
     })
 }
