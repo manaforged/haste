@@ -207,6 +207,9 @@ pub(super) fn check_fn_items(
                 if !is_fn && !is_impl_const {
                     continue;
                 }
+                if !tree.env.test && crate::cli::is_test_only_fn(tree, file, item) {
+                    continue;
+                }
                 if !item.parent.is_some_and(|p| {
                     matches!(items[p as usize].kind, ItemKind::Impl | ItemKind::Trait)
                 }) {
