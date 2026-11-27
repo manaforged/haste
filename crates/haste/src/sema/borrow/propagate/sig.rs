@@ -33,6 +33,7 @@ struct SigFnFlags<'a> {
 
 struct SigCallCtx<'a, 'b> {
     expr: ExprId,
+    fn_item: ItemRef,
     sig: &'b Signature,
     sig_src: &'a Source,
     sig_item: &'a Item,
@@ -246,6 +247,7 @@ impl<'a> Checker<'_, 'a> {
         let flags = self.sig_fn_flags(call.fn_item, call.sig);
         let ctx = SigCallCtx {
             expr: call.expr,
+            fn_item: call.fn_item,
             sig: call.sig,
             sig_src: call.sig_src,
             sig_item: call.sig_item,
@@ -339,7 +341,12 @@ impl<'a> Checker<'_, 'a> {
         state: &State,
     ) -> Vec<BorrowSource> {
         let (sig, sig_src, ret_lts) = (ctx.sig, ctx.sig_src, ctx.ret_lts);
-        if sig_returns_only_static(sig, sig_src, ctx.ret_ast, ret_lts) {
+        if sig_returns_only_static(sig, sig_src, ctx.ret_ast, ret_lts)
+            || (!ret_lts.saw_static
+                && ret_lts.named.is_empty()
+                && !ret_lts.has_elided
+                && self.sig_ret_ast_is_provably_static(ctx.fn_item, sig, sig_src, ctx.ret_ast))
+        {
             return Vec::new();
         }
         let mut out = Vec::new();
@@ -454,7 +461,10 @@ impl<'a> Checker<'_, 'a> {
             return Vec::new();
         }
         if flags.is_iter_fn
-            && matches!(flags.fn_name, "map" | "filter_map" | "flat_map")
+            && matches!(
+                flags.fn_name,
+                "map" | "filter_map" | "flat_map" | "find_map"
+            )
             && closure_arg(0)
         {
             for s in &mut recv_sources {

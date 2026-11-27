@@ -26,7 +26,7 @@ impl Checker<'_, '_> {
         param_ids: &[u32],
         pre_arg_sources: &[Vec<BorrowSource>],
         recv_mut: bool,
-        sig: Option<&Signature>,
+        (sig, fn_item): (Option<&Signature>, Option<ItemRef>),
         state: &mut State,
     ) -> Result<()> {
         let Some(mut p) = self.root_place(receiver) else {
@@ -56,10 +56,10 @@ impl Checker<'_, '_> {
         {
             return Ok(());
         }
-        let fn_item = match self.typed.res.get(&expr).copied() {
+        let fn_item = fn_item.or_else(|| match self.typed.res.get(&expr).copied() {
             Some(Res::Fn(item, _)) => Some(item),
             _ => None,
-        };
+        });
         let keep_env = self.ty_holds_closure(recv_ty);
         let mut self_lts = Lifetimes::default();
         if let Some(item) = fn_item

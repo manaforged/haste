@@ -169,26 +169,36 @@ impl Infer<'_, '_> {
         env
     }
 
-    fn own_closure_is_copy_seen(&mut self, ty: Ty, seen: &mut CopySeen) -> Result<Option<bool>> {
+    fn own_closure_captures(&mut self, ty: Ty) -> Option<Vec<(super::closure::By, Ty)>> {
         let ty = self.resolve(ty);
         let Kind::Closure(parent, substs, at) = self.cx.types.kind(ty) else {
-            return Ok(None);
+            return None;
         };
         let here = self
             .instance
             .as_ref()
             .is_some_and(|(item, args)| item == parent && args == substs);
-        let Some(closure) = here
+        let closure = here
             .then(|| self.out.closures.get(&crate::body::ExprId(*at)))
-            .flatten()
-        else {
+            .flatten()?;
+        Some(
+            closure
+                .captures
+                .iter()
+                .map(|cap| {
+                    let local_ty = self.out.locals[cap.local as usize].ty;
+                    (cap.by, cap.ty(self.cx, local_ty).unwrap_or(local_ty))
+                })
+                .collect(),
+        )
+    }
+
+    fn own_closure_is_copy_seen(&mut self, ty: Ty, seen: &mut CopySeen) -> Result<Option<bool>> {
+        let Some(captures) = self.own_closure_captures(ty) else {
             return Ok(None);
         };
-        let captures: Vec<_> = closure.captures.clone();
-        for cap in captures {
-            let local_ty = self.out.locals[cap.local as usize].ty;
-            let cap_ty = cap.ty(self.cx, local_ty).unwrap_or(local_ty);
-            let copy = match cap.by {
+        for (by, cap_ty) in captures {
+            let copy = match by {
                 super::closure::By::Ref => true,
                 super::closure::By::Mut => false,
                 super::closure::By::Value => self.is_copy_seen(cap_ty, seen)?,
@@ -474,6 +484,16 @@ impl Infer<'_, '_> {
     fn closure_drop_parts(&mut self, ty: Ty) -> Result<Vec<Ty>> {
         let Some(&Kind::Tuple(items)) = self.closure_env(ty).map(|env| self.cx.types.kind(env))
         else {
+            if self.coroutine_output(ty).is_none()
+                && let Some(captures) = self.own_closure_captures(ty)
+            {
+                return Ok(captures
+                    .into_iter()
+                    .filter_map(|(by, cap_ty)| {
+                        matches!(by, super::closure::By::Value).then_some(cap_ty)
+                    })
+                    .collect());
+            }
             bail!("drop of a closure whose defining body was not inferred");
         };
         if self.coroutine_output(ty).is_none() {

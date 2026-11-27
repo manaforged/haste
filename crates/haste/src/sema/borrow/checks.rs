@@ -145,6 +145,7 @@ pub(super) fn compute_static_type_params(
                     &mut cache,
                 ) {
                     out.push(idx);
+                    sig_names.push(name.to_owned());
                 }
                 idx += 1;
             }
@@ -181,6 +182,7 @@ pub(super) fn compute_static_type_params(
                     &mut cache,
                 ) {
                     out.push(idx);
+                    sig_names.push(name.to_owned());
                 }
                 idx += 1;
             }

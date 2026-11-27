@@ -190,8 +190,7 @@ pub(in super::super) fn receiver_has_any_named(src: &Source, item: &Item, named:
 fn impl_self_lifetimes(
     cx: &mut crate::sema::Context<'_>,
     item: crate::names::ItemRef,
-    sig: &crate::body::sig::Signature,
-    src: &Source,
+    static_names: &[String],
 ) -> (bool, bool, Vec<String>) {
     let Some(block) = cx.owner_impl(item) else {
         return (false, false, Vec::new());
@@ -204,25 +203,8 @@ fn impl_self_lifetimes(
         .iter()
         .any(|g| g.kind == crate::body::sig::GenericKind::Lifetime);
     let impl_src = &cx.impl_file(block).source;
-    let bounded_static = |body: &Body, s: &Source, bounds: crate::body::List| {
-        body.list(bounds).iter().any(
-            |&b| matches!(body.bounds[b as usize], Bound::Lifetime(lt) if s.text(lt) == LT_STATIC),
-        )
-    };
-    let has_non_static_ty = hdr.generics.iter().any(|g| {
-        if g.kind != crate::body::sig::GenericKind::Type {
-            return false;
-        }
-        let name = impl_src.text(g.name);
-        !(bounded_static(&hdr.body, impl_src, g.bounds)
-            || hdr.predicates.iter().any(|p| {
-                pred_matches_name_in(&hdr.body, impl_src, p, name)
-                    && bounded_static(&hdr.body, impl_src, p.bounds)
-            })
-            || sig.predicates.iter().any(|p| {
-                pred_matches_name(sig, src, p, name) && bounded_static(&sig.body, src, p.bounds)
-            }))
-    });
+    let has_non_static_ty = crate::sema::infer::scope::type_params(&hdr.generics)
+        .any(|g| !static_names.iter().any(|s| s == impl_src.text(g.name)));
     let mut lts = Lifetimes::default();
     collect_ty_lifetimes(&hdr.body, impl_src, hdr.self_ty, &mut lts);
     let has_lt = has_lt_generic || has_non_static_ty || lts.has_elided || !lts.named.is_empty();
@@ -335,7 +317,7 @@ pub(in super::super) fn compute_param_lifetimes(
             *slot = false;
         }
     }
-    let (impl_has_lt, impl_has_elided, impl_named) = impl_self_lifetimes(cx, item, sig, src);
+    let (impl_has_lt, impl_has_elided, impl_named) = impl_self_lifetimes(cx, item, static_names);
     let mut cursor = 0usize;
     if let Some((kind, _)) = sig.receiver {
         if let Some(&local) = typed.params.get(cursor)
@@ -363,7 +345,14 @@ pub(in super::super) fn compute_param_lifetimes(
                     info.inner_has_elided_lt[slot] = !info.inner_is_static[slot] && impl_has_elided;
                 }
                 crate::body::sig::SelfKind::Typed(ty) => {
-                    record_param_ty(sig, src, ty, (impl_has_lt, static_names), slot, &mut info);
+                    record_param_ty(
+                        cx,
+                        (item, sig, src),
+                        ty,
+                        (impl_has_lt, static_names),
+                        slot,
+                        &mut info,
+                    );
                 }
                 crate::body::sig::SelfKind::Value => {
                     info.is_static[slot] = !impl_has_lt;
@@ -379,8 +368,8 @@ pub(in super::super) fn compute_param_lifetimes(
             && (local as usize) < n
         {
             record_param_ty(
-                sig,
-                src,
+                cx,
+                (item, sig, src),
                 param_ty,
                 (impl_has_lt, static_names),
                 local as usize,
@@ -405,8 +394,8 @@ fn has_elided_or_unbounded_lt(
 }
 
 fn record_param_ty(
-    sig: &crate::body::sig::Signature,
-    src: &Source,
+    cx: &mut crate::sema::Context<'_>,
+    (item, sig, src): (crate::names::ItemRef, &crate::body::sig::Signature, &Source),
     ty: TyId,
     (impl_has_lt, static_names): (bool, &[String]),
     slot: usize,
@@ -434,7 +423,14 @@ fn record_param_ty(
             info.has_elided_lt[slot] = false;
             info.named_lts[slot] = vec![src.text(lt).to_owned()];
         }
-        info.inner_is_static[slot] = super::return_lt::ast_ty_is_provably_static(sig, src, inner);
+        info.inner_is_static[slot] = super::static_ty::ast_ty_is_provably_static_in_item(
+            cx,
+            item,
+            sig,
+            src,
+            inner,
+            static_names,
+        );
         let mut inner_lts = Lifetimes::default();
         collect_ty_lifetimes(&sig.body, src, inner, &mut inner_lts);
         info.inner_has_elided_lt[slot] =
