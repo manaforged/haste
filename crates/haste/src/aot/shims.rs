@@ -27,6 +27,7 @@ pub(in crate::aot) enum Shim {
     FrameFree,
     CatchUnwind,
     StartPanic,
+    StartPanicAbort,
     PanicCleanup,
     DropPush,
     DropPop,
@@ -86,6 +87,7 @@ fn collect_deps<T: Copy>(
             .chain(jmp.map(|j| j.1))
             .chain([crt("abort")])
             .collect(),
+        Shim::StartPanicAbort => vec![crt("abort")],
         Shim::DropPush | Shim::DropPop => tls.to_vec(),
         _ => Vec::new(),
     }
