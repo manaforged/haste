@@ -676,6 +676,7 @@ impl super::super::Checker<'_, '_> {
             Expr::Path(_) => {
                 if let Some(local) = self.expr_plain_local(expr)
                     && self.is_non_static_param(local)
+                    && !self.is_peeled_static_shared_ref_param(expr, local)
                 {
                     return Err(self.borrow_err(
                         Some(expr),

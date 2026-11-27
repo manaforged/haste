@@ -432,11 +432,7 @@ impl Checker<'_, '_> {
         };
         if let Kind::Ref(_, inner) = *self.cx.types.kind(self.local_ty(*local))
             && self.is_ref_ty(inner)
-            && (self.typed.adjusts.get(&expr).is_some_and(|a| a.derefs > 0)
-                || matches!(
-                    self.typed.coercions.get(&expr),
-                    Some(crate::sema::infer::Coercion::Deref(..))
-                ))
+            && self.expr_derefs_ref(expr)
         {
             let mut joined: Vec<BorrowSource> = state
                 .loans
@@ -451,7 +447,9 @@ impl Checker<'_, '_> {
                 })
                 .collect();
             if joined.is_empty() {
-                if self.is_non_static_param(*local) {
+                if self.is_non_static_param(*local)
+                    && !self.is_peeled_static_shared_ref_param(expr, *local)
+                {
                     joined.push(BorrowSource {
                         target: *local,
                         steps: vec![PlaceStep::Deref],
