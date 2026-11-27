@@ -139,7 +139,11 @@ impl<F: FnMut(&Outline, ItemRef) -> Option<u64>> Encoder<'_, F> {
         Some(())
     }
 
-    fn write_verdict(&mut self, out: &mut Vec<u8>, kind: &SummaryKind) -> Option<()> {
+    pub(in crate::sema::summary) fn write_verdict(
+        &mut self,
+        out: &mut Vec<u8>,
+        kind: &SummaryKind,
+    ) -> Option<()> {
         match kind {
             SummaryKind::Poly(_) | SummaryKind::Error(_) => return None,
             SummaryKind::MonomorphicFallback => out.push(0),
@@ -207,7 +211,10 @@ impl Decoder<'_> {
         })
     }
 
-    fn read_verdict(&self, cur: &mut Cursor<'_>) -> Result<SummaryKind> {
+    pub(in crate::sema::summary) fn read_verdict(
+        &self,
+        cur: &mut Cursor<'_>,
+    ) -> Result<SummaryKind> {
         Ok(match cur.u8()? {
             0 => SummaryKind::MonomorphicFallback,
             1 => {

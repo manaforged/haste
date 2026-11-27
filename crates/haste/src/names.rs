@@ -361,6 +361,7 @@ impl Crate {
 }
 
 /// The resolved scopes of every crate in an outline.
+#[derive(Default)]
 pub struct Names {
     pub crates: Vec<Crate>,
     pub symbols: Symbols,

@@ -42,6 +42,19 @@ impl SegKey {
             overflow: Some(Arc::from(segments)),
         }
     }
+
+    pub(super) fn push_syms(&self, out: &mut Vec<crate::names::Sym>) {
+        if let Some(overflow) = &self.overflow {
+            out.extend_from_slice(overflow);
+        } else {
+            out.extend(
+                self.inline[..usize::from(self.len)]
+                    .iter()
+                    .copied()
+                    .map(crate::names::Sym),
+            );
+        }
+    }
 }
 
 #[derive(Default)]
@@ -236,6 +249,7 @@ pub(super) struct Lookups {
     pub(super) file_index: Arc<std::sync::OnceLock<Arc<summary::codec::FileIndex>>>,
     pub(super) lang_items: Arc<std::sync::OnceLock<Arc<LangMap>>>,
     pub(super) skip_warm_sysroot_bodies: bool,
+    pub(super) warm: Arc<summary::WarmState>,
 }
 
 /// What answering the asks of a pass added: nothing new to infer with, the output of procedural macros that function bodies call, or loaded files, resolved names and expanded items.
@@ -251,17 +265,32 @@ impl Lookups {
         self.reconcile(outline, None);
     }
 
-    fn reset_after_names(&mut self, outline: &Outline) {
-        self.selections
-            .retain(|_, found| matches!(found, Some((impls::ImplRef::Module { .. }, _))));
+    fn reset_after_names(&mut self, outline: &Outline, fixed_stable: bool) {
+        self.selections.retain(|_, found| {
+            matches!(found, Some((impls::ImplRef::Module { .. }, _)))
+                || (fixed_stable
+                    && matches!(found, Some((impls::ImplRef::Body(item), _)) if outline.is_fixed(item.krate)))
+        });
         self.projections.retain(|_, found| found.is_some());
         self.forms.retain(|_, found| found.is_some());
         self.scope_traits
             .retain(|home, _| outline.is_fixed(home.krate));
-        self.reveals.clear();
+        if fixed_stable {
+            self.reveals
+                .retain(|&(item, substs)| outline.is_fixed(item.krate) && substs.is_empty());
+            self.type_defs.retain(|&(sc, _), _| {
+                outline.is_fixed(sc.0.krate)
+                    && sc.1.is_none_or(|i| outline.is_fixed(i.krate))
+                    && sc.2.is_none_or(|i| outline.is_fixed(i.krate))
+            });
+            self.trait_calls
+                .retain(|&(item, substs), _| outline.is_fixed(item.krate) && substs.is_empty());
+        } else {
+            self.reveals.clear();
+            self.type_defs.clear();
+            self.trait_calls.clear();
+        }
         self.provisional_rets.clear();
-        self.type_defs.clear();
-        self.trait_calls.clear();
         self.assoc_types.clear();
         self.auto_traits.clear();
         self.checked_impls.retain_entries(|_, &settled| settled);
@@ -269,17 +298,16 @@ impl Lookups {
 
     pub(super) fn reconcile(&mut self, outline: &Outline, answer: Option<Answer>) {
         let after_names = matches!(answer, Some(Answer::Names));
-        if after_names {
-            self.reset_after_names(outline);
-        }
         let loaded: Vec<crate::outline::tree::CrateExtent> = outline
             .crates
             .iter()
             .map(crate::outline::tree::Crate::extent)
             .collect();
-        let mut guard = write_lock(&self.state.loaded);
+        let state = Arc::clone(&self.state);
+        let mut guard = write_lock(&state.loaded);
         if *guard == loaded {
             if after_names {
+                self.reset_after_names(outline, true);
                 self.heads.retain(|holder, index| {
                     let impls::Holder::Crate(k) = *holder else {
                         return false;
@@ -307,6 +335,9 @@ impl Lookups {
         };
         let reset_sysroot = extent_changed(Outline::is_sysroot);
         let reset_fixed = reset_sysroot || extent_changed(Outline::is_fixed);
+        if after_names {
+            self.reset_after_names(outline, !reset_fixed);
+        }
         if same_len {
             self.modules
                 .retain(|k, _| guard.get(*k as usize) == loaded.get(*k as usize));
@@ -371,23 +402,23 @@ impl Lookups {
             *write_lock(&self.state.langs) = None;
             *write_lock(&self.state.primitives) = None;
         }
-        if reset_fixed {
-            if same_len {
-                if let Some(heads) = &mut self.sysroot_heads {
-                    let stale_any = heads
-                        .keys()
-                        .any(|&k| guard.get(k as usize) != loaded.get(k as usize));
-                    if stale_any {
-                        let map = Arc::make_mut(heads);
-                        map.retain(|&k, _| guard.get(k as usize) == loaded.get(k as usize));
-                        if map.is_empty() {
-                            self.sysroot_heads = None;
-                        }
+        if same_len {
+            if let Some(heads) = &mut self.sysroot_heads {
+                let stale_any = heads
+                    .keys()
+                    .any(|&k| guard.get(k as usize) != loaded.get(k as usize));
+                if stale_any {
+                    let map = Arc::make_mut(heads);
+                    map.retain(|&k, _| guard.get(k as usize) == loaded.get(k as usize));
+                    if map.is_empty() {
+                        self.sysroot_heads = None;
                     }
                 }
-            } else {
-                self.sysroot_heads = None;
             }
+        } else {
+            self.sysroot_heads = None;
+        }
+        if reset_fixed {
             self.file_index = Arc::new(std::sync::OnceLock::new());
             self.fresh_summaries.clear();
             self.fresh_instances.clear();
@@ -471,6 +502,11 @@ impl Cache {
     /// Whether warm `.substrate` sysroot lookups eagerly parse bodies for lowering.
     pub fn warm_sysroot_bodies(&self) -> bool {
         !self.lookups.skip_warm_sysroot_bodies
+    }
+
+    /// Returns the one-shot warm check snapshot state attached to this cache.
+    pub(crate) fn warm_state(&self) -> &summary::WarmState {
+        &self.lookups.warm
     }
 
     /// Drops cached final function outcomes while keeping resolved types, lookups, and summaries.
