@@ -8,8 +8,8 @@
 
 ## Key capabilities
 
-- One-shot CLI (`haste build`): re-checks the local crate with only dependency summaries cached on disk (`2.35 s` median leaf edit, `2.35 s` public-type edit on a 340-crate workspace vs `1.95 s` / `2.21 s` for `cargo check`).
-- Resident daemon (`haste build --daemon`, Unix, `900 s` default idle timeout): `8.4–9.0 ms` on small crates and `22.3 ms` median (`22.1–37.3 ms`, `87x` faster than `cargo check`) on 340-crate leaf edits (`4.65 s` cold start; `3.00 s` on cross-crate public-type edits); unchanged no-ops in `0.7–2.3 ms`.
+- One-shot CLI (`haste build`): re-checks the local crate with only dependency summaries cached on disk (`120–122 ms` single-line edit on bundled `tests/diff`; `2.35 s` median leaf or public-type edit on an unbundled 340-crate workspace vs `1.95 s` / `2.21 s` for `cargo check`).
+- Resident daemon (`haste build --daemon`, Unix, `900 s` default idle timeout): `7.1–7.3 ms` single-line edit on bundled `tests/diff` (`16.1x–23.5x` vs `cargo check`); on an unbundled 340-crate workspace, `22.3 ms` median leaf edit (`22.1–37.3 ms`, `87x` vs `1.95 s` `cargo check`) paired with `3.00 s` on cross-crate public-type edits (vs `2.21 s` `cargo check`) and `4.65 s` cold start; unchanged no-ops in `0.6–2.8 ms`.
 - Embeddable Rust library API (`haste::Compiler` / `CompilerBuilder`): retains configuration and loads a fresh build per `check`/`test`/`emit` call (no resident daemon; does not provide daemon edit latency; executes `build.rs` and proc macros with invoking user privileges).
 - In-memory execution & tests (Unix): `haste run`, `haste test` (including `#[tokio::test]` and pre-lowering test filtering; self-spawning `std::env::current_exe()` tests and `harness = false` fail under JIT), and `haste run --watch` (live function hot-reload, `85.3 ms` save-to-first-changed-response on a local TCP handler).
 - Shared cache footprint: `159 MiB` isolated `HASTE_HOME` after a cold 340-crate check (`+6–18 MiB` per additional workspace), with no per-project `target/` directory.

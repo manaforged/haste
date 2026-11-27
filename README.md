@@ -44,8 +44,8 @@ If a workspace has no `Cargo.lock`, `haste` runs `cargo generate-lockfile` autom
 
 `haste` has three distinct execution models with different incremental latency:
 
-1. **One-shot CLI (`haste build`):** runs a fresh process per invocation, re-checks the local crate, and caches only dependency summaries on disk. On a 340-crate workspace (macOS ARM64, 6 CPUs), leaf edits take `2.35 s` median (`2.33–2.49 s`) and public-type edits take `2.35 s` (`2.33–2.40 s`), compared to `1.95 s` (leaf) and `2.21 s` (public-type) for `cargo check`.
-2. **Resident daemon (`haste build --daemon`, Unix):** keeps workspace and dependency state warm in a background `haste serve` process (`900 s` idle timeout, configurable via `HASTE_SERVE_IDLE_SECS`). On small crates, single-line edits take `8.4–9.0 ms`. On the 340-crate workspace, daemon cold start takes `4.65 s`, leaf edits drop to `22.3 ms` median (`22.1–37.3 ms`, `87x` faster than `cargo check`), and cross-crate public-type edits take `3.00 s` (`2.94–3.09 s`). Plain `haste` commands never spawn a daemon, though they reuse an already-running daemon for the same workspace unless `HASTE_NO_DAEMON=1` is set.
+1. **One-shot CLI (`haste build`):** runs a fresh process per invocation, re-checks the local crate, and caches only dependency summaries on disk. On the bundled `tests/diff` fixture (`144` functions), single-line edits take `120–122 ms` (`1.0x–2.0x` vs `cargo check`) and unchanged no-ops take `0.6–2.8 ms`. On an unbundled 340-crate workspace (macOS ARM64, 6 CPUs), leaf edits take `2.35 s` median (`2.33–2.49 s`) and public-type edits take `2.35 s` (`2.33–2.40 s`), compared to `1.95 s` (leaf) and `2.21 s` (public-type) for `cargo check`.
+2. **Resident daemon (`haste build --daemon`, Unix):** keeps workspace and dependency state warm in a background `haste serve` process (`900 s` idle timeout, configurable via `HASTE_SERVE_IDLE_SECS`). On the bundled `tests/diff` fixture, single-line edits take `7.1–7.3 ms` (`16.1x–23.5x` vs `cargo check`). On the unbundled 340-crate workspace, daemon cold start takes `4.65 s`, leaf edits drop to `22.3 ms` median (`22.1–37.3 ms`, `87x` faster than `cargo check` at `1.95 s`), while cross-crate public-type edits take `3.00 s` (`2.94–3.09 s`, slower than `cargo check` at `2.21 s`). Plain `haste` commands never spawn a daemon, though they reuse an already-running daemon for the same workspace unless `HASTE_NO_DAEMON=1` is set.
 3. **Embeddable library (`haste::Compiler`):** retains configuration across calls, but loads a fresh build on every `check`, `test`, or `emit` call. It does not run a resident daemon, so embedders should not assume `--daemon` edit latency.
 
 Inspect or stop background daemons with `serve status` and `serve stop` (`PATH` is optional):
@@ -72,28 +72,26 @@ Pure-Rust executables are zero-linker and standalone. Linux ELF binaries are non
 
 ## Benchmarks
 
-Run `bash scripts/bench.sh` to reproduce build-speed and AOT runtime numbers on your machine (pass `--long` for 4x compute iterations). By default, `scripts/bench.sh` runs with `HASTE_BENCH_COLD=1`, which isolates `HASTE_HOME` per suite, warms the stdlib index once on `examples/hello`, and prints `Cold debug` rows for a fair cold-to-cold comparison (set `HASTE_BENCH_COLD=0` to reuse your existing `$HASTE_HOME` and print `Warm cache` rows).
+Run `bash scripts/bench.sh` to reproduce build-speed and AOT runtime numbers on your machine (pass `--long` for 4x compute iterations). By default, `scripts/bench.sh` runs with `HASTE_BENCH_COLD=1`, which isolates `HASTE_HOME` and reports two distinct cold rows on `tests/diff` against a fresh `cargo` target directory: **Empty `HASTE_HOME`** (first command after install, including one-time stdlib indexing) and **First project build, stdlib indexed** (first build of a new project after stdlib indexing on `examples/hello`). Set `HASTE_BENCH_COLD=0` to reuse your existing `$HASTE_HOME` and print `Warm cache` rows instead.
 
-### Build speed (`tests/diff`, measured with warm toolchain cache)
+### Build speed (`tests/diff`, bundled 144-function fixture, `HASTE_BENCH_COLD=1`)
 
-Resident-daemon edits (`--daemon`) compare a warm background `haste serve` process against one-shot `cargo check`; one-shot `haste build` pays process startup (`0.6x–0.9x` on small edits), while unchanged no-ops exit in `0.7–2.3 ms` (`5.3x–11.0x`). The table below was recorded with `HASTE_BENCH_COLD=0` (`Warm cache`), where `haste` reuses `$HASTE_HOME` while `cargo` compiles into a fresh temporary target dir; default `HASTE_BENCH_COLD=1` (`Cold debug`) is the fair cold-to-cold comparison.
+Resident-daemon edits (`--daemon`) compare a warm background `haste serve` process against one-shot `cargo check`. `Empty HASTE_HOME` includes one-time stdlib indexing (`852–987 ms` for `haste build` vs `295–479 ms` for `cargo check`); once stdlib is indexed, the first build of a new project drops to `81.5–121 ms` (`2.4x–5.9x` faster than `cargo check`).
 
 | Benchmark | Platform | haste | cargo | Speedup |
 | --- | --- | ---: | ---: | ---: |
-| Single-line edit (`haste build --daemon` vs `cargo check`) | macOS ARM64 (`rustc 1.98.1`) | 8.4 ms | 62.2 ms | 7.4x |
-| Single-line edit (`haste build` vs `cargo check`) | macOS ARM64 (`rustc 1.98.1`) | 66.3 ms | 62.2 ms | 0.9x |
-| Single-line edit (`haste build -o` vs `cargo build`) | macOS ARM64 (`rustc 1.98.1`) | 161 ms | 185 ms | 1.1x |
-| Unchanged no-op (`haste build` vs `cargo check`) | macOS ARM64 (`rustc 1.98.1`) | 2.3 ms | 12.1 ms | 5.3x |
-| Unchanged no-op (`haste build -o` vs `cargo build`) | macOS ARM64 (`rustc 1.98.1`) | 2.3 ms | 12.4 ms | 5.4x |
-| Warm cache (`haste build` vs `cargo check`) | macOS ARM64 (`rustc 1.98.1`) | 75.7 ms | 227 ms | 3.0x |
-| Warm cache (`haste build -o` vs `cargo build`) | macOS ARM64 (`rustc 1.98.1`) | 226 ms | 508 ms | 2.3x |
-| Single-line edit (`haste build --daemon` vs `cargo check`) | Linux x86-64 (`rustc 1.99.1`) | 9.0 ms | 55.7 ms | 6.2x |
-| Single-line edit (`haste build` vs `cargo check`) | Linux x86-64 (`rustc 1.99.1`) | 94.2 ms | 55.7 ms | 0.6x |
-| Single-line edit (`haste build -o` vs `cargo build`) | Linux x86-64 (`rustc 1.99.1`) | 183 ms | 110 ms | 0.6x |
-| Unchanged no-op (`haste build` vs `cargo check`) | Linux x86-64 (`rustc 1.99.1`) | 0.7 ms | 7.1 ms | 10.1x |
-| Unchanged no-op (`haste build -o` vs `cargo build`) | Linux x86-64 (`rustc 1.99.1`) | 0.7 ms | 7.1 ms | 11.0x |
-| Warm cache (`haste build` vs `cargo check`) | Linux x86-64 (`rustc 1.99.1`) | 113 ms | 202 ms | 1.8x |
-| Warm cache (`haste build -o` vs `cargo build`) | Linux x86-64 (`rustc 1.99.1`) | 345 ms | 506 ms | 1.5x |
+| Single-line edit (`haste build --daemon` vs `cargo check`) | macOS ARM64 (`rustc 1.98.1`) | 7.1 ms | 167 ms | 23.5x |
+| Single-line edit (`haste build` vs `cargo check`) | macOS ARM64 (`rustc 1.98.1`) | 120 ms | 234 ms | 2.0x |
+| Single-line edit (`haste build -o` vs `cargo build`) | macOS ARM64 (`rustc 1.98.1`) | 233 ms | 403 ms | 1.7x |
+| Unchanged no-op (`haste build` vs `cargo check`) | macOS ARM64 (`rustc 1.98.1`) | 2.8 ms | 106 ms | 37.6x |
+| Empty `HASTE_HOME` (`haste build` vs `cargo check`) | macOS ARM64 (`rustc 1.98.1`) | 987 ms | 479 ms | 0.5x |
+| First project build, stdlib indexed (`haste build` vs `cargo check`) | macOS ARM64 (`rustc 1.98.1`) | 81.5 ms | 479 ms | 5.9x |
+| Single-line edit (`haste build --daemon` vs `cargo check`) | Linux x86-64 (`rustc 1.99.1`) | 7.3 ms | 118 ms | 16.1x |
+| Single-line edit (`haste build` vs `cargo check`) | Linux x86-64 (`rustc 1.99.1`) | 122 ms | 121 ms | 1.0x |
+| Single-line edit (`haste build -o` vs `cargo build`) | Linux x86-64 (`rustc 1.99.1`) | 290 ms | 182 ms | 0.6x |
+| Unchanged no-op (`haste build` vs `cargo check`) | Linux x86-64 (`rustc 1.99.1`) | 0.6 ms | 70.0 ms | 121.9x |
+| Empty `HASTE_HOME` (`haste build` vs `cargo check`) | Linux x86-64 (`rustc 1.99.1`) | 852 ms | 295 ms | 0.3x |
+| First project build, stdlib indexed (`haste build` vs `cargo check`) | Linux x86-64 (`rustc 1.99.1`) | 121 ms | 295 ms | 2.4x |
 
 On a larger private multi-crate workspace (not bundled; `340` crates, `45` build scripts, `17,521` functions, macOS ARM64, 6 CPUs):
 
