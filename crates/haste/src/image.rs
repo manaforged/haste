@@ -518,10 +518,9 @@ pub(super) fn resolve_host_symbol(
     aot: bool,
 ) -> Result<(HostSymbol, usize), String> {
     let name = cx.symbol_name(item);
-    let lib = cx.link_lib(item);
     let resolved = name
         .as_deref()
-        .and_then(|n| HostSymbol::resolve_for_lib(n, lib.as_deref(), aot))
+        .and_then(|n| resolve_symbol_with_fallback(cx, item, n, aot))
         .and_then(|sym| {
             if aot {
                 Some((sym, 0))
@@ -532,6 +531,33 @@ pub(super) fn resolve_host_symbol(
     resolved.ok_or_else(|| format!("{}: no host symbol links to it", cx.name(item)))
 }
 
+fn resolve_symbol_with_fallback(
+    cx: &Context<'_>,
+    item: crate::names::ItemRef,
+    name: &str,
+    aot: bool,
+) -> Option<HostSymbol> {
+    if let Some(lib) = cx.link_lib(item) {
+        return HostSymbol::resolve_for_lib(name, Some(&lib), aot);
+    }
+    let libs = cx.crate_link_libs(item.krate);
+    if libs.is_empty() {
+        return HostSymbol::resolve_for_lib(name, None, aot);
+    }
+    if HostSymbol::resolve_for_lib(name, None, false).is_some() {
+        return HostSymbol::resolve_for_lib(name, None, aot);
+    }
+    for lib in libs {
+        if HostSymbol::resolve_for_lib(name, Some(lib), false).is_some() {
+            return HostSymbol::resolve_for_lib(name, Some(lib), aot);
+        }
+    }
+    if aot && let Some(lib) = libs.first() {
+        return HostSymbol::resolve_for_lib(name, Some(lib), true);
+    }
+    None
+}
+
 pub(super) fn weak(cx: &Context<'_>, item: crate::names::ItemRef) -> bool {
     cx.attr_value(item, "linkage") == Some("extern_weak")
 }
@@ -540,5 +566,137 @@ fn patch(addresses: &[usize], code: usize) {
     for &address in addresses {
         // SAFETY: address is an 8-aligned word of a constant table that data handed out, which stays mapped for the life of the process; an aligned word store is single-copy atomic, so a thread that reads it sees the old entry or the new one, and both run the same function.
         unsafe { (*(address as *const AtomicUsize)).store(code, Ordering::Release) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rustc_hash::FxHashMap as HashMap;
+
+    use crate::names::{Crate as NamesCrate, ItemRef, Names, Symbols};
+    use crate::outline::build::{Loader, Others};
+    use crate::outline::tree::{Crate, Decl, Env, Files, Module, State};
+    use crate::outline::{Outline, Role, Root};
+    use crate::sema::{Cache, Context};
+
+    #[test]
+    fn crate_level_link_framework_fallback_collects_and_resolves() {
+        let dir = std::env::temp_dir().join(format!("haste_link_fallback_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let lib_path = dir.join("lib.rs");
+        let str_path = dir.join("string.rs");
+        std::fs::write(
+            &lib_path,
+            concat!(
+                "#[cfg_attr(all(any(target_os = \"macos\", target_os = \"linux\"), feature = \"link\"), link(name = \"CoreFoundation\", kind = \"framework\"))]\n",
+                "extern \"C\" {}\n",
+                "#[cfg(FALSE)]\n",
+                "#[link(name = \"DisabledLib\", kind = \"framework\")]\n",
+                "extern \"C\" {}\n",
+                "pub mod string;\n",
+            ),
+        )
+        .expect("write lib.rs");
+        std::fs::write(
+            &str_path,
+            "unsafe extern \"C\" { pub fn CFStringGetCStringPtr(s: *const u8, enc: u32) -> *const u8; pub fn free(ptr: *mut u8); }\n",
+        )
+        .expect("write string.rs");
+
+        let mut features = std::collections::BTreeSet::new();
+        features.insert("link".to_owned());
+        let env = Env {
+            target: crate::graph::cfg::Target::host(),
+            features,
+            known: true,
+            ..Env::default()
+        };
+        let files = Files::default();
+        let mut tree = Crate {
+            env,
+            modules: vec![Module {
+                file: usize::MAX,
+                item: None,
+                parent: None,
+                name: String::new(),
+                dir: dir.clone(),
+                parts: Vec::new(),
+                vis: crate::outline::item::Vis::Pub,
+                macro_use: false,
+                state: State::Declared(Decl::File {
+                    candidates: vec![lib_path.clone()],
+                    by_attr: true,
+                }),
+                textual: None,
+            }],
+            ..Crate::default()
+        };
+        Loader::new(0, &files, Others::Crates(&[]), &[], &mut tree)
+            .load_module(0)
+            .expect("load root");
+        Loader::new(0, &files, Others::Crates(&[]), &[], &mut tree)
+            .load_module(1)
+            .expect("load string");
+
+        assert_eq!(tree.link_libs, vec!["framework=CoreFoundation".to_owned()]);
+
+        let outline = Outline {
+            roots: vec![Root {
+                unit: 0,
+                name: "core_foundation_sys".to_owned(),
+                path: lib_path,
+                role: Role::Lib,
+                edition: "2021".to_owned(),
+                proc_macro: false,
+            }],
+            crates: vec![tree],
+            deps: vec![Vec::new()],
+            cache: files,
+            procs: HashMap::default(),
+            pins: vec![None],
+        };
+        let mut names = Names {
+            crates: vec![NamesCrate::default()],
+            symbols: Symbols::default(),
+        };
+        names.crates[0].eager = true;
+        let cx = Context::new(&outline, &names, Cache::default());
+        assert_eq!(
+            cx.crate_link_libs(0),
+            &["framework=CoreFoundation".to_owned()]
+        );
+
+        let free_item = ItemRef {
+            krate: 0,
+            file: 1,
+            item: 2,
+        };
+        assert_eq!(cx.link_lib(free_item), None);
+        assert!(matches!(
+            super::resolve_host_symbol(&cx, free_item, true),
+            Ok((crate::host::HostSymbol::Dynamic { lib: None, .. }, 0))
+        ));
+
+        #[cfg(target_vendor = "apple")]
+        {
+            let cf_item = ItemRef {
+                krate: 0,
+                file: 1,
+                item: 1,
+            };
+            assert_eq!(cx.link_lib(cf_item), None);
+            assert!(matches!(
+                super::resolve_host_symbol(&cx, cf_item, true),
+                Ok((
+                    crate::host::HostSymbol::Dynamic {
+                        lib: Some(ref lib),
+                        ..
+                    },
+                    0
+                )) if lib.as_ref() == "framework=CoreFoundation"
+            ));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

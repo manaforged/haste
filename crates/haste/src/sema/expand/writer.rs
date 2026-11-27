@@ -29,6 +29,9 @@ pub(super) struct Writer {
     pub(super) uses: Vec<(String, Source)>,
     pub(super) globs: Vec<Source>,
     pub(super) externs: Vec<(String, ModRef)>,
+    pub(super) macro_uses: Vec<ModRef>,
+    pub(super) local_inner_scopes: HashMap<u32, ItemRef>,
+    macro_use_target: Option<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -82,23 +85,6 @@ fn path_word(src: &Source, at: u32) -> bool {
         && (kind != TokenKind::Ident
             || !RESERVED.contains(&src.text(at))
             || PATH_KEYWORDS.contains(&src.text(at)))
-}
-
-pub(super) fn def_site_macro(
-    cx: &mut Context<'_>,
-    src: &Source,
-    path: (u32, u32),
-) -> Option<ItemRef> {
-    let mark_at = if src.kind(path.0) == TokenKind::Colon && path.0 + 2 <= path.1 {
-        path.0 + 2
-    } else {
-        path.0
-    };
-    let Some(Mark::Home { krate, file, item }) = src.mark(mark_at) else {
-        return None;
-    };
-    let module = cx.module_of(ItemRef { krate, file, item }).ok()?;
-    macro_at(&cx.paths(module.krate), src, path, module)
 }
 
 pub(super) fn defined_expand(
@@ -155,6 +141,41 @@ impl Writer {
             uses: Vec::new(),
             globs: Vec::new(),
             externs: Vec::new(),
+            macro_uses: Vec::new(),
+            local_inner_scopes: HashMap::default(),
+            macro_use_target: None,
+        }
+    }
+
+    pub(super) fn def_site_macro(
+        &self,
+        cx: &mut Context<'_>,
+        src: &Source,
+        path: (u32, u32),
+    ) -> Option<ItemRef> {
+        let mark_at = if src.kind(path.0) == TokenKind::Colon && path.0 + 2 <= path.1 {
+            path.0 + 2
+        } else {
+            path.0
+        };
+        match src.mark(mark_at)? {
+            Mark::Home { krate, file, item } => {
+                let module = cx.module_of(ItemRef { krate, file, item }).ok()?;
+                macro_at(&cx.paths(module.krate), src, path, module)
+            }
+            Mark::Scope { id, .. } => {
+                let &found = self.local_inner_scopes.get(&id)?;
+                let root = ModRef {
+                    krate: found.krate,
+                    module: 0,
+                };
+                macro_at(&cx.paths(found.krate), src, path, root).or_else(|| {
+                    cx.module_of(found)
+                        .ok()
+                        .and_then(|module| macro_at(&cx.paths(module.krate), src, path, module))
+                })
+            }
+            _ => None,
         }
     }
 
@@ -196,16 +217,26 @@ impl Writer {
         Ok(src.pair(next) + 1)
     }
 
-    fn configured_out(&self, cx: &Context<'_>, src: &Source, at: u32) -> Option<u32> {
+    fn configured_out(&mut self, cx: &Context<'_>, src: &Source, at: u32) -> Option<u32> {
         let mut attrs = Vec::new();
         let Ok(word) = attr::attrs(src, at, false, &mut attrs) else {
             return None;
         };
-        if word == at
-            || cx.outline.crates[self.home.krate as usize]
-                .env
-                .enabled(&attrs)
-        {
+        let env = &cx.outline.crates[self.home.krate as usize].env;
+        if word == at {
+            return None;
+        }
+        if env.enabled(&attrs) {
+            if env.has_attr(&attrs, &|a| matches!(a, Attr::MacroUse)) {
+                let mut target = word;
+                if src.text(target) == "pub" {
+                    target += 1;
+                    if src.kind(target) == TokenKind::OpenParen {
+                        target = src.pair(target) + 1;
+                    }
+                }
+                self.macro_use_target = Some(target);
+            }
             return None;
         }
         if src.kind(word) == TokenKind::OpenBrace {
@@ -220,6 +251,10 @@ impl Writer {
     }
 
     fn non_bang(&mut self, cx: &Context<'_>, src: &Source, at: u32) -> Result<u32> {
+        let macro_use = self.macro_use_target == Some(at);
+        if self.macro_use_target.is_some_and(|target| at >= target) {
+            self.macro_use_target = None;
+        }
         if src.text(at) == "macro" && is_name(src.kind(at + 1)) && opens(src.kind(at + 2)) {
             return self.define_macro(src, at + 1);
         }
@@ -231,7 +266,7 @@ impl Writer {
         if src.text(at) == "extern"
             && src.text(at + 1) == "crate"
             && is_name(src.kind(at + 2))
-            && let Some(next) = self.note_extern(cx, src, at)
+            && let Some(next) = self.note_extern(cx, src, at, macro_use)
         {
             return Ok(next);
         }
@@ -245,9 +280,16 @@ impl Writer {
         path: (u32, u32),
         open: u32,
     ) -> Result<()> {
-        let Some(output) = self.expand_one(cx, run, path, open)? else {
+        let Some((output, found)) = self.expand_one_with_item(cx, run, path, open)? else {
             return Ok(());
         };
+        if let Some(found) = found
+            && cx.outline.crates[found.krate as usize]
+                .env
+                .has_attr(&cx.item(found).1.attrs, &|a| *a == Attr::MacroExport(true))
+        {
+            self.note_local_inner_scopes(run.src, open, &output, found);
+        }
         let block = self.offset + self.out.len();
         self.calls.insert(run.shift + open, block);
         self.out.lexed("{");
@@ -265,6 +307,29 @@ impl Writer {
             },
             output.len(),
         )
+    }
+
+    fn note_local_inner_scopes(
+        &mut self,
+        call_src: &Source,
+        open: u32,
+        output: &Source,
+        found: ItemRef,
+    ) {
+        let close = call_src.pair(open);
+        let arg_scopes: Vec<u32> = (open..=close)
+            .filter_map(|tok| match call_src.mark(tok) {
+                Some(Mark::Scope { id, .. }) => Some(id),
+                _ => None,
+            })
+            .collect();
+        for tok in 0..output.len() {
+            if let Some(Mark::Scope { id, .. }) = output.mark(tok)
+                && !arg_scopes.contains(&id)
+            {
+                self.local_inner_scopes.insert(id, found);
+            }
+        }
     }
 
     fn module_file(&mut self, cx: &mut Context<'_>, run: Run<'_>, at: u32) -> Result<Option<u32>> {
@@ -320,6 +385,18 @@ impl Writer {
         path: (u32, u32),
         open: u32,
     ) -> Result<Option<Source>> {
+        Ok(self
+            .expand_one_with_item(cx, run, path, open)?
+            .map(|(src, _)| src))
+    }
+
+    pub(super) fn expand_one_with_item(
+        &self,
+        cx: &mut Context<'_>,
+        run: Run<'_>,
+        path: (u32, u32),
+        open: u32,
+    ) -> Result<Option<(Source, Option<ItemRef>)>> {
         if run.depth as usize >= crate::RECURSION_LIMIT {
             bail!(
                 "macro {} recursed past {} levels",
@@ -341,13 +418,13 @@ impl Writer {
                 (open, self.home.krate),
                 None,
             )
-            .map(Some);
+            .map(|out| Some((out, None)));
         }
         let Some(found) = self.find_macro(cx, run, path, name)? else {
             return Ok(None);
         };
         if let Some(output) = defined_expand(cx, found, run.src, open) {
-            return output.map(Some);
+            return output.map(|out| Some((out, Some(found))));
         }
         if let Some((_, ProcKind::Bang)) = found
             .outer()
@@ -355,7 +432,8 @@ impl Writer {
             .then(|| cx.item(found))
             .and_then(|(src, item)| proc_kind(src, item))
         {
-            return proc_bang(cx, self.home.krate, run.src, found, open);
+            return proc_bang(cx, self.home.krate, run.src, found, open)
+                .map(|out| out.map(|src| (src, Some(found))));
         }
         let Some(builtin) = cx.builtin(found) else {
             return Ok(None);
@@ -370,6 +448,7 @@ impl Writer {
         if !self.builtin(cx, run, site, &mut out)? {
             return Ok(None);
         }
-        out.finish(run.src.path.clone()).map(Some)
+        out.finish(run.src.path.clone())
+            .map(|src| Some((src, None)))
     }
 }
