@@ -424,11 +424,12 @@ impl Checker<'_, '_> {
             && matches!(*self.cx.types.kind(ty), Kind::Array(_, len) if self.cx.types.len(len) == Some(0))
     }
 
-    pub(in super::super) fn is_non_promotable_temp(&self, expr: ExprId) -> bool {
+    pub(in super::super) fn is_non_promotable_temp(&mut self, expr: ExprId) -> bool {
         if self.has_overloaded_deref(expr) {
             return true;
         }
-        match *self.body.expr(expr) {
+        let body = self.body;
+        match *body.expr(expr) {
             Expr::Path(_) => {
                 !self.is_const_or_static_item()
                     && matches!(self.typed.res.get(&expr), Some(Res::Local(_)))
@@ -457,9 +458,15 @@ impl Checker<'_, '_> {
                     if !is_const {
                         return true;
                     }
+                    let ty = self.expr_ty(expr);
+                    if !self.is_const_or_static_item()
+                        && ty != Ty::NONE
+                        && !is_copy_ty(self.cx, self.item, self.typed, ty)
+                    {
+                        return true;
+                    }
                 }
-                self.body
-                    .list(args)
+                body.list(args)
                     .iter()
                     .any(|&a| self.is_non_promotable_temp(ExprId(a)))
             }
@@ -470,10 +477,14 @@ impl Checker<'_, '_> {
                     self.typed.res.get(&expr),
                     Some(Res::Fn(item, _)) if self.is_const_fn(*item)
                 );
+                let ty = self.expr_ty(expr);
+                let non_copy = !self.is_const_or_static_item()
+                    && ty != Ty::NONE
+                    && !is_copy_ty(self.cx, self.item, self.typed, ty);
                 !is_const
+                    || non_copy
                     || self.is_non_promotable_temp(receiver)
-                    || self
-                        .body
+                    || body
                         .list(params)
                         .iter()
                         .any(|&a| self.is_non_promotable_temp(ExprId(a)))
@@ -482,23 +493,21 @@ impl Checker<'_, '_> {
             Expr::Block {
                 kind, stmts, tail, ..
             } => self.block_is_non_promotable(kind, stmts, tail),
-            Expr::Tuple(list) | Expr::Array(list) => self
-                .body
+            Expr::Tuple(list) | Expr::Array(list) => body
                 .list(list)
                 .iter()
                 .any(|&a| self.is_non_promotable_temp(ExprId(a))),
             Expr::Struct { fields, base, .. } => {
-                self.body
-                    .list(fields)
+                body.list(fields)
                     .iter()
-                    .any(|&f| self.is_non_promotable_temp(self.body.fields[f as usize].value))
+                    .any(|&f| self.is_non_promotable_temp(body.fields[f as usize].value))
                     || base.is_some_and(|b| self.is_non_promotable_temp(b))
             }
             Expr::Repeat(a, _) => self.is_non_promotable_temp(a),
             Expr::Index(a, b) => {
                 let a_ty = self.expr_ty(a);
                 let full_range = matches!(
-                    *self.body.expr(self.unwrap_parens(b)),
+                    *body.expr(self.unwrap_parens(b)),
                     Expr::Range {
                         from: None,
                         to: None,
@@ -522,11 +531,10 @@ impl Checker<'_, '_> {
             }
             Expr::Match(_, arms) => {
                 !self.is_const_or_static_item()
-                    || self
-                        .body
+                    || body
                         .list(arms)
                         .iter()
-                        .any(|&a| self.is_non_promotable_temp(self.body.arms[a as usize].body))
+                        .any(|&a| self.is_non_promotable_temp(body.arms[a as usize].body))
             }
             Expr::Loop { .. } | Expr::While { .. } | Expr::For { .. } => {
                 !self.is_const_or_static_item()
@@ -536,7 +544,7 @@ impl Checker<'_, '_> {
     }
 
     fn block_is_non_promotable(
-        &self,
+        &mut self,
         kind: BlockKind,
         stmts: crate::body::List,
         tail: Option<ExprId>,
@@ -544,11 +552,12 @@ impl Checker<'_, '_> {
         if matches!(kind, BlockKind::Const) {
             return false;
         }
-        let ids = self.body.list(stmts);
+        let body = self.body;
+        let ids = body.list(stmts);
         if !ids.is_empty() && !self.is_const_or_static_item() {
             return true;
         }
-        ids.iter().any(|&s| match self.body.stmts[s as usize] {
+        ids.iter().any(|&s| match body.stmts[s as usize] {
             Stmt::Let { init, .. } => init.is_some_and(|e| self.is_non_promotable_temp(e)),
             Stmt::Expr(e, _) => self.is_non_promotable_temp(e),
             _ => false,

@@ -583,6 +583,24 @@ impl Checker<'_, '_> {
         }
     }
 
+    pub(super) fn check_by_val_receiver(
+        &mut self,
+        receiver: ExprId,
+        state: &mut super::super::State,
+        outer_live: &rustc_hash::FxHashSet<u32>,
+        depth: u32,
+    ) -> anyhow::Result<()> {
+        let pre = self
+            .ty_holds_borrow(self.expr_ty(receiver))
+            .then(|| self.expr_borrow_sources(receiver, state))
+            .unwrap_or_default();
+        self.check_expr(receiver, state, false, outer_live, true, depth)?;
+        if !pre.is_empty() {
+            self.temp_sources.entry(receiver).or_insert(pre);
+        }
+        Ok(())
+    }
+
     pub(super) fn param_shares_ret_ty(&mut self, local: u32) -> bool {
         self.param_lts
             .only_type_param

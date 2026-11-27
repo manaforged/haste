@@ -11,7 +11,7 @@ use super::super::calls::{
     Lifetimes, ast_ty_may_carry_elided_lt, collect_ty_lifetimes, for_each_param_bound_list,
     sig_param_idx, sig_returns_only_static, sig_type_params, ty_shares_name,
 };
-use super::super::places::{Place, PlaceStep};
+use super::super::places::Place;
 use super::super::propagate::{BorrowSource, TupleSources, dedup_sources};
 use super::super::{Checker, Loan, State, is_temp_holder};
 use super::is_temp_target;
@@ -359,16 +359,10 @@ impl Checker<'_, '_> {
         self.returns_only_static = true;
         let sources = self.expr_borrow_sources(expr, state);
         self.returns_only_static = saved_static;
+        if requires_static && sources.is_empty() {
+            self.check_static_param_escape(expr)?;
+        }
         self.check_caller_lt_sources(expr, &sources, requires_static, req_named_lts, outer_hrtb)
-    }
-
-    fn source_peeled_outer_ref(&mut self, expr: ExprId, s: &BorrowSource) -> bool {
-        let c_ty = self.local_ty(s.target);
-        let e_ty = self.expr_ty(expr);
-        self.is_ref_ty(c_ty)
-            && e_ty != Ty::NONE
-            && (s.steps.iter().any(|st| matches!(st, PlaceStep::Deref))
-                || self.ty_max_ref_depth(e_ty) < self.ty_max_ref_depth(c_ty))
     }
 
     fn check_caller_lt_sources(
@@ -404,12 +398,14 @@ impl Checker<'_, '_> {
                 continue;
             }
             let target_ty = self.local_ty(s.target);
+            let e_ty = self.expr_ty(expr);
             let peel_by_origin = (outer_hrtb || s.origin_only)
+                && !self.is_dyn_only_borrow(e_ty)
                 && self.is_ref_ty(target_ty)
                 && matches!(
                     *self.cx.types.kind(target_ty),
                     Kind::Ref(_, pointee)
-                        if self.expr_ty(expr) != Ty::NONE
+                        if e_ty != Ty::NONE
                             && expr_depth <= self.ty_max_ref_depth(pointee)
                 );
             let peel_outer = peel_by_origin
