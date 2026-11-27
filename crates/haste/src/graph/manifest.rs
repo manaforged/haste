@@ -481,19 +481,31 @@ fn resolver_of(table: &Table) -> Option<u8> {
     }
 }
 
-/// Whether feature resolution uses Cargo's v2/v3 host/target split for `workspace` and `members`.
-pub(super) fn uses_resolver_v2(
-    workspace: Option<&Table>,
-    packages: &[super::Package],
-    members: &[usize],
-) -> bool {
-    if let Some(ws) = workspace {
-        return matches!(resolver_of(ws), Some(2 | 3));
-    }
-    let Some(&member) = members.first() else {
-        return true;
+/// Parent directories of workspace `members` / `default-members` glob entries (`/*`).
+pub(crate) fn member_glob_dirs(top: &Path) -> Vec<PathBuf> {
+    let Ok(Some(ws)) = workspace_of(top) else {
+        return Vec::new();
     };
-    let manifest = &packages[member].manifest;
+    let mut dirs = Vec::new();
+    for key in ["members", "default-members"] {
+        let listed = ws
+            .get(key)
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(toml::Value::as_str);
+        for member in listed {
+            if let Some(parent) = member.strip_suffix("/*") {
+                dirs.push(top.join(parent));
+            }
+        }
+    }
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+fn package_uses_resolver_v2(manifest: &Manifest) -> bool {
     match manifest.resolver {
         Some(1) => false,
         Some(2 | 3) => true,
@@ -502,6 +514,29 @@ pub(super) fn uses_resolver_v2(
             .parse::<u32>()
             .is_ok_and(|year| year >= 2021),
     }
+}
+
+/// Whether feature resolution uses Cargo's v2/v3 host/target split for `workspace` and `members`.
+pub(super) fn uses_resolver_v2(
+    workspace: Option<&Table>,
+    top: &Path,
+    packages: &[super::Package],
+    members: &[usize],
+) -> bool {
+    if let Some(ws) = workspace {
+        if let Some(r) = resolver_of(ws) {
+            return matches!(r, 2 | 3);
+        }
+        let top_norm = normalize(top);
+        return packages
+            .iter()
+            .find(|p| !p.locked.is_registry() && normalize(&p.manifest.dir) == top_norm)
+            .is_some_and(|root| package_uses_resolver_v2(&root.manifest));
+    }
+    let Some(&member) = members.first() else {
+        return true;
+    };
+    package_uses_resolver_v2(&packages[member].manifest)
 }
 
 fn package_meta(package: &Table, workspace: Option<&Table>) -> PackageMeta {

@@ -531,6 +531,7 @@ impl Env {
         attrs.iter().all(|attr| match attr {
             Attr::Cfg(cfg) => self.allows(cfg),
             Attr::CfgAttr(cfg, inner) => self.eval(cfg) == Truth::No || self.enabled(inner),
+            Attr::Test | Attr::Bench => self.test,
             _ => true,
         })
     }

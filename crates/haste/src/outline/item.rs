@@ -60,6 +60,8 @@ pub enum Attr {
     NoStd,
     NoCore,
     NoImplicitPrelude,
+    Test,
+    Bench,
     Other(u32),
 }
 

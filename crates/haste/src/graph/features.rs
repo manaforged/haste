@@ -270,10 +270,15 @@ pub fn resolve(
     targets: &super::Targets,
     members: &[usize],
     features: &[&str],
-    (default_features, all_features, workspace): (bool, bool, Option<&toml::Table>),
+    (default_features, all_features, workspace, top): (
+        bool,
+        bool,
+        Option<&toml::Table>,
+        &std::path::Path,
+    ),
 ) -> Result<Graph> {
     validate_features(packages, members, features)?;
-    let unify_sides = !super::manifest::uses_resolver_v2(workspace, packages, members);
+    let unify_sides = !super::manifest::uses_resolver_v2(workspace, top, packages, members);
     let mut resolver = Resolver {
         packages,
         targets,
@@ -444,47 +449,89 @@ mod tests {
     #[test]
     fn resolver_unifies_host_and_target_in_v1_and_isolates_in_v2() {
         let targets = test_targets();
+        let root_top = std::path::Path::new("");
+        let virtual_top = std::path::Path::new("/virtual-workspace");
 
         let pkgs_2018 = clap_packages("2018", None);
-        let g1 = resolve(&pkgs_2018, &targets, &[0], &[], (true, false, None))
-            .expect("resolve edition 2018");
+        let g1 = resolve(
+            &pkgs_2018,
+            &targets,
+            &[0],
+            &[],
+            (true, false, None, root_top),
+        )
+        .expect("resolve edition 2018");
         assert!(unit_features(&g1, 1, Side::Host).contains("cargo"));
         assert!(unit_features(&g1, 2, Side::Host).contains("cargo"));
         assert!(unit_features(&g1, 1, Side::Target).contains("default"));
 
         let pkgs_2021 = clap_packages("2021", None);
-        let g2 = resolve(&pkgs_2021, &targets, &[0], &[], (true, false, None))
-            .expect("resolve edition 2021");
+        let g2 = resolve(
+            &pkgs_2021,
+            &targets,
+            &[0],
+            &[],
+            (true, false, None, root_top),
+        )
+        .expect("resolve edition 2021");
         assert!(unit_features(&g2, 1, Side::Target).contains("cargo"));
         assert!(!unit_features(&g2, 1, Side::Host).contains("cargo"));
         assert!(!unit_features(&g2, 2, Side::Host).contains("cargo"));
 
         let ws_no_resolver = toml::Table::new();
-        let g_ws1 = resolve(
+        let g_ws_virtual = resolve(
             &pkgs_2021,
             &targets,
             &[0],
             &[],
-            (true, false, Some(&ws_no_resolver)),
+            (true, false, Some(&ws_no_resolver), virtual_top),
         )
-        .expect("resolve default workspace");
-        assert!(unit_features(&g_ws1, 1, Side::Host).contains("cargo"));
+        .expect("resolve virtual workspace");
+        assert!(unit_features(&g_ws_virtual, 1, Side::Host).contains("cargo"));
+
+        let g_ws_root_2021 = resolve(
+            &pkgs_2021,
+            &targets,
+            &[0],
+            &[],
+            (true, false, Some(&ws_no_resolver), root_top),
+        )
+        .expect("resolve non-virtual edition 2021 workspace");
+        assert!(!unit_features(&g_ws_root_2021, 1, Side::Host).contains("cargo"));
 
         let mut ws_v2 = toml::Table::new();
         ws_v2.insert("resolver".to_owned(), toml::Value::String("2".to_owned()));
-        let g_ws2 = resolve(&pkgs_2021, &targets, &[0], &[], (true, false, Some(&ws_v2)))
-            .expect("resolve v2 workspace");
+        let g_ws2 = resolve(
+            &pkgs_2021,
+            &targets,
+            &[0],
+            &[],
+            (true, false, Some(&ws_v2), virtual_top),
+        )
+        .expect("resolve v2 workspace");
         assert!(!unit_features(&g_ws2, 1, Side::Host).contains("cargo"));
 
         let mut ws_v3 = toml::Table::new();
         ws_v3.insert("resolver".to_owned(), toml::Value::String("3".to_owned()));
-        let g_ws3 = resolve(&pkgs_2021, &targets, &[0], &[], (true, false, Some(&ws_v3)))
-            .expect("resolve v3 workspace");
+        let g_ws3 = resolve(
+            &pkgs_2021,
+            &targets,
+            &[0],
+            &[],
+            (true, false, Some(&ws_v3), virtual_top),
+        )
+        .expect("resolve v3 workspace");
         assert!(!unit_features(&g_ws3, 1, Side::Host).contains("cargo"));
 
         let pkgs_explicit_v1 = clap_packages("2021", Some(1));
-        let g_pkg1 = resolve(&pkgs_explicit_v1, &targets, &[0], &[], (true, false, None))
-            .expect("resolve explicit resolver 1");
+        let g_pkg1 = resolve(
+            &pkgs_explicit_v1,
+            &targets,
+            &[0],
+            &[],
+            (true, false, None, root_top),
+        )
+        .expect("resolve explicit resolver 1");
         assert!(unit_features(&g_pkg1, 2, Side::Host).contains("cargo"));
     }
 }

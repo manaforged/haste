@@ -87,11 +87,7 @@ impl LocalItemRecord {
     }
 }
 
-pub(super) fn hash_str(s: &str) -> u64 {
-    let mut h = FxHasher::default();
-    s.hash(&mut h);
-    h.finish()
-}
+pub(super) use crate::graph::store::hash_str;
 
 pub(super) fn stable_file_key(outline: &Outline, krate: u32, file: u32) -> Option<u64> {
     let tree = outline.crates.get(krate as usize)?;

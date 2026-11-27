@@ -14,7 +14,7 @@ use crate::graph::store::{FileStamp, file_stamp, hash_env_val, write_new_bytes};
 use rustc_hash::FxHasher;
 
 const NOOP_MAGIC: [u8; 8] = *b"HSTNOP03";
-const NOOP_VERSION: u32 = 1;
+const NOOP_VERSION: u32 = 2;
 const HEADER_LEN: usize = 52;
 const TARGET_DIRS: [&str; 5] = ["src", "src/bin", "tests", "examples", "benches"];
 const ROOT_FILES: [&str; 3] = ["src/lib.rs", "src/main.rs", "build.rs"];
@@ -52,12 +52,19 @@ fn stamp_path(root: &Path, out: Option<&Path>) -> PathBuf {
 
 pub(crate) fn target_dirs(workspace: &crate::graph::Workspace) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
+    let mut top = None;
     for &member in &workspace.graph.members {
         if let Some(pkg) = workspace.packages.get(member) {
+            if top.is_none() {
+                top = crate::graph::workspace_root(&pkg.manifest.dir).ok();
+            }
             for sub in TARGET_DIRS {
                 dirs.push(pkg.manifest.dir.join(sub));
             }
         }
+    }
+    if let Some(root) = top {
+        dirs.extend(crate::graph::manifest::member_glob_dirs(&root));
     }
     dirs.sort();
     dirs.dedup();
@@ -96,12 +103,18 @@ pub(crate) fn hash_target_dir(dir: &Path, hasher: &mut FxHasher) {
         let is_rs = Path::new(&name).extension().and_then(|ext| ext.to_str()) == Some("rs");
         if is_rs && (ft.is_file() || (ft.is_symlink() && dir.join(&name).is_file())) {
             found.push(name);
-        } else if (ft.is_dir() || (ft.is_symlink() && dir.join(&name).is_dir()))
-            && dir.join(&name).join("main.rs").is_file()
-        {
-            let mut joined = name;
-            joined.push("/main.rs");
-            found.push(joined);
+        } else if ft.is_dir() || (ft.is_symlink() && dir.join(&name).is_dir()) {
+            let sub = dir.join(&name);
+            if sub.join("main.rs").is_file() {
+                let mut joined = name.clone();
+                joined.push("/main.rs");
+                found.push(joined);
+            }
+            if sub.join("Cargo.toml").is_file() {
+                let mut joined = name;
+                joined.push("/Cargo.toml");
+                found.push(joined);
+            }
         }
     }
     found.sort();
