@@ -369,6 +369,33 @@ fn has_elided_or_unbounded_lt(
         || has_unbounded_type_param(sig, src, lts, static_names)
 }
 
+fn resolve_slot_lts(
+    sig: &crate::body::sig::Signature,
+    src: &Source,
+    lts: &Lifetimes<'_>,
+    impl_has_lt: bool,
+    static_names: &[String],
+) -> (bool, Vec<String>) {
+    let mut named = owned_lts(lts.named.clone());
+    let mut has_elided = has_elided_or_unbounded_lt(sig, src, lts, impl_has_lt, static_names);
+    if has_elided
+        && !lts.has_elided
+        && !(impl_has_lt && lts.names.contains(&"Self"))
+        && (super::static_ty::collect_type_param_lt_bounds(
+            &sig.body,
+            src,
+            &sig.generics,
+            &sig.predicates,
+            &lts.names,
+            static_names,
+            &mut named,
+        ) || !named.is_empty())
+    {
+        has_elided = false;
+    }
+    (has_elided, named)
+}
+
 fn record_param_ty(
     cx: &mut crate::sema::Context<'_>,
     (item, sig, src): (crate::names::ItemRef, &crate::body::sig::Signature, &Source),
@@ -384,24 +411,9 @@ fn record_param_ty(
         && lts.named.is_empty()
         && !(impl_has_lt && lts.names.contains(&"Self"))
         && has_unbounded_type_param(sig, src, &lts, static_names);
-    info.has_elided_lt[slot] =
-        has_elided_or_unbounded_lt(sig, src, &lts, impl_has_lt, static_names);
-    info.named_lts[slot] = owned_lts(lts.named);
-    if info.has_elided_lt[slot]
-        && !lts.has_elided
-        && !(impl_has_lt && lts.names.contains(&"Self"))
-        && super::static_ty::collect_type_param_lt_bounds(
-            &sig.body,
-            src,
-            &sig.generics,
-            &sig.predicates,
-            &lts.names,
-            static_names,
-            &mut info.named_lts[slot],
-        )
-    {
-        info.has_elided_lt[slot] = false;
-    }
+    let (has_elided, named) = resolve_slot_lts(sig, src, &lts, impl_has_lt, static_names);
+    info.has_elided_lt[slot] = has_elided;
+    info.named_lts[slot] = named;
     if let AstTy::Ref {
         lifetime,
         ty: inner,
@@ -424,9 +436,10 @@ fn record_param_ty(
         );
         let mut inner_lts = Lifetimes::default();
         collect_ty_lifetimes(&sig.body, src, inner, &mut inner_lts);
-        info.inner_has_elided_lt[slot] =
-            has_elided_or_unbounded_lt(sig, src, &inner_lts, impl_has_lt, static_names);
-        info.inner_named_lts[slot] = owned_lts(inner_lts.named);
+        let (inner_has_elided, inner_named) =
+            resolve_slot_lts(sig, src, &inner_lts, impl_has_lt, static_names);
+        info.inner_has_elided_lt[slot] = inner_has_elided;
+        info.inner_named_lts[slot] = inner_named;
     }
 }
 

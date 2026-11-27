@@ -127,11 +127,14 @@ impl Checker<'_, '_> {
                 self.copy_projected_borrow_sources(expr, base, state)
             }
             Expr::Path(_) => {
-                if let Some(local) = self.expr_plain_local(expr)
-                    && state.moved.get(local as usize).copied().unwrap_or(false)
-                    && let Some(cached) = self.temp_sources.get(&expr)
-                {
-                    return cached.clone();
+                if let Some(local) = self.expr_plain_local(expr) {
+                    if state.moved.get(local as usize).copied().unwrap_or(false)
+                        && let Some(cached) = self.temp_sources.get(&expr)
+                    {
+                        return cached.clone();
+                    }
+                    let sources = self.path_borrow_sources(expr, state, allow_mut_ref_reborrow);
+                    return self.path_deref_coercion_sources(expr, local, sources, state);
                 }
                 self.path_borrow_sources(expr, state, allow_mut_ref_reborrow)
             }

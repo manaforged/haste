@@ -474,6 +474,14 @@ impl<'a> Checker<'_, 'a> {
         if flags.is_iter_fn && flags.fn_name == "collect" {
             recv_sources.retain(|s| !s.env_only);
         }
+        if flags.is_iter_fn && flags.fn_name == "next" && !self.ty_holds_mut_ref(ret_ty) {
+            for s in &mut recv_sources {
+                if self.is_param_local(s.target) || self.is_closure_param(s.target) {
+                    s.mutable = false;
+                    s.origin_only = true;
+                }
+            }
+        }
         recv_sources
     }
 
@@ -584,6 +592,9 @@ impl<'a> Checker<'_, 'a> {
             }
         } else {
             if recv_is_by_ref(sig) {
+                if self.recv_independent_of_named_ret(ctx.fn_item, sig, sig_src, ret_lts) {
+                    return Vec::new();
+                }
                 let adj = self.typed.adjusts.get(&ctx.expr);
                 let mut pointee = self.expr_ty(recv);
                 for _ in 0..adj.map_or(0, |a| a.derefs) {

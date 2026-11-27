@@ -683,7 +683,14 @@ impl Checker<'_, '_> {
             let peel = (s.origin_only || s.steps.iter().any(|st| matches!(st, PlaceStep::Deref)))
                 && matches!(
                     target_kind,
-                    Kind::Ref(_, pointee) if self.ty_holds_non_dyn_borrow(pointee)
+                    Kind::Ref(_, pointee)
+                        if self.ty_holds_non_dyn_borrow(pointee)
+                            || (self.is_param_local(s.target)
+                                && !self
+                                    .param_lts
+                                    .inner_named_lts
+                                    .get(s.target as usize)
+                                    .is_none_or(Vec::is_empty))
                 );
             if req_static
                 && self.is_non_static_param(s.target)

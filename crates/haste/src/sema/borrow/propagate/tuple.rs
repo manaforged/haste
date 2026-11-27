@@ -247,6 +247,87 @@ impl<'a> Checker<'_, 'a> {
             inner_ref: None,
         }
     }
+
+    pub(in super::super) fn for_iter_item_sources(
+        &mut self,
+        iter: ExprId,
+        iter_sources: &[BorrowSource],
+        state: &State,
+    ) -> (Vec<BorrowSource>, Option<TupleSources>) {
+        let item_sources = if self.for_iter_item_is_static(iter) {
+            Vec::new()
+        } else {
+            iter_sources
+                .iter()
+                .filter(|s| !s.env_only)
+                .cloned()
+                .collect()
+        };
+        let item_tuple = self.iter_tuple_sources(iter, state);
+        (item_sources, item_tuple)
+    }
+
+    fn leaf_iter_sources(&mut self, expr: ExprId, state: &State) -> TupleSources {
+        let sources = if self.for_iter_item_is_static(expr) {
+            Vec::new()
+        } else {
+            self.expr_borrow_sources(expr, state)
+                .into_iter()
+                .filter(|s| !s.env_only)
+                .collect()
+        };
+        TupleSources::Leaf {
+            sources,
+            inner_ref: None,
+        }
+    }
+
+    fn iter_tuple_sources(&mut self, expr: ExprId, state: &State) -> Option<TupleSources> {
+        let cur = self.unwrap_parens(expr);
+        let Expr::Method {
+            receiver, params, ..
+        } = *self.body.expr(cur)
+        else {
+            return None;
+        };
+        let Some(Res::Fn(fn_item, _)) = self.typed.res.get(&cur).copied() else {
+            return None;
+        };
+        let name = self.cx.name(fn_item);
+        let in_iter = self.is_iter_mod(fn_item);
+        let param_ids: Vec<u32> = self.body.list(params).to_vec();
+        if in_iter && name == "enumerate" && param_ids.is_empty() {
+            let inner = self
+                .iter_tuple_sources(receiver, state)
+                .unwrap_or_else(|| self.leaf_iter_sources(receiver, state));
+            return Some(TupleSources::Tuple(vec![
+                TupleSources::Leaf {
+                    sources: Vec::new(),
+                    inner_ref: None,
+                },
+                inner,
+            ]));
+        }
+        if ((in_iter && name == "zip") || name == "zip_eq") && param_ids.len() == 1 {
+            let left = self
+                .iter_tuple_sources(receiver, state)
+                .unwrap_or_else(|| self.leaf_iter_sources(receiver, state));
+            let arg = ExprId(param_ids[0]);
+            let right = self
+                .iter_tuple_sources(arg, state)
+                .unwrap_or_else(|| self.leaf_iter_sources(arg, state));
+            return Some(TupleSources::Tuple(vec![left, right]));
+        }
+        if in_iter
+            && matches!(
+                name,
+                "skip" | "take" | "step_by" | "rev" | "peekable" | "fuse"
+            )
+        {
+            return self.iter_tuple_sources(receiver, state);
+        }
+        None
+    }
 }
 
 fn unwrap_ast_parens(body: &Body, mut ty: TyId) -> TyId {

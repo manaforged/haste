@@ -459,6 +459,69 @@ impl Checker<'_, '_> {
         cur
     }
 
+    pub(super) fn path_deref_coercion_sources(
+        &mut self,
+        expr: ExprId,
+        local: u32,
+        sources: Vec<BorrowSource>,
+        state: &State,
+    ) -> Vec<BorrowSource> {
+        let local_ty = self.local_ty(local);
+        let has_builtin_deref = self.is_ref_ty(local_ty)
+            && matches!(
+                self.typed
+                    .coercions
+                    .get(&expr)
+                    .map(crate::sema::infer::Coercion::leaf),
+                Some(crate::sema::infer::Coercion::Deref(steps, _))
+                    if steps.iter().any(|(_, res)| res.is_none())
+            );
+        if has_builtin_deref {
+            self.finish_projected_borrow_sources(expr, local_ty, true, sources, state)
+        } else {
+            sources
+        }
+    }
+
+    pub(super) fn recv_independent_of_named_ret(
+        &mut self,
+        fn_item: ItemRef,
+        sig: &Signature,
+        sig_src: &crate::outline::source::Source,
+        ret_lts: &Lifetimes<'_>,
+    ) -> bool {
+        if ret_lts.has_elided || ret_lts.named.is_empty() || ret_lts.names.contains(&"Self") {
+            return false;
+        }
+        let owner_hdr = if let Some(blk) = self.cx.owner_impl(fn_item)
+            && let Ok(hdr) = self.cx.impl_header(blk)
+        {
+            Some((&self.cx.impl_file(blk).source, hdr.generics.clone()))
+        } else if let Some(tr) = self.cx.owner_trait(fn_item)
+            && let Ok(tg) = self.cx.trait_generics(tr)
+        {
+            Some((&self.cx.file(tr).source, tg.1.params.clone()))
+        } else {
+            None
+        };
+        let Some((h_src, h_generics)) = owner_hdr else {
+            return true;
+        };
+        let owner_has_tied_lt = h_generics.iter().any(|g| match g.kind {
+            GenericKind::Lifetime => {
+                let name = h_src.text(g.name);
+                ret_lts.named.contains(&name)
+                    || ret_lts
+                        .named
+                        .iter()
+                        .any(|&r| super::super::calls::lifetime_outlives(sig, sig_src, name, r))
+            }
+            GenericKind::Type => ret_lts.names.contains(&h_src.text(g.name)),
+            _ => false,
+        });
+        !owner_has_tied_lt
+    }
+
     pub(super) fn expr_is_any_downcast(&mut self, mut expr: ExprId, state: &State) -> bool {
         for _ in 0..6 {
             expr = self.unwrap_parens(expr);
