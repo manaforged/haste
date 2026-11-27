@@ -317,37 +317,56 @@ fn read_binop(cur: &mut Cursor<'_>) -> Result<BinOp> {
         .context("invalid binop")
 }
 
-pub(super) fn read_expr(cur: &mut Cursor<'_>) -> Result<Expr> {
+fn read_lit(cur: &mut Cursor<'_>) -> Result<Lit> {
     Ok(match cur.u8()? {
-        0 => Expr::Lit(
-            match cur.u8()? {
-                0 => Lit::Int,
-                1 => Lit::Float,
-                2 => Lit::Char,
-                3 => Lit::Byte,
-                4 => Lit::Str,
-                5 => Lit::ByteStr,
-                6 => Lit::CStr,
-                7 => Lit::Bool(true),
-                8 => Lit::Bool(false),
-                _ => bail!("invalid literal tag"),
-            },
-            cur.u32()?,
-        ),
+        0 => Lit::Int,
+        1 => Lit::Float,
+        2 => Lit::Char,
+        3 => Lit::Byte,
+        4 => Lit::Str,
+        5 => Lit::ByteStr,
+        6 => Lit::CStr,
+        7 => Lit::Bool(true),
+        8 => Lit::Bool(false),
+        _ => bail!("invalid literal tag"),
+    })
+}
+
+fn read_unop(cur: &mut Cursor<'_>) -> Result<UnOp> {
+    Ok(match cur.u8()? {
+        0 => UnOp::Neg,
+        1 => UnOp::Not,
+        2 => UnOp::Deref,
+        _ => bail!("invalid unop"),
+    })
+}
+
+pub(super) fn read_expr(cur: &mut Cursor<'_>) -> Result<Expr> {
+    let tag = cur.u8()?;
+    match tag {
+        0..=6 => read_expr_operator(cur, tag),
+        7..=12 => read_expr_access(cur, tag),
+        13..=20 => read_expr_control(cur, tag),
+        21..=27 => read_expr_aggregate(cur, tag),
+        _ => read_expr_jump(cur, tag),
+    }
+}
+
+fn read_expr_operator(cur: &mut Cursor<'_>, tag: u8) -> Result<Expr> {
+    Ok(match tag {
+        0 => Expr::Lit(read_lit(cur)?, cur.u32()?),
         1 => Expr::Path(PathId(cur.u32()?)),
-        2 => Expr::Unary(
-            match cur.u8()? {
-                0 => UnOp::Neg,
-                1 => UnOp::Not,
-                2 => UnOp::Deref,
-                _ => bail!("invalid unop"),
-            },
-            ExprId(cur.u32()?),
-        ),
+        2 => Expr::Unary(read_unop(cur)?, ExprId(cur.u32()?)),
         3 => Expr::Binary(read_binop(cur)?, ExprId(cur.u32()?), ExprId(cur.u32()?)),
         4 => Expr::Assign(ExprId(cur.u32()?), ExprId(cur.u32()?)),
         5 => Expr::AssignOp(read_binop(cur)?, ExprId(cur.u32()?), ExprId(cur.u32()?)),
         6 => Expr::Call(ExprId(cur.u32()?), read_list(cur)?),
+        _ => bail!("invalid expr tag"),
+    })
+}
+
+fn read_expr_access(cur: &mut Cursor<'_>, tag: u8) -> Result<Expr> {
+    Ok(match tag {
         7 => Expr::Method {
             receiver: ExprId(cur.u32()?),
             name: cur.u32()?,
@@ -366,6 +385,12 @@ pub(super) fn read_expr(cur: &mut Cursor<'_>) -> Result<Expr> {
                 expr: ExprId(cur.u32()?),
             }
         }
+        _ => bail!("invalid expr tag"),
+    })
+}
+
+fn read_expr_control(cur: &mut Cursor<'_>, tag: u8) -> Result<Expr> {
+    Ok(match tag {
         13 => Expr::Block {
             stmts: read_list(cur)?,
             tail: read_opt_u32(cur)?.map(ExprId),
@@ -403,6 +428,12 @@ pub(super) fn read_expr(cur: &mut Cursor<'_>) -> Result<Expr> {
             body: ExprId(cur.u32()?),
             capture: cur.u8()? != 0,
         },
+        _ => bail!("invalid expr tag"),
+    })
+}
+
+fn read_expr_aggregate(cur: &mut Cursor<'_>, tag: u8) -> Result<Expr> {
+    Ok(match tag {
         21 => Expr::Tuple(read_list(cur)?),
         22 => Expr::Array(read_list(cur)?),
         23 => Expr::Repeat(ExprId(cur.u32()?), ExprId(cur.u32()?)),
@@ -419,6 +450,12 @@ pub(super) fn read_expr(cur: &mut Cursor<'_>) -> Result<Expr> {
         },
         26 => Expr::Try(ExprId(cur.u32()?)),
         27 => Expr::Await(ExprId(cur.u32()?)),
+        _ => bail!("invalid expr tag"),
+    })
+}
+
+fn read_expr_jump(cur: &mut Cursor<'_>, tag: u8) -> Result<Expr> {
+    Ok(match tag {
         28 => Expr::Return(read_opt_u32(cur)?.map(ExprId)),
         29 => Expr::Break(read_opt_u32(cur)?, read_opt_u32(cur)?.map(ExprId)),
         30 => Expr::Continue(read_opt_u32(cur)?),

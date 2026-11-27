@@ -334,82 +334,111 @@ fn decode_sec_misc(
 ) -> Result<SectionOut> {
     let mut cur = Cursor::new(bytes);
     let mut out = SectionOut::default();
+    decode_misc_ty_facts(&mut cur, dec, store)?;
+    decode_misc_reveals(&mut cur, dec, store, &mut out)?;
+    decode_misc_trait_facts(&mut cur, dec, syms, store)?;
+    finish_cursor(&cur, bytes)?;
+    Ok(out)
+}
+
+fn decode_misc_ty_facts(
+    cur: &mut Cursor<'_>,
+    dec: &Decoder<'_>,
+    store: &crate::sema::Cache,
+) -> Result<()> {
     let lk = &store.lookups;
     for _ in 0..cur.count()? {
-        let item = dec.read_item_ref(&mut cur)?;
-        let substs = dec.substs(&mut cur)?;
+        let item = dec.read_item_ref(cur)?;
+        let substs = dec.substs(cur)?;
         store.evaluated.insert((item, substs), cur.u128()?);
     }
     for _ in 0..cur.count()? {
-        lk.drops.insert(dec.read_ty_ref(&mut cur)?, cur.u8()? != 0);
+        lk.drops.insert(dec.read_ty_ref(cur)?, cur.u8()? != 0);
     }
     for _ in 0..cur.count()? {
-        lk.own_drops
-            .insert(dec.read_ty_ref(&mut cur)?, cur.u8()? != 0);
+        lk.own_drops.insert(dec.read_ty_ref(cur)?, cur.u8()? != 0);
     }
     for _ in 0..cur.count()? {
         lk.unpins
-            .insert(dec.read_ty_ref(&mut cur)?, (cur.u8()? != 0, cur.u32()?));
+            .insert(dec.read_ty_ref(cur)?, (cur.u8()? != 0, cur.u32()?));
     }
     for _ in 0..cur.count()? {
         lk.freezes
-            .insert(dec.read_ty_ref(&mut cur)?, (cur.u8()? != 0, cur.u32()?));
+            .insert(dec.read_ty_ref(cur)?, (cur.u8()? != 0, cur.u32()?));
     }
     for _ in 0..cur.count()? {
-        let ty = dec.read_ty_ref(&mut cur)?;
-        lk.glues.insert(ty, read_opt(&mut cur, |c| dec.res(c))?);
+        let ty = dec.read_ty_ref(cur)?;
+        lk.glues.insert(ty, read_opt(cur, |c| dec.res(c))?);
     }
     for _ in 0..cur.count()? {
-        let ty = dec.read_ty_ref(&mut cur)?;
-        lk.futures.insert(ty, dec.read_ty_ref(&mut cur)?);
+        let ty = dec.read_ty_ref(cur)?;
+        lk.futures.insert(ty, dec.read_ty_ref(cur)?);
     }
+    Ok(())
+}
+
+fn decode_misc_reveals(
+    cur: &mut Cursor<'_>,
+    dec: &Decoder<'_>,
+    store: &crate::sema::Cache,
+    out: &mut SectionOut,
+) -> Result<()> {
     let reveals_n = cur.count()?;
     out.reveals.reserve(reveals_n);
     for _ in 0..reveals_n {
-        let item = dec.read_item_ref(&mut cur)?;
-        let s = dec.substs(&mut cur)?;
-        let ty = dec.read_ty_ref(&mut cur)?;
+        let item = dec.read_item_ref(cur)?;
+        let s = dec.substs(cur)?;
+        let ty = dec.read_ty_ref(cur)?;
         out.reveals.push(((item, s), ty));
     }
     for _ in 0..cur.count()? {
-        let item = dec.read_item_ref(&mut cur)?;
-        let s = dec.substs(&mut cur)?;
-        let ty = dec.read_ty_ref(&mut cur)?;
-        lk.provisional_rets.insert((item, s), ty);
+        let item = dec.read_item_ref(cur)?;
+        let s = dec.substs(cur)?;
+        let ty = dec.read_ty_ref(cur)?;
+        store.lookups.provisional_rets.insert((item, s), ty);
     }
+    Ok(())
+}
+
+fn decode_misc_trait_facts(
+    cur: &mut Cursor<'_>,
+    dec: &Decoder<'_>,
+    syms: &[Sym],
+    store: &crate::sema::Cache,
+) -> Result<()> {
+    let lk = &store.lookups;
     for _ in 0..cur.count()? {
-        let tr = dec.read_item_ref(&mut cur)?;
-        let ty = dec.read_ty_ref(&mut cur)?;
-        let a1 = dec.substs(&mut cur)?;
+        let tr = dec.read_item_ref(cur)?;
+        let ty = dec.read_ty_ref(cur)?;
+        let a1 = dec.substs(cur)?;
         let sym = syms
             .get(cur.u32()? as usize)
             .copied()
             .context("sym index out of bounds")?;
-        let a2 = dec.substs(&mut cur)?;
-        let out_ty = read_opt(&mut cur, |c| dec.read_ty_ref(c))?;
+        let a2 = dec.substs(cur)?;
+        let out_ty = read_opt(cur, |c| dec.read_ty_ref(c))?;
         lk.projections.insert((tr, ty, a1, sym, a2), out_ty);
     }
     for _ in 0..cur.count()? {
-        let m = dec.read_item_ref(&mut cur)?;
-        let s = dec.substs(&mut cur)?;
-        lk.trait_calls.insert((m, s), dec.res(&mut cur)?);
+        let m = dec.read_item_ref(cur)?;
+        let s = dec.substs(cur)?;
+        lk.trait_calls.insert((m, s), dec.res(cur)?);
     }
     for _ in 0..cur.count()? {
-        let tr = dec.read_item_ref(&mut cur)?;
-        let ty = dec.read_ty_ref(&mut cur)?;
-        let a1 = dec.substs(&mut cur)?;
-        let assoc = dec.read_item_ref(&mut cur)?;
-        let a2 = dec.substs(&mut cur)?;
-        let val = dec.read_ty_ref(&mut cur)?;
+        let tr = dec.read_item_ref(cur)?;
+        let ty = dec.read_ty_ref(cur)?;
+        let a1 = dec.substs(cur)?;
+        let assoc = dec.read_item_ref(cur)?;
+        let a2 = dec.substs(cur)?;
+        let val = dec.read_ty_ref(cur)?;
         lk.assoc_types.insert((tr, ty, a1, assoc, a2), val);
     }
     for _ in 0..cur.count()? {
-        let tr = dec.read_item_ref(&mut cur)?;
-        let ty = dec.read_ty_ref(&mut cur)?;
+        let tr = dec.read_item_ref(cur)?;
+        let ty = dec.read_ty_ref(cur)?;
         lk.auto_traits.insert((tr, ty), cur.u8()? != 0);
     }
-    finish_cursor(&cur, bytes)?;
-    Ok(out)
+    Ok(())
 }
 
 fn decode_sec_summaries(bytes: &[u8], dec: &Decoder<'_>) -> Result<SectionOut> {
