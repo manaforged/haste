@@ -34,26 +34,56 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
           persist-credentials: false
       - name: Install rust-src
         run: rustup component add rust-src
       - name: Build release binary
         run: cargo build --locked --release -p haste
+      - name: Verify checked-out tag and binary version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          case "$RELEASE_TAG" in
+            ""|*[[:space:]]*|*..*|/*|*/|*//*)
+              echo "invalid release tag: '$RELEASE_TAG'" >&2
+              exit 1
+              ;;
+          esac
+          HEAD_SHA="$(git rev-parse HEAD)"
+          SHORT_SHA="${HEAD_SHA:0:8}"
+          BIN="target/release/haste"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            BIN="target/release/haste.exe"
+          fi
+          ACTUAL_VER="$("$BIN" --version)"
+          echo "Built version: $ACTUAL_VER (commit $SHORT_SHA, tag $RELEASE_TAG)"
+          case "$ACTUAL_VER" in
+            *"($SHORT_SHA)"*) ;;
+            *)
+              echo "version mismatch: expected ($SHORT_SHA) in '$ACTUAL_VER'" >&2
+              exit 1
+              ;;
+          esac
       - name: Package Unix archive
         if: runner.os != 'Windows'
         shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
-          TAG="${GITHUB_REF_NAME}"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then TAG="${{ inputs.tag }}"; fi
-          NAME="haste-${TAG}-${{ matrix.target }}"
+          NAME="haste-${RELEASE_TAG}-${{ matrix.target }}"
           mkdir -p "dist/${NAME}"
           cp target/release/haste LICENSE-MIT README.md "dist/${NAME}/"
           tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
       - name: Package Windows archive
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
-          $tag = if ("${{ github.event_name }}" -eq "workflow_dispatch") { "${{ inputs.tag }}" } else { $env:GITHUB_REF_NAME }
+          $tag = $env:RELEASE_TAG
           $name = "haste-$tag-${{ matrix.target }}"
           New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
           Copy-Item target/release/haste.exe, LICENSE-MIT, README.md "dist/$name/"
@@ -82,7 +112,11 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
-          TAG="${GITHUB_REF_NAME}"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then TAG="${{ inputs.tag }}"; fi
-          gh release create "$TAG" dist/* --title "haste $TAG" --generate-notes
+          gh api "repos/${{ github.repository }}/git/ref/tags/$RELEASE_TAG" >/dev/null
+          gh release create "$RELEASE_TAG" dist/* \
+            --repo "${{ github.repository }}" \
+            --verify-tag \
+            --title "haste $RELEASE_TAG" \
+            --generate-notes

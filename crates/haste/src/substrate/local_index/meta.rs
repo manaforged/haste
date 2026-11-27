@@ -358,7 +358,10 @@ pub(super) fn encode_meta(structural: u64, meta: &LocalMeta) -> Option<Vec<u8>> 
     Some(out)
 }
 
-pub(super) fn decode_meta(data: &[u8], expected_structural: u64) -> Option<LocalMeta> {
+fn decode_meta_prefix<'a>(
+    data: &'a [u8],
+    expected_structural: Option<u64>,
+) -> Option<(u64, Vec<(u64, u64)>, Vec<(PathBuf, FileStamp)>, Cursor<'a>)> {
     if data.len() < 36
         || data[..8] != LOCAL_META_MAGIC
         || data[data.len() - 8..] != LOCAL_META_MAGIC
@@ -367,7 +370,12 @@ pub(super) fn decode_meta(data: &[u8], expected_structural: u64) -> Option<Local
     }
     let mut cur = Cursor::new(&data[..data.len() - 8]);
     cur.take(8).ok()?;
-    if cur.u32().ok()? != LOCAL_INDEX_VERSION || cur.u64().ok()? != expected_structural {
+    let version = cur.u32().ok()?;
+    if expected_structural.is_some() && version != LOCAL_INDEX_VERSION {
+        return None;
+    }
+    let structural = cur.u64().ok()?;
+    if expected_structural.is_some_and(|exp| structural != exp) {
         return None;
     }
     let content_key = cur.u64().ok()?;
@@ -391,6 +399,12 @@ pub(super) fn decode_meta(data: &[u8], expected_structural: u64) -> Option<Local
         };
         watched.push((path, stamp));
     }
+    Some((content_key, dep_keys, watched, cur))
+}
+
+pub(super) fn decode_meta(data: &[u8], expected_structural: u64) -> Option<LocalMeta> {
+    let (content_key, dep_keys, watched, mut cur) =
+        decode_meta_prefix(data, Some(expected_structural))?;
     let env_count = cur.count().ok()?;
     let mut env_reads = Vec::with_capacity(env_count.min(256));
     for _ in 0..env_count {
@@ -451,4 +465,28 @@ pub(super) fn validate_env_reads(env_reads: &[(String, Option<u64>)]) -> bool {
             .map(|v| store::hash_env_val(&LOCAL_META_MAGIC, name, v))
             == *expected
     })
+}
+
+/// Returns the `.bin` content key if an encoded `.meta` buffer watches any path inside `roots`.
+pub(crate) fn matches_workspace(data: &[u8], roots: &[PathBuf]) -> Option<u64> {
+    let (content_key, _, watched, _) = decode_meta_prefix(data, None)?;
+    watched
+        .iter()
+        .any(|(path, _)| super::super::noop::path_in_workspace(path, roots))
+        .then_some(content_key)
+}
+
+#[cfg(test)]
+pub(crate) fn encode_test_meta(content_key: u64, watched: &std::path::Path) -> Vec<u8> {
+    encode_meta(
+        0,
+        &LocalMeta {
+            content_key,
+            dep_keys: Vec::new(),
+            watched: vec![(watched.to_path_buf(), None)],
+            included: Vec::new(),
+            env_reads: Vec::new(),
+        },
+    )
+    .unwrap_or_default()
 }

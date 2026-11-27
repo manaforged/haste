@@ -2,6 +2,10 @@
 
 mod meta;
 
+#[cfg(test)]
+pub(crate) use meta::encode_test_meta;
+pub(crate) use meta::matches_workspace;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 

@@ -41,6 +41,7 @@ run_with_timeout() {
     perl -e 'alarm shift; exec @ARGV or die "exec failed: $!\n"' "$@"
 }
 
+pids=()
 for f in "$work/src"/*.rs; do
     n=$(basename "$f" .rs)
     c="$work/out/$n"
@@ -108,21 +109,38 @@ for f in "$work/src"/*.rs; do
                     fi
                 fi
             } >"$c/fail"
+        else
+            : >"$c/ok"
         fi
     ) &
+    pids+=("$!")
     while [ "$(jobs -r | wc -l)" -ge "$jobs" ]; do
         sleep 0.1
     done
 done
-wait
+
+worker_errors=0
+for pid in ${pids[@]+"${pids[@]}"}; do
+    if ! wait "$pid"; then
+        worker_errors=$((worker_errors + 1))
+    fi
+done
 
 total=$((end - start))
-fails=$(find "$work/out" -name fail | sort)
-if [ -n "$fails" ]; then
+ok_files=("$work/out"/*/ok)
+fail_files=("$work/out"/*/fail)
+agree=${#ok_files[@]}
+fail_count=${#fail_files[@]}
+
+if [ "$fail_count" -ne 0 ]; then
     echo "FUZZ MISMATCH:"
-    while IFS= read -r fp; do
+    for fp in "${fail_files[@]}"; do
         cat "$fp"
-    done <<< "$fails"
+    done
     exit 1
 fi
-echo "fuzz agree=$total of $total (seeds $start..$end, jit+aot)"
+if [ "$worker_errors" -ne 0 ] || [ $((agree + fail_count)) -ne "$total" ]; then
+    echo "FUZZ INCOMPLETE: agree=$agree fail=$fail_count total=$total worker_errors=$worker_errors" >&2
+    exit 1
+fi
+echo "fuzz agree=$agree of $total (seeds $start..$end, jit+aot)"

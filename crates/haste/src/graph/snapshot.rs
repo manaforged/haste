@@ -526,5 +526,68 @@ pub(crate) fn load_or_build(root: &Path, targets: &Targets) -> Result<Workspace>
     Ok(workspace)
 }
 
+/// Returns whether an encoded `.ws` workspace snapshot watches any path inside `roots`.
+pub(crate) fn matches_workspace(data: &[u8], roots: &[PathBuf]) -> bool {
+    if data.len() < HEADER_LEN || data[..8] != WS_MAGIC {
+        return false;
+    }
+    let mut cur = Cursor::new(data);
+    if cur.take(HEADER_LEN).is_err() {
+        return false;
+    }
+    let Ok(struct_files) = read_file_stamps(&mut cur) else {
+        return false;
+    };
+    if struct_files
+        .iter()
+        .any(|(path, _)| crate::substrate::noop::path_in_workspace(path, roots))
+    {
+        return true;
+    }
+    if read_env_hashes(&mut cur).is_err() {
+        return false;
+    }
+    for _ in 0..2 {
+        let Ok(count) = cur.count() else {
+            return false;
+        };
+        for _ in 0..count {
+            let Ok(path) = read_path(&mut cur) else {
+                return false;
+            };
+            if crate::substrate::noop::path_in_workspace(&path, roots) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+pub(crate) fn encode_test_snapshot(path: &Path) -> Vec<u8> {
+    let watched = WatchedGraph {
+        struct_files: vec![(path.to_path_buf(), None)],
+        struct_envs: Vec::new(),
+        dirs: Vec::new(),
+        root_files: Vec::new(),
+        dirs_hash: 0,
+        library: None,
+        script_files: Vec::new(),
+        script_envs: Vec::new(),
+    };
+    let workspace = Workspace {
+        packages: Vec::new(),
+        graph: Graph {
+            units: Vec::new(),
+            members: Vec::new(),
+        },
+        rustflags: Vec::new(),
+        config_env: Vec::new(),
+        profile_dev: ProfileOverride::default(),
+        profile_release: ProfileOverride::default(),
+    };
+    encode_snapshot(0, &watched, &workspace).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests;
