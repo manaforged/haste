@@ -39,6 +39,9 @@ impl VtableMask {
         }
         for _ in 0..4 {
             let next_mask = Self::build_from_live(cx, reached, vtables, &fns);
+            if next_mask.masks.iter().all(Option::is_none) {
+                return (live, vmask);
+            }
             let (next_live, next_fns, next_counts) = step(&next_mask);
             let converged = next_counts == counts;
             live = next_live;
@@ -63,13 +66,20 @@ impl VtableMask {
         rta.run();
         rta.scan_vtable_impls(vtables);
         rta.close_layouts();
+        let mut cands_by_len: HashMap<usize, Vec<ItemRef>> = HashMap::default();
+        for &of in &rta.cand_list {
+            if let Some(layout) = rta.layouts.get(&of) {
+                let expected_len = VTABLE_HEADER + layout.methods.len() + layout.supers.len();
+                cands_by_len.entry(expected_len).or_default().push(of);
+            }
+        }
         let mut matcher = Matcher {
             cx: rta.cx,
             reached,
             vtables,
             demand: &rta.demand,
             layouts: &rta.layouts,
-            cand_list: &rta.cand_list,
+            cands_by_len: &cands_by_len,
             fn_methods: &mut rta.fn_methods,
             memo: HashMap::default(),
         };
@@ -103,7 +113,7 @@ struct Demand {
     wild_slots: HashSet<u32>,
     wild_upcasts: HashSet<u32>,
     cands: HashSet<ItemRef>,
-    seen_tys: HashSet<Ty>,
+    seen_tys: Vec<bool>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -519,7 +529,7 @@ struct Matcher<'a, 'b> {
     vtables: &'a [Vec<VtableEntry>],
     demand: &'a Demand,
     layouts: &'a HashMap<ItemRef, TraitLayout>,
-    cand_list: &'a [ItemRef],
+    cands_by_len: &'a HashMap<usize, Vec<ItemRef>>,
     fn_methods: &'a mut HashMap<ItemRef, Option<ItemRef>>,
     memo: HashMap<(usize, ItemRef), Option<bool>>,
 }
@@ -530,8 +540,8 @@ impl Matcher<'_, '_> {
         if entries.len() < VTABLE_HEADER || has_nonzero_int_tail(entries) {
             return None;
         }
-        let matched: Vec<ItemRef> = self
-            .cand_list
+        let cands = self.cands_by_len.get(&entries.len())?;
+        let matched: Vec<ItemRef> = cands
             .iter()
             .copied()
             .filter(|&of| self.matches_trait(id, of))
@@ -689,10 +699,18 @@ fn dyn_trait_in(types: &Types, ty: Ty, depth: usize) -> Option<ItemRef> {
     }
 }
 
-fn collect_dyn_tys(types: &Types, ty: Ty, seen: &mut HashSet<Ty>, cands: &mut HashSet<ItemRef>) {
-    if ty == Ty::NONE || !seen.insert(ty) {
+fn collect_dyn_tys(types: &Types, ty: Ty, seen: &mut Vec<bool>, cands: &mut HashSet<ItemRef>) {
+    if ty == Ty::NONE {
         return;
     }
+    let idx = ty.0 as usize;
+    if idx >= seen.len() {
+        seen.resize(idx + 1, false);
+    }
+    if seen[idx] {
+        return;
+    }
+    seen[idx] = true;
     if let Kind::Dyn(of, ..) = types.kind(ty) {
         cands.insert(*of);
     }
@@ -704,7 +722,7 @@ fn collect_dyn_tys(types: &Types, ty: Ty, seen: &mut HashSet<Ty>, cands: &mut Ha
 fn collect_vtable_cands(
     types: &Types,
     vt: &Vtable,
-    seen: &mut HashSet<Ty>,
+    seen: &mut Vec<bool>,
     cands: &mut HashSet<ItemRef>,
 ) {
     collect_dyn_tys(types, vt.ty, seen, cands);

@@ -1,9 +1,7 @@
-use std::hash::Hasher as _;
-
 use anyhow::Result;
 use haste_codegen::{Arch, Os};
-use rustc_hash::FxHasher;
 
+use super::codesign::{build_ad_hoc_signature, deterministic_uuid, signature_padded_len};
 use super::shims::{emit_main_trampoline, emit_shims, emit_stub, plan_shims};
 use super::tls::TlsLayout;
 use super::{
@@ -13,6 +11,7 @@ use super::{
 
 const LOCAL_IN_TEXT: u32 = 0x010E;
 const EXT_IN_TEXT: u32 = 0x010F;
+const LC_CODE_SIGNATURE: u32 = 0x1D;
 const LC_UUID: u32 = 0x1B;
 const LC_FUNCTION_STARTS: u32 = 0x26;
 const MH_HAS_TLV_DESCRIPTORS: u32 = 0x0080_0000;
@@ -33,6 +32,8 @@ struct MachMeta<'a> {
     indirect_off: usize,
     strtab_off: usize,
     strtab_len: usize,
+    sig_off: usize,
+    sig_len: usize,
     nimports: usize,
     nlocals: usize,
     nexports: usize,
@@ -111,6 +112,7 @@ fn write_meta(out: &mut Buf, m: &MachMeta<'_>) -> usize {
         m.func_starts_off as u32,
         m.func_starts.len() as u32,
     ]);
+    out.words(&[LC_CODE_SIGNATURE, 16, m.sig_off as u32, m.sig_len as u32]);
     for lib in m.libs {
         let size = (24 + lib.len() + 1).next_multiple_of(8);
         out.words(&[12, size as u32, 24, 0, 0x0001_0000, 0x0001_0000]);
@@ -236,27 +238,6 @@ fn build_func_starts(
     }
     buf.u8(0);
     buf.0
-}
-
-fn deterministic_uuid(bytes: &[u8]) -> [u8; 16] {
-    let mut h1 = FxHasher::default();
-    let mut h2 = FxHasher::default();
-    h1.write_u64(0x9E37_79B9_7F4A_7C15);
-    h2.write_u64(0xBF58_476D_1CE4_E5B9);
-    h1.write_usize(bytes.len());
-    h2.write_usize(bytes.len() ^ 0x5555_5555_5555_5555);
-    h1.write(bytes);
-    for chunk in bytes.chunks(8) {
-        let mut word = [0u8; 8];
-        word[..chunk.len()].copy_from_slice(chunk);
-        h2.write_u64(u64::from_le_bytes(word).swap_bytes());
-    }
-    let mut uuid = [0u8; 16];
-    uuid[..8].copy_from_slice(&h1.finish().to_le_bytes());
-    uuid[8..].copy_from_slice(&h2.finish().to_le_bytes());
-    uuid[6] = (uuid[6] & 0x0F) | 0x40;
-    uuid[8] = (uuid[8] & 0x3F) | 0x80;
-    uuid
 }
 
 fn build_dyld_info(
@@ -386,6 +367,7 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
         + 24
         + 24
         + 16
+        + 16
         + dylib_cmds;
     let tramp_off = (32 + sizeofcmds + 64).next_multiple_of(16);
     let shims_off = (tramp_off + tramp_size).next_multiple_of(16);
@@ -499,9 +481,11 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     let symtab_off = (func_starts_off + func_starts.len()).next_multiple_of(8);
     let indirect_off = symtab_off + (nlocals + nexports + plan.imports.len()) * 16;
     let strtab_off = indirect_off + plan.imports.len() * 8;
-    let linkedit_filesz = (strtab_off + strtab.len()) - linkedit_off;
+    let sig_off = (strtab_off + strtab.len()).next_multiple_of(16);
+    let sig_len = signature_padded_len(sig_off);
+    let linkedit_filesz = (sig_off + sig_len) - linkedit_off;
 
-    let mut out = Buf::new();
+    let mut out = Buf(Vec::with_capacity(sig_off + sig_len));
     let mut flags = if libs.len() == 1 {
         0x0020_0085
     } else {
@@ -519,7 +503,7 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
         },
         if arch == Arch::Arm64 { 0 } else { 3 },
         2,
-        12 + libs.len() as u32,
+        13 + libs.len() as u32,
         sizeofcmds as u32,
         flags,
         0,
@@ -674,6 +658,8 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
             indirect_off,
             strtab_off,
             strtab_len: strtab.len(),
+            sig_off,
+            sig_len,
             nimports: plan.imports.len(),
             nlocals,
             nexports,
@@ -768,7 +754,10 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
         (0..plan.imports.len()).for_each(|idx| out.u32((nlocals + nexports + idx) as u32));
     }
     out.bytes(&strtab);
+    out.align(16);
     let uuid = deterministic_uuid(&out.0);
     out.0[uuid_off..uuid_off + 16].copy_from_slice(&uuid);
+    let sig = build_ad_hoc_signature(&out.0, text_seg_size);
+    out.bytes(&sig);
     Ok(out.0)
 }

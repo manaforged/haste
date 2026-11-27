@@ -345,6 +345,34 @@ impl Image {
         }
     }
 
+    pub(super) fn record_aot_batch(&self, hits: Vec<(usize, AotFn)>) {
+        if hits.is_empty() {
+            return;
+        }
+        let Some(aot) = self.aot() else {
+            return;
+        };
+        let Some(max_idx) = hits.iter().map(|(idx, _)| *idx).max() else {
+            return;
+        };
+        let mut state = lock(aot);
+        state.ensure_len(max_idx + 1);
+        let frontier = state.frontier.clone();
+        let mut discovered = Vec::new();
+        for (index, entry) in hits {
+            if let Some(q) = frontier.as_ref() {
+                discovered.extend(state.collect_new_targets(&entry, q));
+            }
+            state.functions[index] = Some(entry);
+        }
+        drop(state);
+        if let Some(q) = frontier
+            && !discovered.is_empty()
+        {
+            q.push_loose(discovered);
+        }
+    }
+
     pub(super) fn drain_aot_cache_hits(
         &self,
         cx: &mut Context<'_>,
@@ -361,23 +389,39 @@ impl Image {
         }
         let mut misses = Vec::new();
         let mut ty_memo = HashMap::default();
+        let mut hit_inlined = Vec::new();
+        let mut hits = Vec::with_capacity(work.len());
+        let mut hit_count = 0usize;
         for &index in work {
             if let Some(key) = cache.instance_key(cx, reached, index, &mut ty_memo)
-                && let Some((entry, len)) = cache.lookup_instance(index, &key, self, cx, reached)
+                && let Some((entry, len)) =
+                    cache.lookup_instance_batched(index, &key, self, cx, reached, &mut hit_inlined)
             {
-                cache.note_hit();
+                hit_count += 1;
                 let relocs = match &entry {
                     AotFn::Direct { relocs, .. } | AotFn::Dict { relocs, .. } => relocs.as_slice(),
                     AotFn::Alias(_) => &[],
                 };
-                self.register_aot_relocs(relocs);
-                self.record_aot(index, entry, &[]);
+                if relocs.iter().any(|sym| {
+                    matches!(
+                        sym,
+                        SymbolSource::StaticCell { .. }
+                            | SymbolSource::PromotedCell { .. }
+                            | SymbolSource::ThreadSlot(_)
+                    )
+                }) {
+                    self.register_aot_relocs(relocs);
+                }
                 pass.record_size(index, len, 0);
+                hits.push((index, entry));
             } else {
                 cache.note_miss();
                 misses.push(index);
             }
         }
+        cache.note_hits(hit_count);
+        cache.record_hit_inlined_batch(hit_inlined);
+        self.record_aot_batch(hits);
         if !misses.is_empty() {
             cache.mark_miss();
             if self.allow_inline()

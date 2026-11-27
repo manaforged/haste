@@ -1,8 +1,9 @@
+use std::hash::{Hash as _, Hasher as _};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use haste_codegen::{RelocKind, UnwindArg};
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHasher};
 
 use crate::aot::{Executable, Symbol, UNWIND_FN_REC_BYTES};
 use crate::host::HostSymbol;
@@ -55,15 +56,14 @@ impl PreSyms<'_> {
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum RelocTargetKey {
-    SelfSlot(bool),
-    Fn(bool, usize),
+    FnSlot(bool),
     ForeignSlot(bool, Symbol),
     Vtable(VtableId),
     Sym(Symbol),
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
-enum FnIcfKey<'a> {
+#[derive(PartialEq, Eq)]
+enum StaticFnKey<'a> {
     Direct(
         &'a [u8],
         Vec<(u32, RelocKind, RelocTargetKey)>,
@@ -111,107 +111,183 @@ pub(super) fn alias_roots(functions: &[Option<AotFn>]) -> Vec<usize> {
         .collect()
 }
 
-fn slot_reloc_key(
+struct PreparedFn {
+    idx: usize,
+    static_hash: u64,
+    fn_slots: Vec<usize>,
+}
+
+fn slot_static_target(
     self_idx: usize,
     (callee, direct): (usize, bool),
     state: &AotState,
     roots: &[usize],
-    canon: &[usize],
+    fn_slots: &mut Vec<usize>,
 ) -> RelocTargetKey {
     let root = roots.get(callee).copied().unwrap_or(callee);
     if state.functions.get(root).and_then(Option::as_ref).is_some() {
-        if root == self_idx {
-            RelocTargetKey::SelfSlot(direct)
-        } else {
-            RelocTargetKey::Fn(direct, canon[root])
-        }
+        fn_slots.push(if root == self_idx { usize::MAX } else { root });
+        RelocTargetKey::FnSlot(direct)
     } else {
         RelocTargetKey::ForeignSlot(direct, foreign_sym(&state.foreign_fns, callee))
     }
 }
 
-fn sym_reloc_key(
+fn sym_static_target(
     self_idx: usize,
     (sym, direct): (&SymbolSource, bool),
     state: &AotState,
     pre: &PreSyms<'_>,
-    (roots, canon): (&[usize], &[usize]),
+    roots: &[usize],
+    fn_slots: &mut Vec<usize>,
 ) -> Result<RelocTargetKey> {
     Ok(match sym {
         SymbolSource::Slot(callee) => {
-            slot_reloc_key(self_idx, (*callee, direct), state, roots, canon)
+            slot_static_target(self_idx, (*callee, direct), state, roots, fn_slots)
         }
         SymbolSource::Vtable(id) => RelocTargetKey::Vtable(*id),
         other => RelocTargetKey::Sym(pre.translate(other)?),
     })
 }
 
-fn direct_icf_key<'a>(
-    self_idx: usize,
-    (code, relocs): (&'a AotCode, &[SymbolSource]),
+fn prepare_fn(
+    idx: usize,
     state: &AotState,
     pre: &PreSyms<'_>,
-    (roots, canon): (&[usize], &[usize]),
-) -> Result<FnIcfKey<'a>> {
-    let mut sig = Vec::with_capacity(code.relocs().len());
-    for reloc in code.relocs() {
-        let target = if let Some(rt) = reloc.as_runtime() {
-            RelocTargetKey::Sym(Symbol::Runtime(rt))
-        } else {
-            let direct = matches!(reloc.kind, RelocKind::Arm64Call26 | RelocKind::PcRel32);
-            sym_reloc_key(
-                self_idx,
-                (&relocs[reloc.symbol as usize], direct),
-                state,
-                pre,
-                (roots, canon),
-            )?
-        };
-        sig.push((reloc.offset, reloc.kind, target));
+    roots: &[usize],
+) -> Result<Option<PreparedFn>> {
+    let mut h = FxHasher::default();
+    let mut fn_slots = Vec::new();
+    match &state.functions[idx] {
+        Some(AotFn::Direct { code, relocs }) => {
+            0u8.hash(&mut h);
+            code.bytes().hash(&mut h);
+            code.saved_regs().hash(&mut h);
+            code.sites().len().hash(&mut h);
+            for s in code.sites() {
+                (s.ret, s.handler, s.frame_offset).hash(&mut h);
+            }
+            code.relocs().len().hash(&mut h);
+            for reloc in code.relocs() {
+                reloc.offset.hash(&mut h);
+                reloc.kind.hash(&mut h);
+                if let Some(rt) = reloc.as_runtime() {
+                    0u8.hash(&mut h);
+                    rt.hash(&mut h);
+                } else {
+                    1u8.hash(&mut h);
+                    let direct = matches!(reloc.kind, RelocKind::Arm64Call26 | RelocKind::PcRel32);
+                    let target = sym_static_target(
+                        idx,
+                        (&relocs[reloc.symbol as usize], direct),
+                        state,
+                        pre,
+                        roots,
+                        &mut fn_slots,
+                    )?;
+                    target.hash(&mut h);
+                }
+            }
+            code.unwind_drops().len().hash(&mut h);
+            for d in code.unwind_drops() {
+                (d.local_off, d.flag_off, d.arg).hash(&mut h);
+                let target = sym_static_target(
+                    idx,
+                    (&relocs[d.drop_sym as usize], true),
+                    state,
+                    pre,
+                    roots,
+                    &mut fn_slots,
+                )?;
+                target.hash(&mut h);
+            }
+        }
+        Some(AotFn::Dict { body, relocs }) => {
+            1u8.hash(&mut h);
+            (Arc::as_ptr(body) as usize).hash(&mut h);
+            relocs.len().hash(&mut h);
+            for sym in relocs {
+                let target =
+                    sym_static_target(idx, (sym, false), state, pre, roots, &mut fn_slots)?;
+                target.hash(&mut h);
+            }
+        }
+        Some(AotFn::Alias(_)) | None => return Ok(None),
     }
-    let mut drops = Vec::with_capacity(code.unwind_drops().len());
-    for d in code.unwind_drops() {
-        let target = sym_reloc_key(
-            self_idx,
-            (&relocs[d.drop_sym as usize], true),
-            state,
-            pre,
-            (roots, canon),
-        )?;
-        drops.push((d.local_off, d.flag_off, target, d.arg));
-    }
-    let sites = code
-        .sites()
-        .iter()
-        .map(|s| (s.ret, s.handler, s.frame_offset))
-        .collect();
-    Ok(FnIcfKey::Direct(
-        code.bytes(),
-        sig,
-        drops,
-        sites,
-        code.saved_regs(),
-    ))
+    Ok(Some(PreparedFn {
+        idx,
+        static_hash: h.finish(),
+        fn_slots,
+    }))
 }
 
-fn dict_icf_key<'a>(
-    self_idx: usize,
-    (body, relocs): (&Arc<AotCode>, &[SymbolSource]),
-    state: &AotState,
+fn build_static_key<'a>(
+    idx: usize,
+    state: &'a AotState,
     pre: &PreSyms<'_>,
-    (roots, canon): (&[usize], &[usize]),
-) -> Result<FnIcfKey<'a>> {
-    let mut sig = Vec::with_capacity(relocs.len());
-    for sym in relocs {
-        sig.push(sym_reloc_key(
-            self_idx,
-            (sym, false),
-            state,
-            pre,
-            (roots, canon),
-        )?);
-    }
-    Ok(FnIcfKey::Dict(Arc::as_ptr(body) as usize, sig))
+    roots: &[usize],
+) -> Result<Option<StaticFnKey<'a>>> {
+    let mut unused = Vec::new();
+    Ok(match &state.functions[idx] {
+        Some(AotFn::Direct { code, relocs }) => {
+            let mut sig = Vec::with_capacity(code.relocs().len());
+            for reloc in code.relocs() {
+                let target = if let Some(rt) = reloc.as_runtime() {
+                    RelocTargetKey::Sym(Symbol::Runtime(rt))
+                } else {
+                    let direct = matches!(reloc.kind, RelocKind::Arm64Call26 | RelocKind::PcRel32);
+                    sym_static_target(
+                        idx,
+                        (&relocs[reloc.symbol as usize], direct),
+                        state,
+                        pre,
+                        roots,
+                        &mut unused,
+                    )?
+                };
+                sig.push((reloc.offset, reloc.kind, target));
+            }
+            let mut drops = Vec::with_capacity(code.unwind_drops().len());
+            for d in code.unwind_drops() {
+                let target = sym_static_target(
+                    idx,
+                    (&relocs[d.drop_sym as usize], true),
+                    state,
+                    pre,
+                    roots,
+                    &mut unused,
+                )?;
+                drops.push((d.local_off, d.flag_off, target, d.arg));
+            }
+            let sites = code
+                .sites()
+                .iter()
+                .map(|s| (s.ret, s.handler, s.frame_offset))
+                .collect();
+            Some(StaticFnKey::Direct(
+                code.bytes(),
+                sig,
+                drops,
+                sites,
+                code.saved_regs(),
+            ))
+        }
+        Some(AotFn::Dict { body, relocs }) => {
+            let mut sig = Vec::with_capacity(relocs.len());
+            for sym in relocs {
+                sig.push(sym_static_target(
+                    idx,
+                    (sym, false),
+                    state,
+                    pre,
+                    roots,
+                    &mut unused,
+                )?);
+            }
+            Some(StaticFnKey::Dict(Arc::as_ptr(body) as usize, sig))
+        }
+        Some(AotFn::Alias(_)) | None => None,
+    })
 }
 
 pub(super) fn fold_functions(
@@ -221,27 +297,116 @@ pub(super) fn fold_functions(
     roots: &[usize],
 ) -> Result<Vec<usize>> {
     let mut canon = roots.to_vec();
-    for _ in 0..5 {
-        let mut seen: HashMap<FnIcfKey<'_>, usize> = HashMap::default();
-        let mut changed = false;
-        let prev = canon.clone();
-        for idx in 0..state.functions.len() {
-            if !live_fns[idx] || roots[idx] != idx {
+    let live_roots: Vec<usize> = (0..state.functions.len())
+        .filter(|&idx| live_fns[idx] && roots[idx] == idx && state.functions[idx].is_some())
+        .collect();
+    if live_roots.len() < 2 {
+        return Ok(canon);
+    }
+    let workers = crate::jobs().min(live_roots.len() / 64);
+    let prepared: Vec<PreparedFn> = if workers <= 1 {
+        let mut out = Vec::with_capacity(live_roots.len());
+        for &idx in &live_roots {
+            if let Some(p) = prepare_fn(idx, state, pre, roots)? {
+                out.push(p);
+            }
+        }
+        out
+    } else {
+        let chunk_len = live_roots.len().div_ceil(workers).max(1);
+        let chunks: Result<Vec<Vec<PreparedFn>>> = crate::sync::scope(|scope| {
+            let handles: Vec<_> = live_roots
+                .chunks(chunk_len)
+                .map(|chunk| {
+                    scope.spawn(move || {
+                        let mut local = Vec::with_capacity(chunk.len());
+                        for &idx in chunk {
+                            if let Some(p) = prepare_fn(idx, state, pre, roots)? {
+                                local.push(p);
+                            }
+                        }
+                        Ok::<_, anyhow::Error>(local)
+                    })
+                })
+                .collect();
+            let mut out = Vec::with_capacity(handles.len());
+            for h in handles {
+                let res = h.join().map_err(|panic| {
+                    anyhow::anyhow!(
+                        "AOT ICF prepare worker panicked: {}",
+                        crate::sync::panic_text(&*panic)
+                    )
+                })??;
+                out.push(res);
+            }
+            Ok(out)
+        });
+        let mut out = Vec::with_capacity(live_roots.len());
+        for part in chunks? {
+            out.extend(part);
+        }
+        out
+    };
+
+    let mut by_hash: HashMap<u64, Vec<usize>> = HashMap::default();
+    for (pos, p) in prepared.iter().enumerate() {
+        by_hash.entry(p.static_hash).or_default().push(pos);
+    }
+
+    let mut cand_groups: Vec<Vec<usize>> = Vec::new();
+    for (_, bucket) in by_hash {
+        if bucket.len() < 2 {
+            continue;
+        }
+        let mut exact_groups: Vec<(StaticFnKey<'_>, Vec<usize>)> = Vec::new();
+        for pos in bucket {
+            let idx = prepared[pos].idx;
+            let Some(key) = build_static_key(idx, state, pre, roots)? else {
+                continue;
+            };
+            if let Some((_, members)) = exact_groups.iter_mut().find(|(k, _)| *k == key) {
+                members.push(pos);
+            } else {
+                exact_groups.push((key, vec![pos]));
+            }
+        }
+        for (_, mut members) in exact_groups {
+            if members.len() < 2 {
                 continue;
             }
-            let key = match &state.functions[idx] {
-                Some(AotFn::Direct { code, relocs }) => {
-                    direct_icf_key(idx, (code, relocs), state, pre, (roots, &prev))?
+            members.sort_unstable_by_key(|&pos| prepared[pos].idx);
+            if prepared[members[0]].fn_slots.is_empty() {
+                let leader = prepared[members[0]].idx;
+                for &pos in &members {
+                    canon[prepared[pos].idx] = leader;
                 }
-                Some(AotFn::Dict { body, relocs }) => {
-                    dict_icf_key(idx, (body, relocs), state, pre, (roots, &prev))?
+            } else {
+                cand_groups.push(members);
+            }
+        }
+    }
+    if cand_groups.is_empty() {
+        return Ok(canon);
+    }
+
+    for _ in 0..5 {
+        let prev = canon.clone();
+        let mut changed = false;
+        for group in &cand_groups {
+            let mut seen: HashMap<Vec<usize>, usize> =
+                HashMap::with_capacity_and_hasher(group.len(), Default::default());
+            for &pos in group {
+                let p = &prepared[pos];
+                let resolved: Vec<usize> = p
+                    .fn_slots
+                    .iter()
+                    .map(|&r| if r == usize::MAX { usize::MAX } else { prev[r] })
+                    .collect();
+                let leader = *seen.entry(resolved).or_insert(p.idx);
+                if canon[p.idx] != leader {
+                    canon[p.idx] = leader;
+                    changed = true;
                 }
-                Some(AotFn::Alias(_)) | None => continue,
-            };
-            let leader = *seen.entry(key).or_insert(idx);
-            if canon[idx] != leader {
-                canon[idx] = leader;
-                changed = true;
             }
         }
         if !changed {
@@ -316,13 +481,14 @@ fn place_rodata_node<'a>(
         emit_rodata_relocs(off, &resolved, exe, fn_relocs);
         return Ok(off);
     }
-    let off = if let Some(&existing) = seen.get(&(entry.0.as_slice(), resolved.clone())) {
-        existing
-    } else {
-        let fresh = exe.rodata(&entry.0, 16);
-        emit_rodata_relocs(fresh, &resolved, exe, fn_relocs);
-        seen.insert((entry.0.as_slice(), resolved), fresh);
-        fresh
+    let off = match seen.entry((entry.0.as_slice(), resolved)) {
+        std::collections::hash_map::Entry::Occupied(hit) => *hit.get(),
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            let fresh = exe.rodata(&entry.0, 16);
+            emit_rodata_relocs(fresh, &slot.key().1, exe, fn_relocs);
+            slot.insert(fresh);
+            fresh
+        }
     };
     rodata_offs[id] = Some(off);
     Ok(off)
