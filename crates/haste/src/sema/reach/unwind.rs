@@ -95,14 +95,20 @@ fn expr_avoids_normal_drop(body: &Body, expr: &Expr) -> bool {
     }
 }
 
-fn all_params_moved(cx: &Context<'_>, body: &Body, typed: &Typed) -> bool {
+fn all_params_moved(
+    cx: &Context<'_>,
+    body: &Body,
+    typed: &Typed,
+    call_callees: &mut Vec<bool>,
+) -> bool {
     if typed.params.is_empty() {
         return true;
     }
     if !body.fn_params.is_empty() || typed.params.len() > 8 {
         return false;
     }
-    let mut call_callees = vec![false; body.exprs.len()];
+    call_callees.clear();
+    call_callees.resize(body.exprs.len(), false);
     for expr in &body.exprs {
         if let Expr::Call(callee, _) = *expr {
             call_callees[callee.0 as usize] = true;
@@ -164,20 +170,36 @@ fn scan_body_ops(
     matches!(entry, BodyScan::Unwinds)
 }
 
+struct UnwindScratch {
+    body_cache: FxHashMap<(ItemRef, bool), BodyScan>,
+    item_cache: FxHashMap<ItemRef, ItemUnwind>,
+    call_callees: Vec<bool>,
+}
+
+impl UnwindScratch {
+    fn new() -> Self {
+        Self {
+            body_cache: FxHashMap::default(),
+            item_cache: FxHashMap::default(),
+            call_callees: Vec::new(),
+        }
+    }
+}
+
 fn has_indirect_call(
     cx: &mut Context<'_>,
     source: ItemRef,
     overflow_checks: bool,
     typed: &Typed,
-    cache: &mut FxHashMap<(ItemRef, bool), BodyScan>,
+    scratch: &mut UnwindScratch,
 ) -> (bool, bool) {
-    if scan_body_ops(cx, source, overflow_checks, cache) {
+    if scan_body_ops(cx, source, overflow_checks, &mut scratch.body_cache) {
         return (true, false);
     }
     let Some(BodyScan::IndirectCalls {
         calls,
         no_normal_drops,
-    }) = cache.get(&(source, overflow_checks))
+    }) = scratch.body_cache.get(&(source, overflow_checks))
     else {
         return (true, false);
     };
@@ -208,8 +230,9 @@ fn has_indirect_call(
             return (true, false);
         }
     }
-    let skip_drops =
-        no_normal_drops && matches!(typed.shape, Shape::Body) && all_params_moved(cx, &body, typed);
+    let skip_drops = no_normal_drops
+        && matches!(typed.shape, Shape::Body)
+        && all_params_moved(cx, &body, typed, &mut scratch.call_callees);
     (false, skip_drops)
 }
 
@@ -240,14 +263,13 @@ fn direct_may_unwind(
     cx: &mut Context<'_>,
     reached: &Reached,
     index: usize,
-    body_cache: &mut FxHashMap<(ItemRef, bool), BodyScan>,
-    item_cache: &mut FxHashMap<ItemRef, ItemUnwind>,
+    scratch: &mut UnwindScratch,
 ) -> (bool, bool) {
     let Some(((item, substs), res)) = reached.list.get(index) else {
         return (true, false);
     };
     let item = *item;
-    match item_unwind(cx, item, item_cache) {
+    match item_unwind(cx, item, &mut scratch.item_cache) {
         ItemUnwind::Intrinsic(u) | ItemUnwind::Foreign(u) => return (u, false),
         ItemUnwind::Normal => {}
     }
@@ -276,7 +298,7 @@ fn direct_may_unwind(
             };
             let overflow_checks = cx.overflow_checks(source.krate);
             let (indirect, no_normal_drops) =
-                has_indirect_call(cx, source, overflow_checks, typed, body_cache);
+                has_indirect_call(cx, source, overflow_checks, typed, scratch);
             if indirect {
                 return (true, false);
             }
@@ -289,7 +311,7 @@ fn direct_may_unwind(
         typed.calls()
     };
     for (callee, csubsts) in callees {
-        match item_unwind(cx, callee, item_cache) {
+        match item_unwind(cx, callee, &mut scratch.item_cache) {
             ItemUnwind::Intrinsic(true) | ItemUnwind::Foreign(true) => return (true, false),
             ItemUnwind::Intrinsic(false) | ItemUnwind::Foreign(false) => continue,
             ItemUnwind::Normal => {}
@@ -301,19 +323,19 @@ fn direct_may_unwind(
     (false, skip_drops)
 }
 
-pub(super) fn compute_may_unwind(cx: &mut Context<'_>, reached: &Reached) -> Vec<bool> {
-    let n = reached.list.len();
-    let mut may_unwind = vec![false; n];
-    let mut rev: Vec<Vec<usize>> = vec![Vec::new(); n];
-    let mut body_cache = FxHashMap::default();
-    let mut item_cache = FxHashMap::default();
-    let mut work = Vec::new();
-    for u in 0..n {
-        let (direct, skip_drops) =
-            direct_may_unwind(cx, reached, u, &mut body_cache, &mut item_cache);
+fn scan_unwind_slice(
+    cx: &mut Context<'_>,
+    reached: &Reached,
+    range: std::ops::Range<usize>,
+    n: usize,
+) -> (Vec<u32>, Vec<(u32, u32)>) {
+    let mut scratch = UnwindScratch::new();
+    let mut direct_unwinds = Vec::new();
+    let mut edges = Vec::new();
+    for u in range {
+        let (direct, skip_drops) = direct_may_unwind(cx, reached, u, &mut scratch);
         if direct {
-            may_unwind[u] = true;
-            work.push(u);
+            direct_unwinds.push(u as u32);
             continue;
         }
         if skip_drops {
@@ -322,28 +344,94 @@ pub(super) fn compute_may_unwind(cx: &mut Context<'_>, reached: &Reached) -> Vec
                     if let Some(&v) = reached.index.get(&(callee, csubsts))
                         && v < n
                     {
-                        rev[v].push(u);
+                        edges.push((v as u32, u as u32));
                     }
                 }
             }
         } else if let Some(callees) = reached.calls.get(u).filter(|c| !c.is_empty()) {
             for &v in callees {
                 if v < n {
-                    rev[v].push(u);
+                    edges.push((v as u32, u as u32));
                 }
             }
         } else if let Some((_, Ok(typed))) = reached.list.get(u) {
             for v in typed.collect_link_edges(&reached.index).0 {
                 if v < n {
-                    rev[v].push(u);
+                    edges.push((v as u32, u as u32));
                 }
             }
         }
     }
+    (direct_unwinds, edges)
+}
+
+pub(super) fn compute_may_unwind(cx: &mut Context<'_>, reached: &Reached) -> Vec<bool> {
+    let n = reached.list.len();
+    let workers = crate::jobs().min(n / 128);
+    let parts: Vec<(Vec<u32>, Vec<(u32, u32)>)> = if workers <= 1 {
+        vec![scan_unwind_slice(cx, reached, 0..n, n)]
+    } else {
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let worker_scan = |worker: &mut Context<'_>| {
+            let mut direct_all = Vec::new();
+            let mut edges_all = Vec::new();
+            loop {
+                let start = next.fetch_add(128, std::sync::atomic::Ordering::Relaxed);
+                if start >= n {
+                    return (direct_all, edges_all);
+                }
+                let end = (start + 128).min(n);
+                let (d, e) = scan_unwind_slice(worker, reached, start..end, n);
+                direct_all.extend(d);
+                edges_all.extend(e);
+            }
+        };
+        let forks: Vec<Context<'_>> = (1..workers).map(|_| cx.fork()).collect();
+        crate::sync::scope(|scope| {
+            let handles: Vec<_> = forks
+                .into_iter()
+                .map(|mut fork| scope.spawn(move || worker_scan(&mut fork)))
+                .collect();
+            let mut out = Vec::with_capacity(workers);
+            out.push(worker_scan(cx));
+            for h in handles {
+                if let Ok(res) = h.join() {
+                    out.push(res);
+                }
+            }
+            out
+        })
+    };
+    let mut may_unwind = vec![false; n];
+    let mut work = Vec::new();
+    let mut head = vec![0u32; n + 1];
+    for (directs, edges) in &parts {
+        for &u in directs {
+            may_unwind[u as usize] = true;
+            work.push(u);
+        }
+        for &(v, _) in edges {
+            head[v as usize + 1] += 1;
+        }
+    }
+    for i in 1..=n {
+        head[i] += head[i - 1];
+    }
+    let mut cursor = head[..n].to_vec();
+    let mut flat_rev = vec![0u32; head[n] as usize];
+    for (_, edges) in parts {
+        for (v, u) in edges {
+            let at = cursor[v as usize] as usize;
+            cursor[v as usize] = (at + 1) as u32;
+            flat_rev[at] = u;
+        }
+    }
     while let Some(v) = work.pop() {
-        for &u in &rev[v] {
-            if !may_unwind[u] {
-                may_unwind[u] = true;
+        let start = head[v as usize] as usize;
+        let end = head[v as usize + 1] as usize;
+        for &u in &flat_rev[start..end] {
+            if !may_unwind[u as usize] {
+                may_unwind[u as usize] = true;
                 work.push(u);
             }
         }
@@ -354,9 +442,63 @@ pub(super) fn compute_may_unwind(cx: &mut Context<'_>, reached: &Reached) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::names::Names;
+    use crate::outline::Outline;
+    use crate::sema::Cache;
+    use crate::sema::substs::Substs;
+    use std::sync::Arc;
 
     #[test]
     fn thread_cell_host_symbol_may_unwind() {
         assert!(host_symbol_may_unwind(&HostSymbol::ThreadCell));
+    }
+
+    #[test]
+    fn parallel_may_unwind_propagates_across_csr_graph() {
+        let mut src = String::new();
+        for i in 0..300 {
+            src.push_str(&format!("fn f{i}() {{}}\n"));
+        }
+        let parsed = crate::outline::source::Source::parse("test.rs".into(), src).expect("parse");
+        let scanned = crate::outline::scan::scan(&parsed).expect("scan");
+        let mut outline = Outline::file(
+            std::path::Path::new("test.rs"),
+            crate::graph::cfg::Target::default(),
+        );
+        outline.crates[0]
+            .files
+            .push(Arc::new(crate::outline::tree::File::new(
+                parsed, scanned, false,
+            )));
+        let names = Names::default();
+        let store = Cache::default();
+        let empty_typed = Arc::new(Typed::default());
+        let mut reached = Reached::default();
+        for i in 0..300 {
+            let inst = (
+                ItemRef {
+                    krate: 0,
+                    file: 0,
+                    item: i,
+                },
+                Substs::EMPTY,
+            );
+            let res = if i == 299 {
+                Err("err".to_owned())
+            } else {
+                Ok(Arc::clone(&empty_typed))
+            };
+            reached.list.push((inst, res));
+            reached.index.insert(inst, i as usize);
+            reached.calls.push(if i < 299 {
+                vec![(i + 1) as usize]
+            } else {
+                Vec::new()
+            });
+        }
+        let mut cx = Context::new(&outline, &names, store);
+        let unwinds = compute_may_unwind(&mut cx, &reached);
+        assert_eq!(unwinds.len(), 300);
+        assert!(unwinds.into_iter().all(|u| u));
     }
 }

@@ -270,7 +270,7 @@ fn wavefront_worker(
     let mut batch_sealed = HashSet::default();
     let mut local_filter = seed_filter.seed_clone();
     let mut synced_len = *seed_lens;
-    let sync_filter = true;
+    let sync_filter = cx.store.lookups.skip_warm_sysroot_bodies;
     let mut active = ActiveGuard(mutex, cvar, 0);
     loop {
         let delta = {
