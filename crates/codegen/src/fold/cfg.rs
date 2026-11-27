@@ -545,7 +545,31 @@ impl Fold {
                             .is_some_and(|di| insts.contains(&di))
                     };
                     let (lx, ly) = (local(vx), local(vy));
+                    let same_across_edges = edges.len() >= 2
+                        && !lx
+                        && !ly
+                        && !params.contains(&vx)
+                        && !params.contains(&vy);
+                    let idom_block = cfg.idom[block.index()].filter(|&d| d != block);
                     let check = |wc: IntCC| {
+                        if same_across_edges
+                            && let Some(dom) = idom_block
+                            && let (Some(mx), Some(my)) = (
+                                entry_map_val(&env, params, &[], vx, false),
+                                entry_map_val(&env, params, &[], vy, false),
+                            )
+                            && crate::cse::dom_proves_want(
+                                func,
+                                &cfg,
+                                &env,
+                                dom,
+                                Some(block),
+                                ty,
+                                (wc, mx, my),
+                            )
+                        {
+                            return true;
+                        }
                         edges.iter().all(|&(pred, args)| {
                             entry_map_val(&env, params, args, vx, lx)
                                 .zip(entry_map_val(&env, params, args, vy, ly))

@@ -1,7 +1,7 @@
 mod bytes;
 mod canon;
 
-use super::{Fold, defs, extend};
+use super::{Fold, extend};
 use crate::ir::{
     Binary, Convert, Function, Inst, IntCC, Op, ReduceOp, ShuffleMask, Type, Unary, Value,
 };
@@ -83,23 +83,24 @@ fn recast(func: &Function, inst: Inst) -> Option<(Value, Value)> {
     }
 }
 
-pub(super) fn fold_bitcast_loads(func: &mut Function) -> bool {
-    if !func
-        .blocks
-        .iter()
-        .flat_map(|b| &b.insts)
-        .any(|&inst| recast(func, inst).is_some())
-    {
+pub(super) fn fold_bitcast_loads(func: &mut Function, defs: &[Option<Inst>]) -> bool {
+    if !func.blocks.iter().flat_map(|b| &b.insts).any(|&inst| {
+        recast(func, inst).is_some_and(|(src, _)| {
+            defs.get(src.index())
+                .copied()
+                .flatten()
+                .is_some_and(|src_inst| matches!(func.insts[src_inst.index()].op, Op::Load(..)))
+        })
+    }) {
         return canon::fold_const_vectors(func);
     }
     let uses = func.use_counts();
-    let defs = defs(func);
     let mut remap: Vec<Option<Value>> = vec![None; func.types.len()];
     let mut dropped = vec![false; func.insts.len()];
     for inst in func.blocks.iter().flat_map(|b| &b.insts) {
         if let Some((src, res)) = recast(func, *inst)
             && uses[src.index()] == 1
-            && let Some(src_inst) = defs[src.index()]
+            && let Some(src_inst) = defs.get(src.index()).copied().flatten()
             && matches!(func.insts[src_inst.index()].op, Op::Load(..))
         {
             func.types[src.index()] = func.ty(res);

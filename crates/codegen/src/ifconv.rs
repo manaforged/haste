@@ -48,7 +48,8 @@ fn pure_arm_ops(func: &Function, body: &[Inst]) -> bool {
 
 fn safe_arm_op(
     func: &Function,
-    prov: &Provenance,
+    cfg: &Cfg,
+    prov: &std::cell::OnceCell<Provenance>,
     params: &[Value],
     incoming: &[Value],
     inst: Inst,
@@ -68,6 +69,7 @@ fn safe_arm_op(
                     .is_some_and(|e| e <= u64::from(func.slots[slot.index()].size))
         }
         Op::Load(addr, off) => {
+            let prov = prov.get_or_init(|| Provenance::addresses(func, cfg));
             let base_addr = remap_val(params, incoming, addr);
             if off >= 0
                 && (off as u64).checked_add(u64::from(bytes)).is_some_and(|e| {
@@ -109,7 +111,8 @@ fn safe_arm_op(
 
 fn pure_arm(
     func: &Function,
-    prov: &Provenance,
+    cfg: &Cfg,
+    prov: &std::cell::OnceCell<Provenance>,
     block: Block,
     join: Block,
     incoming: &[Value],
@@ -129,7 +132,7 @@ fn pure_arm(
         || !pure_arm_ops(func, body)
         || !body
             .iter()
-            .all(|&inst| safe_arm_op(func, prov, &data.params, incoming, inst))
+            .all(|&inst| safe_arm_op(func, cfg, prov, &data.params, incoming, inst))
     {
         return None;
     }
@@ -143,7 +146,7 @@ fn pure_arm(
 fn match_diamond(
     func: &Function,
     cfg: &Cfg,
-    prov: &Provenance,
+    prov: &std::cell::OnceCell<Provenance>,
     head: Block,
     (then_b, then_args): (Block, &[Value]),
     (else_b, else_args): (Block, &[Value]),
@@ -162,8 +165,8 @@ fn match_diamond(
     {
         return None;
     }
-    let t_args = pure_arm(func, prov, then_b, join_b, then_args)?;
-    let e_args = pure_arm(func, prov, else_b, join_b, else_args)?;
+    let t_args = pure_arm(func, cfg, prov, then_b, join_b, then_args)?;
+    let e_args = pure_arm(func, cfg, prov, else_b, join_b, else_args)?;
     Some(ArmMatch {
         join: join_b,
         t_args,
@@ -175,20 +178,20 @@ fn match_diamond(
 fn match_triangle(
     func: &Function,
     cfg: &Cfg,
-    prov: &Provenance,
+    prov: &std::cell::OnceCell<Provenance>,
     arm: Block,
     arm_args: &[Value],
     join: Block,
 ) -> Option<Vec<Value>> {
     (cfg.pred_count(arm) == 1 && cfg.pred_count(join) >= 2)
-        .then(|| pure_arm(func, prov, arm, join, arm_args))
+        .then(|| pure_arm(func, cfg, prov, arm, join, arm_args))
         .flatten()
 }
 
 fn match_arms(
     func: &Function,
     cfg: &Cfg,
-    prov: &Provenance,
+    prov: &std::cell::OnceCell<Provenance>,
     head: Block,
 ) -> Option<(Value, ArmMatch)> {
     let &brif_inst = func.blocks[head.index()].insts.last()?;
@@ -288,7 +291,7 @@ fn hoist_block_body(
 fn try_head(
     func: &mut Function,
     cfg: &Cfg,
-    prov: &Provenance,
+    prov: &std::cell::OnceCell<Provenance>,
     (is_const, region, loop_info): (
         &[bool],
         &[bool],
@@ -382,13 +385,17 @@ pub(crate) fn flatten(func: &mut Function, blocks: &[bool]) -> bool {
 }
 
 fn convert(func: &mut Function, only: Option<&[bool]>) -> Domain {
-    if func.entry.is_none() || func.coroutine.is_some() {
+    if func.entry.is_none()
+        || func.coroutine.is_some()
+        || func.blocks.len() < 2
+        || !crate::schedule::has_live_op(func, |op| matches!(op, Op::Brif(..)))
+    {
         return Domain::NONE;
     }
     let mut any = false;
     loop {
         let cfg = func.cfg();
-        let prov = Provenance::addresses(func, &cfg);
+        let prov = std::cell::OnceCell::new();
         let mut is_const = vec![false; func.types.len()];
         for block in &func.blocks {
             for &inst in &block.insts {

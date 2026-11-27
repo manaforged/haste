@@ -70,6 +70,7 @@ fn join_track_args(
     (blocks, entry): (&[BlockData], &[Value]),
     target: Block,
     args: &[Value],
+    mut dirty: Option<(&mut [bool], Option<&mut [bool]>)>,
 ) -> bool {
     let mut changed = false;
     for (&param, &arg) in blocks[target.index()].params.iter().zip(args) {
@@ -77,6 +78,12 @@ fn join_track_args(
             let next = tracked[param.index()].join(tracked[arg.index()].across_edge(entry));
             if next != tracked[param.index()] {
                 tracked[param.index()] = next;
+                if let Some((cur_dirty, next_dirty)) = dirty.as_mut() {
+                    cur_dirty[param.index()] = true;
+                    if let Some(nd) = next_dirty.as_deref_mut() {
+                        nd[param.index()] = true;
+                    }
+                }
                 changed = true;
             }
         }
@@ -138,12 +145,28 @@ fn track_def(
     changed
 }
 
-fn track_edges(func: &Function, entry: &[Value], inst: Inst, tracked: &mut [TrackRoot]) -> bool {
+fn track_edges(
+    func: &Function,
+    entry: &[Value],
+    inst: Inst,
+    tracked: &mut [TrackRoot],
+    dirty: Option<(&mut [bool], &mut [bool])>,
+) -> bool {
     let blocks = (func.blocks.as_slice(), entry);
     match &func.insts[inst.index()].op {
-        Op::Jump(t, args) => join_track_args(tracked, blocks, *t, args),
+        Op::Jump(t, args) => {
+            join_track_args(tracked, blocks, *t, args, dirty.map(|(c, n)| (c, Some(n))))
+        }
         Op::Brif(_, t, ta, f, fa) => {
-            join_track_args(tracked, blocks, *t, ta) | join_track_args(tracked, blocks, *f, fa)
+            let mut changed = false;
+            if let Some((c, n)) = dirty {
+                changed |= join_track_args(tracked, blocks, *t, ta, Some((&mut *c, Some(&mut *n))));
+                changed |= join_track_args(tracked, blocks, *f, fa, Some((&mut *c, Some(&mut *n))));
+            } else {
+                changed |= join_track_args(tracked, blocks, *t, ta, None);
+                changed |= join_track_args(tracked, blocks, *f, fa, None);
+            }
+            changed
         }
         _ => false,
     }
@@ -300,6 +323,34 @@ impl RootScan<'_> {
     }
 }
 
+fn join_edge_back(
+    tracked: &mut [TrackRoot],
+    blocks: (&[BlockData], &[Value]),
+    target: Block,
+    args: &[Value],
+    is_back: bool,
+    dirty: &mut Vec<bool>,
+) -> bool {
+    if args.is_empty() {
+        return false;
+    }
+    if is_back {
+        if dirty.is_empty() {
+            dirty.resize(tracked.len(), false);
+        }
+        join_track_args(
+            tracked,
+            blocks,
+            target,
+            args,
+            Some((dirty.as_mut_slice(), None)),
+        )
+    } else {
+        join_track_args(tracked, blocks, target, args, None);
+        false
+    }
+}
+
 fn join_block_terminator(
     func: &Function,
     entry: &[Value],
@@ -307,31 +358,33 @@ fn join_block_terminator(
     rank: Option<&[usize]>,
     br: usize,
     insts: &[Inst],
+    dirty: &mut Vec<bool>,
 ) -> bool {
     let (Some(rank), Some(&last)) = (rank, insts.last()) else {
         return false;
     };
     let blocks = (func.blocks.as_slice(), entry);
     match &func.insts[last.index()].op {
-        Op::Jump(t, args)
-            if !args.is_empty()
-                && join_track_args(tracked, blocks, *t, args)
-                && rank[t.index()] <= br =>
-        {
-            true
+        Op::Jump(t, args) => {
+            join_edge_back(tracked, blocks, *t, args, rank[t.index()] <= br, dirty)
         }
         Op::Brif(_, t, ta, f, fa) if !ta.is_empty() || !fa.is_empty() => {
-            let mut back = false;
-            if !ta.is_empty() && join_track_args(tracked, blocks, *t, ta) && rank[t.index()] <= br {
-                back = true;
-            }
-            if !fa.is_empty() && join_track_args(tracked, blocks, *f, fa) && rank[f.index()] <= br {
-                back = true;
-            }
-            back
+            join_edge_back(tracked, blocks, *t, ta, rank[t.index()] <= br, dirty)
+                | join_edge_back(tracked, blocks, *f, fa, rank[f.index()] <= br, dirty)
         }
         _ => false,
     }
+}
+
+fn step_reads_dirty(func: &Function, inst: Inst, edges: bool, dirty: &[bool]) -> bool {
+    let op = &func.insts[inst.index()].op;
+    let mut any = false;
+    if edges {
+        op.for_edges(|_, args| any |= args.iter().any(|v| dirty[v.index()]));
+    } else {
+        op.for_operands(|v| any |= dirty[v.index()]);
+    }
+    any
 }
 
 fn run_root_fixpoint(
@@ -340,16 +393,19 @@ fn run_root_fixpoint(
     entry: &[Value],
     affine: &[(Value, i64)],
     tracked: &mut [TrackRoot],
+    dirty: &mut [bool],
 ) -> bool {
+    if dirty.is_empty() {
+        return false;
+    }
     let mut steps = Vec::new();
     for &b in &cfg.rpo {
         let insts = &func.blocks[b.index()].insts;
         for &inst in insts {
             let data = &func.insts[inst.index()];
-            if data
-                .result
-                .is_some_and(|res| is_derived_i64(&data.op, func.ty(res)))
-            {
+            if data.result.is_some_and(|res| {
+                !func.is_unique_ptr(res) && is_derived_i64(&data.op, func.ty(res))
+            }) {
                 steps.push((inst, false));
             }
         }
@@ -363,17 +419,36 @@ fn run_root_fixpoint(
             steps.push((last, true));
         }
     }
+    let mut next_dirty = vec![false; tracked.len()];
     let mut changed = true;
     let mut rounds = 1;
     while changed && rounds < 64 {
         changed = false;
         for &(inst, edges) in &steps {
-            changed |= if edges {
-                track_edges(func, entry, inst, tracked)
-            } else {
-                track_def(func, inst, tracked, affine)
-            };
+            if !step_reads_dirty(func, inst, edges, dirty) {
+                continue;
+            }
+            if edges {
+                changed |= track_edges(
+                    func,
+                    entry,
+                    inst,
+                    tracked,
+                    Some((&mut *dirty, &mut next_dirty)),
+                );
+            } else if let Some(res) = func.insts[inst.index()].result
+                && track_def(func, inst, tracked, affine)
+            {
+                dirty[res.index()] = true;
+                next_dirty[res.index()] = true;
+                changed = true;
+            }
         }
+        if !changed {
+            break;
+        }
+        dirty.copy_from_slice(&next_dirty);
+        next_dirty.fill(false);
         rounds += 1;
     }
     changed
@@ -415,6 +490,7 @@ pub(super) fn compute_tracked_roots(
         has_span_op: false,
         affine,
     };
+    let mut dirty = Vec::new();
     let mut need_fixpoint = false;
     for &b in &cfg.rpo {
         let br = rank.as_ref().map_or(0, |r| r[b.index()]);
@@ -422,8 +498,15 @@ pub(super) fn compute_tracked_roots(
         for (pos, &inst) in insts.iter().enumerate() {
             scan.scan_inst(func, b, pos, inst);
         }
-        need_fixpoint |=
-            join_block_terminator(func, entry, &mut scan.tracked, rank.as_deref(), br, insts);
+        need_fixpoint |= join_block_terminator(
+            func,
+            entry,
+            &mut scan.tracked,
+            rank.as_deref(),
+            br,
+            insts,
+            &mut dirty,
+        );
     }
     if !scan.called.is_empty()
         && escape::finish_fresh_owners(
@@ -435,10 +518,12 @@ pub(super) fn compute_tracked_roots(
             &mut scan.tracked,
         )
     {
+        dirty.clear();
+        dirty.resize(n, true);
         need_fixpoint = true;
     }
     let still_changed =
-        need_fixpoint && run_root_fixpoint(func, cfg, entry, affine, &mut scan.tracked);
+        need_fixpoint && run_root_fixpoint(func, cfg, entry, affine, &mut scan.tracked, &mut dirty);
     if still_changed {
         scan.tracked.fill(TrackRoot::Conflict);
         scan.has_caller_loc = false;

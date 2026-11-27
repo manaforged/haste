@@ -322,28 +322,70 @@ fn slot_liveness_batch(
     batch: &[StackSlot],
 ) -> (Vec<u64>, Vec<u64>, Vec<u64>, Vec<u64>) {
     let n = func.blocks.len();
-    let all_mask = if batch.len() == 64 {
-        u64::MAX
-    } else {
-        (1_u64 << batch.len()) - 1
-    };
     let mut slot_bit = vec![0_u64; func.slots.len()];
+    let mut always_esc = 0_u64;
+    let mut frontiers = Vec::new();
     for (i, &s) in batch.iter().enumerate() {
-        slot_bit[s.index()] = 1_u64 << i;
+        let bit = 1_u64 << i;
+        slot_bit[s.index()] = bit;
+        if prov.slot_unwind_target(s) {
+            always_esc |= bit;
+        } else if !prov.slot_addr_unescaped(s) {
+            match prov.slot_frontier(s) {
+                Some(f) => frontiers.push((bit, f)),
+                None => always_esc |= bit,
+            }
+        }
     }
     let (mut reads, mut kill, mut writes) = (vec![0_u64; n], vec![0_u64; n], vec![0_u64; n]);
+    let mut local_esc: Vec<(u32, u64)> = Vec::new();
+    let mut block_rem: Vec<(u64, &crate::mem::escape::Frontier)> = Vec::new();
     for &b in &cfg.rpo {
         let bi = b.index();
-        let (mut r_mask, mut k_mask, mut w_mask) = (0_u64, 0_u64, 0_u64);
-        for &inst in &func.blocks[bi].insts {
-            let mut rem = all_mask & !(r_mask | k_mask);
-            while rem != 0 {
-                let i = rem.trailing_zeros() as usize;
-                rem &= rem - 1;
-                if prov.slot_unwind_target(batch[i])
-                    || prov.slot_is_escaped_at(batch[i], Some(inst))
-                {
-                    r_mask |= 1_u64 << i;
+        let insts = &func.blocks[bi].insts;
+        if insts.is_empty() {
+            continue;
+        }
+        let mut r_mask = always_esc;
+        let (mut k_mask, mut w_mask) = (0_u64, 0_u64);
+        local_esc.clear();
+        block_rem.clear();
+        let mut rem_mask = 0_u64;
+        for &(bit, f) in &frontiers {
+            if f.block_seen(b) {
+                r_mask |= bit;
+            } else {
+                block_rem.push((bit, f));
+                rem_mask |= bit;
+                if let Some(p) = f.first_point_in(b) {
+                    local_esc.push((p, bit));
+                }
+            }
+        }
+        if local_esc.len() > 1 {
+            local_esc.sort_unstable_by_key(|&(p, _)| p);
+        }
+        let mut esc_idx = 0usize;
+        for (pos, &inst) in insts.iter().enumerate() {
+            if rem_mask & !(r_mask | k_mask) != 0 {
+                match prov.inst_loc(inst) {
+                    None => {
+                        r_mask |= rem_mask & !k_mask;
+                        rem_mask = 0;
+                    }
+                    Some((eb, epos)) if eb == b.0 && epos == pos as u32 => {
+                        while esc_idx < local_esc.len() && local_esc[esc_idx].0 <= epos {
+                            r_mask |= local_esc[esc_idx].1 & !k_mask;
+                            esc_idx += 1;
+                        }
+                    }
+                    Some(loc) => {
+                        for &(bit, f) in &block_rem {
+                            if (r_mask | k_mask) & bit == 0 && f.reached(loc) {
+                                r_mask |= bit;
+                            }
+                        }
+                    }
                 }
             }
             let op = &func.insts[inst.index()].op;

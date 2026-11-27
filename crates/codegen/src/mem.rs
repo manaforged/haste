@@ -1,5 +1,5 @@
 mod alias;
-mod escape;
+pub(crate) mod escape;
 mod frame;
 mod loop_mem;
 mod roots;
@@ -279,15 +279,25 @@ impl Provenance {
         (loc.base, off, off + size)
     }
 
+    /// The `(block, pos)` recorded for `inst` when this provenance was built, if any.
+    pub(crate) fn inst_loc(&self, inst: Inst) -> Option<(u32, u32)> {
+        self.inst_at
+            .get(inst.index())
+            .copied()
+            .filter(|&(block, _)| block != u32::MAX)
+    }
+
     /// Whether `slot`'s address may have left the function by the time `at` runs; `None` means anywhere.
     pub(crate) fn slot_escaped_at(&self, slot: StackSlot, at: Option<Inst>) -> bool {
         let (Some(inst), Some(frontier)) = (at, self.frontiers.get(&slot.0)) else {
             return true;
         };
-        match self.inst_at.get(inst.index()) {
-            Some(&(block, pos)) if block != u32::MAX => frontier.reached((block, pos)),
-            _ => true,
-        }
+        self.inst_loc(inst).is_none_or(|loc| frontier.reached(loc))
+    }
+
+    /// The precomputed escape frontier of `slot`, when one exists.
+    pub(crate) fn slot_frontier(&self, slot: StackSlot) -> Option<&escape::Frontier> {
+        self.frontiers.get(&slot.0)
     }
 
     /// Whether `slot` has escaped by `at`, returning `false` for slots whose address never escapes.

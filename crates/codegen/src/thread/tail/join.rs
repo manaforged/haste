@@ -18,6 +18,7 @@ pub(super) fn thread_repaired_joins(
             }
             let defs = defs_cache.get_or_insert_with(|| crate::fold::defs(func));
             let consts = consts_cache.get_or_insert_with(|| func.const_values());
+            let mut uses_cache: Option<Vec<u32>> = None;
             let mut picked = None;
             'blocks: for at in 0..func.blocks.len() {
                 let block = Block(at as u32);
@@ -39,6 +40,28 @@ pub(super) fn thread_repaired_joins(
                         own_vals.push(r);
                     }
                 }
+                if own_vals.is_empty() {
+                    continue;
+                }
+                let uses = uses_cache.get_or_insert_with(|| func.use_counts());
+                let mut ext_uses: Vec<u32> = own_vals.iter().map(|&v| uses[v.index()]).collect();
+                for &inst in &func.blocks[at].insts {
+                    func.insts[inst.index()].op.for_operands(|v| {
+                        if let Some(pos) = own_vals.iter().position(|&ov| ov == v) {
+                            ext_uses[pos] = ext_uses[pos].saturating_sub(1);
+                        }
+                    });
+                }
+                let mut keep_idx = 0usize;
+                own_vals.retain(|_| {
+                    let keep = ext_uses[keep_idx] > 0;
+                    keep_idx += 1;
+                    keep
+                });
+                if own_vals.is_empty() {
+                    continue;
+                }
+                let mut plan_cache: Vec<(Block, Option<SsaRepairPlan>)> = Vec::new();
                 for &pred in cfg.preds_of(block) {
                     if pred == block || cfg.dominates(block, pred) {
                         continue;
@@ -59,14 +82,25 @@ pub(super) fn thread_repaired_joins(
                     if is_brif && cfg.preds_of(to).iter().any(|&p| cfg.dominates(to, p)) {
                         continue;
                     }
-                    let Some(ssa) = plan_ssa_joins(func, &cfg, block, to, &[], &own_vals) else {
+                    let entry = if let Some(pos) = plan_cache.iter().position(|&(t, _)| t == to) {
+                        &mut plan_cache[pos].1
+                    } else {
+                        let plan = plan_ssa_joins(func, &cfg, block, to, &[], &own_vals)
+                            .filter(|ssa| !ssa.need.is_empty());
+                        plan_cache.push((to, plan));
+                        let last_idx = plan_cache.len() - 1;
+                        &mut plan_cache[last_idx].1
+                    };
+                    let Some(ssa) = entry.as_ref() else {
                         continue;
                     };
-                    if ssa.need.is_empty() || (is_brif && ssa.joins.len() > 1) {
+                    if is_brif && ssa.joins.len() > 1 {
                         continue;
                     }
-                    picked = Some((edge, block, to, ssa));
-                    break 'blocks;
+                    if let Some(ssa) = entry.take() {
+                        picked = Some((edge, block, to, ssa));
+                        break 'blocks;
+                    }
                 }
             }
             picked

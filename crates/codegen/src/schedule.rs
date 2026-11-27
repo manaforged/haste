@@ -272,26 +272,24 @@ pub(crate) fn has_live_op(func: &Function, mut pred: impl FnMut(&Op) -> bool) ->
     })
 }
 
-fn has_small_cycle(func: &Function, entry: Block) -> bool {
+fn has_cycle(func: &Function, entry: Block) -> bool {
     let n = func.blocks.len();
     if entry.index() >= n {
         return false;
     }
-    let mut state = [0_u8; 64];
-    let mut stack = [0_u8; 64];
-    let mut cursor = [0_usize; 64];
+    let mut state = vec![0_u8; n];
+    let mut stack = Vec::with_capacity(n.min(64));
     state[entry.index()] = 1;
-    stack[0] = entry.index() as u8;
-    let mut sp = 1_usize;
-    while sp > 0 {
-        let b = stack[sp - 1] as usize;
-        let idx = cursor[sp - 1];
-        let Some(target) = func.successors(Block(b as u32)).nth(idx) else {
-            state[b] = 2;
-            sp -= 1;
+    stack.push((entry.index(), 0_usize));
+    while let Some((b, idx)) = stack.last_mut() {
+        let cur = *b;
+        let succ_idx = *idx;
+        let Some(target) = func.successors(Block(cur as u32)).nth(succ_idx) else {
+            state[cur] = 2;
+            stack.pop();
             continue;
         };
-        cursor[sp - 1] = idx + 1;
+        *idx = succ_idx + 1;
         let t = target.index();
         if t < n {
             if state[t] == 1 {
@@ -299,9 +297,7 @@ fn has_small_cycle(func: &Function, entry: Block) -> bool {
             }
             if state[t] == 0 {
                 state[t] = 1;
-                stack[sp] = t as u8;
-                cursor[sp] = 0;
-                sp += 1;
+                stack.push((t, 0));
             }
         }
     }
@@ -315,7 +311,7 @@ fn detect_loops(func: &Function) -> bool {
     if func.blocks.len() <= 1 {
         return func.successors(entry).any(|t| t == entry);
     }
-    if func.blocks.len() <= 64 && !has_small_cycle(func, entry) {
+    if !has_cycle(func, entry) {
         return false;
     }
     !func.cfg().loops().list.is_empty()
