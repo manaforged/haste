@@ -191,7 +191,10 @@ impl Checker<'_, '_> {
     pub(in super::super) fn expr_derefs_ref(&self, expr: ExprId) -> bool {
         self.typed.adjusts.get(&expr).is_some_and(|a| a.derefs > 0)
             || matches!(
-                self.typed.coercions.get(&expr),
+                self.typed
+                    .coercions
+                    .get(&expr)
+                    .map(crate::sema::infer::Coercion::leaf),
                 Some(crate::sema::infer::Coercion::Deref(..))
             )
     }
@@ -752,5 +755,35 @@ impl Checker<'_, '_> {
             }
         }
         expanded
+    }
+
+    pub(super) fn unwrap_ref_place_container_loan(
+        &mut self,
+        local: u32,
+        steps: &[PlaceStep],
+        loan: &super::super::Loan,
+        mutable: bool,
+        state: &State,
+        out: &mut Vec<BorrowSource>,
+    ) -> bool {
+        let Kind::Ref(_, inner) = *self.cx.types.kind(self.local_ty(local)) else {
+            return false;
+        };
+        if !self.is_ref_ty(inner)
+            || steps.first() != Some(&PlaceStep::Deref)
+            || self.from_caller(loan.target, loan.through_ref)
+            || self.is_param_local(loan.target)
+            || self.is_closure_param(loan.target)
+            || !self.ty_holds_borrow(self.local_ty(loan.target))
+        {
+            return false;
+        }
+        for l in state.loans.iter().filter(|l| l.holder == Some(loan.target)) {
+            out.push(BorrowSource {
+                mutable: mutable && l.mutable,
+                ..BorrowSource::from_loan(l)
+            });
+        }
+        true
     }
 }

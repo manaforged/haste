@@ -257,14 +257,48 @@ impl<'a> Checker<'_, 'a> {
         let item_sources = if self.for_iter_item_is_static(iter) {
             Vec::new()
         } else {
-            iter_sources
+            let srcs: Vec<BorrowSource> = iter_sources
                 .iter()
                 .filter(|s| !s.env_only)
                 .cloned()
-                .collect()
+                .collect();
+            if self.is_iter_copied_call(iter) {
+                self.unwrap_outer_container_loans(srcs, state, true)
+            } else {
+                srcs
+            }
         };
         let item_tuple = self.iter_tuple_sources(iter, state);
         (item_sources, item_tuple)
+    }
+
+    fn is_iter_copied_call(&mut self, expr: ExprId) -> bool {
+        let cur = self.unwrap_parens(expr);
+        let Expr::Method { params, .. } = *self.body.expr(cur) else {
+            return false;
+        };
+        if !self.body.list(params).is_empty() {
+            return false;
+        }
+        let Some(Res::Fn(fn_item, _)) = self.typed.res.get(&cur).copied() else {
+            return false;
+        };
+        self.is_iter_mod(fn_item) && matches!(self.cx.name(fn_item), "copied" | "cloned")
+    }
+
+    fn unwrap_tuple_sources_containers(&mut self, ts: TupleSources, state: &State) -> TupleSources {
+        match ts {
+            TupleSources::Leaf { sources, inner_ref } => TupleSources::Leaf {
+                sources: self.unwrap_outer_container_loans(sources, state, true),
+                inner_ref,
+            },
+            TupleSources::Tuple(elems) => TupleSources::Tuple(
+                elems
+                    .into_iter()
+                    .map(|e| self.unwrap_tuple_sources_containers(e, state))
+                    .collect(),
+            ),
+        }
     }
 
     fn leaf_iter_sources(&mut self, expr: ExprId, state: &State) -> TupleSources {
@@ -318,10 +352,25 @@ impl<'a> Checker<'_, 'a> {
                 .unwrap_or_else(|| self.leaf_iter_sources(arg, state));
             return Some(TupleSources::Tuple(vec![left, right]));
         }
+        if in_iter && matches!(name, "copied" | "cloned") && param_ids.is_empty() {
+            let inner = self
+                .iter_tuple_sources(receiver, state)
+                .unwrap_or_else(|| self.leaf_iter_sources(receiver, state));
+            return Some(self.unwrap_tuple_sources_containers(inner, state));
+        }
         if in_iter
             && matches!(
                 name,
-                "skip" | "take" | "step_by" | "rev" | "peekable" | "fuse"
+                "skip"
+                    | "take"
+                    | "step_by"
+                    | "rev"
+                    | "peekable"
+                    | "fuse"
+                    | "filter"
+                    | "inspect"
+                    | "take_while"
+                    | "skip_while"
             )
         {
             return self.iter_tuple_sources(receiver, state);

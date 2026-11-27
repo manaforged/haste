@@ -288,4 +288,35 @@ impl Checker<'_, '_> {
             _ => false,
         }
     }
+
+    pub(super) fn recv_borrow_sources_after_deref(
+        &mut self,
+        call_expr: ExprId,
+        recv: ExprId,
+        sig: &crate::body::sig::Signature,
+        state: &super::super::State,
+    ) -> Vec<super::BorrowSource> {
+        let srcs = self.expr_borrow_sources(recv, state);
+        let adj = self.typed.adjusts.get(&call_expr).copied();
+        let derefs = adj.map_or(0, |a| a.derefs);
+        if derefs == 0
+            || adj.and_then(|a| a.autoref).is_some()
+            || !matches!(sig.receiver, Some((crate::body::sig::SelfKind::Ref, _)))
+            || (0..derefs).any(|s| self.typed.derefs.contains_key(&(call_expr, s)))
+        {
+            return srcs;
+        }
+        let mut cur = self.expr_ty(recv);
+        for _ in 0..derefs {
+            if cur == Ty::NONE {
+                return srcs;
+            }
+            cur = self.builtin_deref_ty(cur).unwrap_or(Ty::NONE);
+        }
+        if cur != Ty::NONE && matches!(*self.cx.types.kind(cur), Kind::Ref(Mut::Not, _)) {
+            self.unwrap_outer_container_loans(srcs, state, true)
+        } else {
+            srcs
+        }
+    }
 }

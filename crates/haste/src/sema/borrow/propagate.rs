@@ -678,6 +678,9 @@ impl Checker<'_, '_> {
                     out.push(
                         self.combine_closure_loan_source(local, l, steps, tail_steps, mutable),
                     );
+                } else if self
+                    .unwrap_ref_place_container_loan(local, steps, l, mutable, state, &mut out)
+                {
                 } else if steps_conflict(&l.steps, tail_steps)
                     || tail_steps.is_empty()
                     || l.steps.is_empty()

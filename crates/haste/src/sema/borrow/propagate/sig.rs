@@ -555,7 +555,15 @@ impl<'a> Checker<'_, 'a> {
                 (ret_lts.has_elided && (self_lts.has_elided || !self_lts.named.is_empty()))
                     || ret_lts.named.iter().any(|n| self_lts.named.contains(n))
             }
-            Some((SelfKind::Value, _)) => true,
+            Some((SelfKind::Value, _)) => {
+                let self_ty = self.method_self_ty(ctx.expr, recv, Some(sig));
+                if self.ty_is_borrow_free(self_ty)
+                    || self.recv_independent_of_named_ret(ctx.fn_item, sig, sig_src, ret_lts)
+                {
+                    return Vec::new();
+                }
+                true
+            }
             None => false,
         };
         let recv_is_mut = recv_ref_mut(sig) == Some(Mut::Mut);
@@ -580,7 +588,7 @@ impl<'a> Checker<'_, 'a> {
             {
                 self.method_recv_borrow_sources(ctx.expr, recv, mutability == Mut::Mut, state)
             } else {
-                self.expr_borrow_sources(recv, state)
+                self.recv_borrow_sources_after_deref(ctx.expr, recv, sig, state)
             };
             let inner_only = (!ret_lts.has_elided || ctx.flags.is_owned_copy_fn)
                 && matches!(sig.receiver, Some((SelfKind::Ref | SelfKind::RefMut, _)))
@@ -591,25 +599,11 @@ impl<'a> Checker<'_, 'a> {
                 srcs
             }
         } else {
-            if recv_is_by_ref(sig) {
-                if self.recv_independent_of_named_ret(ctx.fn_item, sig, sig_src, ret_lts) {
-                    return Vec::new();
-                }
-                let adj = self.typed.adjusts.get(&ctx.expr);
-                let mut pointee = self.expr_ty(recv);
-                for _ in 0..adj.map_or(0, |a| a.derefs) {
-                    if let Kind::Ref(_, inner) = *self.cx.types.kind(pointee) {
-                        pointee = inner;
-                    }
-                }
-                if adj.and_then(|a| a.autoref).is_none()
-                    && let Kind::Ref(_, inner) = *self.cx.types.kind(pointee)
-                {
-                    pointee = inner;
-                }
-                if self.ty_is_borrow_free(pointee) {
-                    return Vec::new();
-                }
+            if recv_is_by_ref(sig)
+                && (self.recv_independent_of_named_ret(ctx.fn_item, sig, sig_src, ret_lts)
+                    || self.ty_is_borrow_free(self.method_self_ty(ctx.expr, recv, Some(sig))))
+            {
+                return Vec::new();
             }
             let mut srcs = self.expr_borrow_sources_inner(recv, state, !recv_is_by_ref(sig), None);
             if recv_is_by_ref(sig) {
