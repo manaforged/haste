@@ -13,7 +13,7 @@ pid_engine=$!
 (env -u HASTE_VERIFY_STENCIL bash -c 'source scripts/cargo.sh && run_haste --release build -o "$1" "$2" && "$1"' _ "$tmp/aot_bin" "$dir") </dev/null >"$tmp/aot.out" 2>"$tmp/aot.err" &
 pid_aot=$!
 wait "$pid_rustc"; status_rustc=$?
-wait "$pid_engine"
+wait "$pid_engine"; status_engine=$?
 wait "$pid_aot"; status_aot=$?
 rustc_side=$(grep '^case_' "$tmp/rustc.out" | sort)
 engine_all=$(cat "$tmp/engine"); finished='^cases '
@@ -40,6 +40,11 @@ check_side() {
         exit 1
     fi
 }
+if [ "$status_engine" -ne 0 ]; then
+    echo "JIT FAILED (status $status_engine):"
+    printf '%s\n' "$engine_all" | tail -20 | cut -c1-200
+    exit 1
+fi
 check_side jit "$engine_side"
 if [ "$status_aot" -ne 0 ]; then
     echo "AOT FAILED (status $status_aot):"

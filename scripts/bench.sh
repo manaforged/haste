@@ -312,7 +312,9 @@ mult = 4 if bench_long else 1
 run_cold = os.environ.get("HASTE_BENCH_COLD", "1") != "0"
 rounds = max(1, int(os.environ.get("HASTE_BENCH_ROUNDS", "5")))
 warm_haste_env = dict(os.environ)
-cargo_env = {k: v for k, v in os.environ.items() if k not in ("RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER")}
+cargo_env = {k: v for k, v in os.environ.items() if k not in ("RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")}
+cargo_env["CARGO_BUILD_RUSTC_WRAPPER"] = ""
+cargo_env["CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"] = ""
 
 def isolated_haste_env(tag):
     if not run_cold:
@@ -405,7 +407,13 @@ if suite in ("all", "build"):
     cargo_check_cmd = cargo_cmd("check", cargo_check_target, diff_manifest)
     cargo_build_cmd = cargo_cmd("build", cargo_build_target, diff_manifest)
 
+    h_check_empty = None
+    h_emit_empty = None
     if run_cold:
+        empty_check_env = isolated_haste_env("empty_check")
+        empty_emit_env = isolated_haste_env("empty_emit")
+        h_check_empty = run_timed(haste_check_cmd, env=empty_check_env)
+        h_emit_empty = run_timed(haste_emit_cmd, env=empty_emit_env)
         for env in (check_haste_env, emit_haste_env, daemon_haste_env):
             subprocess.run([haste_bin, "build", hello_dir], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
@@ -470,13 +478,22 @@ if suite in ("all", "build"):
     ]
     if h_daemon_edits:
         rows.insert(0, ("Single-line edit (`haste build --daemon` vs `cargo check`)", median_of(h_daemon_edits), median_of(c_daemon_check_edits)))
-    cold_label = "Cold debug" if run_cold else "Warm cache"
     rows.extend([
         ("Unchanged no-op (`haste build` vs `cargo check`)", h_check_noop, c_check_noop),
         ("Unchanged no-op (`haste build -o` vs `cargo build`)", h_emit_noop, c_build_noop),
-        (f"{cold_label} (`haste build` vs `cargo check`)", h_check_cold, c_check_cold),
-        (f"{cold_label} (`haste build -o` vs `cargo build`)", h_emit_cold, c_build_cold),
     ])
+    if run_cold:
+        rows.extend([
+            ("Empty HASTE_HOME (`haste build` vs `cargo check`)", h_check_empty, c_check_cold),
+            ("Empty HASTE_HOME (`haste build -o` vs `cargo build`)", h_emit_empty, c_build_cold),
+            ("First project build, stdlib indexed (`haste build` vs `cargo check`)", h_check_cold, c_check_cold),
+            ("First project build, stdlib indexed (`haste build -o` vs `cargo build`)", h_emit_cold, c_build_cold),
+        ])
+    else:
+        rows.extend([
+            ("Warm cache (`haste build` vs `cargo check`)", h_check_cold, c_check_cold),
+            ("Warm cache (`haste build -o` vs `cargo build`)", h_emit_cold, c_build_cold),
+        ])
     print_build_table(f"### Build Speed (`tests/diff`, {case_count} fns)", rows, sections > 0)
     sections += 1
 
