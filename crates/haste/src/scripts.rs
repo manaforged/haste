@@ -484,8 +484,8 @@ fn run(
         target: targets.host.clone(),
         host: targets.host.clone(),
     };
-    let mut compilation = crate::macros::load_eager(workspace, &host_targets, &slow_units)?;
     binary::with_script_profile(|| {
+        let mut compilation = crate::macros::load_eager(workspace, &host_targets, &slow_units)?;
         let outline = &compilation.outline;
         let scripts: Vec<(usize, usize)> = outline
             .roots

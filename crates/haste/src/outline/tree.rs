@@ -276,6 +276,7 @@ pub struct Crate {
     pub derived: Vec<Held>,
     pub attributed: Vec<Held>,
     pub consumed: rustc_hash::FxHashSet<(u32, u32)>,
+    pub resolved_tests: rustc_hash::FxHashSet<(u32, u32)>,
     pub macro_use: Vec<usize>,
     pub expansions: usize,
     pub cached_included: Option<Vec<(PathBuf, PathBuf)>>,
@@ -531,7 +532,6 @@ impl Env {
         attrs.iter().all(|attr| match attr {
             Attr::Cfg(cfg) => self.allows(cfg),
             Attr::CfgAttr(cfg, inner) => self.eval(cfg) == Truth::No || self.enabled(inner),
-            Attr::Test | Attr::Bench => self.test,
             _ => true,
         })
     }

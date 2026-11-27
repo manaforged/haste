@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::outline::Outline;
-use crate::outline::item::ProcKind;
+use crate::outline::item::{ItemKind, ProcKind};
 use crate::outline::source::Source;
 use crate::outline::tree::{File, Held, Waiting};
 
@@ -76,19 +76,39 @@ impl Names {
                 .collect();
             let paths = paths_of(self, outline, krate, &demands);
             let (mut left, start) = (Vec::new(), bound.len());
+            let mut builtin_tests = Vec::new();
             for site in sites {
                 let before = demands.count();
                 match proc_at(outline, &paths, &site, krate) {
-                    Some((run, kind)) => bound.push(Bound {
+                    Some(AttrBinding::Proc(run, kind)) => bound.push(Bound {
                         krate,
                         run,
                         kind,
                         site,
                     }),
+                    Some(AttrBinding::BuiltinTest(kind_name)) => {
+                        if let Site::Attribute(held) = site {
+                            builtin_tests.push((held, kind_name));
+                        }
+                    }
                     None => left.push((demands.count() > before, site)),
                 }
             }
             drop(paths);
+            for (held, kind_name) in builtin_tests {
+                if let Some(file_idx) = outline.crates[krate]
+                    .files
+                    .iter()
+                    .position(|f| Arc::ptr_eq(f, &held.file))
+                {
+                    let coord = (file_idx as u32, held.at);
+                    if !outline.crates[krate].env.test {
+                        outline.crates[krate].consumed.insert(coord);
+                    } else if kind_name == "test" {
+                        outline.crates[krate].resolved_tests.insert(coord);
+                    }
+                }
+            }
             defer_derives(&mut bound, start, &mut left);
             left.into_iter()
                 .for_each(|(asked, site)| hold(outline, krate, asked, site));
@@ -142,12 +162,12 @@ fn hold(outline: &mut Outline, krate: usize, asked: bool, site: Site) {
     }
 }
 
-fn proc_at(
-    outline: &Outline,
-    paths: &Paths<'_>,
-    site: &Site,
-    krate: usize,
-) -> Option<(ItemRef, ProcKind)> {
+enum AttrBinding {
+    Proc(ItemRef, ProcKind),
+    BuiltinTest(&'static str),
+}
+
+fn proc_at(outline: &Outline, paths: &Paths<'_>, site: &Site, krate: usize) -> Option<AttrBinding> {
     let (src, path) = site.path()?;
     let run = macro_at(
         paths,
@@ -162,6 +182,20 @@ fn proc_at(
         return None;
     }
     let file = &outline.crates[run.krate as usize].files[run.file as usize];
-    let (_, kind) = collect::proc_kind(&file.source, &file.items.items[run.item as usize])?;
-    site.wanted(kind).then_some((run, kind))
+    let item = &file.items.items[run.item as usize];
+    if let Some((_, kind)) = collect::proc_kind(&file.source, item) {
+        return site.wanted(kind).then_some(AttrBinding::Proc(run, kind));
+    }
+    if matches!(site, Site::Attribute(_))
+        && outline.is_sysroot(run.krate)
+        && item.kind == ItemKind::Macro
+        && let Some(name) = item.name
+    {
+        return match file.source.text(name) {
+            "test" => Some(AttrBinding::BuiltinTest("test")),
+            "bench" => Some(AttrBinding::BuiltinTest("bench")),
+            _ => None,
+        };
+    }
+    None
 }

@@ -201,7 +201,9 @@ pub fn dir(workspace: &Workspace, unit: usize) -> PathBuf {
     } else {
         "target"
     };
-    let profile = if crate::profile() == crate::outline::tree::Profile::Release {
+    let profile = if entry.side == Side::Target
+        && crate::profile() == crate::outline::tree::Profile::Release
+    {
         "release"
     } else {
         "debug"

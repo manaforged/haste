@@ -136,12 +136,26 @@ fn test_target_selected(outline: &outline::Outline, krate: usize, sel: &crate::S
         })
 }
 
-fn is_test_fn(
+fn item_coord(
     tree: &outline::tree::Crate,
     file: &outline::tree::File,
     item: &outline::item::Item,
-) -> bool {
-    outline::attr::has_attr(&file.source, &item.attrs, &tree.env, "test")
+) -> Option<(u32, u32)> {
+    let fidx = tree
+        .files
+        .iter()
+        .position(|f| std::ptr::eq(f.as_ref(), file))? as u32;
+    let idx = file
+        .items
+        .items
+        .iter()
+        .position(|it| std::ptr::eq(it, item))? as u32;
+    Some((fidx, idx))
+}
+
+fn is_test_fn(tree: &outline::tree::Crate, item_ref: ItemRef) -> bool {
+    tree.resolved_tests
+        .contains(&(item_ref.file, item_ref.item))
 }
 
 pub(crate) fn is_test_only_fn(
@@ -150,8 +164,9 @@ pub(crate) fn is_test_only_fn(
     item: &outline::item::Item,
 ) -> bool {
     item.kind == outline::item::ItemKind::Fn
-        && (is_test_fn(tree, file, item)
-            || outline::attr::has_attr(&file.source, &item.attrs, &tree.env, "bench"))
+        && item_coord(tree, file, item).is_some_and(|coord| {
+            tree.consumed.contains(&coord) || tree.resolved_tests.contains(&coord)
+        })
 }
 
 /// Counts enabled `#[test]` functions across loaded member test crates matching target selection.
@@ -162,7 +177,7 @@ pub(crate) fn outline_test_count(outline: &outline::Outline) -> usize {
             outline.crates[krate].env.test && test_target_selected(outline, krate, &sel)
         })
         .flat_map(|krate| crate_fns(krate, &outline.crates[krate]))
-        .filter(|(_, tree, file, item)| is_test_fn(tree, file, item))
+        .filter(|(item_ref, tree, _, _)| is_test_fn(tree, *item_ref))
         .count()
 }
 
@@ -172,10 +187,10 @@ pub(crate) fn test_items(
 ) -> Vec<TestItem> {
     let sel = crate::selection();
     member_fns(workspace, outline)
-        .filter(|(item_ref, tree, file, item)| {
+        .filter(|(item_ref, tree, _, _)| {
             tree.env.test
                 && test_target_selected(outline, item_ref.krate as usize, &sel)
-                && is_test_fn(tree, file, item)
+                && is_test_fn(tree, *item_ref)
         })
         .map(|(item_ref, tree, file, item)| {
             let should_panic =

@@ -372,3 +372,69 @@ fn script_manifests_invalidate_on_included_and_env_reads() {
     drop(std::fs::remove_dir_all(&root));
     drop(std::fs::remove_dir_all(&home));
 }
+
+#[test]
+fn host_unit_out_dir_stays_debug_under_release_profile() {
+    let root = temp_dir("host-out");
+    let home = temp_dir("host-out-home");
+    write_files(
+        &root,
+        &[
+            (
+                "Cargo.toml",
+                concat!(
+                    "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                    "[build-dependencies]\nhelper = { path = \"helper\" }\n",
+                ),
+            ),
+            (
+                "helper/Cargo.toml",
+                "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("helper/build.rs", "fn main() {}\n"),
+            ("helper/src/lib.rs", ""),
+            ("build.rs", "fn main() {}\n"),
+            ("src/main.rs", "fn main() {}\n"),
+            (
+                "Cargo.lock",
+                concat!(
+                    "version = 4\n",
+                    "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"helper\"]\n",
+                    "[[package]]\nname = \"helper\"\nversion = \"0.1.0\"\n",
+                ),
+            ),
+        ],
+    );
+    let targets = test_targets();
+    let ws = crate::graph::load(&root, &targets, &Default::default()).expect("load ws");
+    let host_unit = ws
+        .graph
+        .units
+        .iter()
+        .position(|u| u.side == crate::graph::Side::Host)
+        .expect("host unit");
+    let target_unit = ws
+        .graph
+        .units
+        .iter()
+        .position(|u| u.side == crate::graph::Side::Target)
+        .expect("target unit");
+
+    with_scripts_env(&home, || {
+        let debug_host = store::dir(&ws, host_unit);
+        let debug_target = store::dir(&ws, target_unit);
+        let mut rel_cfg = (*crate::config()).clone();
+        rel_cfg.profile = crate::outline::tree::Profile::Release;
+        crate::with_config(Arc::new(rel_cfg), || {
+            assert_eq!(store::dir(&ws, host_unit), debug_host);
+            assert_ne!(store::dir(&ws, target_unit), debug_target);
+            binary::with_script_profile(|| {
+                assert_eq!(crate::profile(), crate::outline::tree::Profile::Debug);
+                assert_eq!(store::dir(&ws, host_unit), debug_host);
+            });
+        });
+    });
+
+    drop(std::fs::remove_dir_all(&root));
+    drop(std::fs::remove_dir_all(&home));
+}

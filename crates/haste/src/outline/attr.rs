@@ -294,14 +294,6 @@ pub fn content(src: &Source, from: u32, to: u32) -> Result<Attr> {
     if is_derive_at(src, from, to) {
         return Ok(Attr::Derive(after));
     }
-    if !matches!(next, TokenKind::OpenParen | TokenKind::Eq) {
-        if attr_is_named(src, from, "test") {
-            return Ok(Attr::Test);
-        }
-        if attr_is_named(src, from, "bench") {
-            return Ok(Attr::Bench);
-        }
-    }
     let path = src.span(from, after.saturating_sub(1).max(from));
     Ok(match (path, next) {
         ("unsafe", TokenKind::OpenParen) => content(src, after + 1, src.pair(after))?,

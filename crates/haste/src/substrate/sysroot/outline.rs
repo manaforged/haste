@@ -266,9 +266,9 @@ fn write_members<'a>(
     Some(())
 }
 
-fn write_consumed(out: &mut Vec<u8>, consumed: &HashSet<(u32, u32)>) -> Option<()> {
-    write_usize(out, consumed.len())?;
-    for &(file, item) in consumed {
+fn write_coords(out: &mut Vec<u8>, coords: &HashSet<(u32, u32)>) -> Option<()> {
+    write_usize(out, coords.len())?;
+    for &(file, item) in coords {
         write_u32(out, file);
         write_u32(out, item);
     }
@@ -297,7 +297,8 @@ pub(super) fn write_outline_crate<'a>(
     write_waitings(out, &krate.global_asm, tables)?;
     write_helds(out, &krate.derived, tables)?;
     write_helds(out, &krate.attributed, tables)?;
-    write_consumed(out, &krate.consumed)?;
+    write_coords(out, &krate.consumed)?;
+    write_coords(out, &krate.resolved_tests)?;
     write_local_krates(out, &krate.macro_use, tables)?;
     write_usize(out, krate.expansions)?;
     Some(())
@@ -468,17 +469,17 @@ fn read_members(
     Ok(members)
 }
 
-fn read_consumed(reader: &mut Reader<'_>) -> Result<HashSet<(u32, u32)>> {
-    let consumed_len = reader.count()?;
-    if consumed_len == 0 {
+fn read_coords(reader: &mut Reader<'_>) -> Result<HashSet<(u32, u32)>> {
+    let count = reader.count()?;
+    if count == 0 {
         return Ok(HashSet::default());
     }
-    let consumed_bytes = reader.take(consumed_len.checked_mul(8).context("consumed overflow")?)?;
-    let mut consumed = HashSet::with_capacity_and_hasher(consumed_len, Default::default());
-    for c in consumed_bytes.chunks_exact(8) {
-        consumed.insert((u32_le(c, 0), u32_le(c, 4)));
+    let bytes = reader.take(count.checked_mul(8).context("coords overflow")?)?;
+    let mut coords = HashSet::with_capacity_and_hasher(count, Default::default());
+    for c in bytes.chunks_exact(8) {
+        coords.insert((u32_le(c, 0), u32_le(c, 4)));
     }
-    Ok(consumed)
+    Ok(coords)
 }
 
 pub(super) fn read_outline_crate(
@@ -505,7 +506,8 @@ pub(super) fn read_outline_crate(
     let global_asm = read_waitings(reader, files, textuals)?;
     let derived = read_helds(reader, files)?;
     let attributed = read_helds(reader, files)?;
-    let consumed = read_consumed(reader)?;
+    let consumed = read_coords(reader)?;
+    let resolved_tests = read_coords(reader)?;
     let macro_use = read_remapped_krates(reader, remap, "macro_use crate out of bounds")?;
     let expansions = reader.u32()? as usize;
     Ok(OutlineCrate {
@@ -528,6 +530,7 @@ pub(super) fn read_outline_crate(
         derived,
         attributed,
         consumed,
+        resolved_tests,
         macro_use,
         expansions,
         cached_included: None,

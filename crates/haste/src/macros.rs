@@ -429,7 +429,29 @@ fn split_ready_bound(outline: &mut Outline, bound: Vec<Bound>) -> Vec<Bound> {
 fn expand_bound_scoped(compilation: &mut Compilation, filter: Option<&[bool]>) -> Result<bool> {
     let mut changed = false;
     loop {
+        let consumed_before: Vec<usize> = compilation
+            .outline
+            .crates
+            .iter()
+            .map(|c| c.consumed.len())
+            .collect();
         let (bound, asks) = bind_procs_in(compilation, filter);
+        let mut stale = Vec::new();
+        for (krate, &before) in consumed_before.iter().enumerate() {
+            if compilation.outline.crates[krate].consumed.len() > before {
+                stale.extend(compilation.outline.dependents(krate));
+            }
+        }
+        stale.sort_unstable();
+        stale.dedup();
+        let reset_any = !stale.is_empty();
+        stale
+            .into_iter()
+            .for_each(|krate| compilation.names.reset(krate));
+        if reset_any {
+            changed = true;
+            compilation.names.resolve(&mut compilation.outline)?;
+        }
         if bound.is_empty() {
             if asks.count() == 0 || !compilation.names.load(&mut compilation.outline, asks)? {
                 return Ok(changed);
