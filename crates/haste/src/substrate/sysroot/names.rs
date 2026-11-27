@@ -439,10 +439,19 @@ fn read_deps(cur: &mut Cursor<'_>, remap: &[u32], sym_remap: &[Sym]) -> Result<V
     Ok(deps)
 }
 
-fn read_pending(cur: &mut Cursor<'_>, remap: &[u32], sym_remap: &[Sym]) -> Result<Vec<Pending>> {
+type DecodedPending = (
+    Vec<Pending>,
+    HashMap<(u32, Sym), Vec<usize>>,
+    HashMap<u32, Vec<usize>>,
+);
+
+fn read_pending(cur: &mut Cursor<'_>, remap: &[u32], sym_remap: &[Sym]) -> Result<DecodedPending> {
     let pend_len = cur.count()?;
     let mut pending = Vec::with_capacity(pend_len);
-    for _ in 0..pend_len {
+    let mut named: HashMap<(u32, Sym), Vec<usize>> =
+        HashMap::with_capacity_and_hasher(pend_len, Default::default());
+    let mut globs: HashMap<u32, Vec<usize>> = HashMap::default();
+    for index in 0..pend_len {
         let b = cur.take(20)?;
         let module = u32_le(b, 0);
         let file = u32_le(b, 4);
@@ -467,6 +476,10 @@ fn read_pending(cur: &mut Cursor<'_>, remap: &[u32], sym_remap: &[Sym]) -> Resul
             None
         };
         let active = cur.u8()? != 0;
+        match name {
+            Some(sym) => named.entry((module, sym)).or_default().push(index),
+            None => globs.entry(module).or_default().push(index),
+        }
         pending.push(Pending {
             module,
             file,
@@ -481,7 +494,7 @@ fn read_pending(cur: &mut Cursor<'_>, remap: &[u32], sym_remap: &[Sym]) -> Resul
             active,
         });
     }
-    Ok(pending)
+    Ok((pending, named, globs))
 }
 
 fn read_enums(cur: &mut Cursor<'_>, sym_remap: &[Sym]) -> Result<HashMap<(u32, u32), Box<[Sym]>>> {
@@ -509,7 +522,7 @@ pub(super) fn read_names_crate_body(
     let edition_2015 = cur.u8()? != 0;
     let edition = read_str(cur)?.to_owned();
     let collected = read_u32s_map(cur, |v| (v != u32::MAX).then_some(v as usize))?;
-    let pending = read_pending(cur, remap, sym_remap)?;
+    let (pending, named, globs) = read_pending(cur, remap, sym_remap)?;
     let enums = read_enums(cur, sym_remap)?;
     let eager = cur.u8()? != 0;
     let mut out = NamesCrate::default();
@@ -521,11 +534,10 @@ pub(super) fn read_names_crate_body(
     out.edition_2015 = edition_2015;
     out.edition = edition;
     out.collected = collected;
-    out.pending = pending;
+    out.set_pending_with_indices(pending, named, globs);
     out.enums = enums;
     out.eager = eager;
     out.settled = true;
-    out.rebuild_indices();
     Ok(out)
 }
 

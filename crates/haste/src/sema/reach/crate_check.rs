@@ -17,6 +17,60 @@ use crate::sema::ty::Ty;
 
 use super::{Instance, Reached, ReachedEntry, typed_once};
 
+#[derive(Clone, Copy)]
+enum CheckTask {
+    Const(ItemRef),
+    Static(ItemRef),
+    Adt(ItemRef, ItemKind),
+    Impl(ImplRef, ItemRef),
+}
+
+#[derive(Default)]
+struct CheckOutcome {
+    unlaid: Vec<String>,
+    note_at: Option<usize>,
+    error: Option<(Instance, String)>,
+    deferred: bool,
+}
+
+fn apply_outcome(reached: &mut Reached, outcome: CheckOutcome) {
+    reached.unlaid.extend(outcome.unlaid);
+    if let Some(at) = outcome.note_at {
+        reached.note_crate_error(at);
+    }
+    if let Some((instance, error)) = outcome.error {
+        reached.record_crate_error(instance, error);
+    }
+}
+
+fn run_check_task(
+    cx: &mut Context<'_>,
+    reached: &Reached,
+    task: CheckTask,
+    force_commit: bool,
+) -> CheckOutcome {
+    let deferred0 = cx.deferred_evals.len();
+    let mut outcome = match task {
+        CheckTask::Const(item) => check_const_outcome(cx, reached, item, force_commit),
+        CheckTask::Static(item) => check_with_error(cx, item, force_commit, |cx| {
+            Infer::check_static_item_sync(cx, item)
+        }),
+        CheckTask::Adt(item, kind) => {
+            check_with_error(cx, item, force_commit, |cx| check_adt_inner(cx, item, kind))
+        }
+        CheckTask::Impl(block, item) => check_with_error(cx, item, force_commit, |cx| {
+            Infer::check_local_trait_impl(cx, block)
+        }),
+    };
+    if cx.deferred_evals.len() > deferred0 {
+        outcome.deferred = true;
+        outcome.unlaid.clear();
+        outcome.note_at = None;
+        outcome.error = None;
+    }
+    outcome
+}
+
 /// Validates local crate constants, statics, trait impls, and ADTs.
 pub(super) fn check_local_crate_items(
     cx: &mut Context<'_>,
@@ -32,18 +86,79 @@ pub(super) fn check_local_crate_items(
         collect_crate_items(cx, krate, &mut items);
         collect_crate_impls(cx, krate, &mut impls);
     }
+    let mut tasks = Vec::with_capacity(items.len() + impls.len());
     for (item, kind) in items {
         match kind {
-            ItemKind::Const => check_const_item(cx, reached, item, force_commit),
-            ItemKind::Static => check_static_item(cx, reached, item, force_commit),
+            ItemKind::Const => tasks.push(CheckTask::Const(item)),
+            ItemKind::Static => tasks.push(CheckTask::Static(item)),
             ItemKind::Enum | ItemKind::Union | ItemKind::Struct => {
-                check_adt_item(cx, reached, item, kind, force_commit);
+                tasks.push(CheckTask::Adt(item, kind));
             }
             _ => {}
         }
     }
     for (block, item) in impls {
-        check_impl_block(cx, reached, block, item, force_commit);
+        tasks.push(CheckTask::Impl(block, item));
+    }
+    let workers = crate::jobs().min(tasks.len() / 4);
+    if tasks.len() < 8 || workers <= 1 {
+        for task in tasks {
+            let outcome = run_check_task(cx, reached, task, force_commit);
+            apply_outcome(reached, outcome);
+        }
+        return;
+    }
+    let forks: Vec<Context<'_>> = (0..workers - 1).map(|_| cx.fork()).collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    cx.in_parallel = true;
+    let worker_loop = |worker: &mut Context<'_>| {
+        let mut out = Vec::new();
+        loop {
+            let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let Some(&task) = tasks.get(idx) else {
+                break;
+            };
+            out.push((idx, run_check_task(worker, reached, task, force_commit)));
+        }
+        out
+    };
+    let (mut results, joined) = crate::sync::scope(|scope| {
+        let handles: Vec<_> = forks
+            .into_iter()
+            .map(|mut fork| {
+                scope.spawn(move || {
+                    let out = worker_loop(&mut fork);
+                    let deferred = fork.take_deferred_evals();
+                    let (_, asks) = fork.release();
+                    (asks, deferred, out)
+                })
+            })
+            .collect();
+        let own = worker_loop(cx);
+        let joined: Vec<_> = handles
+            .into_iter()
+            .map(|h| h.join().map_or(None, Some))
+            .collect();
+        (own, joined)
+    });
+    cx.in_parallel = false;
+    let mut deferred = cx.take_deferred_evals();
+    for (asks, worker_deferred, worker_out) in joined.into_iter().flatten() {
+        cx.asks.repeat(&asks);
+        deferred.extend(worker_deferred);
+        results.extend(worker_out);
+    }
+    if !deferred.is_empty() {
+        super::wave::eval_deferred_list(cx, deferred);
+    }
+    results.sort_unstable_by_key(|&(idx, _)| idx);
+    for (idx, outcome) in results {
+        if outcome.deferred {
+            let retried = run_check_task(cx, reached, tasks[idx], force_commit);
+            apply_outcome(reached, retried);
+        } else {
+            apply_outcome(reached, outcome);
+        }
     }
 }
 
@@ -131,60 +246,62 @@ fn is_checkable_item(tree: &Crate, items: &[Item], at: usize, kind: ItemKind) ->
     true
 }
 
-fn check_const_item(
+fn check_const_outcome(
     cx: &mut Context<'_>,
-    reached: &mut Reached,
+    reached: &Reached,
     item: ItemRef,
     force_commit: bool,
-) {
+) -> CheckOutcome {
+    let mut outcome = CheckOutcome::default();
     if cx.foreign(item) || expected_param_count(cx, item) != Some(0) {
-        return;
+        return outcome;
     }
     let asks0 = cx.asks.count();
     let Ok(body) = cx.body(item) else {
-        return;
+        return outcome;
     };
     if body.root.is_none() {
-        return;
+        return outcome;
     }
     let instance = (item, Substs::EMPTY);
     let typed = match reached.index.get(&instance).copied() {
         Some(at) if reached.states[at] == ReachedEntry::Settled => match &reached.list[at].1 {
             Ok(typed) => Arc::clone(typed),
             Err(_) => {
-                reached.note_crate_error(at);
-                return;
+                outcome.note_at = Some(at);
+                return outcome;
             }
         },
         _ => {
             let mut unlaid = Vec::new();
             match typed_once(cx, &instance, &mut unlaid) {
                 Ok(typed) => {
-                    reached.unlaid.extend(unlaid);
+                    outcome.unlaid = unlaid;
                     typed
                 }
                 Err(err) => {
                     if force_commit || cx.asks.count() == asks0 {
-                        reached.record_crate_error(instance, err);
+                        outcome.error = Some((instance, err));
                     }
-                    return;
+                    return outcome;
                 }
             }
         }
     };
     if !const_may_fail(&body, &typed) || !evaluate::is_installed() {
-        return;
+        return outcome;
     }
     let Some(bits) = const_eval_bits(cx, typed.ret) else {
-        return;
+        return outcome;
     };
     let eval_asks0 = cx.asks.count();
     if let Err(err) = evaluate::run(cx, &instance, bits)
         && (force_commit || cx.asks.count() == eval_asks0)
     {
         let err = anyhow::anyhow!("evaluation of constant value failed: {err:#}");
-        reached.record_crate_error(instance, crate::diag::format_error(cx.name(item), &err));
+        outcome.error = Some((instance, crate::diag::format_error(cx.name(item), &err)));
     }
+    outcome
 }
 
 fn const_may_fail(body: &Body, typed: &Typed) -> bool {
@@ -220,57 +337,23 @@ fn const_eval_bits(cx: &mut Context<'_>, ret: Option<Ty>) -> Option<u32> {
     None
 }
 
-fn check_static_item(
+fn check_with_error(
     cx: &mut Context<'_>,
-    reached: &mut Reached,
     item: ItemRef,
     force_commit: bool,
-) {
+    run: impl FnOnce(&mut Context<'_>) -> Result<()>,
+) -> CheckOutcome {
+    let mut outcome = CheckOutcome::default();
     let asks0 = cx.asks.count();
-    if let Err(err) = Infer::check_static_item_sync(cx, item)
+    if let Err(err) = run(cx)
         && (force_commit || cx.asks.count() == asks0)
     {
-        reached.record_crate_error(
+        outcome.error = Some((
             (item, Substs::EMPTY),
             crate::diag::format_error(cx.name(item), &err),
-        );
+        ));
     }
-}
-
-fn check_impl_block(
-    cx: &mut Context<'_>,
-    reached: &mut Reached,
-    block: ImplRef,
-    item: ItemRef,
-    force_commit: bool,
-) {
-    let asks0 = cx.asks.count();
-    if let Err(err) = Infer::check_local_trait_impl(cx, block)
-        && (force_commit || cx.asks.count() == asks0)
-    {
-        reached.record_crate_error(
-            (item, Substs::EMPTY),
-            crate::diag::format_error(cx.name(item), &err),
-        );
-    }
-}
-
-fn check_adt_item(
-    cx: &mut Context<'_>,
-    reached: &mut Reached,
-    item: ItemRef,
-    kind: ItemKind,
-    force_commit: bool,
-) {
-    let asks0 = cx.asks.count();
-    if let Err(err) = check_adt_inner(cx, item, kind)
-        && (force_commit || cx.asks.count() == asks0)
-    {
-        reached.record_crate_error(
-            (item, Substs::EMPTY),
-            crate::diag::format_error(cx.name(item), &err),
-        );
-    }
+    outcome
 }
 
 fn check_adt_inner(cx: &mut Context<'_>, item: ItemRef, kind: ItemKind) -> Result<()> {

@@ -340,23 +340,15 @@ impl Crate {
         }
     }
 
-    pub(crate) fn rebuild_indices(&mut self) {
-        self.named.clear();
-        self.globs.clear();
-        for index in 0..self.pending.len() {
-            match self.pending[index].name {
-                Some(name) => self
-                    .named
-                    .entry((self.pending[index].module, name))
-                    .or_default()
-                    .push(index),
-                None => self
-                    .globs
-                    .entry(self.pending[index].module)
-                    .or_default()
-                    .push(index),
-            }
-        }
+    pub(crate) fn set_pending_with_indices(
+        &mut self,
+        pending: Vec<collect::Pending>,
+        named: FxHashMap<(u32, Sym), Vec<usize>>,
+        globs: FxHashMap<u32, Vec<usize>>,
+    ) {
+        self.pending = pending;
+        self.named = named;
+        self.globs = globs;
     }
 }
 

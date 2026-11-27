@@ -114,18 +114,20 @@ fn typed_fresh(
     Ok(typed)
 }
 
+fn is_layout_kind(kind: &Kind) -> bool {
+    matches!(
+        kind,
+        Kind::Adt(..) | Kind::Tuple(_) | Kind::Array(..) | Kind::Closure(..)
+    )
+}
+
 fn lay_out_ty(cx: &mut Context<'_>, ty: Ty) -> anyhow::Result<()> {
     if let Kind::Adt(item, _) = *cx.types.kind(ty)
         && cx.item(item).1.kind == ItemKind::Enum
     {
         cx.discriminants(item)?;
     }
-    if matches!(
-        cx.types.kind(ty),
-        Kind::Adt(..) | Kind::Tuple(_) | Kind::Array(..) | Kind::Closure(..)
-    ) {
-        cx.layout(ty)?;
-    }
+    cx.layout(ty)?;
     Ok(())
 }
 
@@ -139,7 +141,7 @@ pub(crate) fn lay_out(cx: &mut Context<'_>, typed: &Typed) -> anyhow::Result<()>
             .map(|local| local.ty)
             .chain(typed.ret)
         {
-            if ty != Ty::NONE {
+            if ty != Ty::NONE && is_layout_kind(cx.types.kind(ty)) {
                 lay_out_ty(cx, ty)?;
             }
         }
@@ -164,7 +166,7 @@ pub(crate) fn lay_out(cx: &mut Context<'_>, typed: &Typed) -> anyhow::Result<()>
         .chain(pats)
         .chain(intrinsic_args)
     {
-        if ty == Ty::NONE || !seen.insert(ty) {
+        if ty == Ty::NONE || !is_layout_kind(cx.types.kind(ty)) || !seen.insert(ty) {
             continue;
         }
         lay_out_ty(cx, ty)?;
