@@ -535,3 +535,106 @@ pub(in super::super) fn all_self_behind_named_ref(body: &Body, src: &Source, ty:
 pub(in super::super) fn ast_ty_refs_self(body: &Body, src: &Source, ty: TyId) -> bool {
     self_ref_status(body, src, ty, false, false).0
 }
+
+pub(in super::super) fn ast_ty_contains_impl_trait(body: &Body, ty: TyId) -> bool {
+    let args_contain = |args: Option<Args>| match args {
+        Some(Args::Angle(list)) => {
+            body.list(list)
+                .iter()
+                .any(|&arg| match body.args[arg as usize] {
+                    GenericArg::Ty(t) | GenericArg::Binding { ty: t, .. } => {
+                        ast_ty_contains_impl_trait(body, t)
+                    }
+                    _ => false,
+                })
+        }
+        Some(Args::Paren { inputs, output }) => {
+            body.list(inputs)
+                .iter()
+                .any(|&t| ast_ty_contains_impl_trait(body, TyId(t)))
+                || output.is_some_and(|o| ast_ty_contains_impl_trait(body, o))
+        }
+        _ => false,
+    };
+    match *body.ty(ty) {
+        AstTy::ImplTrait(..) => true,
+        AstTy::Ref { ty: inner, .. }
+        | AstTy::Ptr { ty: inner, .. }
+        | AstTy::Slice(inner)
+        | AstTy::Array(inner, _)
+        | AstTy::Paren(inner)
+        | AstTy::Pat(inner, _) => ast_ty_contains_impl_trait(body, inner),
+        AstTy::Tuple(list) => body
+            .list(list)
+            .iter()
+            .any(|&t| ast_ty_contains_impl_trait(body, TyId(t))),
+        AstTy::Path(path) => body
+            .list(body.path(path).segments)
+            .iter()
+            .any(|&s| args_contain(body.segments[s as usize].args)),
+        AstTy::Fn { params, ret, .. } => {
+            body.list(params)
+                .iter()
+                .any(|&t| ast_ty_contains_impl_trait(body, TyId(t)))
+                || ret.is_some_and(|r| ast_ty_contains_impl_trait(body, r))
+        }
+        AstTy::DynTrait(list) => body.list(list).iter().any(|&b| {
+            matches!(
+                body.bounds[b as usize],
+                Bound::Trait { path, .. }
+                    if body
+                        .list(body.path(path).segments)
+                        .iter()
+                        .any(|&s| args_contain(body.segments[s as usize].args))
+            )
+        }),
+        _ => false,
+    }
+}
+
+impl Checker<'_, '_> {
+    pub(in super::super) fn sig_captures_edition_2024_rpit(
+        &mut self,
+        fn_item: crate::names::ItemRef,
+        sig: &crate::body::sig::Signature,
+        sig_src: &Source,
+        ret_ast: TyId,
+    ) -> bool {
+        if sig.is_async
+            || !self
+                .cx
+                .crate_edition(fn_item.krate)
+                .is_some_and(|e| e >= "2024")
+            || !ast_ty_contains_impl_trait(&sig.body, ret_ast)
+        {
+            return false;
+        }
+        let mut lts = super::super::calls::Lifetimes::default();
+        super::super::calls::collect_ty_lifetimes(&sig.body, sig_src, ret_ast, &mut lts);
+        !super::super::calls::sig_returns_only_static(sig, sig_src, ret_ast, &lts)
+            && !self.sig_ret_ast_is_provably_static(fn_item, sig, sig_src, ret_ast)
+    }
+
+    pub(in super::super) fn expr_is_capturing_rpit(&mut self, expr: ExprId) -> bool {
+        let cur = self.unwrap_parens_and_empty_blocks(expr);
+        let fn_item = match *self.body.expr(cur) {
+            crate::body::Expr::Method { .. } => match self.typed.res.get(&cur).copied() {
+                Some(crate::sema::infer::Res::Fn(it, _)) => Some(it),
+                _ => None,
+            },
+            crate::body::Expr::Call(callee, _) => self.call_sig_fn_item(cur, callee),
+            _ => None,
+        };
+        let Some(fn_item) = fn_item else {
+            return false;
+        };
+        let Ok(sig) = self.cx.signature(fn_item) else {
+            return false;
+        };
+        let Some(ret_ast) = sig.ret else {
+            return false;
+        };
+        let sig_src = self.cx.item(fn_item).0;
+        self.sig_captures_edition_2024_rpit(fn_item, &sig, sig_src, ret_ast)
+    }
+}

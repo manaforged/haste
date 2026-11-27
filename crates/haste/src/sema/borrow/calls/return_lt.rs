@@ -8,43 +8,14 @@ use crate::sema::ty::Kind;
 use super::super::checks::{VarianceLifetimes, collect_ast_variance, is_temp_target};
 use super::super::places::PlaceStep;
 use super::super::propagate::BorrowSource;
-use super::lifetimes::{
-    Lifetimes, collect_ty_lifetimes, is_owned_container, lifetime_outlives_in_headers, owned_lts,
-};
+use super::lifetimes::{Lifetimes, collect_ty_lifetimes, is_owned_container, owned_lts};
 
 pub(in super::super) use super::static_ty::{
     ast_ref_dyn_requires_static, ast_ty_is_provably_static_in,
 };
 pub(super) use super::static_ty::{ast_ty_contains_dyn, ast_ty_is_provably_static};
 
-pub(in super::super) fn lifetime_outlives_in_item(
-    cx: &mut crate::sema::Context<'_>,
-    item: crate::names::ItemRef,
-    sig: &crate::body::sig::Signature,
-    src: &Source,
-    a: &str,
-    b: &str,
-) -> bool {
-    let impl_hdr = cx
-        .owner_impl(item)
-        .and_then(|block| cx.impl_header(block).ok().map(|hdr| (block, hdr)));
-    match impl_hdr {
-        Some((block, ref hdr)) => {
-            let impl_src = &cx.impl_file(block).source;
-            lifetime_outlives_in_headers(
-                &[
-                    (&sig.body, src, &sig.generics, &sig.predicates),
-                    (&hdr.body, impl_src, &hdr.generics, &hdr.predicates),
-                ],
-                a,
-                b,
-            )
-        }
-        None => {
-            lifetime_outlives_in_headers(&[(&sig.body, src, &sig.generics, &sig.predicates)], a, b)
-        }
-    }
-}
+pub(in super::super) use super::bounds::lifetime_outlives_in_item;
 
 impl super::super::Checker<'_, '_> {
     pub(in super::super) fn param_satisfies_caller_lt(
@@ -53,7 +24,7 @@ impl super::super::Checker<'_, '_> {
         req_lts: &[&str],
         peel_outer_ref: bool,
     ) -> bool {
-        self.param_satisfies_lt_mode(local, req_lts, peel_outer_ref, true)
+        self.param_satisfies_lt_mode(local, req_lts, peel_outer_ref, true, None)
     }
 
     pub(in super::super) fn param_satisfies_lt_mode(
@@ -62,6 +33,7 @@ impl super::super::Checker<'_, '_> {
         req_lts: &[&str],
         peel_outer_ref: bool,
         check_invariant: bool,
+        share_target: Option<super::bounds::ShareTarget>,
     ) -> bool {
         if !self.is_non_static_param(local) {
             return true;
@@ -71,10 +43,15 @@ impl super::super::Checker<'_, '_> {
             return true;
         }
         let (has_elided, declared) = self.param_lts.slot(slot, peel_outer_ref);
-        if has_elided {
+        let declared = declared.map(<[String]>::to_vec);
+        let allow_shared_ty_param = share_target.is_some_and(|target| {
+            self.param_lts.elided_ty_param_only(slot, peel_outer_ref)
+                && self.src_non_static_params_shared_with(local, peel_outer_ref, target)
+        });
+        if has_elided && !allow_shared_ty_param {
             return false;
         }
-        let Some(declared) = declared.map(<[String]>::to_vec) else {
+        let Some(declared) = declared else {
             return false;
         };
         if declared.is_empty() {
@@ -121,7 +98,7 @@ impl super::super::Checker<'_, '_> {
         if mut_ret_from_mut
             && let Some(inner_req) = ret_mut_inner
             && !inner_req.is_empty()
-            && !self.param_satisfies_lt_mode(src.target, inner_req, true, true)
+            && !self.param_satisfies_lt_mode(src.target, inner_req, true, true, None)
         {
             return Err(self.borrow_err(
                 Some(expr),
@@ -132,9 +109,15 @@ impl super::super::Checker<'_, '_> {
             ));
         }
         if self.param_shares_ret_ty(src.target)
-            || req
-                .iter()
-                .any(|&r| self.param_satisfies_lt_mode(src.target, &[r], false, false))
+            || req.iter().any(|&r| {
+                self.param_satisfies_lt_mode(
+                    src.target,
+                    &[r],
+                    false,
+                    false,
+                    self.typed.ret.map(super::bounds::ShareTarget::Ret),
+                )
+            })
         {
             return Ok(());
         }
@@ -162,9 +145,15 @@ impl super::super::Checker<'_, '_> {
                         || self.ty_max_ref_depth(expr_ty) <= self.ty_max_ref_depth(inner))
             });
         if can_peel
-            && req
-                .iter()
-                .any(|&r| self.param_satisfies_lt_mode(src.target, &[r], true, false))
+            && req.iter().any(|&r| {
+                self.param_satisfies_lt_mode(
+                    src.target,
+                    &[r],
+                    true,
+                    false,
+                    self.typed.ret.map(super::bounds::ShareTarget::Ret),
+                )
+            })
         {
             return Ok(());
         }

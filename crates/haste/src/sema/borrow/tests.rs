@@ -1,3 +1,4 @@
+mod soundness_p0;
 mod tokio_cases;
 mod tokio_wave18;
 
@@ -241,7 +242,7 @@ fn compute_param_lifetimes_resolves_named_type_param_and_assoc_item_bounds() {
     };
     let fn_src = &outline.crates[0].files[0].source;
     let info = super::calls::compute_param_lifetimes(&mut cx, item, &sig, fn_src, &typed, (3, &[]));
-    assert!(!info.has_elided_lt[0]);
+    assert!(info.has_elided_lt[0]);
     assert_eq!(info.named_lts[0], vec!["'a".to_owned()]);
     assert!(!info.inner_has_elided_lt[1]);
     assert_eq!(info.inner_named_lts[1], vec!["'a".to_owned()]);

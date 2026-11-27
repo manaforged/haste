@@ -188,6 +188,8 @@ struct Checker<'c, 'a> {
     drop_cache: HashMap<Ty, bool>,
     drop_locals: HashSet<u32>,
     variance: checks::VarianceMeta,
+    outer_temp_only_locals: HashSet<u32>,
+    peelable_ref_field_locals: HashSet<u32>,
     current_expr: Option<ExprId>,
     current_pat: Option<PatId>,
 }
@@ -327,6 +329,8 @@ pub(super) fn check(
         drop_cache: HashMap::default(),
         drop_locals: HashSet::default(),
         variance: checks::VarianceMeta::new(n),
+        outer_temp_only_locals: HashSet::default(),
+        peelable_ref_field_locals: HashSet::default(),
         current_expr: None,
         current_pat: None,
     };
@@ -676,6 +680,58 @@ impl Checker<'_, '_> {
             }
         }
         self.check_drop_order(block_depth, state)
+    }
+
+    pub(super) fn strip_loop_locals(&mut self, state: &mut State, loop_locals: &HashSet<u32>) {
+        checks::retain_non_loop_state(state, loop_locals);
+        for f in &mut self.breaks {
+            for s in &mut f.states {
+                checks::retain_non_loop_state(s, loop_locals);
+            }
+            for s in &mut f.continues {
+                checks::retain_non_loop_state(s, loop_locals);
+            }
+        }
+    }
+
+    pub(super) fn finish_loop_iter(
+        &mut self,
+        iter_state: &State,
+        drop_temps: Vec<u32>,
+        exit_cond_states: &mut Vec<State>,
+        loop_locals: &HashSet<u32>,
+        outer_live: &HashSet<u32>,
+        loop_depth: u32,
+    ) -> Result<Option<State>> {
+        let continues = self
+            .breaks
+            .last_mut()
+            .map(|f| std::mem::take(&mut f.continues))
+            .unwrap_or_default();
+        let fallthrough = (!iter_state.diverged).then(|| iter_state.clone());
+        let mut merged_next = checks::merge_break_states(fallthrough, continues);
+        for id in drop_temps {
+            if let Some(ref mut next) = merged_next {
+                self.release_temp_holder(next, id);
+            } else {
+                self.release_temp_in_breaks(id);
+            }
+            Checker::release_temp_states(exit_cond_states, id);
+        }
+        let Some(mut next_state) = merged_next else {
+            return Ok(None);
+        };
+        self.check_drop_order(loop_depth, &next_state)?;
+        checks::retain_non_loop_state(&mut next_state, loop_locals);
+        self.check_block_escape(loop_depth, &next_state, outer_live)?;
+        for loan in &mut next_state.loans {
+            for step in &mut loan.steps {
+                if matches!(step, PlaceStep::Opaque(Some(_))) {
+                    *step = PlaceStep::Opaque(None);
+                }
+            }
+        }
+        Ok(Some(next_state))
     }
 }
 

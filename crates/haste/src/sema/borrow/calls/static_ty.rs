@@ -249,7 +249,7 @@ fn ast_ty_is_provably_static_in_mode(
             }
             let seg = body.segments[segs[segs.len() - 1] as usize];
             let name = crate::names::plain(src.text(seg.name));
-            if seg.args.is_none() && is_prim_name(name) {
+            if seg.args.is_none() && (is_prim_name(name) || (segs.len() == 1 && name == "String")) {
                 return true;
             }
             if is_owned_container(name)
@@ -450,14 +450,7 @@ impl Checker<'_, '_> {
                 let Bound::Trait { path, .. } = sig.body.bounds[b_id as usize] else {
                     continue;
                 };
-                let Some(&last_seg) = sig.body.list(sig.body.path(path).segments).last() else {
-                    continue;
-                };
-                let seg = sig.body.segments[last_seg as usize];
-                if !matches!(plain(self.src.text(seg.name)), "IntoIterator" | "Iterator") {
-                    continue;
-                }
-                let Some(Args::Angle(args)) = seg.args else {
+                let Some(Args::Angle(args)) = self.iter_trait_path_args(&sig, path) else {
                     continue;
                 };
                 for &a_id in sig.body.list(args) {
@@ -473,7 +466,7 @@ impl Checker<'_, '_> {
             return false;
         }
         let static_names = self.static_param_names(&sig);
-        item_tys.into_iter().any(|item_ty| {
+        item_tys.into_iter().all(|item_ty| {
             ast_ty_is_provably_static_in_item(
                 self.cx,
                 self.item,

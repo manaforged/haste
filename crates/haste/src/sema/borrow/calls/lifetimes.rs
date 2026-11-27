@@ -1,4 +1,4 @@
-use crate::body::sig::{GenericKind, Signature};
+use crate::body::sig::Signature;
 use crate::body::{Args, Body, Bound, GenericArg, Ty as AstTy, TyId};
 use crate::outline::item::Item;
 use crate::outline::source::Source;
@@ -194,8 +194,10 @@ pub(in super::super) struct ParamLifetimes {
     pub(in super::super) only_type_param: Vec<bool>,
     pub(in super::super) named_lts: Vec<Vec<String>>,
     pub(in super::super) has_elided_lt: Vec<bool>,
+    pub(in super::super) elided_from_ty_param: Vec<bool>,
     pub(in super::super) inner_named_lts: Vec<Vec<String>>,
     pub(in super::super) inner_has_elided_lt: Vec<bool>,
+    pub(in super::super) inner_elided_from_ty_param: Vec<bool>,
 }
 
 impl ParamLifetimes {
@@ -212,10 +214,19 @@ impl ParamLifetimes {
             )
         }
     }
+
+    pub(in super::super) fn elided_ty_param_only(&self, slot: usize, peel: bool) -> bool {
+        let slice = if peel {
+            &self.inner_elided_from_ty_param
+        } else {
+            &self.elided_from_ty_param
+        };
+        slice.get(slot).copied().unwrap_or(false)
+    }
 }
 
 pub(in super::super) fn is_prim_name(name: &str) -> bool {
-    crate::names::Primitive::named(name).is_some() || name == "String"
+    crate::names::Primitive::named(name).is_some()
 }
 
 pub(in super::super) fn is_owned_container(name: &str) -> bool {
@@ -285,8 +296,10 @@ pub(in super::super) fn compute_param_lifetimes(
         only_type_param: vec![false; n],
         named_lts: vec![Vec::new(); n],
         has_elided_lt: vec![false; n],
+        elided_from_ty_param: vec![false; n],
         inner_named_lts: vec![Vec::new(); n],
         inner_has_elided_lt: vec![false; n],
+        inner_elided_from_ty_param: vec![false; n],
     };
     for &p in &typed.params {
         if let Some(slot) = info.is_static.get_mut(p as usize) {
@@ -366,7 +379,7 @@ fn resolve_slot_lts(
     impl_lts: (bool, bool, &[String]),
     static_names: &[String],
     allow_self_elided: bool,
-) -> (bool, Vec<String>) {
+) -> (bool, bool, Vec<String>) {
     let (impl_has_lt, impl_has_elided, impl_named) = impl_lts;
     let has_self = lts.names.contains(&"Self");
     let mut named = owned_lts(lts.named.clone());
@@ -380,10 +393,9 @@ fn resolve_slot_lts(
     let self_elided = allow_self_elided && impl_has_elided && has_self;
     let mut has_elided =
         lts.has_elided || self_elided || has_unbounded_type_param(sig, src, lts, static_names);
-    if has_elided
-        && !lts.has_elided
-        && !self_elided
-        && (super::static_ty::collect_type_param_lt_bounds(
+    let mut ty_param_only = false;
+    if has_elided && !lts.has_elided && !self_elided {
+        if super::static_ty::collect_type_param_lt_bounds(
             &sig.body,
             src,
             &sig.generics,
@@ -391,11 +403,13 @@ fn resolve_slot_lts(
             &lts.names,
             static_names,
             &mut named,
-        ) || !named.is_empty())
-    {
-        has_elided = false;
+        ) {
+            has_elided = false;
+        } else {
+            ty_param_only = true;
+        }
     }
-    (has_elided, named)
+    (has_elided, ty_param_only, named)
 }
 
 fn record_param_ty(
@@ -415,8 +429,11 @@ fn record_param_ty(
         && has_unbounded_type_param(sig, src, &lts, static_names);
     let allow_elided =
         !super::super::propagate::closure_peel::all_self_behind_named_ref(&sig.body, src, ty);
-    (info.has_elided_lt[slot], info.named_lts[slot]) =
-        resolve_slot_lts(sig, src, &lts, impl_lts, static_names, allow_elided);
+    (
+        info.has_elided_lt[slot],
+        info.elided_from_ty_param[slot],
+        info.named_lts[slot],
+    ) = resolve_slot_lts(sig, src, &lts, impl_lts, static_names, allow_elided);
     if let AstTy::Ref {
         lifetime,
         ty: inner,
@@ -427,6 +444,7 @@ fn record_param_ty(
             && is_named_lt(src.text(lt))
         {
             info.has_elided_lt[slot] = false;
+            info.elided_from_ty_param[slot] = false;
             info.named_lts[slot] = vec![src.text(lt).to_owned()];
         }
         info.inner_is_static[slot] = super::static_ty::ast_ty_is_provably_static_in_item(
@@ -439,8 +457,11 @@ fn record_param_ty(
         );
         let mut inner_lts = Lifetimes::default();
         collect_ty_lifetimes(&sig.body, src, inner, &mut inner_lts);
-        (info.inner_has_elided_lt[slot], info.inner_named_lts[slot]) =
-            resolve_slot_lts(sig, src, &inner_lts, impl_lts, static_names, true);
+        (
+            info.inner_has_elided_lt[slot],
+            info.inner_elided_from_ty_param[slot],
+            info.inner_named_lts[slot],
+        ) = resolve_slot_lts(sig, src, &inner_lts, impl_lts, static_names, true);
     }
 }
 
@@ -585,7 +606,9 @@ pub(in super::super) fn ast_ty_may_carry_elided_lt(
             }
             let seg = body.segments[segs[0] as usize];
             let name = src.text(seg.name);
-            if seg.args.is_none() && (is_prim_name(name) || outer_params.contains(&name)) {
+            if seg.args.is_none()
+                && (is_prim_name(name) || name == "String" || outer_params.contains(&name))
+            {
                 return false;
             }
             if is_owned_container(name)
@@ -735,61 +758,4 @@ pub(in super::super) fn ast_ty_has_type_param(
     }
 }
 
-pub(in super::super) fn for_each_param_bound_list(
-    sig: &Signature,
-    src: &Source,
-    param_ty: TyId,
-    mut visit: impl FnMut(crate::body::List),
-) {
-    match *sig.body.ty(param_ty) {
-        AstTy::ImplTrait(_, bounds) | AstTy::DynTrait(bounds) => visit(bounds),
-        AstTy::Ref { ty: inner, .. } => {
-            if let AstTy::ImplTrait(_, bounds) | AstTy::DynTrait(bounds) = *sig.body.ty(inner) {
-                visit(bounds);
-            }
-        }
-        AstTy::Path(path) => {
-            let p = sig.body.path(path);
-            let segs = sig.body.list(p.segments);
-            if p.qself.is_none() && segs.len() == 1 {
-                let name = src.text(sig.body.segments[segs[0] as usize].name);
-                for g in sig
-                    .generics
-                    .iter()
-                    .filter(|g| g.kind == GenericKind::Type && src.text(g.name) == name)
-                {
-                    visit(g.bounds);
-                }
-                for pred in sig
-                    .predicates
-                    .iter()
-                    .filter(|pred| pred_matches_name(sig, src, pred, name))
-                {
-                    visit(pred.bounds);
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-pub(in super::super) fn callable_param_inputs(
-    sig: &Signature,
-    src: &Source,
-    param_ty: TyId,
-) -> Vec<TyId> {
-    let mut inputs_out = Vec::new();
-    for_each_param_bound_list(sig, src, param_ty, |list| {
-        for &b_id in sig.body.list(list) {
-            if let Bound::Trait { path, .. } = sig.body.bounds[b_id as usize]
-                && let Some(&seg_id) = sig.body.list(sig.body.path(path).segments).last()
-                && let seg = sig.body.segments[seg_id as usize]
-                && matches!(src.text(seg.name), "Fn" | "FnMut" | "FnOnce")
-                && let Some(Args::Paren { inputs, .. }) = seg.args
-            {
-                inputs_out.extend(sig.body.list(inputs).iter().copied().map(TyId));
-            }
-        }
-    });
-    inputs_out
-}
+pub(in super::super) use super::bounds::{callable_param_inputs, for_each_param_bound_list};

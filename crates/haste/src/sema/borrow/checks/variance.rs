@@ -26,6 +26,7 @@ pub(in super::super) struct VarianceMeta {
     pub(in super::super) local_static_inv: Vec<bool>,
     pub(in super::super) local_static_ann: Vec<bool>,
     pub(in super::super) local_inv_lts: HashMap<u32, Vec<String>>,
+    pub(in super::super) local_ann_ast_ty: HashMap<u32, TyId>,
     pub(in super::super) local_contra_lts: HashMap<u32, ContraLifetimes>,
     pub(in super::super) param_inv_lts: Vec<InvariantLifetimes>,
     pub(in super::super) param_inner_inv_lts: Vec<InvariantLifetimes>,
@@ -42,6 +43,7 @@ impl VarianceMeta {
             local_static_inv: vec![false; n],
             local_static_ann: vec![false; n],
             local_inv_lts: HashMap::default(),
+            local_ann_ast_ty: HashMap::default(),
             local_contra_lts: HashMap::default(),
             param_inv_lts: vec![InvariantLifetimes::default(); n],
             param_inner_inv_lts: vec![InvariantLifetimes::default(); n],
@@ -190,6 +192,7 @@ impl Checker<'_, '_> {
         let Some(&local) = bound.iter().next() else {
             return Ok(());
         };
+        self.variance.local_ann_ast_ty.insert(local, ty_id);
         let Ok(sig) = self.cx.signature(self.item) else {
             return Ok(());
         };
@@ -646,7 +649,17 @@ impl Checker<'_, '_> {
         }
         let (req_static, req_named) =
             self.target_invariant_req(target_local, peel_target_ref, has_field_step);
-        self.check_sources_fit_invariant_lts(site, sources, req_static, &req_named)
+        let target_ty = self.local_ty(target_local);
+        self.check_sources_fit_invariant_lts_with_target(
+            site,
+            sources,
+            req_static,
+            &req_named,
+            Some(super::super::calls::bounds::ShareTarget::Local(
+                target_local,
+                target_ty,
+            )),
+        )
     }
 
     pub(in super::super) fn check_sources_fit_invariant_lts(
@@ -655,6 +668,17 @@ impl Checker<'_, '_> {
         sources: &[BorrowSource],
         req_static: bool,
         req_named: &[String],
+    ) -> Result<()> {
+        self.check_sources_fit_invariant_lts_with_target(site, sources, req_static, req_named, None)
+    }
+
+    fn check_sources_fit_invariant_lts_with_target(
+        &mut self,
+        site: Option<ExprId>,
+        sources: &[BorrowSource],
+        req_static: bool,
+        req_named: &[String],
+        dest: Option<super::super::calls::bounds::ShareTarget>,
     ) -> Result<()> {
         if (!req_static && req_named.is_empty()) || sources.is_empty() {
             return Ok(());
@@ -715,7 +739,7 @@ impl Checker<'_, '_> {
                     self.check_local_place_invariant_fit(
                         site, s.target, peel, req_static, req_named,
                     )?;
-                } else if !self.param_satisfies_lt_mode(s.target, &req_refs, peel, false) {
+                } else if !self.param_satisfies_lt_mode(s.target, &req_refs, peel, false, dest) {
                     return Err(self.does_not_live_long_enough(site, s.target));
                 }
             }

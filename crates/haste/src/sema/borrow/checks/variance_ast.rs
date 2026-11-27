@@ -691,8 +691,12 @@ fn collect_path_variance(
         (variance, false)
     } else {
         let adt_item = adt_info.as_ref().map(|(it, _)| *it).or(resolved_item);
-        let owned = is_owned_container(last_name)
-            || adt_item.is_some_and(|it| is_owned_container(walk.cx.plain_name(it)));
+        let owned = match adt_item {
+            Some(it) => {
+                walk.cx.outline.is_sysroot(it.krate) && is_owned_container(walk.cx.plain_name(it))
+            }
+            None => segs.len() == 1 && is_owned_container(last_name),
+        };
         let next_var = if variance == Variance::Invariant
             || is_interior_mut_name(last_name)
             || adt_item.is_some_and(|it| is_interior_mut_adt(walk.cx, it))

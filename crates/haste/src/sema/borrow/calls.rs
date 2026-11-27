@@ -1,4 +1,5 @@
 mod arg_refs;
+pub(super) mod bounds;
 mod closure;
 pub(super) mod lifetimes;
 pub(super) mod return_lt;

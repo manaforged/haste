@@ -235,7 +235,10 @@ impl<'a> Checker<'_, 'a> {
         ret_ty: Ty,
         state: &State,
     ) -> Vec<BorrowSource> {
-        if ret_ty != Ty::NONE && !self.ty_holds_borrow(ret_ty) {
+        if ret_ty != Ty::NONE
+            && !self.ty_holds_borrow(ret_ty)
+            && !self.sig_captures_edition_2024_rpit(call.fn_item, call.sig, call.sig_src, ret_ast)
+        {
             return Vec::new();
         }
         let ret_lts = self.collect_ret_lifetimes(call.fn_item, call.sig, call.sig_src, ret_ast);
@@ -432,6 +435,9 @@ impl<'a> Checker<'_, 'a> {
         }
         if let Some((SelfKind::Typed(self_ty), _)) = sig.receiver
             && !self.is_ref_ty(ret_ty)
+            && sig.ret.is_none_or(|ret_ast| {
+                !super::closure_peel::ast_ty_contains_impl_trait(&sig.body, ret_ast)
+            })
             && super::closure_peel::ast_ty_refs_self(&sig.body, sig_src, self_ty)
         {
             return self.unwrap_typed_self_ref_sources(call_expr, recv, recv_sources, state);

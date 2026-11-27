@@ -184,6 +184,7 @@ pub struct Infer<'c, 'a> {
     auto_dep: usize,
     matches: Vec<(ExprId, Ty, crate::body::List)>,
     let_pats: Vec<(PatId, Ty)>,
+    named_param_pats: Vec<(u32, Res, Ty)>,
     uninhabited: HashMap<Ty, bool>,
     active_discr: Option<(ItemRef, Vec<Option<i128>>, Vec<bool>)>,
 }
@@ -425,6 +426,7 @@ impl<'c, 'a> Infer<'c, 'a> {
             auto_dep: usize::MAX,
             matches: Vec::new(),
             let_pats: Vec::new(),
+            named_param_pats: Vec::new(),
             uninhabited: HashMap::default(),
             active_discr: None,
         }
@@ -627,8 +629,10 @@ impl Infer<'_, '_> {
                         let local = self.new_local(ty);
                         if let Some(own) = own {
                             self.bind_pat(own, ty)?;
+                            self.let_pats.push((own, ty));
                             self.out.unpacks.insert(local, own);
                         } else {
+                            self.named_param_pats.push((name, res, ty));
                             let mut target = ty;
                             if !self.is_const(&res) {
                                 while let Kind::Ref(_, inner) =
@@ -653,6 +657,7 @@ impl Infer<'_, '_> {
                 };
                 let local = self.new_local(ty);
                 self.bind_pat(own, ty)?;
+                self.let_pats.push((own, ty));
                 self.out.unpacks.insert(local, own);
                 Ok(local)
             }

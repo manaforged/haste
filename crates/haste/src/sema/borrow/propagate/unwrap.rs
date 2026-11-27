@@ -490,7 +490,8 @@ impl Checker<'_, '_> {
                     if steps.iter().any(|(_, res)| res.is_none())
             );
         if has_builtin_deref {
-            self.finish_projected_borrow_sources(expr, local_ty, true, sources, state)
+            let unwrap_temp = self.peelable_ref_field_locals.contains(&local);
+            self.finish_projected_borrow_sources(expr, local_ty, unwrap_temp, sources, state)
         } else {
             sources
         }
