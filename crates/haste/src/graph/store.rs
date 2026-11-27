@@ -530,9 +530,19 @@ fn build_script_inputs(manifest_dir: &Path, build_path: &Path, into: &mut Vec<Pa
         return;
     };
     let mut extras: Vec<PathBuf> = entries
-        .filter_map(|entry| entry.ok().map(|e| e.path()))
-        .filter(|path| {
-            path.extension().and_then(|ext| ext.to_str()) == Some("rs") && path.is_file()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            if Path::new(&name).extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                return None;
+            }
+            let ft = entry.file_type().ok()?;
+            let path = entry.path();
+            if ft.is_file() || (ft.is_symlink() && path.is_file()) {
+                Some(path)
+            } else {
+                None
+            }
         })
         .collect();
     extras.sort();

@@ -13,8 +13,12 @@ use crate::image::{self, Driver, Ended, Jit, Script};
 use crate::outline::Role;
 
 mod binary;
+mod fast;
+#[cfg(test)]
+mod tests;
 
 use binary::{Binaries, Kept};
+use fast::WaveQueue;
 
 const OUT: &str = "out";
 
@@ -382,6 +386,7 @@ fn vars(workspace: &Workspace, targets: &Targets, unit: usize, ran: &Ran) -> Vec
 }
 
 /// Why a script has no output, with the unit of the crate whose function did not build, when one did not: a script whose broken crate had its own script run since builds again, since that script's cfgs may fix it.
+#[derive(Debug)]
 struct Failure {
     error: String,
     broken: Option<usize>,
@@ -445,7 +450,7 @@ enum Start {
     Executable(std::path::PathBuf),
 }
 
-/// Builds and runs the scripts of the units `units`, each from its kept executable while its crates hash the same, else in children that compile each function on its first call, keeping the executable of each script that ran before.
+/// Builds and runs the scripts of the units `units`, each from its kept executable directly before parsing/expanding when its `script.fast` manifest holds, else in children that compile each function on its first call under fast script profile and keep the executable for later runs.
 fn run(
     workspace: &Workspace,
     targets: &Targets,
@@ -454,166 +459,178 @@ fn run(
     locks: &mut HashMap<usize, store::Lock>,
     ran: &mut Ran,
 ) -> Result<Outcome> {
-    let host_targets = Targets {
-        target: targets.host.clone(),
+    let mut unit_dirs = HashMap::default();
+    let mut fast_exec = HashMap::default();
+    let mut slow_units = Vec::new();
+    for &unit in units {
+        let dir = store::dir(workspace, unit);
+        if let Some(path) = binary::fast_kept(workspace, targets, unit, &dir) {
+            fast_exec.insert(unit, path);
+        } else {
+            slow_units.push(unit);
+        }
+        unit_dirs.insert(unit, dir);
+    }
+    if slow_units.is_empty() {
+        return fast::run_executables(workspace, targets, dag, units, &fast_exec, locks, ran);
+    }
+
+    let outer_cfg = crate::config();
+    let outer_targets = Targets {
+        target: targets.target.clone(),
         host: targets.host.clone(),
     };
-    let mut compilation = crate::macros::load_eager(workspace, &host_targets, units)?;
-    let outline = &compilation.outline;
-    let scripts: Vec<(usize, usize)> = outline
-        .roots
-        .iter()
-        .enumerate()
-        .filter(|(_, root)| root.role == Role::Script)
-        .map(|(krate, root)| (root.unit, krate))
-        .collect();
-    let binaries = Binaries::new(workspace, outline, &scripts);
-    let kept: Vec<Kept> = scripts
-        .iter()
-        .map(|&(unit, _)| binaries.kept(workspace, unit))
-        .collect();
-    let compiled: Vec<(usize, usize)> = scripts
-        .iter()
-        .zip(&kept)
-        .filter(|(_, kept)| !matches!(kept, Kept::Executable(_)))
-        .map(|(script, _)| *script)
-        .collect();
-    if !compiled.is_empty() {
-        let user_scripts = compiled
+    binary::with_script_profile(|| {
+        let host_targets = Targets {
+            target: targets.host.clone(),
+            host: targets.host.clone(),
+        };
+        let mut compilation = crate::macros::load_eager(workspace, &host_targets, &slow_units)?;
+        let outline = &compilation.outline;
+        let scripts: Vec<(usize, usize)> = outline
+            .roots
             .iter()
-            .filter(|&&(unit, _)| !workspace.packages[workspace.graph.units[unit].package].sysroot)
-            .count();
-        if user_scripts > 0 {
-            eprintln!(
-                "haste: running {user_scripts} build script{}...",
-                if user_scripts == 1 { "" } else { "s" }
+            .enumerate()
+            .filter(|(_, root)| root.role == Role::Script)
+            .map(|(krate, root)| (root.unit, krate))
+            .collect();
+        let binaries = Binaries::new(
+            workspace,
+            outline,
+            &scripts,
+            unit_dirs,
+            Arc::clone(&outer_cfg),
+            Targets {
+                target: outer_targets.target.clone(),
+                host: outer_targets.host.clone(),
+            },
+        );
+        let kept: Vec<Kept> = scripts
+            .iter()
+            .map(|&(unit, _)| binaries.kept(workspace, unit))
+            .collect();
+        let compiled: Vec<(usize, usize)> = scripts
+            .iter()
+            .zip(&kept)
+            .filter(|(_, kept)| !matches!(kept, Kept::Executable(_)))
+            .map(|(script, _)| *script)
+            .collect();
+        if !compiled.is_empty() {
+            let user_scripts = compiled
+                .iter()
+                .filter(|&&(unit, _)| {
+                    !workspace.packages[workspace.graph.units[unit].package].sysroot
+                })
+                .count();
+            if user_scripts > 0 {
+                eprintln!(
+                    "haste: running {user_scripts} build script{}...",
+                    if user_scripts == 1 { "" } else { "s" }
+                );
+            }
+        }
+        let mains: Vec<Option<crate::names::ItemRef>> = compiled
+            .iter()
+            .map(|(_, krate)| outline.main(*krate))
+            .collect();
+        let owners = outline.roots.iter().map(|root| root.unit).collect();
+        let (slot, cache) = if sysroot_scripts_settled(workspace) {
+            crate::build::substrate::cache_with_toolchain_substrate(workspace)
+        } else {
+            (None, crate::sema::Cache::default())
+        };
+        let (entries, store) = image::entries(&mut compilation, (cache, &mains))?;
+        let mut demand = Jit::new(store)?;
+        let has_build_deps = compiled.iter().any(|&(unit, _)| {
+            workspace.graph.units[unit]
+                .deps
+                .iter()
+                .any(|&(_, _, kind)| kind == Kind::Build)
+        });
+        if has_build_deps {
+            demand.set_optimize(true);
+        } else {
+            demand.set_fast(true);
+        }
+        demand.set_ahead(!has_build_deps);
+        let mut entries_map: HashMap<usize, Result<Start, String>> = HashMap::default();
+        for (&(unit, _), entry) in compiled.iter().zip(entries) {
+            entries_map.insert(
+                unit,
+                entry.map(|pair| Start::Jit(pair.map(|root| demand.declare(root)))),
             );
         }
-    }
-    let mains: Vec<Option<crate::names::ItemRef>> = compiled
-        .iter()
-        .map(|(_, krate)| outline.main(*krate))
-        .collect();
-    let owners = outline.roots.iter().map(|root| root.unit).collect();
-    let (slot, cache) = if sysroot_scripts_settled(workspace) {
-        crate::build::substrate::cache_with_toolchain_substrate(workspace)
-    } else {
-        (None, crate::sema::Cache::default())
-    };
-    let (entries, store) = image::entries(&mut compilation, (cache, &mains))?;
-    let mut demand = Jit::new(store)?;
-    let has_build_deps = compiled.iter().any(|&(unit, _)| {
-        workspace.graph.units[unit]
-            .deps
+        let missing: HashSet<usize> = scripts
             .iter()
-            .any(|&(_, _, kind)| kind == Kind::Build)
-    });
-    if has_build_deps {
-        demand.set_optimize(true);
-    } else {
-        demand.set_fast(true);
-    }
-    demand.set_ahead(!has_build_deps);
-    let mut unit_set = HashSet::default();
-    for &(unit, _) in &scripts {
-        unit_set.insert(unit);
-    }
-    let mut entries_map: HashMap<usize, Result<Start, String>> = HashMap::default();
-    for (&(unit, _), entry) in compiled.iter().zip(entries) {
-        entries_map.insert(
-            unit,
-            entry.map(|pair| Start::Jit(pair.map(|root| demand.declare(root)))),
-        );
-    }
-    let missing: HashSet<usize> = scripts
-        .iter()
-        .zip(&kept)
-        .filter(|(_, kept)| matches!(kept, Kept::Missing))
-        .map(|(&(unit, _), _)| unit)
-        .collect();
-    for (&(unit, _), kept) in scripts.iter().zip(kept) {
-        if let Kept::Executable(path) = kept {
+            .zip(&kept)
+            .filter(|(_, kept)| matches!(kept, Kept::Missing))
+            .map(|(&(unit, _), _)| unit)
+            .collect();
+        for (&(unit, _), kept) in scripts.iter().zip(kept) {
+            if let Kept::Executable(path) = kept {
+                entries_map.insert(unit, Ok(Start::Executable(path)));
+            }
+        }
+        for (unit, path) in fast_exec {
             entries_map.insert(unit, Ok(Start::Executable(path)));
         }
-    }
-    let mut ready = VecDeque::new();
-    let mut waiting = Vec::new();
-    let mut wave_links_rem = HashMap::default();
-    let mut active_build_rem = HashMap::default();
-    for &(unit, _) in &scripts {
-        let lrem = dag.links_rem[unit];
-        let brem = dag.build_deps[unit]
-            .iter()
-            .filter(|dep| unit_set.contains(dep))
-            .count();
-        wave_links_rem.insert(unit, lrem);
-        active_build_rem.insert(unit, brem);
-        if lrem == 0 && brem == 0 {
-            ready.push_back(unit);
-        } else {
-            waiting.push(unit);
+        let mut driver = Runs {
+            workspace,
+            targets: &outer_targets,
+            outer_cfg,
+            owners,
+            dag,
+            locks: &mut *locks,
+            entries: entries_map,
+            queue: WaveQueue::new(dag, units),
+            running: Vec::new(),
+            ran: ran.clone(),
+            outcome: Outcome::new(),
+            missing,
+            reran: HashSet::default(),
+            executables: HashSet::default(),
+            client_env: prepare_client_env(),
+        };
+        image::serve(
+            &mut compilation,
+            &crate::macros::load,
+            &mut demand,
+            &mut driver,
+        )?;
+        if let Some(slot) = slot {
+            crate::build::substrate::save_jit_substrate(
+                &compilation.outline,
+                demand.store(),
+                demand.image(),
+                slot,
+            );
         }
-    }
-    let mut driver = Runs {
-        workspace,
-        targets,
-        owners,
-        dag,
-        locks: &mut *locks,
-        entries: entries_map,
-        ready,
-        waiting,
-        wave_links_rem,
-        active_build_rem,
-        running: Vec::new(),
-        ran: ran.clone(),
-        outcome: Outcome::new(),
-        missing,
-        reran: HashSet::default(),
-        executables: HashSet::default(),
-        client_env: prepare_client_env(),
-    };
-    image::serve(
-        &mut compilation,
-        &crate::macros::load,
-        &mut demand,
-        &mut driver,
-    )?;
-    if let Some(slot) = slot {
-        crate::build::substrate::save_jit_substrate(
-            &compilation.outline,
-            demand.store(),
-            demand.image(),
-            slot,
-        );
-    }
-    let Runs { outcome, reran, .. } = driver;
-    let rerun: Vec<(usize, usize)> = scripts
-        .into_iter()
-        .filter(|(unit, _)| {
-            reran.contains(unit)
-                && outcome
-                    .iter()
-                    .any(|(at, result)| at == unit && result.is_ok())
-        })
-        .collect();
-    if let Err(error) = binaries.keep_detached(workspace, &mut compilation, &rerun, locks) {
-        eprintln!("cannot keep the executables of build scripts: {error}");
-    }
-    Ok(outcome)
+        let Runs { outcome, reran, .. } = driver;
+        let rerun: Vec<(usize, usize)> = scripts
+            .into_iter()
+            .filter(|(unit, _)| {
+                reran.contains(unit)
+                    && outcome
+                        .iter()
+                        .any(|(at, result)| at == unit && result.is_ok())
+            })
+            .collect();
+        if let Err(error) = binaries.keep_detached(workspace, &mut compilation, &rerun, locks) {
+            eprintln!("cannot keep the executables of build scripts: {error}");
+        }
+        Ok(outcome)
+    })
 }
 
 struct Runs<'w, 'l> {
     workspace: &'w Workspace,
     targets: &'w Targets,
+    outer_cfg: Arc<crate::config::Config>,
     owners: Vec<usize>,
     dag: &'w ScriptDag,
     locks: &'l mut HashMap<usize, store::Lock>,
     entries: HashMap<usize, Result<Start, String>>,
-    ready: VecDeque<usize>,
-    waiting: Vec<usize>,
-    wave_links_rem: HashMap<usize, usize>,
-    active_build_rem: HashMap<usize, usize>,
+    queue: WaveQueue,
     running: Vec<(usize, usize, Script)>,
     ran: Ran,
     outcome: Outcome,
@@ -625,40 +642,14 @@ struct Runs<'w, 'l> {
 
 impl Runs<'_, '_> {
     fn next(&mut self) -> Option<(usize, Result<Start, String>)> {
-        let unit = self.ready.pop_front().or_else(|| {
-            self.running
-                .is_empty()
-                .then(|| (!self.waiting.is_empty()).then(|| self.waiting.remove(0)))
-                .flatten()
-        })?;
+        let unit = self.queue.pop_ready(self.running.is_empty())?;
         let entry = self.entries.remove(&unit)?;
         Some((unit, entry))
     }
 
     fn complete_unit(&mut self, unit: usize) {
         self.locks.remove(&unit);
-        for &user in &self.dag.links_users[unit] {
-            if let Some(rem) = self.wave_links_rem.get_mut(&user) {
-                *rem = rem.saturating_sub(1);
-                self.try_wake(user);
-            }
-        }
-        for &user in &self.dag.build_users[unit] {
-            if let Some(rem) = self.active_build_rem.get_mut(&user) {
-                *rem = rem.saturating_sub(1);
-                self.try_wake(user);
-            }
-        }
-    }
-
-    fn try_wake(&mut self, user: usize) {
-        if self.wave_links_rem.get(&user).copied() == Some(0)
-            && self.active_build_rem.get(&user).copied() == Some(0)
-            && let Some(pos) = self.waiting.iter().position(|&u| u == user)
-        {
-            self.waiting.swap_remove(pos);
-            self.ready.push_back(user);
-        }
+        self.queue.complete(self.dag, unit);
     }
 }
 
@@ -668,14 +659,17 @@ impl Driver for Runs<'_, '_> {
             let Some((unit, entry)) = self.next() else {
                 return Ok(());
             };
-            if self.missing.contains(&unit) && binary::ran_before(self.workspace, unit) {
+            let was_ran_before = crate::with_config(Arc::clone(&self.outer_cfg), || {
+                binary::ran_before(self.workspace, unit)
+            });
+            if self.missing.contains(&unit) && was_ran_before {
                 self.reran.insert(unit);
             }
             let script = entry.map_err(Failure::from).and_then(|start| {
-                Ok((
-                    job(self.workspace, self.targets, unit, &start, &self.ran)?,
-                    start,
-                ))
+                let s = crate::with_config(Arc::clone(&self.outer_cfg), || {
+                    job(self.workspace, self.targets, unit, &start, &self.ran)
+                })?;
+                Ok((s, start))
             });
             match script {
                 Ok((script, start)) => {
@@ -716,7 +710,11 @@ impl Driver for Runs<'_, '_> {
                 .map_err(|error| {
                     Failure::from(format!("printed output that is not UTF-8: {error}"))
                 })
-                .and_then(|text| finished(self.workspace, unit, &script, &text)),
+                .and_then(|text| {
+                    crate::with_config(Arc::clone(&self.outer_cfg), || {
+                        finished(self.workspace, unit, &script, &text)
+                    })
+                }),
             (_, Some((error, item))) => Err(Failure {
                 error: format!("does not build: {error}"),
                 broken: self.owners.get(item.krate as usize).copied(),
@@ -735,7 +733,9 @@ impl Driver for Runs<'_, '_> {
             if !self.executables.contains(&unit) || failure.fatal {
                 return failure;
             }
-            binary::distrust(self.workspace, unit);
+            crate::with_config(Arc::clone(&self.outer_cfg), || {
+                binary::distrust(self.workspace, unit);
+            });
             Failure {
                 interrupted: true,
                 ..failure
