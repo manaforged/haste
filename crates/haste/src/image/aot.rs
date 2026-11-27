@@ -14,7 +14,7 @@ use crate::sema::Context;
 use crate::sema::reach::Reached;
 use crate::sync::lock;
 
-pub(super) mod cache;
+pub(crate) mod cache;
 mod emit;
 mod icf;
 mod queue;

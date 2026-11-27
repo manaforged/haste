@@ -23,7 +23,7 @@ pub(crate) mod reloc;
 mod simd;
 mod slice_pat;
 mod slots;
-mod stencil;
+pub(crate) mod stencil;
 mod stmt;
 
 pub(super) use abi::is_freeze_ty;

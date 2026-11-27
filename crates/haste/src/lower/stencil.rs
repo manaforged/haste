@@ -144,17 +144,17 @@ struct TemplateKey {
     sole: bool,
 }
 
-struct InlineTemplate {
-    body: Arc<Function>,
-    returns: bool,
-    reloc_plan: Arc<RelocPlan>,
-    height: u8,
-    size: u16,
-    form: Form,
+pub(crate) struct InlineTemplate {
+    pub(crate) body: Arc<Function>,
+    pub(crate) returns: bool,
+    pub(crate) reloc_plan: Arc<RelocPlan>,
+    pub(crate) height: u8,
+    pub(crate) size: u16,
+    pub(crate) form: Form,
 }
 
 impl InlineTemplate {
-    fn shape(&self) -> (bool, u8, u16) {
+    pub(crate) fn shape(&self) -> (bool, u8, u16) {
         (self.returns, self.height, self.size)
     }
 }

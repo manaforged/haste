@@ -398,14 +398,14 @@ fn try_cached_template<'a>(
     (reached, slots): (&Reached, &'a dyn Slots),
     key: &TemplateKey,
     (shape_only, open_ok, quiet): (bool, bool, &Quiet),
-) -> Result<Option<Option<Found>>, Option<persist::Disk<'a>>> {
+) -> Result<Option<(Option<Found>, bool)>, Option<persist::Disk<'a>>> {
     if slots.bodies().rejected.get(key).is_some() {
         tally(Tally::Hit);
-        return Ok(Some(None));
+        return Ok(Some((None, false)));
     }
     if let Some(template) = slots.bodies().templates.get(key) {
         tally(Tally::Hit);
-        return Ok(Some(Some(Found::Body(template, None))));
+        return Ok(Some((Some(Found::Body(template, None)), false)));
     }
     tally(Tally::Miss);
     let disk = if key.compact {
@@ -417,9 +417,10 @@ fn try_cached_template<'a>(
         && open_ok
         && let Some(shape) = disk.as_ref().and_then(persist::Disk::hit)
     {
-        return Ok(Some(shape.map(|(returns, height, size)| {
-            Found::Shape(returns, height, size)
-        })));
+        return Ok(Some((
+            shape.map(|(returns, height, size)| Found::Shape(returns, height, size)),
+            false,
+        )));
     }
     if !shape_only
         && open_ok
@@ -437,7 +438,7 @@ fn try_cached_template<'a>(
                 }
             }
         }
-        return Ok(Some(found.map(|t| Found::Body(t, None))));
+        return Ok(Some((found.map(|t| Found::Body(t, None)), true)));
     }
     Err(disk)
 }
@@ -534,6 +535,32 @@ fn lower_with_compact(
     Ok((lowered, true))
 }
 
+fn apply_inline_cache_hit(
+    bodies: &Bodies,
+    key: TemplateKey,
+    hit: crate::image::aot_cache::InlineCacheHit,
+) -> Option<InlineHit> {
+    use crate::image::aot_cache::InlineCacheHit;
+    match hit {
+        InlineCacheHit::Negative(footprint) => {
+            bodies
+                .rejected
+                .get_or_insert_with(TemplateKey { footprint, ..key }, || ());
+            None
+        }
+        InlineCacheHit::Shape(footprint, returns, height, size) => {
+            Some((footprint, Found::Shape(returns, height, size)))
+        }
+        InlineCacheHit::Body(footprint, template) => {
+            bodies.bump_transient();
+            let stored = bodies
+                .templates
+                .get_or_insert_with(TemplateKey { footprint, ..key }, || template);
+            Some((footprint, Found::Body(stored, None)))
+        }
+    }
+}
+
 fn ensure_inline_template_inner(
     cx: &mut Context<'_>,
     (reached, slots): (&Reached, &dyn Slots),
@@ -542,6 +569,34 @@ fn ensure_inline_template_inner(
     (limit, shape_only, quiet): (usize, bool, &Quiet),
 ) -> Result<(Option<InlineHit>, usize)> {
     let item = reached.list[index].0.0;
+    let depth = inline.stack.len().saturating_sub(1);
+    let cyclic = slots.bodies().is_cyclic(cx, reached, index);
+    let key_low = slots.low_entries();
+    let key_compact = inline.host.compact;
+    let key_sole = super::super::budget::stable_sole(cx, reached, index);
+    let aot_cache = slots.aot_cache();
+    if !cyclic
+        && quiet.holds(cx, slots)
+        && let Some(cache) = aot_cache.as_ref()
+        && let Some(hit) = cache.lookup_inline(
+            (slots, cx, reached),
+            index,
+            (limit, key_low, key_compact, key_sole, shape_only),
+        )
+    {
+        let probe_key = TemplateKey {
+            item,
+            footprint: FootprintId(0),
+            limit,
+            low: key_low,
+            compact: key_compact,
+            sole: key_sole,
+        };
+        return Ok((
+            apply_inline_cache_hit(slots.bodies(), probe_key, hit),
+            usize::MAX,
+        ));
+    }
     let fp_res = eval_footprint_with_cycle(cx, (reached, slots), inline, index);
     if inline.aborted {
         return Ok((None, usize::MAX));
@@ -555,11 +610,10 @@ fn ensure_inline_template_inner(
         item,
         footprint,
         limit,
-        low: slots.low_entries(),
-        compact: inline.host.compact,
-        sole: super::super::budget::stable_sole(cx, reached, index),
+        low: key_low,
+        compact: key_compact,
+        sole: key_sole,
     };
-    let depth = inline.stack.len().saturating_sub(1);
     let servable = shape_only && fp_cycle > depth;
     let disk = match try_cached_template(
         cx,
@@ -567,7 +621,30 @@ fn ensure_inline_template_inner(
         &key,
         (shape_only, fp_cycle > depth, quiet),
     ) {
-        Ok(Some(hit)) => return Ok((hit.map(|f| (footprint, f)), fp_cycle)),
+        Ok(Some((hit, from_disk))) => {
+            if from_disk
+                && !cyclic
+                && fp_cycle > depth
+                && quiet.holds(cx, slots)
+                && let Some(cache) = aot_cache.as_ref()
+            {
+                let empty_plan = RelocPlan::default();
+                let (tmpl, plan) = match &hit {
+                    Some(Found::Body(t, _)) => (Some(t), t.reloc_plan.as_ref()),
+                    _ => (None, &empty_plan),
+                };
+                cache.record_inline(
+                    (cx, reached),
+                    index,
+                    (limit, key.low, key.compact, key.sole),
+                    footprint,
+                    tmpl,
+                    plan,
+                    &[],
+                );
+            }
+            return Ok((hit.map(|f| (footprint, f)), fp_cycle));
+        }
         Ok(None) => None,
         Err(disk) => disk,
     };
@@ -602,6 +679,7 @@ fn ensure_inline_template_inner(
         return Ok((None, fp_cycle));
     };
     let cycle = fp_cycle.min(ir_cycle);
+    let plan_for_cache = Arc::clone(&reloc_plan);
     let template = pack_template(
         fit,
         reloc_plan,
@@ -618,6 +696,21 @@ fn ensure_inline_template_inner(
         template,
         (disk, quiet.holds(cx, slots), servable, cycle <= depth),
     );
+    if !cyclic
+        && cycle > depth
+        && quiet.holds(cx, slots)
+        && let Some(cache) = aot_cache.as_ref()
+    {
+        cache.record_inline(
+            (cx, reached),
+            index,
+            (limit, key.low, key.compact, key.sole),
+            footprint,
+            template.as_ref(),
+            &plan_for_cache,
+            &relocs,
+        );
+    }
     Ok((
         template.map(|t| (footprint, Found::Body(t, Some(relocs)))),
         cycle,

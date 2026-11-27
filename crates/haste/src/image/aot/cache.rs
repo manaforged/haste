@@ -1,6 +1,9 @@
 mod codec;
+mod inline;
+mod plan;
 mod relocs;
 mod tables;
+mod view;
 
 use std::hash::{Hash as _, Hasher as _};
 use std::path::{Path, PathBuf};
@@ -14,10 +17,8 @@ use crate::graph::store::home;
 use crate::image::Image;
 use crate::image::aot::{AotCode, AotFn, AotState};
 use crate::image::stencil::DictConfig;
-use crate::lower::{
-    RelocPlan, RodataId, RodataReloc, RodataTarget, Slots, SymbolSource, VtableEntry, VtableId,
-    Word,
-};
+use crate::lower::stencil::InlineTemplate;
+use crate::lower::{FootprintId, RelocPlan, Slots, SymbolSource};
 use crate::names::ItemRef;
 use crate::outline::Outline;
 use crate::outline::tree::Profile;
@@ -33,11 +34,11 @@ use codec::{
     parse_bundle_header, prune_stale_bundles, read_u32_le, read_u64_le, stable_entry_item_key,
     stable_substs_hash, touched_stamps_digest, write_bundle,
 };
+pub(crate) use inline::InlineCacheHit;
+use inline::{InlCache, inline_bundle_path};
 use relocs::{LocalFileIndex, collect_inlined_local_files, hash_str, stable_file_key};
-use tables::{
-    BundleEncoder, SharedTables, decode_symbol_list, read_code_span, read_rodata_span,
-    read_vtable_span,
-};
+use tables::{BundleEncoder, SharedTables, decode_symbol_list, read_code_span};
+use view::BundleView;
 
 const CACHE_MAGIC: [u8; 8] = *b"HSTAOT03";
 const CACHE_VERSION: u32 = 3;
@@ -145,20 +146,17 @@ struct CacheStats {
     tables_err: OnceLock<String>,
 }
 
-pub(in crate::image) struct AotCache {
+pub(crate) struct AotCache {
     path: PathBuf,
     config: AotConfigKey,
     stamps: Stamps,
     file_index: OnceLock<LocalFileIndex>,
     local_file_stamps: OnceLock<HashMap<u64, u64>>,
-    backing: Option<Backing>,
-    header: LoadedHeader,
-    tables: OnceLock<Option<SharedTables>>,
+    view: BundleView,
     decoded_codes: Box<[OnceLock<Option<Arc<AotCode>>>]>,
-    decoded_rodatas: Box<[OnceLock<Option<RodataId>>]>,
-    decoded_vtables: Box<[OnceLock<Option<VtableId>>]>,
     compiled_inlined: Mutex<HashMap<usize, Vec<(u32, u32)>>>,
     hit_inlined: Mutex<HashMap<usize, Vec<(u64, u64)>>>,
+    inl: InlCache,
     has_misses: AtomicBool,
     stats: CacheStats,
 }
@@ -188,13 +186,11 @@ impl AotCache {
         );
         let bundle_key = compute_bundle_key(cx.outline, reached, roots, config);
         let path = bundle_path(bundle_key);
-        let (backing, header) = match open_bundle(&path, config) {
-            Some((b, h)) => (Some(b), h),
-            None => (None, LoadedHeader::empty()),
-        };
-        let decoded_codes = (0..header.codes_count).map(|_| OnceLock::new()).collect();
-        let decoded_rodatas = (0..header.rodatas_count).map(|_| OnceLock::new()).collect();
-        let decoded_vtables = (0..header.vtables_count).map(|_| OnceLock::new()).collect();
+        let view = BundleView::open(&path, CACHE_MAGIC, CACHE_VERSION, config);
+        let decoded_codes = (0..view.header.codes_count)
+            .map(|_| OnceLock::new())
+            .collect();
+        let inl = InlCache::open(inline_bundle_path(&path), config);
         let stats = CacheStats::default();
         stats
             .open_us
@@ -205,21 +201,18 @@ impl AotCache {
             stamps,
             file_index: OnceLock::new(),
             local_file_stamps: OnceLock::new(),
-            backing,
-            header,
-            tables: OnceLock::new(),
+            view,
             decoded_codes,
-            decoded_rodatas,
-            decoded_vtables,
             compiled_inlined: Mutex::default(),
             hit_inlined: Mutex::default(),
+            inl,
             has_misses: AtomicBool::new(false),
             stats,
         })
     }
 
     pub(in crate::image) fn has_loaded_bundle(&self) -> bool {
-        self.backing.is_some()
+        self.view.has_backing()
     }
 
     pub(in crate::image) fn mark_miss(&self) {
@@ -252,21 +245,26 @@ impl AotCache {
         }
     }
 
-    pub(in crate::image) fn instance_key(
+    fn key_parts(
         &self,
         cx: &mut Context<'_>,
         reached: &Reached,
         index: usize,
         ty_memo: &mut HashMap<Ty, u64>,
-    ) -> Option<CacheInstanceKey> {
+        count_stats: bool,
+    ) -> Option<(u64, u64, u64, bool, bool)> {
         let ((item, substs), res) = reached.list.get(index)?;
         if res.is_err() {
-            self.stats.key_none.fetch_add(1, Ordering::Relaxed);
+            if count_stats {
+                self.stats.key_none.fetch_add(1, Ordering::Relaxed);
+            }
             return None;
         }
         let Some(item_key) = stable_entry_item_key(cx.outline, &self.stamps, *item) else {
-            self.stats.key_none.fetch_add(1, Ordering::Relaxed);
-            self.stats.key_item_none.fetch_add(1, Ordering::Relaxed);
+            if count_stats {
+                self.stats.key_none.fetch_add(1, Ordering::Relaxed);
+                self.stats.key_item_none.fetch_add(1, Ordering::Relaxed);
+            }
             return None;
         };
         let substs_hash = if substs.is_empty() {
@@ -275,20 +273,36 @@ impl AotCache {
             let Some(sh) =
                 stable_substs_hash(cx.outline, &cx.types, &self.stamps, *substs, ty_memo)
             else {
-                self.stats.key_none.fetch_add(1, Ordering::Relaxed);
-                self.stats.key_substs_none.fetch_add(1, Ordering::Relaxed);
+                if count_stats {
+                    self.stats.key_none.fetch_add(1, Ordering::Relaxed);
+                    self.stats.key_substs_none.fetch_add(1, Ordering::Relaxed);
+                }
                 return None;
             };
             sh
         };
         let Some(stamps_digest) = touched_stamps_digest(&cx.types, &self.stamps, *item, *substs)
         else {
-            self.stats.key_none.fetch_add(1, Ordering::Relaxed);
-            self.stats.key_stamps_none.fetch_add(1, Ordering::Relaxed);
+            if count_stats {
+                self.stats.key_none.fetch_add(1, Ordering::Relaxed);
+                self.stats.key_stamps_none.fetch_add(1, Ordering::Relaxed);
+            }
             return None;
         };
         let is_cold = cx.has_attr(*item, "cold");
         let may_unwind = reached.may_unwind(cx, index);
+        Some((item_key, substs_hash, stamps_digest, is_cold, may_unwind))
+    }
+
+    pub(in crate::image) fn instance_key(
+        &self,
+        cx: &mut Context<'_>,
+        reached: &Reached,
+        index: usize,
+        ty_memo: &mut HashMap<Ty, u64>,
+    ) -> Option<CacheInstanceKey> {
+        let (item_key, substs_hash, stamps_digest, is_cold, may_unwind) =
+            self.key_parts(cx, reached, index, ty_memo, true)?;
         let flags = u32::from(is_cold) | (u32::from(may_unwind) << 1);
         let (key_hi, key_lo) = hash_entry_128(
             self.config.config_digest,
@@ -305,6 +319,74 @@ impl AotCache {
             stamps_digest,
             flags,
         })
+    }
+
+    pub(crate) fn lookup_inline(
+        &self,
+        (slots, cx, reached): (&dyn Slots, &mut Context<'_>, &Reached),
+        index: usize,
+        (limit, low, compact, sole, shape_only): (usize, bool, bool, bool, bool),
+    ) -> Option<InlineCacheHit> {
+        if !self.inl.view.has_backing() {
+            self.inl.note_miss();
+            return None;
+        }
+        let mut ty_memo = HashMap::default();
+        let Some((item_key, substs_hash, stamps_digest, is_cold, may_unwind)) =
+            self.key_parts(cx, reached, index, &mut ty_memo, false)
+        else {
+            self.inl.note_miss();
+            return None;
+        };
+        let Some(key) = self.inl.key_for_entry(
+            (item_key, substs_hash, stamps_digest),
+            self.config.config_digest,
+            (limit, low, compact, sole, is_cold, may_unwind),
+        ) else {
+            self.inl.note_miss();
+            return None;
+        };
+        let local_stamps = self.local_file_stamps(cx.outline);
+        let hit = self.inl.lookup(
+            (slots, cx, reached),
+            key,
+            &self.file_index,
+            &self.stamps,
+            local_stamps,
+            shape_only,
+        );
+        if hit.is_none() {
+            self.inl.note_miss();
+        }
+        hit
+    }
+
+    pub(crate) fn record_inline(
+        &self,
+        (cx, reached): (&mut Context<'_>, &Reached),
+        index: usize,
+        (limit, low, compact, sole): (usize, bool, bool, bool),
+        footprint: FootprintId,
+        template: Option<&Arc<InlineTemplate>>,
+        plan: &RelocPlan,
+        relocs: &[SymbolSource],
+    ) {
+        let mut ty_memo = HashMap::default();
+        let Some((item_key, substs_hash, stamps_digest, is_cold, may_unwind)) =
+            self.key_parts(cx, reached, index, &mut ty_memo, false)
+        else {
+            return;
+        };
+        self.inl.record(
+            (cx, reached),
+            (item_key, substs_hash, stamps_digest),
+            self.config.config_digest,
+            (index, limit, low, compact, sole, is_cold, may_unwind),
+            footprint,
+            template,
+            plan,
+            relocs,
+        );
     }
 
     fn local_file_stamps(&self, outline: &Outline) -> &HashMap<u64, u64> {
@@ -327,138 +409,38 @@ impl AotCache {
     }
 
     fn shared_tables(&self, cx: &Context<'_>) -> Option<&SharedTables> {
-        let data = self.backing.as_ref()?.as_slice();
-        let res = self
-            .tables
-            .get_or_init(|| {
-                let started = Instant::now();
-                let file_index = self
-                    .file_index
-                    .get_or_init(|| LocalFileIndex::build(cx.outline));
-                let decoded = match SharedTables::decode(
-                    data,
-                    &self.header,
-                    cx.outline,
-                    &cx.types,
-                    file_index,
-                    &self.stamps,
-                ) {
-                    Ok(t) => Some(t),
-                    Err(err) => {
-                        drop(self.stats.tables_err.set(err.to_string()));
-                        None
-                    }
-                };
-                self.stats
-                    .tables_us
-                    .store(started.elapsed().as_micros() as usize, Ordering::Relaxed);
-                decoded
-            })
-            .as_ref();
+        let started = Instant::now();
+        let res = self.view.shared_tables(
+            cx.outline,
+            &cx.types,
+            &self.file_index,
+            &self.stamps,
+            Some(&self.stats.tables_err),
+        );
+        self.stats
+            .tables_us
+            .compare_exchange(
+                0,
+                started.elapsed().as_micros() as usize,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .ok();
         if res.is_none() {
             self.stats.tables_none.fetch_add(1, Ordering::Relaxed);
         }
         res
     }
 
-    fn blob_slice(&self, off: u32, len: u32) -> Option<&[u8]> {
-        let data = self.backing.as_ref()?.as_slice();
-        let off = off as usize;
-        let end = off.checked_add(len as usize)?;
-        if end > self.header.blob_len {
-            return None;
-        }
-        data.get(self.header.blob_off + off..self.header.blob_off + end)
-    }
-
     fn decode_code(&self, code_id: u32) -> Option<Arc<AotCode>> {
         let slot = self.decoded_codes.get(code_id as usize)?;
         slot.get_or_init(|| {
-            let data = self.backing.as_ref()?.as_slice();
-            let span = read_code_span(data, &self.header, code_id as usize)?;
-            let blob = self.blob_slice(span.code_off, span.code_len)?;
+            let data = self.view.backing.as_ref()?.as_slice();
+            let span = read_code_span(data, &self.view.header, code_id as usize)?;
+            let blob = self.view.blob_slice(span.code_off, span.code_len)?;
             decode_code_blob(blob)
         })
         .clone()
-    }
-
-    fn decode_rodata(
-        &self,
-        tables: &SharedTables,
-        image: &Image,
-        cx: &Context<'_>,
-        reached: &Reached,
-        id: u32,
-    ) -> Option<RodataId> {
-        let slot = self.decoded_rodatas.get(id as usize)?;
-        *slot.get_or_init(|| {
-            let data = self.backing.as_ref()?.as_slice();
-            let span = read_rodata_span(data, &self.header, id as usize)?;
-            let bytes = self.blob_slice(span.data_off, span.data_len)?;
-            let reloc_base = self.header.blob_off + span.reloc_off as usize;
-            let reloc_slice = data.get(reloc_base..self.header.blob_off + self.header.blob_len)?;
-            let mut cur = Cursor::new(reloc_slice);
-            let mut relocs = Vec::with_capacity((span.reloc_count as usize).min(4096));
-            for _ in 0..span.reloc_count {
-                let offset = cur.u32().ok()?;
-                let target = match cur.u8().ok()? {
-                    0 => {
-                        let child_id = cur.u32().ok()?;
-                        if child_id >= id {
-                            return None;
-                        }
-                        RodataTarget::Rodata(
-                            self.decode_rodata(tables, image, cx, reached, child_id)?,
-                        )
-                    }
-                    1 => {
-                        RodataTarget::Fn(tables.read_instance(&cx.types, reached, image, &mut cur)?)
-                    }
-                    _ => return None,
-                };
-                relocs.push(RodataReloc { offset, target });
-            }
-            Some(image.rodata(bytes, &relocs))
-        })
-    }
-
-    fn decode_vtable(
-        &self,
-        tables: &SharedTables,
-        image: &Image,
-        cx: &Context<'_>,
-        reached: &Reached,
-        id: u32,
-    ) -> Option<VtableId> {
-        let slot = self.decoded_vtables.get(id as usize)?;
-        *slot.get_or_init(|| {
-            let data = self.backing.as_ref()?.as_slice();
-            let span = read_vtable_span(data, &self.header, id as usize)?;
-            let entry_base = self.header.blob_off + span.entry_off as usize;
-            let entry_slice = data.get(entry_base..self.header.blob_off + self.header.blob_len)?;
-            let mut cur = Cursor::new(entry_slice);
-            let mut entries = Vec::with_capacity((span.entry_count as usize).min(1024));
-            for _ in 0..span.entry_count {
-                let entry = match cur.u8().ok()? {
-                    0 => VtableEntry::Word(Word::Int(cur.u64().ok()?)),
-                    1 => VtableEntry::Word(Word::Code(
-                        tables.read_instance(&cx.types, reached, image, &mut cur)?,
-                    )),
-                    2 => {
-                        let super_id = cur.u32().ok()?;
-                        if super_id >= id {
-                            return None;
-                        }
-                        VtableEntry::Super(
-                            self.decode_vtable(tables, image, cx, reached, super_id)?,
-                        )
-                    }
-                    _ => return None,
-                };
-                entries.push(entry);
-            }
-            Some(image.vtable_id(&entries))
-        })
     }
 
     pub(in crate::image) fn lookup_instance(
@@ -469,22 +451,22 @@ impl AotCache {
         cx: &Context<'_>,
         reached: &Reached,
     ) -> Option<(AotFn, u32)> {
-        let backing = self.backing.as_ref()?;
+        let backing = self.view.backing.as_ref()?;
         let data = backing.as_slice();
         let Some(idx) = find_record(
             data,
-            self.header.records_off,
-            self.header.records_count,
+            self.view.header.records_off,
+            self.view.header.records_count,
             (key.key_hi, key.key_lo),
         ) else {
             self.stats.lookup_none.fetch_add(1, Ordering::Relaxed);
             self.stats.lookup_find_miss.fetch_add(1, Ordering::Relaxed);
             return None;
         };
-        let rec = self.header.records_off + idx * RECORD_LEN;
+        let rec = self.view.header.records_off + idx * RECORD_LEN;
         let off = read_u32_le(data, rec + 16);
         let len = read_u32_le(data, rec + 20);
-        let Some(payload) = self.blob_slice(off, len).filter(|p| p.len() >= 40) else {
+        let Some(payload) = self.view.blob_slice(off, len).filter(|p| p.len() >= 40) else {
             self.stats.lookup_none.fetch_add(1, Ordering::Relaxed);
             return None;
         };
@@ -557,8 +539,14 @@ impl AotCache {
                 image,
                 &mut cur,
                 reloc_count,
-                |id| self.decode_rodata(tables, image, cx, reached, id),
-                |id| self.decode_vtable(tables, image, cx, reached, id),
+                |id| {
+                    self.view
+                        .decode_rodata(tables, image, &cx.types, reached, id)
+                },
+                |id| {
+                    self.view
+                        .decode_vtable(tables, image, &cx.types, reached, id)
+                },
             ) else {
                 self.stats.lookup_none.fetch_add(1, Ordering::Relaxed);
                 self.stats
@@ -621,11 +609,14 @@ impl AotCache {
         let lookup_item_none = self.stats.key_item_none.load(Ordering::Relaxed);
         let lookup_substs_none = self.stats.key_substs_none.load(Ordering::Relaxed);
         let lookup_stamps_none = self.stats.key_stamps_none.load(Ordering::Relaxed);
+        let (inl_loaded, inl_records, inl_hits, inl_misses) = self.inl.stats();
+        let aot_loaded = self.view.header.records_count > 0;
+        let aot_records = self.view.header.records_count;
         let mut flushed_records = 0usize;
         let mut flush_us = 0usize;
         if should_write && self.has_misses.load(Ordering::Relaxed) {
             let started = Instant::now();
-            drop(self.backing.take());
+            drop(self.view.backing.take());
             let mut ty_memo = HashMap::default();
             let mut entries = Vec::with_capacity(state.functions.len());
             for idx in 0..state.functions.len() {
@@ -649,13 +640,37 @@ impl AotCache {
                 }
             }
             if let Some(sections) = enc.finish()
-                && write_bundle(&self.path, self.config, &sections).is_ok()
+                && write_bundle(
+                    &self.path,
+                    CACHE_MAGIC,
+                    CACHE_VERSION,
+                    self.config,
+                    &sections,
+                )
+                .is_ok()
                 && let Some(dir) = self.path.parent()
             {
-                prune_stale_bundles(dir, &self.path, MAX_BUNDLES - 1);
+                prune_stale_bundles(dir, &self.path, "aot", MAX_BUNDLES - 1);
             }
             flush_us = started.elapsed().as_micros() as usize;
         }
+        let (inl_flushed, inl_flush_us) = if should_write {
+            let _ = self.local_file_stamps(cx.outline);
+            if let Some(local_stamps) = self.local_file_stamps.get() {
+                self.inl.flush(
+                    state,
+                    (cx, reached),
+                    self.config,
+                    &self.file_index,
+                    &self.stamps,
+                    local_stamps,
+                )
+            } else {
+                (0, 0)
+            }
+        } else {
+            (0, 0)
+        };
         if debug_enabled() {
             let s = &self.stats;
             let err = s.tables_err.get().map_or("none", String::as_str);
@@ -664,10 +679,10 @@ impl AotCache {
                 .load(Ordering::Relaxed)
                 .saturating_sub(lookup_key_none);
             eprintln!(
-                "[aot-cache] bundle={} loaded={} records={} hits={} misses={} key_none={} (item={} substs={} stamps={}) tables_none={} tables_err={err} lookup_none={} (find={} meta={} inlined={} code={} relocs={} tail={}) warm={} flushed={} flush_key_none={} open_ms={:.1} tables_ms={:.1} flush_ms={:.1}",
+                "[aot-cache] bundle={} loaded={} records={} hits={} misses={} key_none={} (item={} substs={} stamps={}) tables_none={} tables_err={err} lookup_none={} (find={} meta={} inlined={} code={} relocs={} tail={}) warm={} flushed={} flush_key_none={} open_ms={:.1} tables_ms={:.1} flush_ms={:.1} inl_loaded={} inl_records={} inl_hits={} inl_misses={} inl_flushed={} inl_flush_ms={:.1}",
                 self.path.file_name().and_then(|n| n.to_str()).unwrap_or(""),
-                self.header.records_count > 0,
-                self.header.records_count,
+                aot_loaded,
+                aot_records,
                 s.hits.load(Ordering::Relaxed),
                 s.misses.load(Ordering::Relaxed),
                 lookup_key_none,
@@ -688,6 +703,12 @@ impl AotCache {
                 s.open_us.load(Ordering::Relaxed) as f64 / 1000.0,
                 s.tables_us.load(Ordering::Relaxed) as f64 / 1000.0,
                 flush_us as f64 / 1000.0,
+                inl_loaded,
+                inl_records,
+                inl_hits,
+                inl_misses,
+                inl_flushed,
+                inl_flush_us as f64 / 1000.0,
             );
         }
     }
@@ -708,9 +729,14 @@ fn resolve_aot_fn(
     None
 }
 
-fn open_bundle(path: &Path, config: AotConfigKey) -> Option<(Backing, LoadedHeader)> {
+fn open_bundle(
+    path: &Path,
+    magic: [u8; 8],
+    version: u32,
+    config: AotConfigKey,
+) -> Option<(Backing, LoadedHeader)> {
     let backing = Backing::open(path, HEADER_LEN).ok()?;
-    let header = parse_bundle_header(backing.as_slice(), config)?;
+    let header = parse_bundle_header(backing.as_slice(), magic, version, config)?;
     Some((backing, header))
 }
 
@@ -745,5 +771,7 @@ fn compute_bundle_key(
     h.finish()
 }
 
+#[cfg(test)]
+mod inline_tests;
 #[cfg(test)]
 mod tests;

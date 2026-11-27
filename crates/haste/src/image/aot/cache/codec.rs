@@ -19,7 +19,7 @@ use crate::sync::lock;
 
 use super::relocs::{hash_str, item_check_key, stable_file_key};
 use super::tables::BundleSections;
-use super::{AotConfigKey, CACHE_MAGIC, CACHE_VERSION, HEADER_LEN, RECORD_LEN};
+use super::{AotConfigKey, HEADER_LEN, RECORD_LEN};
 
 const CODE_HEADER_LEN: usize = 28;
 
@@ -105,6 +105,8 @@ pub(super) fn read_u64_le(data: &[u8], at: usize) -> u64 {
 
 pub(super) fn write_bundle(
     path: &Path,
+    magic: [u8; 8],
+    version: u32,
     config: AotConfigKey,
     sec: &BundleSections,
 ) -> std::io::Result<()> {
@@ -117,8 +119,8 @@ pub(super) fn write_bundle(
     let blob_off = records_off + (sec.records.len() * RECORD_LEN) as u32;
     let blob_len = sec.blob.len() as u32;
     write_new_with(path, |writer| {
-        writer.write_all(&CACHE_MAGIC)?;
-        writer.write_all(&CACHE_VERSION.to_le_bytes())?;
+        writer.write_all(&magic)?;
+        writer.write_all(&version.to_le_bytes())?;
         writer.write_all(&0u32.to_le_bytes())?;
         writer.write_all(&config.config_digest.to_le_bytes())?;
         writer.write_all(&config.target_hash.to_le_bytes())?;
@@ -169,11 +171,16 @@ pub(super) fn write_bundle(
     })
 }
 
-pub(super) fn parse_bundle_header(data: &[u8], config: AotConfigKey) -> Option<LoadedHeader> {
-    if data.len() < HEADER_LEN || data[0..8] != CACHE_MAGIC {
+pub(super) fn parse_bundle_header(
+    data: &[u8],
+    magic: [u8; 8],
+    version: u32,
+    config: AotConfigKey,
+) -> Option<LoadedHeader> {
+    if data.len() < HEADER_LEN || data[0..8] != magic {
         return None;
     }
-    if read_u32_le(data, 8) != CACHE_VERSION {
+    if read_u32_le(data, 8) != version {
         return None;
     }
     if read_u64_le(data, 16) != config.config_digest
@@ -757,7 +764,7 @@ pub(super) fn hash_entry_128(
     (hi.finish(), lo.finish())
 }
 
-pub(super) fn prune_stale_bundles(dir: &Path, keep: &Path, keep_others: usize) {
+pub(super) fn prune_stale_bundles(dir: &Path, keep: &Path, ext: &str, keep_others: usize) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -765,7 +772,7 @@ pub(super) fn prune_stale_bundles(dir: &Path, keep: &Path, keep_others: usize) {
         .filter_map(|entry| {
             let entry = entry.ok()?;
             let path = entry.path();
-            if path == keep || path.extension().and_then(|e| e.to_str()) != Some("aot") {
+            if path == keep || path.extension().and_then(|e| e.to_str()) != Some(ext) {
                 return None;
             }
             let meta = entry.metadata().ok()?;

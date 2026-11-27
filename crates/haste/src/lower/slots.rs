@@ -69,6 +69,10 @@ pub trait Slots {
     ) -> Option<RelocPlan> {
         None
     }
+    /// Returns the active persistent AOT cache when building an AOT image.
+    fn aot_cache(&self) -> Option<std::sync::Arc<crate::image::aot_cache::AotCache>> {
+        None
+    }
     /// Resolves a symbolic relocation entry to its concrete 64-bit value in this image.
     fn resolve_symbol(&self, sym: &SymbolSource) -> u64 {
         match *sym {
