@@ -386,6 +386,8 @@ pub struct Env {
     pub fixed: bool,
     /// Whether `cfg(test)` is enabled for this crate.
     pub test: bool,
+    /// Manifest `[profile.*]` overrides for `debug_assertions` and `overflow_checks`.
+    pub profile_override: crate::graph::manifest::ProfileOverride,
     /// Process/client environment variables read by compile-time `env!`/`option_env!` expansions and the values observed.
     pub env_reads: std::sync::Mutex<rustc_hash::FxHashMap<String, Option<String>>>,
 }
@@ -450,9 +452,19 @@ impl Env {
         }
     }
 
+    /// Whether `cfg(debug_assertions)` holds in this crate's bodies.
+    pub fn debug_assertions(&self) -> bool {
+        self.profile_override
+            .debug_assertions
+            .unwrap_or_else(|| self.profile().contains(&"debug_assertions"))
+    }
+
     /// Whether rustc checks arithmetic for overflow in this crate's bodies.
     pub fn overflow_checks(&self) -> bool {
-        self.profile().contains(&"overflow_checks")
+        self.profile_override
+            .overflow_checks
+            .or(self.profile_override.debug_assertions)
+            .unwrap_or_else(|| self.profile().contains(&"overflow_checks"))
     }
 
     /// The profile cfgs that hold: none under the release profile, else the debug profile, or for a sysroot crate the release build rustc ships, whose UB checks follow the user crate.
@@ -467,6 +479,12 @@ impl Env {
     fn name(&self, name: &str) -> Truth {
         if name == "test" {
             return truth(self.test);
+        }
+        if name == "debug_assertions" {
+            return truth(self.debug_assertions());
+        }
+        if name == "overflow_checks" {
+            return truth(self.overflow_checks());
         }
         if self.target.has_name(name)
             || self.profile().contains(&name)
