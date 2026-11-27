@@ -171,7 +171,8 @@ pub(crate) fn run(func: &mut Function, post_inline: bool, target: &crate::Target
         target,
         post_inline,
     };
-    let has_join = cfg.rpo.len() > 1 && cfg.rpo.iter().any(|&b| cfg.pred_count(b) >= 2);
+    let single = cfg.rpo.len() <= 1;
+    let has_join = !single && cfg.rpo.iter().any(|&b| cfg.pred_count(b) >= 2);
     let (mut renamed, mut scan_changed, mut def_blocks) = (
         false,
         false,
@@ -181,11 +182,21 @@ pub(crate) fn run(func: &mut Function, post_inline: bool, target: &crate::Target
             Vec::new()
         },
     );
-    let (mut visited, mut added_phis) =
-        (vec![false; func.blocks.len()], vec![0u8; func.blocks.len()]);
-    let mut known_out: Vec<KnownLoads> =
-        (0..func.blocks.len()).map(|_| KnownLoads::new()).collect();
-    let mut block_bases: Vec<Vec<(MemBase, MemRoot)>> = vec![Vec::new(); func.blocks.len()];
+    let (mut visited, mut added_phis) = if single {
+        (Vec::new(), Vec::new())
+    } else {
+        (vec![false; func.blocks.len()], vec![0u8; func.blocks.len()])
+    };
+    let mut known_out: Vec<KnownLoads> = if single {
+        Vec::new()
+    } else {
+        (0..func.blocks.len()).map(|_| KnownLoads::new()).collect()
+    };
+    let mut block_bases: Vec<Vec<(MemBase, MemRoot)>> = if single {
+        Vec::new()
+    } else {
+        vec![Vec::new(); func.blocks.len()]
+    };
     let mut bufs = ScanBuf {
         kept: Vec::new(),
         pending_stores: Vec::new(),
@@ -195,7 +206,11 @@ pub(crate) fn run(func: &mut Function, post_inline: bool, target: &crate::Target
     for &block in &cfg.rpo {
         let (mut known, mut bases) =
             bw.entry_known(func, state.subst, &known_out, &block_bases, block);
-        let preds = eligible_join_preds(func, &cfg, &visited, block);
+        let preds = if single {
+            None
+        } else {
+            eligible_join_preds(func, &cfg, &visited, block)
+        };
         let mut join = JoinCtx {
             cfg: &cfg,
             bw: &bw,
@@ -218,9 +233,13 @@ pub(crate) fn run(func: &mut Function, post_inline: bool, target: &crate::Target
         if has_join {
             def_blocks.resize(func.types.len(), Some(block));
         }
-        visited[block.index()] = true;
+        if !single {
+            visited[block.index()] = true;
+            if func.successors(block).next().is_some() {
+                (known_out[block.index()], block_bases[block.index()]) = (known, bases);
+            }
+        }
         (scan_changed, changed, renamed) = (scan_changed | bc, changed | bc, renamed | br);
-        (known_out[block.index()], block_bases[block.index()]) = (known, bases);
     }
     if renamed {
         rename(func, state.subst);

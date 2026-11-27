@@ -412,29 +412,37 @@ pub(crate) fn plan<R: Copy + PartialEq + std::fmt::Debug>(
         copies: &copies,
     };
     let (passed_ints, passed_floats) = hints::passed(func, classify, regs.high_product);
-    let (homes, used) = allocate(
-        func,
-        &live,
-        &setup::int_class(
+    let (homes, used) = if ints.iter().any(|&p| p) {
+        allocate(
             func,
-            regs,
-            (order, copied, &elided),
-            params,
-            passed_ints,
-            &live.preserved_calls,
-        ),
-        &ints,
-        &hints,
-    );
+            &live,
+            &setup::int_class(
+                func,
+                regs,
+                (order, copied, &elided),
+                params,
+                passed_ints,
+                &live.preserved_calls,
+            ),
+            &ints,
+            &hints,
+        )
+    } else {
+        (vec![None; count], Vec::new())
+    };
     place(&mut locations, homes, Location::Reg);
     restore_promoted(&mut locations, promoted_consts, promoted_syms);
-    let (float_homes, used_floats) = allocate(
-        func,
-        &live,
-        &setup::float_class(regs, params, passed_floats, &live.preserved_calls),
-        &floats,
-        &hints,
-    );
+    let (float_homes, used_floats) = if floats.iter().any(|&p| p) {
+        allocate(
+            func,
+            &live,
+            &setup::float_class(regs, params, passed_floats, &live.preserved_calls),
+            &floats,
+            &hints,
+        )
+    } else {
+        (vec![None; count], Vec::new())
+    };
     place(&mut locations, float_homes, Location::Float);
     zero_vector_consts(func, &mut locations);
     let (pairs, deferred) = fold::pairs(func, &locations, &elided);

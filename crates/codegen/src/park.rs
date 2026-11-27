@@ -318,6 +318,7 @@ fn value_priority(
 const MAX_REQUEUE: u8 = 8;
 const RES_CHUNK: usize = 32;
 
+#[derive(Default)]
 struct BackIndex {
     entries: Vec<(u32, u32, usize, usize, bool)>,
     chunk_max: Vec<u32>,
@@ -325,6 +326,9 @@ struct BackIndex {
 
 impl BackIndex {
     fn new(back_args: &[(usize, usize)], live: &Live) -> Self {
+        if back_args.is_empty() {
+            return Self::default();
+        }
         let mut pairs = Vec::with_capacity(back_args.len() * 2);
         for &(param, arg) in back_args {
             if param != arg {
@@ -334,12 +338,9 @@ impl BackIndex {
         }
         pairs.sort_unstable();
         pairs.dedup();
-        let mut entries: Vec<(u32, u32, usize, usize, bool)> = pairs
+        let mut entries: Vec<_> = pairs
             .into_iter()
-            .filter_map(|(target, partner, is_param)| {
-                live.bounds(target)
-                    .map(|(s, e)| (s, e, target, partner, is_param))
-            })
+            .filter_map(|(t, p, ip)| live.bounds(t).map(|(s, e)| (s, e, t, p, ip)))
             .collect();
         entries.sort_unstable_by_key(|e| e.0);
         let chunk_max = entries
@@ -359,6 +360,9 @@ impl BackIndex {
         reserved: &mut Vec<F>,
     ) {
         reserved.clear();
+        if self.entries.is_empty() {
+            return;
+        }
         let bound = self.entries.partition_point(|e| e.0 <= end);
         for (c, chunk) in self.entries[..bound].chunks(RES_CHUNK).enumerate() {
             if self.chunk_max[c] < start {
@@ -658,6 +662,9 @@ pub(crate) fn allocate<F: Copy + PartialEq>(
     pooled: &[bool],
     hints: &Hints,
 ) -> (Vec<Option<F>>, Vec<F>) {
+    if !pooled.iter().any(|&p| p) {
+        return (vec![None; pooled.len()], Vec::new());
+    }
     let pool = pool(func, class, live, pooled, hints);
     if let Some(weights) = hints.weights {
         return allocate_weighted(func, live, &pool, pooled, hints, weights);
@@ -715,6 +722,15 @@ pub(crate) fn allocate<F: Copy + PartialEq>(
             pool.regs.len(),
             &mut reserved,
         );
+        let key = (
+            value,
+            start,
+            end,
+            wide_val,
+            needs_saved,
+            can_park,
+            has_free_saved,
+        );
         let mut chosen = choose_free(
             &pool,
             &holders,
@@ -725,18 +741,10 @@ pub(crate) fn allocate<F: Copy + PartialEq>(
             &[],
             &reserved,
             |s| used.contains(&pool.regs[s]),
-            (
-                value,
-                start,
-                end,
-                wide_val,
-                needs_saved,
-                can_park,
-                has_free_saved,
-            ),
+            key,
         );
         if chosen.is_none() {
-            let demote = (!wide_val)
+            if let Some(demote) = (!wide_val)
                 .then(|| {
                     find_demote_free(
                         &pool,
@@ -747,21 +755,8 @@ pub(crate) fn allocate<F: Copy + PartialEq>(
                         (ranges, start, value),
                     )
                 })
-                .flatten();
-            let victim = if demote.is_some() {
-                None
-            } else {
-                victim_slot_unweighted(
-                    &pool,
-                    &slots,
-                    &homes,
-                    live,
-                    &back_partners[value],
-                    (start, end, value),
-                    suits_any,
-                )
-            };
-            if let Some(demote) = demote {
+                .flatten()
+            {
                 apply_demote(
                     &pool,
                     live,
@@ -771,7 +766,15 @@ pub(crate) fn allocate<F: Copy + PartialEq>(
                     &demote,
                 );
                 chosen = Some(demote.slot);
-            } else if let Some(v) = victim {
+            } else if let Some(v) = victim_slot_unweighted(
+                &pool,
+                &slots,
+                &homes,
+                live,
+                &back_partners[value],
+                (start, end, value),
+                suits_any,
+            ) {
                 evict_slot(
                     Some(&mut holders[v.slot]),
                     &mut slots,

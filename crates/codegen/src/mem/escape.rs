@@ -1,5 +1,3 @@
-use rustc_hash::FxHashMap as HashMap;
-
 use crate::cfg::Cfg;
 use crate::ir::{
     AbiParam, ArgumentPurpose, Binary, Block, Convert, Function, InstData, Op, StackSlot, Value,
@@ -25,7 +23,7 @@ pub(super) struct SlotEscapes {
     pub(super) return_only: Vec<bool>,
     pub(super) noalias: Vec<bool>,
     pub(super) spilled: Vec<bool>,
-    pub(super) points: HashMap<u32, Vec<(u32, u32)>>,
+    pub(super) points: Vec<Vec<(u32, u32)>>,
 }
 
 /// Where an escaped slot's address leaves the function: blocks entered after an escape, and the escaping instructions.
@@ -65,7 +63,7 @@ impl SlotEscapes {
             return_only: vec![true; func.slots.len()],
             noalias: vec![false; func.signature.params.len()],
             spilled: vec![false; func.slots.len()],
-            points: HashMap::default(),
+            points: Vec::new(),
         }
     }
 }
@@ -467,7 +465,11 @@ pub(super) fn classify_uses(
         returns: Vec::new(),
     };
     let danger = std::cell::OnceCell::new();
-    let mut points: HashMap<u32, Vec<(u32, u32)>> = HashMap::default();
+    let mut points: Vec<Vec<(u32, u32)>> = if positions {
+        vec![Vec::new(); func.slots.len()]
+    } else {
+        Vec::new()
+    };
     let mut used: Vec<(Value, StackSlot, u32)> = Vec::new();
     for &b in &cfg.rpo {
         for (pos, &inst) in func.blocks[b.index()].insts.iter().enumerate() {
@@ -548,10 +550,7 @@ pub(super) fn classify_uses(
                             0
                         };
                     if after - before < uses {
-                        points
-                            .entry(s.0)
-                            .or_default()
-                            .push((b.index() as u32, pos as u32));
+                        points[s.index()].push((b.index() as u32, pos as u32));
                     }
                 }
             }
@@ -563,23 +562,22 @@ pub(super) fn classify_uses(
 }
 
 /// The escape frontier of every escaped, unspilled slot, omitted when any call may already see it.
-pub(super) fn frontiers(func: &Function, esc: &SlotEscapes) -> HashMap<u32, Frontier> {
+pub(super) fn frontiers(func: &Function, esc: &mut SlotEscapes) -> Vec<Option<Frontier>> {
     let words = func.blocks.len().div_ceil(64);
-    let wanted = |s: u32, pts: &Vec<(u32, u32)>| {
-        let idx = s as usize;
-        !esc.unescaped[idx] && !esc.spilled[idx] && !pts.is_empty()
-    };
+    let wanted =
+        |s: usize, pts: &Vec<(u32, u32)>| !esc.unescaped[s] && !esc.spilled[s] && !pts.is_empty();
     let active_count = esc
         .points
         .iter()
-        .filter(|&(&s, pts)| wanted(s, pts))
+        .enumerate()
+        .filter(|&(s, pts)| wanted(s, pts))
         .count();
     if active_count == 0 || active_count * words > FRONTIER_WORDS {
-        return HashMap::default();
+        return Vec::new();
     }
     let mut queue = Vec::new();
-    let mut out = HashMap::default();
-    for (&s, pts) in &esc.points {
+    let mut out = (0..func.slots.len()).map(|_| None).collect::<Vec<_>>();
+    for (s, pts) in esc.points.iter_mut().enumerate() {
         if !wanted(s, pts) {
             continue;
         }
@@ -597,13 +595,10 @@ pub(super) fn frontiers(func: &Function, esc: &SlotEscapes) -> HashMap<u32, Fron
                 }
             }
         }
-        out.insert(
-            s,
-            Frontier {
-                seen,
-                points: pts.clone(),
-            },
-        );
+        out[s] = Some(Frontier {
+            seen,
+            points: std::mem::take(pts),
+        });
     }
     out
 }

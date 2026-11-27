@@ -4,8 +4,6 @@ mod frame;
 mod loop_mem;
 mod roots;
 
-use rustc_hash::FxHashMap as HashMap;
-
 pub(crate) use alias::{
     KnownLoads, clobbers, clobbers_load, in_range, is_atomic_barrier, is_hard_barrier, is_rodata,
     may_alias, may_alias_at,
@@ -103,7 +101,7 @@ pub(crate) struct Provenance {
     pub affine: Vec<(Value, i64)>,
     pub spans: Vec<Option<(MemBase, i64, i64)>>,
     pub has_caller_loc: bool,
-    frontiers: HashMap<u32, escape::Frontier>,
+    frontiers: Vec<Option<escape::Frontier>>,
     inst_at: Vec<(u32, u32)>,
     frame: frame::FrameFacts,
 }
@@ -129,7 +127,7 @@ impl Provenance {
             (&tracked, has_caller_loc, symbol_defs, frame_runtime),
             affine,
         );
-        let esc = escape::classify_uses(
+        let mut esc = escape::classify_uses(
             func,
             cfg,
             &prov.slot_offsets,
@@ -137,7 +135,7 @@ impl Provenance {
             (is_spill, positions),
         );
         if positions {
-            prov.frontiers = escape::frontiers(func, &esc);
+            prov.frontiers = escape::frontiers(func, &mut esc);
         }
         prov.unescaped_slots = esc.unescaped;
         prov.addr_unescaped_slots = esc.addr_unescaped;
@@ -289,7 +287,7 @@ impl Provenance {
 
     /// Whether `slot`'s address may have left the function by the time `at` runs; `None` means anywhere.
     pub(crate) fn slot_escaped_at(&self, slot: StackSlot, at: Option<Inst>) -> bool {
-        let (Some(inst), Some(frontier)) = (at, self.frontiers.get(&slot.0)) else {
+        let (Some(inst), Some(frontier)) = (at, self.slot_frontier(slot)) else {
             return true;
         };
         self.inst_loc(inst).is_none_or(|loc| frontier.reached(loc))
@@ -297,7 +295,7 @@ impl Provenance {
 
     /// The precomputed escape frontier of `slot`, when one exists.
     pub(crate) fn slot_frontier(&self, slot: StackSlot) -> Option<&escape::Frontier> {
-        self.frontiers.get(&slot.0)
+        self.frontiers.get(slot.index()).and_then(Option::as_ref)
     }
 
     /// Whether `slot` has escaped by `at`, returning `false` for slots whose address never escapes.

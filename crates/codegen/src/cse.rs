@@ -34,8 +34,7 @@ struct Table {
     unary_src: Vec<Option<(Unary, Value)>>,
     conv_src: Vec<Option<(Convert, Value, Type)>>,
     select_def: Vec<Option<(Value, Value, Value)>>,
-    drop_buf: Vec<Key>,
-    const_count: usize,
+    const_epoch: u32,
 }
 
 impl Table {
@@ -115,20 +114,7 @@ impl Table {
             let prev = self.known.insert(tc_key, *result);
             self.added.push((tc_key, prev));
         }
-        if self.const_count > 0 {
-            self.drop_buf.clear();
-            self.drop_buf.extend(
-                self.known
-                    .keys()
-                    .copied()
-                    .filter(|k| matches!(k, Key::Const(..))),
-            );
-            for k in self.drop_buf.drain(..) {
-                let prev = self.known.remove(&k);
-                self.const_count -= usize::from(prev.is_some());
-                self.added.push((k, prev));
-            }
-        }
+        self.const_epoch = self.const_epoch.wrapping_add(1);
         true
     }
 
@@ -181,7 +167,6 @@ impl Table {
                     }
                 }
                 let prev = self.known.insert(key, result);
-                self.const_count += usize::from(prev.is_none() && matches!(key, Key::Const(..)));
                 self.added.push((key, prev));
                 true
             }
@@ -190,16 +175,15 @@ impl Table {
         mutated
     }
 
-    fn forget(&mut self, mark: usize) {
+    fn forget(&mut self, mark: usize, saved_epoch: u32) {
+        self.const_epoch = saved_epoch;
         for (key, prev) in self.added.drain(mark..).rev() {
-            let is_const = matches!(key, Key::Const(..));
             match prev {
                 Some(v) => {
-                    self.const_count +=
-                        usize::from(self.known.insert(key, v).is_none() && is_const);
+                    self.known.insert(key, v);
                 }
                 None => {
-                    self.const_count -= usize::from(self.known.remove(&key).is_some() && is_const);
+                    self.known.remove(&key);
                 }
             }
         }
@@ -208,7 +192,7 @@ impl Table {
 
 enum Visit {
     Enter(Block),
-    Leave(usize),
+    Leave(usize, u32),
 }
 
 struct Facts {
@@ -219,6 +203,13 @@ struct Facts {
     def_block: Vec<u32>,
     local_flag_only: Vec<bool>,
     has_narrow_uext: bool,
+    any_result: bool,
+    has_add_sub: bool,
+    has_stack_addr: bool,
+    has_assoc: bool,
+    has_unary: bool,
+    has_conv: bool,
+    has_select: bool,
 }
 
 fn record_def_fact(func: &Function, op: &Op, res: Value, facts: &mut Facts) {
@@ -241,23 +232,31 @@ fn record_def_fact(func: &Function, op: &Op, res: Value, facts: &mut Facts) {
             }
         }
         Op::Fcmp(..) | Op::Fits(..) => facts.bool_val[ri] = true,
-        Op::Convert(Convert::Uextend, x) => {
-            if facts.bool_val[x.index()] {
+        Op::Convert(conv, x) => {
+            facts.has_conv = true;
+            if conv == Convert::Uextend {
+                if facts.bool_val[x.index()] {
+                    facts.bool_val[ri] = true;
+                }
+                if matches!(func.ty(x), Type::I8 | Type::I16) {
+                    facts.has_narrow_uext = true;
+                }
+            }
+        }
+        Op::Binary(Binary::Band, x, y) => {
+            facts.has_assoc = true;
+            if facts.bool_val[x.index()] || facts.bool_val[y.index()] {
                 facts.bool_val[ri] = true;
             }
-            if matches!(func.ty(x), Type::I8 | Type::I16) {
-                facts.has_narrow_uext = true;
+        }
+        Op::Binary(Binary::Bor, x, y) => {
+            facts.has_assoc = true;
+            if facts.bool_val[x.index()] && facts.bool_val[y.index()] {
+                facts.bool_val[ri] = true;
             }
         }
-        Op::Binary(Binary::Band, x, y)
-            if facts.bool_val[x.index()] || facts.bool_val[y.index()] =>
-        {
-            facts.bool_val[ri] = true;
-        }
-        Op::Binary(Binary::Bor, x, y) if facts.bool_val[x.index()] && facts.bool_val[y.index()] => {
-            facts.bool_val[ri] = true;
-        }
         Op::Binary(Binary::Bxor, x, y) => {
+            facts.has_assoc = true;
             facts.bool_val[ri] = facts.bool_val[x.index()] && facts.bool_val[y.index()];
             if facts.consts[y.index()] == Some(1) && facts.bool_val[x.index()] {
                 facts.bool_neg[ri] = Some(x);
@@ -265,14 +264,22 @@ fn record_def_fact(func: &Function, op: &Op, res: Value, facts: &mut Facts) {
                 facts.bool_neg[ri] = Some(y);
             }
         }
-        Op::Binary(Binary::Isub, x, y)
-            if facts.consts[x.index()] == Some(1) && facts.bool_val[y.index()] =>
-        {
-            facts.bool_val[ri] = true;
-            facts.bool_neg[ri] = Some(y);
+        Op::Binary(Binary::Isub, x, y) => {
+            facts.has_add_sub = true;
+            if facts.consts[x.index()] == Some(1) && facts.bool_val[y.index()] {
+                facts.bool_val[ri] = true;
+                facts.bool_neg[ri] = Some(y);
+            }
         }
-        Op::Select(_, x, y) if facts.bool_val[x.index()] && facts.bool_val[y.index()] => {
-            facts.bool_val[ri] = true;
+        Op::Binary(Binary::Iadd, ..) => facts.has_add_sub = true,
+        Op::Binary(Binary::Imul, ..) => facts.has_assoc = true,
+        Op::Unary(Unary::Ineg | Unary::Bnot | Unary::Bswap, _) => facts.has_unary = true,
+        Op::StackAddr(..) => facts.has_stack_addr = true,
+        Op::Select(_, x, y) => {
+            facts.has_select = true;
+            if facts.bool_val[x.index()] && facts.bool_val[y.index()] {
+                facts.bool_val[ri] = true;
+            }
         }
         _ => {}
     }
@@ -288,6 +295,13 @@ fn collect_facts(func: &Function, cfg: &Cfg) -> Facts {
         def_block: vec![0_u32; n],
         local_flag_only: vec![false; n],
         has_narrow_uext: false,
+        any_result: false,
+        has_add_sub: false,
+        has_stack_addr: false,
+        has_assoc: false,
+        has_unary: false,
+        has_conv: false,
+        has_select: false,
     };
     let mut uses = vec![0_u32; n];
     let mut flag_cands: Vec<(Value, u32)> = Vec::new();
@@ -298,6 +312,7 @@ fn collect_facts(func: &Function, cfg: &Cfg) -> Facts {
             let data = &func.insts[inst.index()];
             data.op.for_operands(|v| uses[v.index()] += 1);
             if let Some(res) = data.result {
+                facts.any_result = true;
                 facts.def_block[res.index()] = btag;
                 record_def_fact(func, &data.op, res, &mut facts);
             }
@@ -326,11 +341,21 @@ pub(crate) fn run(func: &mut Function) -> Domain {
         return Domain::NONE;
     }
     let cfg = func.cfg();
-    let children = cfg.children();
+    let facts = collect_facts(func, &cfg);
+    if !facts.any_result && !facts.has_narrow_uext {
+        return Domain::NONE;
+    }
     let nvals = func.types.len();
     let mut subst = identity(nvals);
-    let facts = collect_facts(func, &cfg);
-    let affine = identity(nvals).into_iter().map(|v| (v, 0_i64)).collect();
+    let children = cfg.children();
+    let affine = if facts.has_add_sub {
+        identity(nvals).into_iter().map(|v| (v, 0_i64)).collect()
+    } else {
+        Vec::new()
+    };
+    fn opt_vec<T: Clone>(need: bool, len: usize) -> Vec<Option<T>> {
+        if need { vec![None; len] } else { Vec::new() }
+    }
     let mut table = Table {
         consts: facts.consts,
         bool_neg: facts.bool_neg,
@@ -339,19 +364,19 @@ pub(crate) fn run(func: &mut Function) -> Domain {
         local_flag_only: facts.local_flag_only,
         bool_val: facts.bool_val,
         affine,
-        stack_addrs: vec![None; nvals],
-        assoc: vec![None; nvals],
-        unary_src: vec![None; nvals],
-        conv_src: vec![None; nvals],
-        select_def: vec![None; nvals],
+        stack_addrs: opt_vec(facts.has_stack_addr, nvals),
+        assoc: opt_vec(facts.has_assoc || facts.has_conv, nvals),
+        unary_src: opt_vec(facts.has_unary, nvals),
+        conv_src: opt_vec(facts.has_conv, nvals),
+        select_def: opt_vec(facts.has_select, nvals),
         ..Table::default()
     };
     let (mut dropped, mut stack) = (false, vec![Visit::Enter(entry)]);
     while let Some(visit) = stack.pop() {
         match visit {
-            Visit::Leave(mark) => table.forget(mark),
+            Visit::Leave(mark, saved_epoch) => table.forget(mark, saved_epoch),
             Visit::Enter(block) => {
-                stack.push(Visit::Leave(table.added.len()));
+                stack.push(Visit::Leave(table.added.len(), table.const_epoch));
                 dropped |= table.scan(func, block, &mut subst);
                 stack.extend(
                     children[block.index()]

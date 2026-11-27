@@ -53,7 +53,8 @@ impl Table {
                 return Some(Err(base));
             }
             if ty == Type::I64
-                && let Some((slot, base_off)) = self.stack_addrs[base.index()]
+                && let Some((slot, base_off)) =
+                    self.stack_addrs.get(base.index()).copied().flatten()
                 && let Some(total) = i32::try_from(delta as i64)
                     .ok()
                     .and_then(|d| base_off.checked_add(d))
@@ -71,7 +72,14 @@ impl Table {
             let (a, b) = order_pair(Operand::Val(root), Operand::Imm(ty, total));
             return Some(Ok(Key::Binary(Binary::Iadd, a, b)));
         }
-        key(op, &self.consts, &self.bool_neg, types, ty, subst).map(Ok)
+        key(
+            op,
+            (&self.consts, &self.bool_neg, self.const_epoch),
+            types,
+            ty,
+            subst,
+        )
+        .map(Ok)
     }
 
     fn norm_assoc_bin(
@@ -93,7 +101,14 @@ impl Table {
             _ => None,
         };
         let Some((v, raw_imm)) = val_imm else {
-            return key(op, &self.consts, &self.bool_neg, types, ty, subst).map(Ok);
+            return key(
+                op,
+                (&self.consts, &self.bool_neg, self.const_epoch),
+                types,
+                ty,
+                subst,
+            )
+            .map(Ok);
         };
         let imm = extend(raw_imm, ty, false);
         let all_ones = extend(-1, ty, false);
@@ -127,7 +142,7 @@ impl Table {
             None
         };
         if let Some(cval) = known_const
-            && let Some(&existing) = self.known.get(&Key::Const(ty, cval))
+            && let Some(&existing) = self.known.get(&Key::Const(self.const_epoch, ty, cval))
         {
             return Some(Err(existing));
         }
@@ -250,7 +265,7 @@ impl Table {
         );
         if a == b {
             let cval = i64::from(crate::fold::holds(cc, x_ty, 0, 0));
-            if let Some(&existing) = self.known.get(&Key::Const(ty, cval)) {
+            if let Some(&existing) = self.known.get(&Key::Const(self.const_epoch, ty, cval)) {
                 return Some(Err(existing));
             }
         }
@@ -261,7 +276,9 @@ impl Table {
                 if ity == Type::I8 {
                     return Some(Err(v));
                 }
-                if let Some((Convert::Uextend, inner, Type::I8)) = self.conv_src[v.index()] {
+                if let Some((Convert::Uextend, inner, Type::I8)) =
+                    self.conv_src.get(v.index()).copied().flatten()
+                {
                     return Some(Err(find(subst, inner)));
                 }
             }
@@ -324,7 +341,14 @@ impl Table {
                 if let Operand::Imm(_, 0) = operand(&self.consts, types, subst, y) {
                     return Some(Err(find(subst, x)));
                 }
-                key(op, &self.consts, &self.bool_neg, types, ty, subst).map(Ok)
+                key(
+                    op,
+                    (&self.consts, &self.bool_neg, self.const_epoch),
+                    types,
+                    ty,
+                    subst,
+                )
+                .map(Ok)
             }
             Op::Binary(bin @ (Binary::Iadd | Binary::Isub), x, y) if ty.is_small_int() => {
                 self.norm_add_sub(op, bin, (x, y), types, ty, result, subst)
@@ -337,7 +361,14 @@ impl Table {
             Op::Convert(conv, x) => self.norm_convert(conv, x, types, ty, result, subst),
             Op::Icmp(cc, x, y) => self.norm_icmp(cc, x, y, types, ty, subst),
             Op::Select(c, x, y) => self.norm_select(c, x, y, types, result, subst),
-            _ => key(op, &self.consts, &self.bool_neg, types, ty, subst).map(Ok),
+            _ => key(
+                op,
+                (&self.consts, &self.bool_neg, self.const_epoch),
+                types,
+                ty,
+                subst,
+            )
+            .map(Ok),
         }
     }
 }
