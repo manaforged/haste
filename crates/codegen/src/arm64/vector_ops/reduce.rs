@@ -1,8 +1,9 @@
 use super::super::asm::{Alu, Cond, Reg, Shift, Size, Vreg, ZR};
+use super::super::int::encode_bitmask_imm;
 use super::super::vector::{V2, V3, VecSpec};
 use super::super::{A, C, D, Emit, IP, V0};
 use super::{NEON_AND, NEON_EOR, NEON_EXT, NEON_ORR, NEON_SMAX, NEON_SMIN, NEON_UMAX, NEON_UMIN};
-use crate::ir::{Lane, ReduceOp, Value};
+use crate::ir::{Binary, Convert, Function, Inst, Lane, Op, ReduceOp, Unary, Value};
 
 impl Emit<'_> {
     pub(in super::super) fn vec_reduce(
@@ -15,7 +16,7 @@ impl Emit<'_> {
         let src = self.fin(vec, V0);
         if op == ReduceOp::Movemask {
             let dst = self.dst(result);
-            self.vec_movemask(spec, dst, src);
+            self.vec_movemask(spec, dst, src, vec);
             self.put(result, dst);
             return Ok(());
         }
@@ -136,9 +137,18 @@ impl Emit<'_> {
         self.put(result, dst);
     }
 
-    fn vec_movemask(&mut self, spec: VecSpec, dst: Reg, source: Vreg) {
+    fn vec_movemask(&mut self, spec: VecSpec, dst: Reg, source: Vreg, val: Value) {
         match spec.lane {
-            Lane::I8 | Lane::I16 => self.movemask_mul(spec, dst, source),
+            Lane::I8 | Lane::I16 => {
+                if spec.lane == Lane::I8
+                    && spec.q == 1
+                    && is_byte_bool_mask(self.func, &self.defs, val, 4)
+                    && self.movemask_shrn(dst, source)
+                {
+                    return;
+                }
+                self.movemask_mul(spec, dst, source);
+            }
             Lane::I32 | Lane::F32 => self.movemask_i32(spec.count, dst, source),
             Lane::I64 | Lane::F64 => {
                 if spec.count == 1 {
@@ -154,6 +164,34 @@ impl Emit<'_> {
                 }
             }
         }
+    }
+
+    fn movemask_shrn(&mut self, dst: Reg, source: Vreg) -> bool {
+        let (Some(m1), Some(m2), Some(m3), Some(m4)) = (
+            encode_bitmask_imm(0x1111_1111_1111_1111, true),
+            encode_bitmask_imm(0x0303_0303_0303_0303, true),
+            encode_bitmask_imm(0x000F_000F_000F_000F, true),
+            encode_bitmask_imm(0xFFFF, true),
+        ) else {
+            return false;
+        };
+        self.clobber_vreg(V2);
+        self.v_two(0x0F0C_8400, V2, source);
+        self.asm.fmov_out(true, A, V2);
+        self.clobber_reg(A);
+        self.asm.alu_bitmask(Alu::And, Size::X, m1, A, A);
+        self.asm
+            .alu_shifted(Alu::Orr, Size::X, Shift::Lsr, 3, A, A, A);
+        self.asm.alu_bitmask(Alu::And, Size::X, m2, A, A);
+        self.asm
+            .alu_shifted(Alu::Orr, Size::X, Shift::Lsr, 6, A, A, A);
+        self.asm.alu_bitmask(Alu::And, Size::X, m3, A, A);
+        self.asm
+            .alu_shifted(Alu::Orr, Size::X, Shift::Lsr, 12, A, A, A);
+        self.asm
+            .alu_shifted(Alu::Orr, Size::X, Shift::Lsr, 24, A, A, A);
+        self.asm.alu_bitmask(Alu::And, Size::X, m4, dst, A);
+        true
     }
 
     fn movemask_mul(&mut self, spec: VecSpec, dst: Reg, source: Vreg) {
@@ -215,5 +253,107 @@ impl Emit<'_> {
         self.asm.lsr_imm(C, C, 63);
         self.asm
             .alu_shifted(Alu::Orr, Size::X, Shift::Lsl, 3, dst, dst, C);
+    }
+}
+
+fn is_byte_bool_mask(func: &Function, defs: &[Option<Inst>], val: Value, depth: u8) -> bool {
+    if depth == 0 {
+        return false;
+    }
+    let Some(inst) = defs.get(val.index()).copied().flatten() else {
+        return false;
+    };
+    match func.insts[inst.index()].op {
+        Op::Icmp(..) | Op::Fcmp(..) => true,
+        Op::Unary(Unary::Bnot, inner) => is_byte_bool_mask(func, defs, inner, depth - 1),
+        Op::Binary(Binary::Band | Binary::Bor | Binary::Bxor, a, b) => {
+            is_byte_bool_mask(func, defs, a, depth - 1)
+                && is_byte_bool_mask(func, defs, b, depth - 1)
+        }
+        Op::Convert(Convert::Bitcast, inner)
+            if func.ty(inner).is_vector() && func.ty(inner).bytes() == func.ty(val).bytes() =>
+        {
+            is_byte_bool_mask(func, defs, inner, depth - 1)
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ir::{IntCC, Lane, ReduceOp, Type};
+    use crate::{
+        AbiParam, CallConv, Effort, Function, FunctionBuilder, Signature, Target, compile,
+    };
+
+    fn words(bytes: &[u8]) -> Vec<u32> {
+        bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    #[test]
+    fn arm64_cmp_movemask_uses_shrn_without_madd() {
+        let mut target = *Target::find("aarch64-apple-darwin").expect("arm64 target");
+        target.effort = Effort::Full;
+        let vty = Type::Vec {
+            lane: Lane::I8,
+            count: 16,
+        };
+        let mut sig = Signature::new(CallConv::Internal);
+        sig.params.push(AbiParam::new(vty));
+        sig.params.push(AbiParam::new(vty));
+        sig.returns.push(AbiParam::new(Type::I32));
+        let mut func = Function::new(sig);
+        {
+            let mut b = FunctionBuilder::new(&mut func);
+            let entry = b.create_block();
+            b.append_block_params_for_function_params(entry);
+            let p = b.block_params(entry).to_vec();
+            b.switch_to_block(entry);
+            let eq = b.ins().icmp(IntCC::Equal, p[0], p[1]);
+            let mask = b.ins().reduce(ReduceOp::Movemask, eq);
+            b.ins().return_(&[mask]);
+        }
+        let code = compile(func, &target).expect("arm64 movemask compiles");
+        let w = words(code.bytes());
+        assert!(
+            w.iter().any(|&insn| (insn & 0xFFFF_FC00) == 0x0F0C_8400),
+            "expected shrn.8b in {w:#x?}"
+        );
+        assert!(
+            !w.iter().any(|&insn| (insn & 0x7FE0_8000) == 0x1B00_0000),
+            "unexpected madd/mul in {w:#x?}"
+        );
+    }
+
+    #[test]
+    fn arm64_arbitrary_byte_movemask_keeps_general_mul_path() {
+        let mut target = *Target::find("aarch64-apple-darwin").expect("arm64 target");
+        target.effort = Effort::Full;
+        let vty = Type::Vec {
+            lane: Lane::I8,
+            count: 16,
+        };
+        let mut sig = Signature::new(CallConv::Internal);
+        sig.params.push(AbiParam::new(vty));
+        sig.returns.push(AbiParam::new(Type::I32));
+        let mut func = Function::new(sig);
+        {
+            let mut b = FunctionBuilder::new(&mut func);
+            let entry = b.create_block();
+            b.append_block_params_for_function_params(entry);
+            let p = b.block_params(entry)[0];
+            b.switch_to_block(entry);
+            let mask = b.ins().reduce(ReduceOp::Movemask, p);
+            b.ins().return_(&[mask]);
+        }
+        let code = compile(func, &target).expect("arm64 general movemask compiles");
+        let w = words(code.bytes());
+        assert!(
+            w.iter().any(|&insn| (insn & 0xFFE0_8000) == 0x9B00_0000),
+            "expected 64-bit mul/madd for general byte input in {w:#x?}"
+        );
     }
 }

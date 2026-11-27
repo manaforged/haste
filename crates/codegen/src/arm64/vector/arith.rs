@@ -106,8 +106,20 @@ impl Emit<'_> {
         y: Value,
         result: Value,
     ) -> Result<(), String> {
-        let spec = VecSpec::of(self.ty(x))?;
+        let ty = self.ty(x);
+        let spec = VecSpec::of(ty)?;
         let dst = self.fdst(result);
+        if let Some((word, a, b)) =
+            super::super::fuse::pairwise_binary_parts(self.func, &self.plan, (op, ty, x, y), |v| {
+                self.defs[v.index()]
+            })
+        {
+            let va = self.fin(a, V0);
+            let vb = self.fin(b, V1);
+            self.asm.vbit(word, dst, va, vb);
+            self.fput(result, dst);
+            return Ok(());
+        }
         let a = self.fin(x, V0);
         if matches!(op, Binary::Ishl | Binary::Ushr | Binary::Sshr)
             && let Some(imm) = self.splat_const_lane(y)
@@ -370,5 +382,80 @@ impl Emit<'_> {
             _ => unreachable!(),
         };
         self.v_two(base | (enc_imm << 16), dst, src);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ir::{Binary, Lane, Type};
+    use crate::{
+        AbiParam, CallConv, Effort, Function, FunctionBuilder, Signature, Target, compile,
+    };
+
+    fn words(bytes: &[u8]) -> Vec<u32> {
+        bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    fn compile_pairwise(op: Binary, lane: Lane, count: u8) -> Vec<u32> {
+        let mut target = *Target::find("aarch64-apple-darwin").expect("arm64 target");
+        target.effort = Effort::Full;
+        let vty = Type::Vec { lane, count };
+        let mut sig = Signature::new(CallConv::Internal);
+        sig.params.push(AbiParam::new(vty));
+        sig.params.push(AbiParam::new(vty));
+        sig.returns.push(AbiParam::new(vty));
+        let mut func = Function::new(sig);
+        {
+            let mut b = FunctionBuilder::new(&mut func);
+            let entry = b.create_block();
+            b.append_block_params_for_function_params(entry);
+            let p = b.block_params(entry).to_vec();
+            b.switch_to_block(entry);
+            let mut even_mask = [0_u8; 16];
+            let mut odd_mask = [0_u8; 16];
+            for i in 0..usize::from(count) {
+                even_mask[i] = (2 * i) as u8;
+                odd_mask[i] = (2 * i + 1) as u8;
+            }
+            let even = b.ins().shuffle(p[0], p[1], even_mask);
+            let odd = b.ins().shuffle(p[0], p[1], odd_mask);
+            let res = match op {
+                Binary::Iadd => b.ins().iadd(even, odd),
+                Binary::Umax => b.ins().umax(even, odd),
+                Binary::Fadd => b.ins().fadd(even, odd),
+                _ => unreachable!(),
+            };
+            b.ins().return_(&[res]);
+        }
+        let code = compile(func, &target).expect("arm64 pairwise compiles");
+        words(code.bytes())
+    }
+
+    #[test]
+    fn arm64_fuses_even_odd_shuffles_into_pairwise_neon_ops() {
+        let umaxp = compile_pairwise(Binary::Umax, Lane::I8, 16);
+        assert!(
+            umaxp.iter().any(|&w| (w & 0xFFE0_FC00) == 0x6E20_A400),
+            "expected umaxp.16b in {umaxp:#x?}"
+        );
+        assert!(
+            !umaxp.iter().any(|&w| (w & 0xBFE0_BC00) == 0x0E00_1800),
+            "unexpected uzp1/uzp2 in {umaxp:#x?}"
+        );
+
+        let addp = compile_pairwise(Binary::Iadd, Lane::I8, 16);
+        assert!(
+            addp.iter().any(|&w| (w & 0xFFE0_FC00) == 0x4E20_BC00),
+            "expected addp.16b in {addp:#x?}"
+        );
+
+        let faddp = compile_pairwise(Binary::Fadd, Lane::F32, 4);
+        assert!(
+            faddp.iter().any(|&w| (w & 0xFFE0_FC00) == 0x6E20_D400),
+            "expected faddp.4s in {faddp:#x?}"
+        );
     }
 }

@@ -5,7 +5,7 @@ use crate::frame::Frame;
 use crate::ir::{Function, Inst, Op, Value};
 use crate::reloc::{FRAME_CACHE_DEPTH, RelocKind, RuntimeSymbol, StencilReloc};
 
-const ARM64_NOP: u32 = 0xD503_201F;
+pub(super) const ARM64_NOP: u32 = 0xD503_201F;
 
 #[derive(Clone, Copy)]
 pub(super) enum TlvInitSym {

@@ -21,7 +21,7 @@ pub(super) use cmp::{cmn_parts, cmn_sum_parts};
 pub(super) use flag::{cinc_operand, preserves_flags, zero_cmp_operand};
 use flag::{fuse_fits, fuse_icmp_flags, fuse_icmp_selects};
 use mem::try_fuse_vec_op;
-pub(super) use mem::{encode_neon_movi, madd_parts, store_source};
+pub(super) use mem::{encode_neon_movi, madd_parts, pairwise_binary_parts, store_source};
 pub(super) use sign::sign_bit_test;
 
 pub(super) fn def_entry(

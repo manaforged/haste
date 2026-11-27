@@ -4,6 +4,7 @@ mod vec;
 use self::sib::parse_sib_base_op;
 pub(super) use self::sib::try_fuse_sib;
 pub(in crate::arm64) use self::vec::encode_neon_movi;
+pub(in crate::arm64) use self::vec::pairwise_binary_parts;
 pub(super) use self::vec::{const_splat, try_fuse_vec_op};
 use super::super::asm::Reg;
 use super::{elided_use_end, local_single, preserved};
