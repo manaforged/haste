@@ -198,6 +198,7 @@ fn expand(
         preload_roots.push(pair[0].krate as usize);
         preload_roots.extend(bound.iter().map(|(call, ..)| call.krate as usize));
         preload_macro_crates(compilation, &preload_roots)?;
+        let (selected, _) = dep_closure(&compilation.outline, &preload_roots);
         let (mut demand, mut roots) = match compilation.expander.take() {
             Some(kept) if kept.matches(&compilation.outline) => (kept.jit, kept.roots),
             _ => {
@@ -233,7 +234,7 @@ fn expand(
                 Answer::Nothing
             })
         };
-        let ran = run_macros(compilation, &mut demand, &jobs, &ask);
+        let ran = run_macros(compilation, &mut demand, &jobs, &selected, &ask);
         drop(jobs);
         let ran = ran?;
         roots.push(pair[0].krate as usize);

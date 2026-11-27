@@ -30,6 +30,9 @@ impl Image {
     ) -> Result<Foreign, String> {
         let item = reached.list[index].0.0;
         let Some(block) = cx.global_asm(item) else {
+            if self.backend.is_check() {
+                return Ok(Foreign::Asm(0));
+            }
             return resolve_host_symbol(cx, item, !self.backend.is_jit())
                 .map(|(sym, address)| Foreign::Host(sym, address))
                 .map_err(|error| unread(cx, error));

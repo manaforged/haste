@@ -57,7 +57,12 @@ impl Libraries {
 
 /// Loads the libraries that the build scripts of the crates in `outline` link and that this process has not loaded yet.
 pub fn load(outline: &Outline) -> Result<()> {
-    let mut libraries = libraries(outline)?;
+    load_selected(outline, None)
+}
+
+/// Loads the libraries linked by the selected crates in `outline` (or every crate when `selected` is `None`).
+pub fn load_selected(outline: &Outline, selected: Option<&[bool]>) -> Result<()> {
+    let mut libraries = libraries(outline, selected)?;
     let mut loaded = LOADED
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -87,13 +92,15 @@ pub fn symbol(name: &str) -> Option<usize> {
 }
 
 /// What the build scripts that ran for the crates of `outline` link, each archive found first in the search directories of the script that asked for it.
-fn libraries(outline: &Outline) -> Result<Libraries> {
+fn libraries(outline: &Outline, selected: Option<&[bool]>) -> Result<Libraries> {
     let mut wanted = Vec::new();
     let mut libraries = Libraries::default();
     for script in outline
         .crates
         .iter()
-        .filter_map(|krate| krate.env.script.as_ref())
+        .enumerate()
+        .filter(|&(k, _)| selected.is_none_or(|mask| mask.get(k).copied().unwrap_or(false)))
+        .filter_map(|(_, krate)| krate.env.script.as_ref())
     {
         let own: Vec<PathBuf> = script.search_dirs().map(PathBuf::from).collect();
         for (kind, name) in script.link_libs() {
@@ -150,7 +157,7 @@ fn archive(own: &[PathBuf], search: &[PathBuf], name: &str) -> Result<PathBuf> {
 
 /// Returns the cached shared library bundling static C archives linked by `outline`'s build scripts, linking it if needed.
 pub fn bundle(outline: &Outline) -> Result<Option<PathBuf>> {
-    let libraries = libraries(outline)?;
+    let libraries = libraries(outline, None)?;
     if libraries.archives.is_empty() {
         return Ok(None);
     }

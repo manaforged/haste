@@ -214,17 +214,35 @@ impl ScriptDag {
     }
 
     fn ready_build_units(&self, workspace: &Workspace, failed: &HashSet<usize>) -> Vec<usize> {
-        let mut pending = Vec::new();
-        let mut ready = Vec::new();
-        for &unit in &self.script_units {
-            if workspace.graph.units[unit].script.is_none() && !failed.contains(&unit) {
-                pending.push(unit);
-                if self.build_rem[unit] == 0 {
-                    ready.push(unit);
-                }
+        let pending: Vec<usize> = self
+            .script_units
+            .iter()
+            .copied()
+            .filter(|&u| workspace.graph.units[u].script.is_none() && !failed.contains(&u))
+            .collect();
+        let mut ready: HashSet<usize> = pending
+            .iter()
+            .copied()
+            .filter(|&u| self.build_rem[u] == 0)
+            .collect();
+        loop {
+            let blocked: HashSet<usize> = pending
+                .iter()
+                .filter(|d| !ready.contains(d))
+                .flat_map(|&d| self.links_users[d].iter().copied())
+                .collect();
+            let before = ready.len();
+            ready.retain(|u| !blocked.contains(u));
+            if ready.len() == before {
+                break;
             }
         }
-        if ready.is_empty() { pending } else { ready }
+        let ordered: Vec<usize> = pending
+            .iter()
+            .copied()
+            .filter(|u| ready.contains(u))
+            .collect();
+        if ordered.is_empty() { pending } else { ordered }
     }
 
     fn finish_unit(
@@ -234,25 +252,22 @@ impl ScriptDag {
         unit: usize,
         kept_queue: &mut VecDeque<usize>,
     ) {
-        for &user in &self.build_users[unit] {
-            self.build_rem[user] = self.build_rem[user].saturating_sub(1);
-            if self.build_rem[user] == 0
-                && self.links_rem[user] == 0
+        let mut wake = |this: &Self, user: usize| {
+            if this.build_rem[user] == 0
+                && this.links_rem[user] == 0
                 && workspace.graph.units[user].script.is_none()
                 && !failed.contains(&user)
             {
                 kept_queue.push_back(user);
             }
+        };
+        for &user in &self.build_users[unit] {
+            self.build_rem[user] = self.build_rem[user].saturating_sub(1);
+            wake(self, user);
         }
         for &user in &self.links_users[unit] {
             self.links_rem[user] = self.links_rem[user].saturating_sub(1);
-            if self.build_rem[user] == 0
-                && self.links_rem[user] == 0
-                && workspace.graph.units[user].script.is_none()
-                && !failed.contains(&user)
-            {
-                kept_queue.push_back(user);
-            }
+            wake(self, user);
         }
     }
 }

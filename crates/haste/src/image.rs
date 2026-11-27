@@ -398,6 +398,9 @@ impl Image {
         reached: &Reached,
         mode: ImageMode,
     ) -> Result<(Image, HashMap<usize, String>)> {
+        if mode != ImageMode::Check {
+            crate::host::native::load(cx.outline)?;
+        }
         let mut image = Self::create(
             reached,
             mode,
@@ -419,6 +422,7 @@ impl Image {
         reached: &Reached,
         roots: &[usize],
     ) -> Result<(Image, HashMap<usize, String>)> {
+        crate::host::native::load(cx.outline)?;
         Self::build_aot_streaming(cx, reached, roots)
     }
 
