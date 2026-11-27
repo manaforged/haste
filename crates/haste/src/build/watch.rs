@@ -39,12 +39,11 @@ fn collect_included(local: &[usize], outline: &outline::Outline) -> Vec<(PathBuf
     out
 }
 
-fn build_stamps(
+fn collect_sources_and_included(
     workspace: &graph::Workspace,
     outline: &outline::Outline,
-    reuse: Option<&HashMap<PathBuf, Stamp>>,
     extra_sources: Vec<PathBuf>,
-) -> Vec<Watch> {
+) -> (Vec<PathBuf>, Vec<(PathBuf, PathBuf)>) {
     let local: Vec<usize> = (0..outline.roots.len())
         .filter(|&krate| outline.package(workspace, krate).local())
         .collect();
@@ -61,6 +60,16 @@ fn build_stamps(
     sources.sort();
     sources.dedup();
     let included = collect_included(&local, outline);
+    (sources, included)
+}
+
+fn build_stamps(
+    workspace: &graph::Workspace,
+    outline: &outline::Outline,
+    reuse: Option<&HashMap<PathBuf, Stamp>>,
+    extra_sources: Vec<PathBuf>,
+) -> Vec<Watch> {
+    let (sources, included) = collect_sources_and_included(workspace, outline, extra_sources);
     let mut pending = Vec::with_capacity(sources.len() + included.len());
     let mut missing = Vec::new();
     for (path, by) in sources
@@ -128,6 +137,18 @@ pub(super) fn stamps_with_seen(
 /// The path of each file of `stamps`.
 pub(super) fn paths(stamps: &[Watch]) -> Vec<PathBuf> {
     stamps.iter().map(|watch| watch.path.clone()).collect()
+}
+
+/// Local source and included file paths without stating files on disk.
+pub(super) fn watch_paths(
+    workspace: &graph::Workspace,
+    outline: &outline::Outline,
+) -> Vec<PathBuf> {
+    let (mut sources, included) =
+        collect_sources_and_included(workspace, outline, local_source_paths(workspace));
+    sources.reserve(included.len());
+    sources.extend(included.into_iter().map(|(path, _)| path));
+    sources
 }
 
 fn local_source_paths(workspace: &graph::Workspace) -> Vec<PathBuf> {

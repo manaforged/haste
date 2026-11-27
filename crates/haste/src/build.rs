@@ -185,6 +185,22 @@ impl Build {
         })
     }
 
+    /// Loads every crate of `workspace` for a one-shot CLI invocation without pre-collecting file watch timestamps.
+    pub(crate) fn load_oneshot(workspace: &graph::Workspace, targets: &Targets) -> Result<Build> {
+        let outline_clock = sema::census::Clock::now();
+        let compilation = crate::macros::load_lazy(workspace, targets)?;
+        let outline_span = outline_clock.elapsed();
+        Ok(Build {
+            compilation,
+            cases: None,
+            binary: None,
+            program: None,
+            run_checked: false,
+            stamps: Vec::new(),
+            outline_span,
+        })
+    }
+
     fn load_members(&mut self, workspace: &graph::Workspace) -> Result<()> {
         load_members(workspace, &mut self.compilation)
     }
@@ -314,8 +330,12 @@ impl Build {
     }
 
     /// Local source and included file paths watched by this build.
-    pub(crate) fn watch_paths(&self) -> Vec<PathBuf> {
-        paths(&self.stamps)
+    pub(crate) fn watch_paths(&self, workspace: &graph::Workspace) -> Vec<PathBuf> {
+        if !self.stamps.is_empty() {
+            paths(&self.stamps)
+        } else {
+            watch::watch_paths(workspace, &self.compilation.outline)
+        }
     }
 
     pub(crate) fn env_reads(&self) -> Vec<(String, Option<String>)> {
