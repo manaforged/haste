@@ -9,7 +9,7 @@ use crate::image::Image;
 use crate::macros::Compilation;
 use crate::names::ItemRef;
 use crate::outline;
-use crate::sema::reach::{Instance, Reached, reach_again, reach_anew_in};
+use crate::sema::reach::{Instance, Reached, check_poly_items, reach_again, reach_anew_in};
 use crate::sema::{self, Cache, Edited};
 
 use super::substrate::{
@@ -138,6 +138,12 @@ pub(super) fn check_member_items(
 }
 
 fn batch_labels(cx: &mut sema::Context<'_>, kind: BatchKind, items: &[ItemRef]) -> Vec<String> {
+    if matches!(
+        kind,
+        BatchKind::LibCheck | BatchKind::MainCheck | BatchKind::MainAot
+    ) {
+        return Vec::new();
+    }
     items
         .iter()
         .map(|&item| {
@@ -186,18 +192,6 @@ fn main_items(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<I
     items
 }
 
-fn check_poly_items(cx: &mut sema::Context<'_>, items: &[ItemRef]) -> Vec<(ItemRef, String)> {
-    let mut out = Vec::new();
-    for &item in items {
-        if !sema::infer::is_concrete_fn(cx, item)
-            && let Err(err) = sema::summary::check_poly_item(cx, item)
-        {
-            out.push((item, err));
-        }
-    }
-    out
-}
-
 fn check_poly_resolved(
     compilation: &mut Compilation,
     store: Cache,
@@ -223,6 +217,7 @@ fn recompile(
     (cx, reached): (&mut sema::Context<'_>, &Reached),
     fresh: &[usize],
     roots: &[usize],
+    is_check: bool,
 ) {
     let mut expanded = fresh.to_vec();
     if crate::profile() == outline::tree::Profile::Release
@@ -250,6 +245,9 @@ fn recompile(
                 expanded.push(u);
             }
         }
+    }
+    if is_check {
+        expanded.retain(|&idx| !cx.outline.is_fixed(reached.list[idx].0.0.krate));
     }
     expanded.iter().for_each(|at| drop(broken.remove(at)));
     broken.extend(image.compile(cx, reached, &expanded));
@@ -692,6 +690,7 @@ impl Batch {
             (&mut cx, &self.reached),
             &fresh,
             &self.roots,
+            self.kind.mode() == crate::image::ImageMode::Check,
         );
         self.store = Some(cx.release().0);
         true
@@ -791,6 +790,7 @@ impl Batch {
             (&mut cx, &self.reached),
             &fresh,
             &self.roots,
+            self.kind.mode() == crate::image::ImageMode::Check,
         );
         self.store = Some(cx.release().0);
         true

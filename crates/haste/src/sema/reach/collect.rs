@@ -150,21 +150,15 @@ pub fn reach_anew_in(
     roots: &[Instance],
     only_crates: Option<&[u32]>,
 ) -> Vec<usize> {
-    for &index in dead {
-        reached.index.remove(&reached.list[index].0);
-        reached.set_entry(
-            index,
-            ReachedEntry::Replaced,
-            Err("replaced by an edit".to_owned()),
-        );
-    }
-    reached.unlink(dead);
+    reached.filter.forget_crates(only_crates);
+    reached.replace_dead(dead);
     let mut found = drain(cx, reached, roots.to_vec());
     let extra = enqueue_bounds_check(cx, reached);
     if !extra.is_empty() {
         found.extend(drain_wave(cx, reached, extra, true));
     }
     super::crate_check::check_local_crate_items_in(cx, reached, roots, true, only_crates);
+    reached.trim_replaced();
     reached.pin_roots(roots);
     reached.link(&found);
     found
@@ -198,10 +192,17 @@ fn enqueue(reached: &mut Reached, candidates: Vec<Instance>) -> Vec<usize> {
     let mut wave = Vec::new();
     for instance in candidates {
         if let std::collections::hash_map::Entry::Vacant(slot) = reached.index.entry(instance) {
-            let at = reached.list.len();
+            let at = if let Some(free) = reached.free.pop() {
+                reached.list[free] = (instance, Err(String::new()));
+                reached.states[free] = ReachedEntry::Enqueued;
+                free
+            } else {
+                let end = reached.list.len();
+                reached.list.push((instance, Err(String::new())));
+                reached.states.push(ReachedEntry::Enqueued);
+                end
+            };
             slot.insert(at);
-            reached.list.push((instance, Err(String::new())));
-            reached.states.push(ReachedEntry::Enqueued);
             wave.push(at);
         }
     }

@@ -12,7 +12,7 @@ pub(super) fn refresh_edits(
     workspace: &graph::Workspace,
     stamps: &mut [Watch],
     outline: &mut outline::Outline,
-) -> Result<(Vec<(u32, u32)>, Vec<u32>)> {
+) -> Result<(Vec<(u32, u32)>, Vec<u32>, Vec<PathBuf>)> {
     let changed: Vec<(usize, Stamp)> = if stamps.len() >= 64 && crate::jobs() > 1 {
         crate::sync::parallel_map((0..stamps.len()).collect(), |idx| {
             let now = stamp(&stamps[idx].path);
@@ -31,7 +31,7 @@ pub(super) fn refresh_edits(
             })
             .collect()
     };
-    let (mut stale, mut crates) = (Vec::new(), Vec::new());
+    let (mut stale, mut crates, mut paths) = (Vec::new(), Vec::new(), Vec::new());
     for (idx, now) in changed {
         if now.is_none() {
             anyhow::bail!("watched file removed: {}", stamps[idx].path.display());
@@ -49,12 +49,22 @@ pub(super) fn refresh_edits(
                     .any(|&(krate, _)| expands_proc_macro(workspace, outline, krate)) =>
             {
                 crates.extend(slots.iter().map(|&(krate, _)| krate));
+                paths.push(stamps[idx].path.clone());
             }
-            Edit::Bodies(slots) => stale.extend(slots),
-            Edit::Items(edited) => crates.extend(edited),
+            Edit::Bodies(slots) => {
+                stale.extend(slots);
+                paths.push(stamps[idx].path.clone());
+            }
+            Edit::Items(edited) => {
+                crates.extend(edited);
+                paths.push(stamps[idx].path.clone());
+                if let Some(by) = &stamps[idx].by {
+                    paths.push(by.clone());
+                }
+            }
         }
     }
-    Ok((stale, crates))
+    Ok((stale, crates, paths))
 }
 
 pub(super) fn update_stamps(

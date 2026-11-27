@@ -45,6 +45,28 @@ pub(super) struct ReachFilter {
 }
 
 impl ReachFilter {
+    pub(super) fn forget_crates(&mut self, only_crates: Option<&[u32]>) {
+        match only_crates {
+            Some(crates) => self
+                .seen_fixed_poly
+                .retain(|item| !crates.contains(&item.krate)),
+            None => self.seen_fixed_poly.clear(),
+        }
+    }
+
+    pub(super) fn seed_clone(&self) -> Self {
+        Self {
+            seen_fixed_poly: self.seen_fixed_poly.clone(),
+            seen_sealed_sysroot: self.seen_sealed_sysroot.clone(),
+            sealed_cache: self.sealed_cache.clone(),
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn log_lens(&self) -> (usize, usize) {
+        (self.sealed_log.len(), self.seen_sealed_log.len())
+    }
+
     fn record_sealed(&mut self, item: ItemRef, info: SealInfo) {
         if self.sealed_cache.insert(item, info).is_none() {
             self.dirty.push((item, info));

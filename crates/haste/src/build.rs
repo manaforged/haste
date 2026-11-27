@@ -352,7 +352,7 @@ impl Build {
 
     /// Brings the build up to date with the local files: infers and compiles again the functions of files whose bodies changed, reads again a crate whose items changed, and loads from nothing when that fails.
     pub fn refresh(&mut self, workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
-        let Ok((stale, crates)) =
+        let Ok((stale, crates, paths)) =
             refresh_edits(workspace, &mut self.stamps, &mut self.compilation.outline)
         else {
             return self.rebuild(workspace, targets);
@@ -365,6 +365,7 @@ impl Build {
                     .into_iter()
                     .chain(stale.iter().map(|&(krate, _)| krate))
                     .collect(),
+                &paths,
             ),
             (false, true) => self.again(&stale),
         };
@@ -386,18 +387,21 @@ impl Build {
             .all(|batch| batch.again(compilation, stale))
     }
 
-    fn reload(&mut self, workspace: &graph::Workspace, edited: Vec<u32>) -> bool {
+    fn reload(
+        &mut self,
+        workspace: &graph::Workspace,
+        edited: Vec<u32>,
+        changed_paths: &[PathBuf],
+    ) -> bool {
         self.run_checked = false;
-        let mut crates: Vec<u32> = Vec::new();
-        for krate in edited {
-            if crates.contains(&krate) {
-                continue;
-            }
-            let Ok(reloaded) = self.compilation.outline.reload(krate as usize) else {
-                return false;
-            };
-            crates.extend(reloaded.into_iter().map(|at| at as u32));
-        }
+        let Ok(reloaded) = self
+            .compilation
+            .outline
+            .reload_edited(&edited, changed_paths)
+        else {
+            return false;
+        };
+        let mut crates: Vec<u32> = reloaded.into_iter().map(|at| at as u32).collect();
         crates.sort_unstable();
         crates.dedup();
         crates

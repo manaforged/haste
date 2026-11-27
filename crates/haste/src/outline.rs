@@ -211,20 +211,42 @@ impl Outline {
         Ok(())
     }
 
-    /// Reads crate `krate` and every crate that depends on it again from their roots after files of `krate` changed outside function bodies, and returns those crates.
-    pub fn reload(&mut self, krate: usize) -> Result<Vec<usize>> {
+    /// Reads `edited` crates and their dependents again, forgetting cached parsed sources only for `changed_paths` (and macro-expanded files if macros changed), loading in parallel.
+    pub(crate) fn reload_edited(
+        &mut self,
+        edited: &[u32],
+        changed_paths: &[PathBuf],
+    ) -> Result<Vec<usize>> {
         let mut seen = vec![false; self.deps.len()];
-        let crates = dependents_of(&self.users(), &mut seen, [krate]);
-        let paths: Vec<PathBuf> = crates
-            .iter()
-            .flat_map(|&at| {
-                self.crates[at]
-                    .files
-                    .iter()
-                    .map(|file| file.source.path.clone())
-            })
-            .collect();
-        self.cache.forget(&paths);
+        let crates = dependents_of(&self.users(), &mut seen, edited.iter().map(|&k| k as usize));
+        let mut forget: Vec<PathBuf> = changed_paths.to_vec();
+        let old_macros = collect_macro_defs(self, edited, changed_paths);
+        let mut macro_stale = edited.iter().any(|&k| self.roots[k as usize].proc_macro)
+            || old_macros.is_none()
+            || has_macro2(self, edited);
+        forget.sort();
+        forget.dedup();
+        self.cache.forget(&forget);
+        if !macro_stale
+            && let Some(old) = old_macros
+            && let Some(new) = read_macro_defs(&self.cache, changed_paths)
+        {
+            macro_stale = old != new;
+        } else if !macro_stale {
+            macro_stale = true;
+        }
+        if macro_stale {
+            for &at in &crates {
+                for file in &self.crates[at].files {
+                    if !file.expanded {
+                        forget.push(file.source.path.clone());
+                    }
+                }
+            }
+            forget.sort();
+            forget.dedup();
+            self.cache.forget(&forget);
+        }
         for &at in &crates {
             let env = std::mem::take(&mut self.crates[at].env);
             self.crates[at] = Crate {
@@ -234,7 +256,8 @@ impl Outline {
             };
         }
         self.procs.retain(|(run, _), _| !seen[run.krate as usize]);
-        crates.iter().try_for_each(|&at| self.load_crate(at))?;
+        self.load_selected(&seen)?;
+        self.retry_waiting()?;
         Ok(crates)
     }
 
@@ -456,4 +479,56 @@ impl Outline {
         }
         Ok(())
     }
+}
+
+fn file_macro_defs(file: &tree::File) -> Vec<(String, String)> {
+    let mut defs = Vec::new();
+    for item in &file.items.items {
+        if matches!(item.kind, ItemKind::MacroRules | ItemKind::Macro) {
+            let name = item
+                .name
+                .map_or_else(String::new, |at| file.source.text(at).to_owned());
+            defs.push((name, file.source.span(item.start, item.end).to_owned()));
+        }
+    }
+    defs
+}
+
+fn collect_macro_defs(
+    outline: &Outline,
+    edited: &[u32],
+    changed_paths: &[PathBuf],
+) -> Option<Vec<Vec<(String, String)>>> {
+    let mut out = Vec::with_capacity(changed_paths.len());
+    for path in changed_paths {
+        let found = edited.iter().find_map(|&k| {
+            outline.crates[k as usize]
+                .files
+                .iter()
+                .find(|f| !f.expanded && f.source.path == *path)
+        })?;
+        out.push(file_macro_defs(found));
+    }
+    Some(out)
+}
+
+fn read_macro_defs(cache: &Files, changed_paths: &[PathBuf]) -> Option<Vec<Vec<(String, String)>>> {
+    let mut out = Vec::with_capacity(changed_paths.len());
+    for path in changed_paths {
+        let file = cache.file(path).ok()?;
+        out.push(file_macro_defs(&file));
+    }
+    Some(out)
+}
+
+fn has_macro2(outline: &Outline, edited: &[u32]) -> bool {
+    edited.iter().any(|&k| {
+        outline.crates[k as usize].files.iter().any(|f| {
+            !f.expanded
+                && f.items
+                    .items
+                    .iter()
+                    .any(|item| item.kind == ItemKind::Macro)
+        })
+    })
 }
