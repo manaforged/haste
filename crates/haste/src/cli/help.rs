@@ -20,7 +20,7 @@ impl HelpTopic {
             Command::Request(Request::Test) => Self::Test,
             Command::Serve(_) => Self::Serve,
             Command::Prep => Self::Prep,
-            Command::Clean => Self::Clean,
+            Command::Clean { .. } => Self::Clean,
             Command::Debug(_) => Self::Debug,
         }
     }
@@ -89,7 +89,7 @@ Commands:
   test    Compile and run #[test] and #[tokio::test] suites (Unix JIT)
   serve   Run a foreground resident compiler daemon or inspect/stop daemons
   prep    Precompile dependencies with rustc for --prepared (Linux x86_64 only)
-  clean   Remove the local haste cache directory
+  clean   Remove cached build artifacts for a workspace (or --all for everything)
   debug   Inspect the workspace graph, outline, types, expansions, or machine code
 
 Common options:
@@ -215,11 +215,16 @@ Options:
 );
 
 const CLEAN_HELP: &str = "\
-Usage: haste clean
+Usage: haste clean [PATH | --all]
+       (PATH defaults to `.`)
 
-Remove the local haste cache directory ($HASTE_HOME or platform cache dir).
+Stop any active daemon and remove workspace-scoped caches (`noop`, `ws`, `local`)
+for the workspace at PATH, or pass `--all` to wipe the entire $HASTE_HOME cache.
 
 Options:
+      --all                  Stop all daemons and remove the entire $HASTE_HOME cache directory
+      --manifest-path <PATH> Path to Cargo.toml
+  -q, --quiet                Suppress non-error status output
   -h, --help                 Print help";
 
 const DEBUG_HELP: &str = "\

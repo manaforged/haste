@@ -1,6 +1,7 @@
 //! Build scripts as Cargo runs them: the directives a script prints and the environment it runs in.
 
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use super::{Targets, Workspace};
 
@@ -310,7 +311,12 @@ pub fn script_vars(
     );
     let apply_flags = rustflags_apply(workspace, targets, unit);
     let extra_cfgs = apply_flags.then(|| rustflag_cfgs(&workspace.rustflags));
-    vars.extend(cfg_vars(target, extra_cfgs.as_ref()));
+    vars.extend(cfg_vars(
+        workspace,
+        &manifest.dir,
+        target,
+        extra_cfgs.as_ref(),
+    ));
     vars.extend(
         manifest
             .links
@@ -369,10 +375,19 @@ fn upper(name: &str) -> String {
 }
 
 fn cfg_vars(
+    workspace: &Workspace,
+    manifest_dir: &Path,
     target: &super::cfg::Target,
     extra_cfgs: Option<&(BTreeSet<String>, BTreeSet<(String, String)>)>,
 ) -> Vec<(String, String)> {
-    let debug = crate::profile() != crate::outline::tree::Profile::Release;
+    let release = crate::profile() == crate::outline::tree::Profile::Release;
+    let profile_override = if release {
+        workspace.profile_release
+    } else {
+        workspace.profile_dev
+    };
+    let debug = profile_override.debug_assertions.unwrap_or(!release);
+    let panic_override = super::manifest::profile_panic_for(manifest_dir, release);
     let extra_names = extra_cfgs
         .into_iter()
         .flat_map(|(names, _)| names.iter().map(String::as_str));
@@ -388,15 +403,18 @@ fn cfg_vars(
         .map(|name| (format!("CARGO_CFG_{}", upper(name)), String::new()))
         .collect();
     let extra_pairs = extra_cfgs.into_iter().flat_map(|(_, pairs)| pairs.iter());
-    let pairs: BTreeSet<(&str, &str)> = target
-        .pairs
-        .iter()
-        .chain(extra_pairs)
-        .map(|(key, value)| (key.as_str(), value.as_str()))
-        .collect();
     let mut joined: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
-    for (key, value) in pairs {
-        joined.entry(key).or_default().push(value);
+    for (key, value) in &target.pairs {
+        joined.entry(key.as_str()).or_default().push(value.as_str());
+    }
+    if let Some(strategy) = panic_override.as_deref() {
+        joined.insert("panic", vec![strategy]);
+    }
+    for (key, value) in extra_pairs {
+        let vals = joined.entry(key.as_str()).or_default();
+        if !vals.contains(&value.as_str()) {
+            vals.push(value.as_str());
+        }
     }
     vars.extend(
         joined
@@ -533,5 +551,82 @@ mod tests {
         let host_vars = script_vars(&ws, &cross_targets, 1, &[]);
         assert!(!host_vars.iter().any(|(k, _)| k == "CARGO_CFG_MY_FLAG"));
         assert!(!host_vars.iter().any(|(k, _)| k == "CARGO_CFG_MY_KV"));
+    }
+
+    #[test]
+    fn script_vars_honors_profile_debug_assertions_and_panic_overrides() {
+        let dir = std::env::temp_dir().join(format!("haste-script-prof-{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&dir));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            concat!(
+                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+                "[profile.dev]\ndebug-assertions = false\npanic = \"abort\"\n",
+                "[profile.release]\ndebug-assertions = true\npanic = \"unwind\"\n",
+            ),
+        )
+        .expect("write");
+        let manifest = Manifest {
+            dir: dir.clone(),
+            ..Manifest::default()
+        };
+        let pkg = Package {
+            locked: Locked {
+                name: "demo".to_owned(),
+                version: semver::Version::new(0, 1, 0),
+                source: None,
+                checksum: None,
+                dependencies: Vec::new(),
+            },
+            manifest,
+            resolved: BTreeMap::new(),
+            sysroot: false,
+        };
+        let (profile_dev, profile_release) = super::super::manifest::profiles_of(&dir);
+        let ws = Workspace {
+            packages: vec![pkg],
+            graph: Graph {
+                units: vec![Unit {
+                    package: 0,
+                    side: Side::Target,
+                    features: BTreeSet::new(),
+                    deps: Vec::new(),
+                    script: None,
+                }],
+                members: vec![0],
+            },
+            rustflags: Vec::new(),
+            config_env: Vec::new(),
+            profile_dev,
+            profile_release,
+        };
+        let targets = Targets {
+            target: cfg::Target::host(),
+            host: cfg::Target::host(),
+        };
+        let dev_vars = script_vars(&ws, &targets, 0, &[]);
+        assert!(
+            !dev_vars
+                .iter()
+                .any(|(k, _)| k == "CARGO_CFG_DEBUG_ASSERTIONS")
+        );
+        assert!(dev_vars.contains(&("CARGO_CFG_PANIC".to_owned(), "abort".to_owned())));
+        assert_eq!(
+            dev_vars
+                .iter()
+                .filter(|(k, _)| k == "CARGO_CFG_PANIC")
+                .count(),
+            1
+        );
+
+        let mut rel_cfg = crate::config::Config::current();
+        rel_cfg.profile = crate::outline::tree::Profile::Release;
+        crate::with_config(std::sync::Arc::new(rel_cfg), || {
+            let rel_vars = script_vars(&ws, &targets, 0, &[]);
+            assert!(rel_vars.contains(&("CARGO_CFG_DEBUG_ASSERTIONS".to_owned(), String::new())));
+            assert!(rel_vars.contains(&("CARGO_CFG_PANIC".to_owned(), "unwind".to_owned())));
+        });
+        drop(std::fs::remove_dir_all(&dir));
     }
 }
