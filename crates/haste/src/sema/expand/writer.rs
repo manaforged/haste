@@ -89,8 +89,12 @@ pub(super) fn def_site_macro(
     src: &Source,
     path: (u32, u32),
 ) -> Option<ItemRef> {
-    let Some(Mark::Home { krate, file, item }) = src.mark(path.0).filter(|_| path.0 == path.1)
-    else {
+    let mark_at = if src.kind(path.0) == TokenKind::Colon && path.0 + 2 <= path.1 {
+        path.0 + 2
+    } else {
+        path.0
+    };
+    let Some(Mark::Home { krate, file, item }) = src.mark(mark_at) else {
         return None;
     };
     let module = cx.module_of(ItemRef { krate, file, item }).ok()?;
