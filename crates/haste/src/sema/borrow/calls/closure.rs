@@ -611,20 +611,38 @@ impl Checker<'_, '_> {
         let is_by_val = sig
             .as_deref()
             .is_some_and(|s| matches!(s.receiver, Some((crate::body::sig::SelfKind::Value, _))));
+        let recv_mut = sig.as_deref().and_then(super::recv_ref_mut);
+        if !is_by_val
+            && derefs > 0
+            && let Some(m) = recv_mut
+        {
+            return Some(m);
+        }
         let by_val_reborrow = is_by_val
             && derefs == 0
             && self.root_place(receiver).is_some()
             && self.is_mut_ref_by_val_impl(expr, receiver);
         ((!is_by_val || by_val_reborrow) && self.is_mut_ref_ty(self.expr_ty(receiver))).then(|| {
-            if sig
-                .as_deref()
-                .is_some_and(|s| super::recv_ref_mut(s) == Some(crate::sema::ty::Mut::Not))
-            {
+            if recv_mut == Some(crate::sema::ty::Mut::Not) {
                 crate::sema::ty::Mut::Not
             } else {
                 crate::sema::ty::Mut::Mut
             }
         })
+    }
+
+    pub(super) fn needs_instantiated_arg_ref(
+        &self,
+        ctx: &super::ArgListCtx<'_>,
+        arg: ExprId,
+        has_coercion: bool,
+    ) -> bool {
+        has_coercion
+            || ctx.ctor_res.is_some()
+            || ctx.arg_tys.is_some()
+            || (self.is_mut_ref_ty(self.expr_ty(arg))
+                && self.place_behind_ref(arg, false)
+                && !self.place_behind_shared_ref(arg))
     }
 
     fn is_mut_ref_by_val_impl(&mut self, expr: ExprId, receiver: ExprId) -> bool {

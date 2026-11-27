@@ -717,7 +717,7 @@ impl super::super::Checker<'_, '_> {
         {
             return Some(m);
         }
-        if coercion.is_none() && ctx.ctor_res.is_none() && ctx.arg_tys.is_none() {
+        if !self.needs_instantiated_arg_ref(ctx, arg, coercion.is_some()) {
             return None;
         }
         let expected_ty = ctx.arg_tys.and_then(|ts| ts.get(idx).copied()).or_else(|| {

@@ -302,16 +302,19 @@ impl Checker<'_, '_> {
         if derefs == 0
             || adj.and_then(|a| a.autoref).is_some()
             || !matches!(sig.receiver, Some((crate::body::sig::SelfKind::Ref, _)))
-            || (0..derefs).any(|s| self.typed.derefs.contains_key(&(call_expr, s)))
         {
             return srcs;
         }
         let mut cur = self.expr_ty(recv);
-        for _ in 0..derefs {
+        for step in 0..derefs {
             if cur == Ty::NONE {
                 return srcs;
             }
-            cur = self.builtin_deref_ty(cur).unwrap_or(Ty::NONE);
+            cur = if self.typed.derefs.contains_key(&(call_expr, step)) {
+                self.deref_target_ty(call_expr, step).unwrap_or(Ty::NONE)
+            } else {
+                self.builtin_deref_ty(cur).unwrap_or(Ty::NONE)
+            };
         }
         if cur != Ty::NONE && matches!(*self.cx.types.kind(cur), Kind::Ref(Mut::Not, _)) {
             self.unwrap_outer_container_loans_with_res(srcs, state, true, self.expr_ty(call_expr))

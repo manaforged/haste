@@ -1,3 +1,5 @@
+mod tokio_cases;
+
 use rustc_hash::FxHashSet as HashSet;
 
 use super::places::PlaceStep;
@@ -7,9 +9,7 @@ use super::{Loan, State, prune_dead_loans};
 #[test]
 fn prune_dead_loans_drops_guard_only_binding_and_keeps_arm_live_binding() {
     let mut state = State::new(vec![true, true, true]);
-    let f = 0;
-    let guard_only = 1;
-    let live_in_arm = 2;
+    let (f, guard_only, live_in_arm) = (0, 1, 2);
     state.loans.push(Loan::new(
         f,
         Vec::new(),
@@ -27,23 +27,18 @@ fn prune_dead_loans_drops_guard_only_binding_and_keeps_arm_live_binding() {
         None,
     ));
 
-    let guard_live = HashSet::from_iter([live_in_arm]);
-    prune_dead_loans(&mut state, &guard_live);
-
+    prune_dead_loans(&mut state, &HashSet::from_iter([live_in_arm]));
     assert_eq!(state.loans.len(), 1);
     assert_eq!(state.loans[0].holder, Some(live_in_arm));
 
-    let empty_live = HashSet::default();
-    prune_dead_loans(&mut state, &empty_live);
+    prune_dead_loans(&mut state, &HashSet::default());
     assert!(state.loans.is_empty());
 }
 
 #[test]
 fn unwrap_container_loans_drops_temps_and_unwraps_intermediate_local_slices() {
     let mut state = State::new(vec![true, true, true]);
-    let raw_line = 0;
-    let local_vec = 1;
-    let input_vec = 2;
+    let (raw_line, local_vec, input_vec) = (0, 1, 2);
     state.loans.push(Loan::new(
         raw_line,
         vec![PlaceStep::Deref],
@@ -60,7 +55,6 @@ fn unwrap_container_loans_drops_temps_and_unwraps_intermediate_local_slices() {
         false,
         None,
     ));
-
     let sources = vec![
         BorrowSource::temp(1, false, false),
         BorrowSource {
@@ -75,7 +69,6 @@ fn unwrap_container_loans_drops_temps_and_unwraps_intermediate_local_slices() {
     let out = unwrap_container_loans(sources, &state, |s| {
         s.target == local_vec || super::checks::is_temp_target(s.target).is_some()
     });
-
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].target, raw_line);
     assert!(out[0].through_ref);
@@ -88,16 +81,30 @@ fn test_outline(code: &str, edition: &str) -> (crate::outline::Outline, crate::n
     use rustc_hash::FxHashMap as HashMap;
 
     use crate::names::{Crate as NamesCrate, Names};
-    use crate::outline::item::Vis;
+    use crate::outline::item::{ItemKind, Vis};
     use crate::outline::scan::scan;
     use crate::outline::source::Source;
-    use crate::outline::tree::{Crate, File, Module, State as TreeState};
+    use crate::outline::tree::{Crate, File, Impl, Module, State as TreeState};
     use crate::outline::{Outline, Role, Root};
 
     let src = Source::parse(PathBuf::from("lib.rs"), code.to_owned()).expect("parse source");
     let items = scan(&src).expect("scan source");
+    let impls = items
+        .items
+        .iter()
+        .enumerate()
+        .filter_map(|(i, it)| {
+            matches!(it.kind, ItemKind::Impl).then(|| Impl {
+                file: 0,
+                at: i as u32,
+                module: 0,
+                parts: Vec::new(),
+            })
+        })
+        .collect();
     let krate = Crate {
         files: vec![Arc::new(File::new(src, items, false))],
+        impls,
         modules: vec![Module {
             file: 0,
             item: None,
@@ -129,8 +136,7 @@ fn test_outline(code: &str, edition: &str) -> (crate::outline::Outline, crate::n
     };
     let mut names = Names::default();
     let mut nc = NamesCrate::default();
-    nc.edition = edition.to_owned();
-    nc.edition_2015 = edition == "2015";
+    (nc.edition, nc.edition_2015) = (edition.to_owned(), edition == "2015");
     names.crates.push(nc);
     (outline, names)
 }
