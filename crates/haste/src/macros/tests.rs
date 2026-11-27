@@ -365,3 +365,60 @@ fn include_part_reexport_macro_resolves() {
     );
     assert_eq!(asks.count(), 0);
 }
+
+#[test]
+fn derive_input_with_cfg_pruned_member_keeps_doc_commented_siblings() {
+    let code = concat!(
+        "#[derive(Debug, Serialize, Deserialize)]\n",
+        "pub struct SyntaxSet {\n",
+        "    syntaxes: Vec<u8>,\n",
+        "    /// Stores the syntax index for every path.\n",
+        "    path_syntaxes: Vec<(String, usize)>,\n",
+        "    #[serde(skip)]\n",
+        "    cache: u8,\n",
+        "    /// Metadata docs.\n",
+        "    #[cfg(feature = \"metadata\")]\n",
+        "    pub(crate) metadata: u8,\n",
+        "}\n",
+        "#[derive(Debug, thiserror::Error)]\n",
+        "#[non_exhaustive]\n",
+        "pub enum LoadingError {\n",
+        "    /// error reading a file\n",
+        "    #[error(\"error reading a file: {0}\")]\n",
+        "    Io(#[from] u8),\n",
+        "    /// a metadata file was invalid\n",
+        "    #[cfg(feature = \"metadata\")]\n",
+        "    #[error(\"Failed to parse JSON\")]\n",
+        "    ParseMetadata(u8),\n",
+        "    /// A path given to a method was invalid.\n",
+        "    /// Possibly UTF-8.\n",
+        "    #[error(\"Invalid path\")]\n",
+        "    BadPath,\n",
+        "}\n",
+    );
+    let src = Source::parse(PathBuf::from("syntect.rs"), code.to_owned()).expect("parse source");
+    let items = scan(&src).expect("scan source");
+    let env = Env::default();
+    let deps = Vec::new();
+    let render = |idx: usize| -> String {
+        super::derive_input_in(&src, &items.items[idx], &env, Some((deps.as_slice(), 0)))
+    };
+
+    let syntax_out = render(0);
+    assert!(!syntax_out.contains("metadata"), "{syntax_out}");
+    assert!(!syntax_out.contains(", ,"), "{syntax_out}");
+    assert!(
+        syntax_out.contains("path_syntaxes : Vec < (String , usize) >")
+            || syntax_out.contains("path_syntaxes: Vec<(String, usize)>"),
+        "{syntax_out}"
+    );
+    assert!(syntax_out.contains("cache: u8"), "{syntax_out}");
+    Source::parse(PathBuf::from("out_struct.rs"), syntax_out.clone()).expect("valid struct tokens");
+
+    let err_out = render(1);
+    assert!(!err_out.contains("ParseMetadata"), "{err_out}");
+    assert!(err_out.contains("Io(#[from] u8)"), "{err_out}");
+    assert!(err_out.contains("BadPath"), "{err_out}");
+    assert!(err_out.contains("error reading a file"), "{err_out}");
+    Source::parse(PathBuf::from("out_enum.rs"), err_out.clone()).expect("valid enum tokens");
+}

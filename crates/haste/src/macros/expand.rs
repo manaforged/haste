@@ -9,6 +9,7 @@ use crate::names::ItemRef;
 use crate::names::path::Requests;
 use crate::outline::Outline;
 use crate::outline::item::{ItemKind, ProcKind};
+use crate::outline::source::Source;
 use crate::outline::tree::PROC_MACRO_ROOT;
 use crate::sema::{Answer, Cache};
 
@@ -368,4 +369,51 @@ pub(super) fn macro_graph_stamp(outline: &Outline, roots: &[usize]) -> u64 {
         }
     }
     hasher.finish()
+}
+
+fn doc_attr_end(src: &Source, at: u32, to: u32) -> Option<u32> {
+    if src.kind(at) != rustc_lexer::TokenKind::Pound {
+        return None;
+    }
+    let br = at + 1 + u32::from(src.kind(at + 1) == rustc_lexer::TokenKind::Bang);
+    if br + 4 >= to || src.kind(br) != rustc_lexer::TokenKind::OpenBracket {
+        return None;
+    }
+    let close = src.pair(br);
+    (close == br + 4
+        && close < to
+        && src.text(br + 1) == "doc"
+        && src.kind(br + 2) == rustc_lexer::TokenKind::Eq
+        && matches!(
+            src.kind(br + 3),
+            rustc_lexer::TokenKind::Literal {
+                kind: rustc_lexer::LiteralKind::RawStr { .. },
+                ..
+            }
+        ))
+    .then_some(close + 1)
+}
+
+pub(super) fn push_layer_span(parts: &mut Vec<String>, src: &Source, from: u32, to: u32) {
+    let mut run_start = from;
+    let mut at = from;
+    while at < to {
+        if let Some(after) = doc_attr_end(src, at, to) {
+            if run_start < at {
+                parts.push(src.span(run_start, at - 1).to_owned());
+            }
+            parts.push(src.span(at, after - 1).to_owned());
+            run_start = after;
+            at = after;
+            continue;
+        }
+        if at + 1 < to && src.byte(at) > src.byte(at + 1) {
+            parts.push(src.span(run_start, at).to_owned());
+            run_start = at + 1;
+        }
+        at += 1;
+    }
+    if run_start < to {
+        parts.push(src.span(run_start, to - 1).to_owned());
+    }
 }

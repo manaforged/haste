@@ -20,7 +20,7 @@ use crate::outline::tree::{PROC_MACRO_ROOT, Profile};
 use crate::sema::reach::{Instance, Reached, reach_wave};
 use crate::sema::{Answer, Cache, Context};
 
-use expand::{Call, dep_closure, infer_caller, macro_graph_stamp, run};
+use expand::{Call, dep_closure, infer_caller, macro_graph_stamp, push_layer_span, run};
 
 const ENTRIES: [&str; 2] = ["__haste_expand1", "__haste_expand2"];
 
@@ -648,10 +648,10 @@ fn push_raw_span(parts: &mut Vec<String>, src: &Source, from: u32, to: u32) {
         return;
     }
     if from < src.offset && to > src.offset {
-        parts.push(src.span(from, src.offset - 1).to_owned());
-        parts.push(src.span(src.offset, to - 1).to_owned());
+        push_layer_span(parts, src, from, src.offset);
+        push_layer_span(parts, src, src.offset, to);
     } else {
-        parts.push(src.span(from, to - 1).to_owned());
+        push_layer_span(parts, src, from, to);
     }
 }
 
