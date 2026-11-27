@@ -14,7 +14,7 @@ use super::table::{self, Table};
 use super::ty::{self, Types};
 use super::{impls, infer, reach, summary, traits, write_lock};
 
-pub(super) type TypeScope = (ModRef, Option<ItemRef>, Option<ItemRef>, bool, Option<u32>);
+pub(super) type TypeScope = (ModRef, Option<ItemRef>, Option<ItemRef>, u8, Option<u32>);
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(super) struct SegKey {
@@ -109,7 +109,7 @@ impl ActiveAttrs {
 
 pub(super) struct LangMap {
     pub(super) map: HashMap<ItemRef, Box<str>>,
-    bloom: [u64; 64],
+    bloom: [u64; 256],
     crates_lo: u64,
     crates_hi: u64,
     any_high: bool,
@@ -120,14 +120,14 @@ impl LangMap {
     fn bloom_bits(item: ItemRef) -> (usize, u64, usize, u64) {
         let h1 = item.file.wrapping_mul(0x9E37_79B1) ^ item.item.wrapping_mul(0x85EB_CA77);
         let h2 = item.file.wrapping_mul(0xC2B2_AE35) ^ item.item.wrapping_mul(0x27D4_EB2F);
-        let b1 = ((h1 ^ (h1 >> 16)) as usize) & 4095;
-        let b2 = ((h2 ^ (h2 >> 16)) as usize) & 4095;
+        let b1 = ((h1 ^ (h1 >> 16)) as usize) & 16383;
+        let b2 = ((h2 ^ (h2 >> 16)) as usize) & 16383;
         (b1 >> 6, 1u64 << (b1 & 63), b2 >> 6, 1u64 << (b2 & 63))
     }
 
     pub(super) fn from_map(map: HashMap<ItemRef, Box<str>>) -> Self {
         let (mut crates_lo, mut crates_hi, mut any_high) = (0u64, 0u64, false);
-        let mut bloom = [0u64; 64];
+        let mut bloom = [0u64; 256];
         for &item in map.keys() {
             if item.krate < 64 {
                 crates_lo |= 1u64 << item.krate;
@@ -196,6 +196,7 @@ pub(super) struct Lookups {
     pub(super) provisional_rets: Table<reach::Instance, ty::Ty>,
     pub(super) futures: Table<ty::Ty, ty::Ty>,
     pub(super) scope_traits: Table<ModRef, Arc<[ItemRef]>>,
+    pub(super) trait_autos: Table<ItemRef, bool>,
     pub(super) type_defs: Table<(TypeScope, SegKey), crate::names::Def>,
     pub(super) impl_traits: Table<impls::ImplRef, Option<ItemRef>>,
     pub(super) selections: Table<
@@ -251,8 +252,6 @@ impl Lookups {
     }
 
     fn reset_after_names(&mut self, outline: &Outline) {
-        self.heads
-            .retain(|holder, index| matches!(holder, impls::Holder::Crate(_)) && index.complete());
         self.selections
             .retain(|_, found| matches!(found, Some((impls::ImplRef::Module { .. }, _))));
         self.projections.retain(|_, found| found.is_some());
@@ -269,7 +268,8 @@ impl Lookups {
     }
 
     pub(super) fn reconcile(&mut self, outline: &Outline, answer: Option<Answer>) {
-        if matches!(answer, Some(Answer::Names)) {
+        let after_names = matches!(answer, Some(Answer::Names));
+        if after_names {
             self.reset_after_names(outline);
         }
         let loaded: Vec<crate::outline::tree::CrateExtent> = outline
@@ -279,6 +279,21 @@ impl Lookups {
             .collect();
         let mut guard = write_lock(&self.state.loaded);
         if *guard == loaded {
+            if after_names {
+                self.heads.retain(|holder, index| {
+                    let impls::Holder::Crate(k) = *holder else {
+                        return false;
+                    };
+                    if index.complete() {
+                        return true;
+                    }
+                    if outline.is_fixed(k) && index.reusable_after_names() {
+                        Arc::make_mut(index).clear_asked();
+                        return true;
+                    }
+                    false
+                });
+            }
             return;
         }
         let same_len = guard.len() == loaded.len();
@@ -300,11 +315,28 @@ impl Lookups {
             self.scope_traits.retain(|home, _| {
                 guard.get(home.krate as usize) == loaded.get(home.krate as usize)
             });
-            self.heads.retain(|holder, _| match *holder {
-                impls::Holder::Crate(k) => guard.get(k as usize) == loaded.get(k as usize),
-                impls::Holder::Body(item) => {
-                    guard.get(item.krate as usize) == loaded.get(item.krate as usize)
+            self.trait_autos.retain(|item, _| {
+                guard.get(item.krate as usize) == loaded.get(item.krate as usize)
+            });
+            self.heads.retain(|holder, index| {
+                let k = match *holder {
+                    impls::Holder::Crate(k) => k,
+                    impls::Holder::Body(item) => {
+                        return !after_names
+                            && guard.get(item.krate as usize) == loaded.get(item.krate as usize);
+                    }
+                };
+                if guard.get(k as usize) != loaded.get(k as usize) {
+                    return false;
                 }
+                if !after_names || index.complete() {
+                    return true;
+                }
+                if outline.is_fixed(k) && index.reusable_after_names() {
+                    Arc::make_mut(index).clear_asked();
+                    return true;
+                }
+                false
             });
             self.summaries.retain_keys(|item| {
                 guard.get(item.krate as usize) == loaded.get(item.krate as usize)
@@ -323,6 +355,7 @@ impl Lookups {
             self.modules.clear();
             self.owners.clear();
             self.scope_traits.clear();
+            self.trait_autos.clear();
             self.heads.clear();
             self.discriminants.clear();
             self.reprs.clear();
@@ -337,11 +370,24 @@ impl Lookups {
         if reset_sysroot {
             *write_lock(&self.state.langs) = None;
             *write_lock(&self.state.primitives) = None;
-            if same_len {
-                self.sysroot_heads = None;
-            }
         }
         if reset_fixed {
+            if same_len {
+                if let Some(heads) = &mut self.sysroot_heads {
+                    let stale_any = heads
+                        .keys()
+                        .any(|&k| guard.get(k as usize) != loaded.get(k as usize));
+                    if stale_any {
+                        let map = Arc::make_mut(heads);
+                        map.retain(|&k, _| guard.get(k as usize) == loaded.get(k as usize));
+                        if map.is_empty() {
+                            self.sysroot_heads = None;
+                        }
+                    }
+                }
+            } else {
+                self.sysroot_heads = None;
+            }
             self.file_index = Arc::new(std::sync::OnceLock::new());
             self.fresh_summaries.clear();
             self.fresh_instances.clear();
@@ -619,6 +665,7 @@ impl Lookups {
         self.owners.retain(|krate, _| !edited.touches_crate(*krate));
         self.scope_traits
             .retain(|home, _| !edited.touches_crate(home.krate));
+        self.trait_autos.retain(|item, _| !mine(*item));
         self.type_defs
             .retain(|key, _| !edited.touches_crate(key.0.0.krate));
         self.trait_defs.retain(|item, _| !mine(*item));

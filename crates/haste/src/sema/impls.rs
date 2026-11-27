@@ -4,7 +4,7 @@ use anyhow::Result;
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::body::sig::{self, ImplHeader};
-use crate::body::{self as syntax, Body};
+use crate::body::{self as syntax};
 use crate::names::path::Path as NamePath;
 use crate::names::{Def, ItemRef, ModRef, Ns, Primitive};
 use crate::outline::item::ItemKind;
@@ -163,15 +163,6 @@ impl<'a> Context<'a> {
     /// Borrows the parsed header of impl `block` from the per-context cache without cloning its `Arc`.
     pub fn impl_header_ref(&mut self, block: ImplRef) -> Result<&ImplHeader> {
         Ok(self.ensure_impl_header(block)?)
-    }
-
-    fn impl_entry(&self, block: ImplRef) -> &'a crate::outline::item::Item {
-        impl_file_entry(self.outline, block).1
-    }
-
-    fn reserved(&self, block: ImplRef) -> bool {
-        let src = &self.impl_file(block).source;
-        self.impl_entry(block).attrs.iter().any(|attr| matches!(attr, crate::outline::item::Attr::Other(at) if src.text(*at) == "rustc_reservation_impl"))
     }
 
     /// The outline file that holds the header of impl `block`.
@@ -362,13 +353,19 @@ impl<'a> Context<'a> {
     }
 
     fn with_crate_index(&mut self, krate: u32, visit: &mut impl FnMut(&Index) -> bool) -> bool {
-        if let Some(index) = self.crate_heads[krate as usize].as_deref() {
-            index.asked.replay(&self.asks);
+        let k = krate as usize;
+        if let Some(index) = self.crate_heads[k].as_deref() {
+            if !self.crate_heads_replayed[k] {
+                index.asked.replay(&self.asks);
+                self.crate_heads_replayed[k] = true;
+            } else if !index.asked.is_empty() {
+                self.asks.bump_taint();
+            }
             return visit(index);
         }
         let index = self.index_of(Holder::Crate(krate));
         let hit = visit(&index);
-        self.crate_heads[krate as usize] = Some(index);
+        self.crate_heads[k] = Some(index);
         hit
     }
 
@@ -445,54 +442,60 @@ impl<'a> Context<'a> {
         if let Some(known) = self.store.lookups.impl_traits.get(&block) {
             return known;
         }
+        let header = self.impl_header(block).ok()?;
+        let src = &self.impl_file(block).source;
+        let home = self.impl_module(block).ok()?;
+        self.impl_trait_with(block, &header, src, home)
+    }
+
+    fn impl_trait_with(
+        &mut self,
+        block: ImplRef,
+        header: &ImplHeader,
+        src: &Source,
+        home: ModRef,
+    ) -> Option<ItemRef> {
+        if let Some(known) = self.store.lookups.impl_traits.get(&block) {
+            return known;
+        }
         let before = self.quiet_mark();
-        let found = self.impl_trait_here(block);
+        let found = header.trait_ref.and_then(|trait_ref| {
+            let syntax::Ty::Path(path) = *header.body.ty(trait_ref) else {
+                return None;
+            };
+            let (segments, absolute, dollar) =
+                segments(&self.names.symbols, src, &header.body, path);
+            match self.resolve_in(
+                block.item(),
+                &NamePath {
+                    segments: &segments,
+                    absolute,
+                    dollar,
+                },
+                home,
+            )? {
+                Def::Item(item) if self.item(item).1.kind == ItemKind::Trait => Some(item),
+                _ => None,
+            }
+        });
         if self.quiet_mark() == before {
             self.store.lookups.impl_traits.insert(block, found);
         }
         found
     }
 
-    fn impl_trait_here(&mut self, block: ImplRef) -> Option<ItemRef> {
-        let header = self.impl_header(block).ok()?;
-        let syntax::Ty::Path(path) = *header.body.ty(header.trait_ref?) else {
-            return None;
-        };
-        let src = &self.impl_file(block).source;
-        let home = self.impl_module(block).ok()?;
-        let (segments, absolute, dollar) = segments(&self.names.symbols, src, &header.body, path);
-        match self.resolve_in(
-            block.item(),
-            &NamePath {
-                segments: &segments,
-                absolute,
-                dollar,
-            },
-            home,
-        )? {
-            Def::Item(item) if self.item(item).1.kind == ItemKind::Trait => Some(item),
-            _ => None,
-        }
-    }
-
     /// The item that `path`, written at the item `at`, names from `home`, first among the items that the body declaring `at` holds.
     fn resolve_in(&self, at: Option<ItemRef>, path: &NamePath<'_>, home: ModRef) -> Option<Def> {
-        let anchor = at
-            .and_then(ItemRef::outer)
-            .map(|(root, from)| (root, Some(from)));
         let paths = self.paths(home.krate);
-        match self.local_path(home, anchor, path, Ns::Types) {
+        let Some((root, from)) = at.and_then(ItemRef::outer) else {
+            return paths.resolve(path, home);
+        };
+        match self.local_path(home, Some((root, Some(from))), path, Ns::Types) {
             Some(BodyPath::Def(def)) => Some(def),
             Some(BodyPath::Variant(_)) => None,
             Some(BodyPath::Outside(skip)) => paths.resolve(&outside(path, skip), home),
-            None => anchor
-                .and_then(|(root, _)| {
-                    self.body_use_path(
-                        (root, home),
-                        path,
-                        at.and_then(ItemRef::outer).map(|(_, at)| at),
-                    )
-                })
+            None => self
+                .body_use_path((root, home), path, Some(from))
                 .or_else(|| paths.resolve(path, home)),
         }
     }
@@ -514,21 +517,48 @@ impl<'a> Context<'a> {
         found
     }
 
+    fn with_fresh_replay<R>(&mut self, build: impl FnOnce(&mut Self) -> R) -> (R, Asked) {
+        let saved = std::mem::replace(
+            &mut self.crate_heads_replayed,
+            vec![false; self.outline.crates.len()],
+        );
+        let mark = self.asks.mark();
+        let out = build(self);
+        let asked = Asked::from_requests(self.asks.since(mark));
+        for (dst, prev) in self.crate_heads_replayed.iter_mut().zip(saved) {
+            *dst |= prev;
+        }
+        (out, asked)
+    }
+
     /// Indexes only the module-level impls of `krate` (excluding `impl_bodies`) for sysroot caching.
     pub(crate) fn index_module_impls(&mut self, krate: u32) -> Index {
-        let mark = self.asks.mark();
-        let count = self.outline.crates[krate as usize].impls.len() as u32;
-        let mut index = Index::default();
-        for idx in 0..count {
-            self.index_block(&mut index, ImplRef::Module { krate, index: idx });
-        }
-        index.asked = Asked::from_requests(self.asks.since(mark));
+        let (mut index, asked) = self.with_fresh_replay(|this| {
+            let count = this.outline.crates[krate as usize].impls.len() as u32;
+            let blocks: Vec<ImplRef> = (0..count)
+                .map(|index| ImplRef::Module { krate, index })
+                .collect();
+            let mut index = Index::default();
+            this.index_blocks(&mut index, blocks);
+            index
+        });
+        index.settled_crate = !self.outline.crates[krate as usize].unsettled();
+        index.asked = asked;
         index
     }
 
     fn index_of(&mut self, holder: Holder) -> Arc<Index> {
         if let Some(found) = self.store.lookups.heads.get(&holder) {
-            found.asked.replay(&self.asks);
+            if let Holder::Crate(k) = holder {
+                if !self.crate_heads_replayed[k as usize] {
+                    found.asked.replay(&self.asks);
+                    self.crate_heads_replayed[k as usize] = true;
+                } else if !found.asked.is_empty() {
+                    self.asks.bump_taint();
+                }
+            } else {
+                found.asked.replay(&self.asks);
+            }
             return found;
         }
         if let Holder::Body(root) = holder
@@ -549,37 +579,70 @@ impl<'a> Context<'a> {
             if tree.impl_bodies.is_empty() && !tree.unsettled() {
                 return cached;
             }
-            let mark = self.asks.mark();
-            if tree.unsettled() {
-                self.asks.crates.borrow_mut().push(krate);
-            }
-            let mut index = (*cached).clone();
-            for block in self.crate_body_impls(krate) {
-                self.index_block(&mut index, block);
-            }
-            index.asked = Asked::from_requests(self.asks.since(mark));
+            let (mut index, asked) = self.with_fresh_replay(|this| {
+                if this.outline.crates[krate as usize].unsettled() {
+                    this.asks.crates.borrow_mut().push(krate);
+                }
+                let mut index = (*cached).clone();
+                let blocks = this.crate_body_impls(krate);
+                this.index_blocks(&mut index, blocks);
+                index
+            });
+            index.settled_crate = !self.outline.crates[krate as usize].unsettled();
+            index.asked = asked;
             let index = Arc::new(index);
             self.store.lookups.heads.insert(holder, Arc::clone(&index));
             return index;
         }
-        let mark = self.asks.mark();
-        if let Holder::Crate(krate) = holder
-            && self.outline.crates[krate as usize].unsettled()
-        {
-            self.asks.crates.borrow_mut().push(krate);
-        }
-        let blocks = match holder {
-            Holder::Crate(krate) => self.crate_impls(krate),
-            Holder::Body(root) => self.body_impls(root),
+        let settled_crate = match holder {
+            Holder::Crate(krate) => !self.outline.crates[krate as usize].unsettled(),
+            Holder::Body(_) => false,
         };
-        let mut index = Index::default();
-        for block in blocks {
-            self.index_block(&mut index, block);
-        }
-        index.asked = Asked::from_requests(self.asks.since(mark));
+        let (mut index, asked) = self.with_fresh_replay(|this| {
+            if let Holder::Crate(krate) = holder
+                && this.outline.crates[krate as usize].unsettled()
+            {
+                this.asks.crates.borrow_mut().push(krate);
+            }
+            let blocks = match holder {
+                Holder::Crate(krate) => this.crate_impls(krate),
+                Holder::Body(root) => this.body_impls(root),
+            };
+            let mut index = Index::default();
+            this.index_blocks(&mut index, blocks);
+            index
+        });
+        index.settled_crate = settled_crate;
+        index.asked = asked;
         let index = Arc::new(index);
         self.store.lookups.heads.insert(holder, Arc::clone(&index));
         index
+    }
+
+    fn index_blocks(&mut self, index: &mut Index, blocks: Vec<ImplRef>) {
+        let workers = crate::jobs().min(blocks.len() / 32);
+        if !self.in_parallel && workers > 1 {
+            let chunk_size = blocks.len().div_ceil(workers);
+            let chunks: Vec<(Context<'_>, Vec<ImplRef>)> = blocks
+                .chunks(chunk_size)
+                .map(|chunk| (self.fork(), chunk.to_vec()))
+                .collect();
+            let results = crate::sync::parallel_map(chunks, |(mut worker, chunk)| {
+                let mut partial = Index::default();
+                for block in chunk {
+                    worker.index_block(&mut partial, block);
+                }
+                (partial, worker.asks)
+            });
+            for (partial, asks) in results {
+                index.merge_from(partial);
+                self.asks.extend_parts(asks.into_parts());
+            }
+        } else {
+            for block in blocks {
+                self.index_block(index, block);
+            }
+        }
     }
 
     /// The impls of crate `krate`: those of its modules, then those in the bodies of its module-level `const _` items and functions.
@@ -601,7 +664,7 @@ impl<'a> Context<'a> {
                 file: file as u32,
                 item,
             };
-            if self.parse_body(root).is_ok() {
+            if self.file(root).body_read(krate, item) || self.parse_body(root).is_ok() {
                 blocks.extend(self.body_impls(root));
             }
         }
@@ -621,146 +684,4 @@ impl<'a> Context<'a> {
             .map(|(at, _)| ImplRef::Body(root.inner(at as u32)))
             .collect()
     }
-
-    fn index_block(&mut self, index: &mut Index, block: ImplRef) {
-        let Ok(header) = self.impl_header(block) else {
-            return;
-        };
-        let src = &self.impl_file(block).source;
-        let Ok(home) = self.impl_module(block) else {
-            return;
-        };
-        let head = if generic_self(src, &header) {
-            None
-        } else {
-            self.syntax_head(src, &header.body, header.self_ty, (home, block.item()))
-        };
-        if header.negative {
-            if let (Some(head), Some(of)) = (head, self.impl_trait(block)) {
-                index.negative.entry(of).or_default().push(head);
-            }
-            return;
-        }
-        match (header.trait_ref.is_some(), head) {
-            (false, Some(head)) => index.inherent.entry(head).or_default().push(block),
-            (false, None) => {}
-            (true, _) => {
-                if !self.reserved(block)
-                    && let Some(of) = self.impl_trait(block)
-                {
-                    let bucket = index.traits.entry(of).or_default();
-                    bucket.all.push(block);
-                    match head {
-                        Some(head) => bucket.by_head.entry(head).or_default().push(block),
-                        None => bucket.blanket.push(block),
-                    }
-                }
-            }
-        }
-    }
-
-    fn syntax_head(
-        &mut self,
-        src: &Source,
-        arena: &Body,
-        ty: syntax::TyId,
-        home: (ModRef, Option<ItemRef>),
-    ) -> Option<Head> {
-        Some(match *arena.ty(ty) {
-            syntax::Ty::Paren(inner) => return self.syntax_head(src, arena, inner, home),
-            syntax::Ty::Ref { mutable, .. } => Head::Ref(if mutable { Mut::Mut } else { Mut::Not }),
-            syntax::Ty::Ptr { mutable, .. } => Head::Ptr(if mutable { Mut::Mut } else { Mut::Not }),
-            syntax::Ty::Slice(_) => Head::Slice,
-            syntax::Ty::Array(..) => Head::Array,
-            syntax::Ty::Tuple(_) => Head::Tuple,
-            syntax::Ty::Never => Head::Never,
-            syntax::Ty::Path(path) => return self.path_head(src, arena, path, home),
-            syntax::Ty::DynTrait(bounds) => return self.dyn_head(src, arena, bounds, home),
-            _ => return None,
-        })
-    }
-
-    fn dyn_head(
-        &mut self,
-        src: &Source,
-        arena: &Body,
-        bounds: crate::body::List,
-        (home, root): (ModRef, Option<ItemRef>),
-    ) -> Option<Head> {
-        arena.list(bounds).iter().find_map(|&at| {
-            let crate::body::Bound::Trait { path, .. } = arena.bounds[at as usize] else {
-                return None;
-            };
-            let (segments, absolute, dollar) = segments(&self.names.symbols, src, arena, path);
-            match self.resolve_in(
-                root,
-                &NamePath {
-                    segments: &segments,
-                    absolute,
-                    dollar,
-                },
-                home,
-            )? {
-                Def::Item(item)
-                    if self.item(item).1.kind == ItemKind::Trait && !self.is_auto_trait(item) =>
-                {
-                    Some(Head::Dyn(item))
-                }
-                _ => None,
-            }
-        })
-    }
-
-    fn path_head(
-        &mut self,
-        src: &Source,
-        arena: &Body,
-        path: syntax::PathId,
-        (home, root): (ModRef, Option<ItemRef>),
-    ) -> Option<Head> {
-        let (segments, absolute, dollar) = segments(&self.names.symbols, src, arena, path);
-        match self.resolve_in(
-            root,
-            &NamePath {
-                segments: &segments,
-                absolute,
-                dollar,
-            },
-            home,
-        )? {
-            Def::Primitive(primitive) => Some(Head::Prim(primitive)),
-            Def::Item(item)
-                if matches!(
-                    self.item(item).1.kind,
-                    ItemKind::Struct | ItemKind::Enum | ItemKind::Union
-                ) || self.foreign(item) =>
-            {
-                Some(Head::Adt(item))
-            }
-            Def::Item(item) if self.item(item).1.kind == ItemKind::Type => {
-                let alias = self.alias_def(item).ok()?;
-                let home = self.module_of(item).ok()?;
-                self.syntax_head(
-                    self.item(item).0,
-                    &alias.arena,
-                    alias.ty,
-                    (home, Some(item)),
-                )
-            }
-            _ => None,
-        }
-    }
-}
-
-fn generic_self(src: &Source, header: &ImplHeader) -> bool {
-    let syntax::Ty::Path(path) = *header.body.ty(header.self_ty) else {
-        return false;
-    };
-    let segments = header.body.list(header.body.path(path).segments);
-    let [only] = segments else { return false };
-    let name = src.text(header.body.segments[*only as usize].name);
-    header
-        .generics
-        .iter()
-        .any(|generic| src.text(generic.name) == name)
 }

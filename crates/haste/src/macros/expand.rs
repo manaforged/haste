@@ -17,6 +17,101 @@ use super::{Compilation, ENTRIES, Expander, expand_bound_scoped, macro_name};
 /// A procedural macro call: the macro function, its kind, and the crate that calls it, `usize::MAX` for a call in a function body.
 pub(super) type Call = (ItemRef, ProcKind, usize);
 
+fn derive_item_name(text: &str) -> Option<&str> {
+    let mut words = text.split_whitespace();
+    while let Some(word) = words.next() {
+        if matches!(word, "struct" | "enum" | "union") {
+            return words
+                .next()
+                .map(|name| name.split(['<', '(', '{', ':', ';']).next().unwrap_or(name));
+        }
+    }
+    None
+}
+
+fn crate_mentions_call(
+    outline: &Outline,
+    krate: usize,
+    run: ItemRef,
+    kind: ProcKind,
+    text: &str,
+) -> bool {
+    let files = &outline.crates[krate].files;
+    if kind == ProcKind::Derive {
+        let Some(name) = derive_item_name(text) else {
+            return false;
+        };
+        return files.iter().any(|file| {
+            file.items.items.iter().any(|item| {
+                matches!(
+                    item.kind,
+                    ItemKind::Struct | ItemKind::Enum | ItemKind::Union
+                ) && item
+                    .name
+                    .is_some_and(|tok| crate::names::plain(file.source.text(tok)) == name)
+            })
+        });
+    }
+    let name = macro_name(outline, run);
+    !name.is_empty()
+        && files
+            .iter()
+            .any(|file| file.source.text.as_str().contains(&name))
+}
+
+pub(super) fn infer_caller(outline: &Outline, run: ItemRef, kind: ProcKind, text: &str) -> usize {
+    let pm_krate = run.krate as usize;
+    let mut candidates: Vec<usize> = (0..outline.crates.len())
+        .filter(|&k| {
+            k != pm_krate
+                && !outline.crates[k].files.is_empty()
+                && dep_closure(outline, &[k]).0[pm_krate]
+        })
+        .collect();
+    if candidates.len() <= 1 {
+        return candidates.into_iter().next().unwrap_or(usize::MAX);
+    }
+    let local: Vec<usize> = candidates
+        .iter()
+        .copied()
+        .filter(|&k| !outline.crates[k].env.fixed)
+        .collect();
+    if !local.is_empty() {
+        candidates = local;
+    }
+    let non_proc: Vec<usize> = candidates
+        .iter()
+        .copied()
+        .filter(|&k| !outline.roots[k].proc_macro)
+        .collect();
+    if !non_proc.is_empty() {
+        candidates = non_proc;
+    }
+    let closures: Vec<(usize, Vec<bool>)> = candidates
+        .iter()
+        .map(|&k| (k, dep_closure(outline, &[k]).0))
+        .collect();
+    let leaves: Vec<usize> = candidates
+        .iter()
+        .copied()
+        .filter(|&k| !closures.iter().any(|(other, deps)| *other != k && deps[k]))
+        .collect();
+    if !leaves.is_empty() {
+        candidates = leaves;
+    }
+    if candidates.len() > 1 {
+        let matching: Vec<usize> = candidates
+            .iter()
+            .copied()
+            .filter(|&k| crate_mentions_call(outline, k, run, kind, text))
+            .collect();
+        if !matching.is_empty() {
+            candidates = matching;
+        }
+    }
+    candidates.into_iter().next().unwrap_or(usize::MAX)
+}
+
 /// The two entry functions of haste's `proc_macro` crate, reading its root first if it is only declared.
 fn entries(outline: &mut Outline) -> Result<[ItemRef; 2]> {
     let Some(krate) = outline
