@@ -11,11 +11,13 @@ use crate::outline::{Outline, Role};
 use crate::sema::summary::codec::{Cursor, read_str, write_str, write_u32, write_u64};
 
 use super::super::backing::{bytes_to_path, path_to_bytes};
-use super::super::sysroot::{EnvReads, SYSROOT_VERSION, crate_order, hash_identity};
+use super::super::sysroot::{SYSROOT_VERSION, crate_order, hash_identity};
 
 pub(super) const LOCAL_INDEX_MAGIC: [u8; 8] = *b"HSTLOC01";
 const LOCAL_META_MAGIC: [u8; 8] = *b"HSTLMT01";
-pub(super) const LOCAL_INDEX_VERSION: u32 = 2;
+pub(super) const LOCAL_INDEX_VERSION: u32 = 3;
+
+pub(super) type EnvHashes = Vec<(String, Option<u64>)>;
 
 pub(super) struct CrateRefs {
     pub local_deps: Vec<usize>,
@@ -29,7 +31,7 @@ pub(super) struct LocalMeta {
     pub dep_keys: Vec<(u64, u64)>,
     pub watched: Vec<(PathBuf, FileStamp)>,
     pub included: Vec<(PathBuf, PathBuf)>,
-    pub env_reads: EnvReads,
+    pub env_reads: EnvHashes,
 }
 
 fn is_local_lib(outline: &Outline, krate: usize) -> bool {
@@ -263,11 +265,23 @@ pub(super) fn collect_watched_files(
     (watched, included)
 }
 
+pub(super) fn hash_env_reads(env_reads: &[(String, Option<String>)]) -> EnvHashes {
+    env_reads
+        .iter()
+        .map(|(name, val)| {
+            let hash = val
+                .as_deref()
+                .map(|v| store::hash_env_val(&LOCAL_META_MAGIC, name, v));
+            (name.clone(), hash)
+        })
+        .collect()
+}
+
 pub(super) fn compute_content_key(
     structural: u64,
     watched: &[(PathBuf, FileStamp)],
     included: &[(PathBuf, PathBuf)],
-    env_reads: &[(String, Option<String>)],
+    env_reads: &[(String, Option<u64>)],
     dep_keys: &[(u64, u64)],
 ) -> u64 {
     let mut hasher = FxHasher::default();
@@ -325,12 +339,12 @@ pub(super) fn encode_meta(structural: u64, meta: &LocalMeta) -> Option<Vec<u8>> 
         }
     }
     write_u32(&mut out, u32::try_from(meta.env_reads.len()).ok()?);
-    for (name, val) in &meta.env_reads {
+    for (name, hash) in &meta.env_reads {
         write_str(&mut out, name)?;
-        match val {
-            Some(v) => {
+        match hash {
+            Some(h) => {
                 out.push(1);
-                write_str(&mut out, v)?;
+                write_u64(&mut out, *h);
             }
             None => out.push(0),
         }
@@ -381,12 +395,12 @@ pub(super) fn decode_meta(data: &[u8], expected_structural: u64) -> Option<Local
     let mut env_reads = Vec::with_capacity(env_count.min(256));
     for _ in 0..env_count {
         let name = read_str(&mut cur).ok()?.to_owned();
-        let val = match cur.u8().ok()? {
+        let hash = match cur.u8().ok()? {
             0 => None,
-            1 => Some(read_str(&mut cur).ok()?.to_owned()),
+            1 => Some(cur.u64().ok()?),
             _ => return None,
         };
-        env_reads.push((name, val));
+        env_reads.push((name, hash));
     }
     let included_count = cur.count().ok()?;
     let mut included = Vec::with_capacity(included_count.min(1024));
@@ -430,8 +444,11 @@ pub(super) fn validate_watched(watched: &[(PathBuf, FileStamp)], parallel: bool)
     })
 }
 
-pub(super) fn validate_env_reads(env_reads: &EnvReads) -> bool {
-    env_reads
-        .iter()
-        .all(|(name, expected)| crate::process_env_var(name) == *expected)
+pub(super) fn validate_env_reads(env_reads: &[(String, Option<u64>)]) -> bool {
+    env_reads.iter().all(|(name, expected)| {
+        crate::process_env_var(name)
+            .as_deref()
+            .map(|v| store::hash_env_val(&LOCAL_META_MAGIC, name, v))
+            == *expected
+    })
 }
