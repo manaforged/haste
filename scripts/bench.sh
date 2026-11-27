@@ -442,12 +442,19 @@ if suite in ("all", "build"):
     h_check_edits, c_check_edits = [], []
     h_emit_edits, c_build_edits = [], []
     h_daemon_edits, c_daemon_check_edits = [], []
+    cargo_out_bin = os.path.join(cargo_build_target, "debug", "diff" + (".exe" if os.name == "nt" else ""))
+    prev_emit_out = subprocess.check_output([haste_out_bin], stderr=subprocess.DEVNULL)
     for i in range(1, 4):
         write_edit(diff_main, orig_src, needle, seed + i * 10)
         h_check_edits.append(run_timed(haste_check_cmd, env=check_haste_env))
         c_check_edits.append(run_timed(cargo_check_cmd, env=cargo_env))
         h_emit_edits.append(run_timed(haste_emit_cmd, env=emit_haste_env))
         c_build_edits.append(run_timed(cargo_build_cmd, env=cargo_env))
+        h_out = subprocess.check_output([haste_out_bin], stderr=subprocess.DEVNULL)
+        c_out = subprocess.check_output([cargo_out_bin], stderr=subprocess.DEVNULL)
+        assert h_out == c_out, f"edit {i}: haste output differed from cargo output"
+        assert h_out != prev_emit_out, f"edit {i}: rebuilt executable output did not change"
+        prev_emit_out = h_out
     if os.name == "posix":
         def stop_daemon():
             subprocess.run([haste_bin, "serve", "stop", diff_dir], env=daemon_haste_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -502,7 +509,7 @@ if suite in ("all", "build"):
             ("Warm cache (`haste build` vs `cargo check`)", h_check_cold, c_check_cold),
             ("Warm cache (`haste build -o` vs `cargo build`)", h_emit_cold, c_build_cold),
         ])
-    print_build_table(f"### Build Speed (`tests/diff`, {case_count} fns)", rows, sections > 0)
+    print_build_table(f"### Build Speed (`tests/diff`, {case_count} cases)", rows, sections > 0)
     sections += 1
 
 if suite in ("all", "self"):
