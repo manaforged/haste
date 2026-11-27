@@ -422,7 +422,9 @@ impl Image {
         reached: &Reached,
         roots: &[usize],
     ) -> Result<(Image, HashMap<usize, String>)> {
-        crate::host::native::load(cx.outline)?;
+        if crate::compile_target() == haste_codegen::Target::host() {
+            crate::host::native::load(cx.outline)?;
+        }
         Self::build_aot_streaming(cx, reached, roots)
     }
 

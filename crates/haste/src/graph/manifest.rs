@@ -47,6 +47,21 @@ pub struct PackageMeta {
     pub rust_version: String,
 }
 
+/// A binary, example, integration test, or benchmark target declared or auto-discovered in a manifest.
+#[derive(Clone, Debug, Default)]
+pub struct TargetSpec {
+    pub name: String,
+    pub path: PathBuf,
+    pub required_features: Vec<String>,
+}
+
+impl TargetSpec {
+    /// Whether every feature listed in `required-features` is enabled in `features`.
+    pub fn enabled(&self, features: &std::collections::BTreeSet<String>) -> bool {
+        self.required_features.iter().all(|f| features.contains(f))
+    }
+}
+
 /// The parts of a `Cargo.toml` that the graph needs.
 #[derive(Clone, Debug, Default)]
 pub struct Manifest {
@@ -60,10 +75,10 @@ pub struct Manifest {
     pub lib: Option<PathBuf>,
     pub lib_name: Option<String>,
     pub proc_macro: bool,
-    pub bins: Vec<(String, PathBuf)>,
-    pub examples: Vec<(String, PathBuf)>,
-    pub tests: Vec<(String, PathBuf)>,
-    pub benches: Vec<(String, PathBuf)>,
+    pub bins: Vec<TargetSpec>,
+    pub examples: Vec<TargetSpec>,
+    pub tests: Vec<TargetSpec>,
+    pub benches: Vec<TargetSpec>,
     pub features: BTreeMap<String, Vec<String>>,
     pub deps: Vec<Dep>,
 }
@@ -242,21 +257,30 @@ fn targets_of(
     root: &Table,
     package: &Table,
     (table_key, auto_key, folder): (&str, &str, &str),
-) -> Vec<(String, PathBuf)> {
+) -> Vec<TargetSpec> {
     let listed = root
         .get(table_key)
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(Value::as_table);
-    let mut found: Vec<(String, PathBuf)> = listed
+    let mut found: Vec<TargetSpec> = listed
         .filter_map(|entry| {
             let target_name = text(entry, "name")?.to_owned();
             let path = text(entry, "path").map_or_else(
                 || dir.join(format!("{folder}/{target_name}.rs")),
                 |path| dir.join(path),
             );
-            Some((target_name, path))
+            let required_features = strings(
+                entry
+                    .get("required-features")
+                    .or_else(|| entry.get("required_features")),
+            );
+            Some(TargetSpec {
+                name: target_name,
+                path,
+                required_features,
+            })
         })
         .collect();
     if !flag(package, &[auto_key]).unwrap_or(true) {
@@ -279,19 +303,30 @@ fn targets_of(
         .collect();
     auto.sort();
     for (name, path) in auto {
-        if !found.iter().any(|(_, existing)| *existing == path) {
-            found.push((name, path));
+        if !found.iter().any(|existing| existing.path == path) {
+            found.push(TargetSpec {
+                name,
+                path,
+                required_features: Vec::new(),
+            });
         }
     }
     found
 }
 
-fn bins_of(dir: &Path, name: &str, root: &Table, package: &Table) -> Vec<(String, PathBuf)> {
+fn bins_of(dir: &Path, name: &str, root: &Table, package: &Table) -> Vec<TargetSpec> {
     let mut bins = targets_of(dir, root, package, ("bin", "autobins", "src/bin"));
     let auto = flag(package, &["autobins"]).unwrap_or(true);
     let main = dir.join("src/main.rs");
-    if auto && main.is_file() && !bins.iter().any(|(_, path)| *path == main) {
-        bins.insert(0, (name.to_owned(), main));
+    if auto && main.is_file() && !bins.iter().any(|t| t.path == main) {
+        bins.insert(
+            0,
+            TargetSpec {
+                name: name.to_owned(),
+                path: main,
+                required_features: Vec::new(),
+            },
+        );
     }
     bins
 }

@@ -584,14 +584,22 @@ impl Batch {
         if !self.broken.is_empty() {
             bail!("{} functions failed to compile", self.broken.len());
         }
-        let reached_crates: HashSet<usize> = self
+        let mut linked_crates: HashSet<usize> = self
             .reached
             .list
             .iter()
             .map(|((item, _), _)| item.krate as usize)
             .collect();
+        let mut queue: Vec<usize> = linked_crates.iter().copied().collect();
+        while let Some(krate_idx) = queue.pop() {
+            for &(_, dep) in &compilation.outline.deps[krate_idx] {
+                if linked_crates.insert(dep) {
+                    queue.push(dep);
+                }
+            }
+        }
         let mut has_static_archive = None;
-        for krate_idx in reached_crates {
+        for krate_idx in linked_crates {
             let krate = &compilation.outline.crates[krate_idx];
             if let Some(script) = &krate.env.script
                 && let Some((_, lib)) = script

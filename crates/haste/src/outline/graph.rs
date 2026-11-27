@@ -40,25 +40,32 @@ pub fn roots(workspace: &Workspace, scripts: &[usize]) -> Vec<Root> {
             });
         }
         if needed.is_none() && workspace.graph.members.contains(&entry.package) {
-            let bins = manifest.bins.iter().map(|(name, path)| Root {
-                unit,
-                name: name.clone(),
-                path: path.clone(),
-                role: Role::Bin,
-                edition: manifest.edition.clone(),
-                proc_macro: false,
-            });
+            let bins = manifest
+                .bins
+                .iter()
+                .filter(|t| t.enabled(&entry.features))
+                .map(|t| Root {
+                    unit,
+                    name: t.name.clone(),
+                    path: t.path.clone(),
+                    role: Role::Bin,
+                    edition: manifest.edition.clone(),
+                    proc_macro: false,
+                });
             roots.extend(bins);
             let sel = crate::selection();
             if sel.all_targets || sel.example.is_some() {
                 let examples = manifest
                     .examples
                     .iter()
-                    .filter(|(name, _)| sel.example.as_deref().is_none_or(|wanted| name == wanted))
-                    .map(|(name, path)| Root {
+                    .filter(|t| {
+                        t.enabled(&entry.features)
+                            && sel.example.as_deref().is_none_or(|wanted| t.name == wanted)
+                    })
+                    .map(|t| Root {
                         unit,
-                        name: name.clone(),
-                        path: path.clone(),
+                        name: t.name.clone(),
+                        path: t.path.clone(),
                         role: Role::Example,
                         edition: manifest.edition.clone(),
                         proc_macro: false,
@@ -66,14 +73,18 @@ pub fn roots(workspace: &Workspace, scripts: &[usize]) -> Vec<Root> {
                 roots.extend(examples);
             }
             if sel.all_targets {
-                let benches = manifest.benches.iter().map(|(name, path)| Root {
-                    unit,
-                    name: name.clone(),
-                    path: path.clone(),
-                    role: Role::Bench,
-                    edition: manifest.edition.clone(),
-                    proc_macro: false,
-                });
+                let benches = manifest
+                    .benches
+                    .iter()
+                    .filter(|t| t.enabled(&entry.features))
+                    .map(|t| Root {
+                        unit,
+                        name: t.name.clone(),
+                        path: t.path.clone(),
+                        role: Role::Bench,
+                        edition: manifest.edition.clone(),
+                        proc_macro: false,
+                    });
                 roots.extend(benches);
             }
             if crate::test_mode()
@@ -85,11 +96,14 @@ pub fn roots(workspace: &Workspace, scripts: &[usize]) -> Vec<Root> {
                 let tests = manifest
                     .tests
                     .iter()
-                    .filter(|(name, _)| sel.test.as_deref().is_none_or(|want| name == want))
-                    .map(|(name, path)| Root {
+                    .filter(|t| {
+                        t.enabled(&entry.features)
+                            && sel.test.as_deref().is_none_or(|want| t.name == want)
+                    })
+                    .map(|t| Root {
                         unit,
-                        name: name.clone(),
-                        path: path.clone(),
+                        name: t.name.clone(),
+                        path: t.path.clone(),
                         role: Role::Test,
                         edition: manifest.edition.clone(),
                         proc_macro: false,

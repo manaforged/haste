@@ -321,8 +321,16 @@ def isolated_haste_env(tag):
         return warm_haste_env
     return {**os.environ, "HASTE_HOME": os.path.join(tmp, f"haste_home_{tag}")}
 
+cargo_bin = "cargo"
+try:
+    resolved = subprocess.run(["rustup", "which", "cargo"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    if resolved.returncode == 0 and resolved.stdout.strip():
+        cargo_bin = resolved.stdout.strip()
+except OSError:
+    pass
+
 def cargo_cmd(sub, target_dir, manifest=None):
-    cmd = ["cargo", sub, "--quiet", "--locked"]
+    cmd = [cargo_bin, sub, "--quiet", "--locked"]
     if manifest is not None:
         cmd.extend(["--manifest-path", manifest])
     cmd.extend(["--target-dir", target_dir])

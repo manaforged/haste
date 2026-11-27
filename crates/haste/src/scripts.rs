@@ -721,7 +721,7 @@ impl Driver for Runs<'_, '_> {
                 error: format!("does not build: {error}"),
                 broken: self.owners.get(item.krate as usize).copied(),
                 interrupted: false,
-                fatal: false,
+                fatal: true,
             }),
             (status, None) => Err(Failure {
                 interrupted: crate::image::interrupted(status),

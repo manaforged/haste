@@ -210,7 +210,7 @@ fn local_paths(
 ) -> Result<BTreeMap<String, PathBuf>> {
     let mut paths = BTreeMap::new();
     let mut seen_ws = BTreeSet::from([top.to_owned()]);
-    let mut stack = vec![root.to_owned()];
+    let mut stack = vec![root.to_owned(), top.to_owned()];
     stack.extend(patch_paths(top)?);
     stack.extend(member_dirs(top, workspace, "members"));
     while let Some(dir) = stack.pop() {
@@ -365,18 +365,28 @@ fn root_package_names(
     if workspace.is_some()
         && (crate::selection().workspace || (manifest_name(root).is_none() && root == top))
     {
-        let mut dirs = if crate::selection().workspace {
+        let use_all = crate::selection().workspace;
+        let mut dirs = if use_all {
             member_dirs(top, workspace, "members")
         } else {
             member_dirs(top, workspace, "default-members")
         };
+        let include_root = use_all || dirs.is_empty();
         if dirs.is_empty() {
             dirs = member_dirs(top, workspace, "members");
         }
-        return Ok(dirs
-            .into_iter()
-            .filter_map(|dir| manifest_name(&dir))
-            .collect());
+        let mut names = Vec::new();
+        if include_root && let Some(root_name) = manifest_name(top) {
+            names.push(root_name);
+        }
+        for dir in dirs {
+            if let Some(name) = manifest_name(&dir)
+                && !names.contains(&name)
+            {
+                names.push(name);
+            }
+        }
+        return Ok(names);
     }
     let owner = owning_workspace(root)?;
     Ok(vec![

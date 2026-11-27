@@ -124,7 +124,21 @@ impl Driver for Run<'_, '_> {
     fn start(&mut self, demand: &mut Jit) -> Result<()> {
         if self.status.is_none() && demand.children.is_empty() {
             let (entry, args, env) = (self.entry, self.args, self.env);
+            let client_env = crate::client_env();
             demand.fork(false, |image, _| {
+                if let Some(vars) = client_env.as_deref() {
+                    let current: Vec<String> = std::env::vars().map(|(k, _)| k).collect();
+                    for key in current {
+                        if !vars.contains_key(&key) {
+                            // SAFETY: single-threaded forked child process before invoking user `main`.
+                            unsafe { std::env::remove_var(&key) };
+                        }
+                    }
+                    for (key, value) in vars {
+                        // SAFETY: single-threaded forked child process before invoking user `main`.
+                        unsafe { std::env::set_var(key, value) };
+                    }
+                }
                 for (key, value) in env {
                     // SAFETY: single-threaded forked child process before invoking user `main`.
                     unsafe { std::env::set_var(key, value) };

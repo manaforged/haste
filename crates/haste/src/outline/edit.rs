@@ -113,7 +113,10 @@ fn included_calls(src: &super::source::Source, env: &super::tree::Env) -> Vec<St
     let calls = (2..src.tokens.len() as u32).filter(|&open| {
         super::source::opens(src.kind(open))
             && src.text(open - 1) == "!"
-            && matches!(src.text(open - 2), "include_str" | "include_bytes")
+            && matches!(
+                src.text(open - 2),
+                "include" | "include_str" | "include_bytes"
+            )
     });
     calls
         .filter_map(|open| super::build::path_text(src, *src.args(open).first()?, env))
