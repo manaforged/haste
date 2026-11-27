@@ -499,6 +499,7 @@ pub(super) fn read_outline_crate(
         consumed,
         macro_use,
         expansions,
+        cached_included: None,
     })
 }
 

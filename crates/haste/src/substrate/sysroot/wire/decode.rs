@@ -19,14 +19,8 @@ use super::super::tokens::{
     frag_from_tag, read_items, read_marks, read_opt_u32, read_origins, read_path, read_rules,
     read_str, u32_le,
 };
-use super::super::{CrateIdentity, EnvReads, HEADER_LEN, match_crate_list};
+use super::super::{EnvReads, HEADER_LEN, match_crate_list_wire};
 use super::{FIXED_SYM_COUNT, opt_u32_le};
-
-type DecodedCrates = (
-    Vec<(usize, OutlineCrate)>,
-    Vec<(usize, NamesCrate)>,
-    HashMap<u32, Arc<ImplIndex>>,
-);
 
 pub(in crate::substrate) type DecodedSnapshot = (
     Vec<(usize, OutlineCrate)>,
@@ -45,33 +39,38 @@ pub(in crate::substrate) struct DecodeSpec<'a> {
     pub scope_bit: u32,
 }
 
-struct WireSections<'a> {
-    sym_count: usize,
-    sym_ends: &'a [u8],
-    sym_blob: &'a [u8],
-    file_slices: Vec<(usize, &'a [u8], Option<u32>)>,
-    macro_slices: Vec<&'a [u8]>,
-    textual_raw: Vec<(String, u32, Option<u32>)>,
-    outline_slices: Vec<&'a [u8]>,
-    name_slices: Vec<&'a [u8]>,
-    impl_slices: Vec<&'a [u8]>,
+pub(super) struct WireSections<'a> {
+    pub sym_count: usize,
+    pub sym_ends: &'a [u8],
+    pub sym_blob: &'a [u8],
+    pub file_slices: Vec<(usize, &'a [u8], Option<u32>)>,
+    pub macro_slices: Vec<&'a [u8]>,
+    pub textual_raw: Vec<(String, u32, Option<u32>)>,
+    pub outline_slices: Vec<&'a [u8]>,
+    pub name_slices: Vec<&'a [u8]>,
+    pub impl_slices: Vec<&'a [u8]>,
 }
 
 fn read_slices<'a>(cur: &mut Cursor<'a>, count: usize) -> Result<Vec<&'a [u8]>> {
     let table_bytes = count.checked_mul(4).context("slice table overflow")?;
     let table = cur.take(table_bytes)?;
-    let mut ranges = Vec::with_capacity(count);
     let mut prev = 0usize;
     for c in table.chunks_exact(4) {
         let end = u32_le(c, 0) as usize;
         if end < prev {
             bail!("non-monotonic sysroot slice offset");
         }
-        ranges.push((prev, end));
         prev = end;
     }
     let blob = cur.take(prev)?;
-    Ok(ranges.into_iter().map(|(s, e)| &blob[s..e]).collect())
+    let mut out = Vec::with_capacity(count);
+    let mut start = 0usize;
+    for c in table.chunks_exact(4) {
+        let end = u32_le(c, 0) as usize;
+        out.push(&blob[start..end]);
+        start = end;
+    }
+    Ok(out)
 }
 
 fn read_file_slices<'a>(
@@ -80,22 +79,72 @@ fn read_file_slices<'a>(
 ) -> Result<Vec<(usize, &'a [u8], Option<u32>)>> {
     let table_bytes = count.checked_mul(8).context("file table overflow")?;
     let table = cur.take(table_bytes)?;
-    let mut entries = Vec::with_capacity(count);
     let mut prev = 0usize;
     for c in table.chunks_exact(8) {
         let end = u32_le(c, 0) as usize;
         if end < prev {
             bail!("non-monotonic sysroot file offset");
         }
-        entries.push((prev, end, opt_u32_le(c, 4)));
         prev = end;
     }
     let blob_off = cur.pos;
     let blob = cur.take(prev)?;
-    Ok(entries
-        .into_iter()
-        .map(|(s, e, base)| (blob_off + s, &blob[s..e], base))
-        .collect())
+    let mut out = Vec::with_capacity(count);
+    let mut start = 0usize;
+    for c in table.chunks_exact(8) {
+        let end = u32_le(c, 0) as usize;
+        out.push((blob_off + start, &blob[start..end], opt_u32_le(c, 4)));
+        start = end;
+    }
+    Ok(out)
+}
+
+fn decode_symbols_parallel(sym_ends: &[u8], sym_blob: &[u8], syms: &Symbols) -> Result<Vec<Sym>> {
+    let text = std::str::from_utf8(sym_blob).context("invalid snapshot symbol utf-8")?;
+    let count = sym_ends.len() / 4;
+    if count == 0 {
+        if !text.is_empty() {
+            bail!("trailing bytes in snapshot symbol blob");
+        }
+        return Ok(Vec::new());
+    }
+    let last_end = u32_le(sym_ends, (count - 1) * 4) as usize;
+    if last_end != text.len() {
+        bail!("trailing bytes in snapshot symbol blob");
+    }
+    let workers = crate::jobs().clamp(1, 8);
+    let chunk_syms = count.div_ceil(workers).max(512);
+    let mut chunks = Vec::with_capacity(count.div_ceil(chunk_syms));
+    let mut start = 0usize;
+    let mut prev = 0usize;
+    while start < count {
+        let end = (start + chunk_syms).min(count);
+        let next_prev = u32_le(sym_ends, (end - 1) * 4) as usize;
+        if next_prev < prev || next_prev > text.len() || !text.is_char_boundary(next_prev) {
+            bail!("invalid snapshot symbol boundary");
+        }
+        chunks.push((prev, &sym_ends[start * 4..end * 4]));
+        prev = next_prev;
+        start = end;
+    }
+    let parts = crate::sync::parallel_map(chunks, |(init_prev, ends)| -> Result<Vec<Sym>> {
+        let mut out = Vec::with_capacity(ends.len() / 4);
+        let mut p = init_prev;
+        for c in ends.chunks_exact(4) {
+            let e = u32_le(c, 0) as usize;
+            if e < p || e > text.len() || !text.is_char_boundary(e) {
+                bail!("invalid snapshot symbol boundary");
+            }
+            out.push(syms.intern(&text[p..e]));
+            p = e;
+        }
+        Ok(out)
+    });
+    let mut sym_remap = Vec::with_capacity(count);
+    for part in parts {
+        sym_remap.extend(part?);
+    }
+    Ok(sym_remap)
 }
 
 fn decode_symbols_with(
@@ -239,7 +288,7 @@ fn decode_macros(
         .collect()
 }
 
-fn decode_crates(
+fn decode_crates_inner(
     outline_slices: Vec<&[u8]>,
     name_slices: Vec<&[u8]>,
     impl_slices: Vec<&[u8]>,
@@ -248,8 +297,12 @@ fn decode_crates(
     textuals: &[Arc<Textual>],
     local_crates: &[usize],
     remap: &[u32],
-    sym_remap: &[Sym],
-) -> Result<DecodedCrates> {
+    sym_remap: Option<&[Sym]>,
+) -> Result<(
+    Vec<(usize, OutlineCrate)>,
+    Vec<(usize, NamesCrate)>,
+    HashMap<u32, Arc<ImplIndex>>,
+)> {
     enum CrateTask<'a> {
         Outline(usize, &'a [u8]),
         Names(usize, &'a [u8]),
@@ -261,12 +314,14 @@ fn decode_crates(
         Impls(usize, Option<Arc<ImplIndex>>),
     }
     let crate_count = local_crates.len();
-    let mut tasks = Vec::with_capacity(crate_count * 3);
+    let mut tasks = Vec::with_capacity(crate_count * (2 + usize::from(sym_remap.is_some())));
     for (pos, slice) in outline_slices.into_iter().enumerate() {
         tasks.push(CrateTask::Outline(pos, slice));
     }
-    for (pos, slice) in name_slices.into_iter().enumerate() {
-        tasks.push(CrateTask::Names(pos, slice));
+    if sym_remap.is_some() {
+        for (pos, slice) in name_slices.into_iter().enumerate() {
+            tasks.push(CrateTask::Names(pos, slice));
+        }
     }
     for (pos, slice) in impl_slices.into_iter().enumerate() {
         tasks.push(CrateTask::Impls(pos, slice));
@@ -280,6 +335,7 @@ fn decode_crates(
         };
         lb.cmp(&la)
     });
+    let parallel_scopes = crate_count < 4;
     let decoded = crate::sync::parallel_map(tasks, |task| -> Result<CrateOut> {
         match task {
             CrateTask::Outline(pos, slice) => {
@@ -292,7 +348,8 @@ fn decode_crates(
             }
             CrateTask::Names(pos, slice) => {
                 let mut ccur = Cursor::new(slice);
-                let krate = read_names_crate(&mut ccur, remap, sym_remap)?;
+                let krate =
+                    read_names_crate(&mut ccur, remap, sym_remap.unwrap_or(&[]), parallel_scopes)?;
                 if ccur.pos != slice.len() {
                     bail!("trailing bytes in snapshot names crate");
                 }
@@ -309,7 +366,11 @@ fn decode_crates(
         }
     });
     let mut outline_slots: Vec<Option<OutlineCrate>> = (0..crate_count).map(|_| None).collect();
-    let mut name_slots: Vec<Option<NamesCrate>> = (0..crate_count).map(|_| None).collect();
+    let mut name_slots: Vec<Option<NamesCrate>> = if sym_remap.is_some() {
+        (0..crate_count).map(|_| None).collect()
+    } else {
+        Vec::new()
+    };
     let mut heads = HashMap::default();
     for item in decoded {
         match item? {
@@ -326,11 +387,15 @@ fn decode_crates(
         .zip(outline_slots)
         .map(|(&k, s)| Ok((k, s.context("missing decoded outline crate")?)))
         .collect::<Result<Vec<_>>>()?;
-    let name_crates = local_crates
-        .iter()
-        .zip(name_slots)
-        .map(|(&k, s)| Ok((k, s.context("missing decoded names crate")?)))
-        .collect::<Result<Vec<_>>>()?;
+    let name_crates = if sym_remap.is_some() {
+        local_crates
+            .iter()
+            .zip(name_slots)
+            .map(|(&k, s)| Ok((k, s.context("missing decoded names crate")?)))
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
     Ok((outline_crates, name_crates, heads))
 }
 
@@ -354,7 +419,7 @@ fn read_env_reads_list(cur: &mut Cursor<'_>) -> Result<Vec<EnvReads>> {
     Ok(all)
 }
 
-fn read_header_and_match(
+pub(super) fn read_header_and_match(
     cur: &mut Cursor<'_>,
     data: &[u8],
     spec: &DecodeSpec<'_>,
@@ -385,11 +450,7 @@ fn read_header_and_match(
     {
         return Ok(None);
     }
-    let mut identities = Vec::with_capacity(ref_count);
-    for _ in 0..ref_count {
-        identities.push(read_identity(cur)?);
-    }
-    if !match_crate_list(&identities, workspace, outline, spec.ref_crates) {
+    if !match_crate_list_wire(cur, workspace, outline, spec.ref_crates)? {
         return Ok(None);
     }
     let env_reads = read_env_reads_list(cur)?;
@@ -403,7 +464,7 @@ fn read_header_and_match(
     Ok(Some(env_reads))
 }
 
-fn read_sections<'a>(
+pub(super) fn read_sections<'a>(
     cur: &mut Cursor<'a>,
     data_len: usize,
     crate_count: usize,
@@ -441,7 +502,7 @@ fn read_sections<'a>(
     })
 }
 
-fn decode_textuals(
+pub(super) fn decode_textuals(
     textual_raw: Vec<(String, u32, Option<u32>)>,
     macros: &[Arc<Macro>],
 ) -> Result<Vec<Arc<Textual>>> {
@@ -463,6 +524,36 @@ fn decode_textuals(
         textuals.push(Arc::new(Textual { name, def, next }));
     }
     Ok(textuals)
+}
+
+fn decode_names_crates(
+    name_slices: Vec<&[u8]>,
+    local_crates: &[usize],
+    remap: &[u32],
+    sym_remap: &[Sym],
+) -> Result<Vec<(usize, NamesCrate)>> {
+    let crate_count = local_crates.len();
+    let parallel_scopes = crate_count < 4;
+    let mut tasks: Vec<(usize, &[u8])> = name_slices.into_iter().enumerate().collect();
+    tasks.sort_unstable_by(|a, b| b.1.len().cmp(&a.1.len()));
+    let decoded = crate::sync::parallel_map(tasks, |(pos, slice)| -> Result<(usize, NamesCrate)> {
+        let mut ccur = Cursor::new(slice);
+        let krate = read_names_crate(&mut ccur, remap, sym_remap, parallel_scopes)?;
+        if ccur.pos != slice.len() {
+            bail!("trailing bytes in snapshot names crate");
+        }
+        Ok((pos, krate))
+    });
+    let mut name_slots: Vec<Option<NamesCrate>> = (0..crate_count).map(|_| None).collect();
+    for item in decoded {
+        let (pos, krate) = item?;
+        name_slots[pos] = Some(krate);
+    }
+    local_crates
+        .iter()
+        .zip(name_slots)
+        .map(|(&k, s)| Ok((k, s.context("missing decoded names crate")?)))
+        .collect::<Result<Vec<_>>>()
 }
 
 pub(in super::super) fn decode_snapshot(
@@ -490,81 +581,87 @@ pub(in super::super) fn decode_snapshot(
         impl_slices,
     } = read_sections(&mut cur, data.len(), spec.cached_crates.len(), spec.magic)?;
 
-    let decode_front = || -> Result<(Vec<Arc<File>>, Vec<Arc<Macro>>, Vec<Arc<Textual>>)> {
-        let files = decode_files(backing, file_slices, &remap, spec.scope_bit)?;
-        let macros = decode_macros(macro_slices, &files, &remap)?;
-        let textuals = decode_textuals(textual_raw, &macros)?;
-        Ok((files, macros, textuals))
-    };
-
-    let ((owned_symbols, sym_remap), (files, macros, textuals)) =
-        if crate::jobs() > 1 && sym_count >= 256 {
-            crate::sync::scope(|scope| -> Result<_> {
+    match existing_symbols {
+        Some(existing) if crate::jobs() > 1 && sym_count >= 2048 => {
+            let files = decode_files(backing, file_slices, &remap, spec.scope_bit)?;
+            let macros = decode_macros(macro_slices, &files, &remap)?;
+            let textuals = decode_textuals(textual_raw, &macros)?;
+            let sym_remap = decode_symbols_parallel(sym_ends, sym_blob, existing)?;
+            let (outline_crates, name_crates, heads) = decode_crates_inner(
+                outline_slices,
+                name_slices,
+                impl_slices,
+                &files,
+                &macros,
+                &textuals,
+                spec.cached_crates,
+                &remap,
+                Some(&sym_remap),
+            )?;
+            Ok(Some((outline_crates, None, name_crates, heads, env_reads)))
+        }
+        _ if crate::jobs() > 1 && sym_count >= 256 => {
+            Ok(crate::sync::scope(|scope| -> Result<_> {
                 let sym_handle =
                     scope.spawn(|| decode_symbols_with(sym_ends, sym_blob, existing_symbols));
-                let front_res = decode_front();
-                let syms_res = match sym_handle.join() {
-                    Ok(res) => res,
+                let files = decode_files(backing, file_slices, &remap, spec.scope_bit)?;
+                let macros = decode_macros(macro_slices, &files, &remap)?;
+                let textuals = decode_textuals(textual_raw, &macros)?;
+                let (outline_crates, _, heads) = decode_crates_inner(
+                    outline_slices,
+                    Vec::new(),
+                    impl_slices,
+                    &files,
+                    &macros,
+                    &textuals,
+                    spec.cached_crates,
+                    &remap,
+                    None,
+                )?;
+                let (owned_symbols, sym_remap) = match sym_handle.join() {
+                    Ok(res) => res?,
                     Err(payload) => std::panic::resume_unwind(payload),
                 };
-                Ok((syms_res?, front_res?))
-            })?
-        } else {
-            (
-                decode_symbols_with(sym_ends, sym_blob, existing_symbols)?,
-                decode_front()?,
-            )
-        };
-
-    let (outline_crates, name_crates, heads) = decode_crates(
-        outline_slices,
-        name_slices,
-        impl_slices,
-        &files,
-        &macros,
-        &textuals,
-        spec.cached_crates,
-        &remap,
-        &sym_remap,
-    )?;
-
-    Ok(Some((
-        outline_crates,
-        owned_symbols,
-        name_crates,
-        heads,
-        env_reads,
-    )))
+                let name_crates =
+                    decode_names_crates(name_slices, spec.cached_crates, &remap, &sym_remap)?;
+                Ok(Some((
+                    outline_crates,
+                    owned_symbols,
+                    name_crates,
+                    heads,
+                    env_reads,
+                )))
+            })?)
+        }
+        _ => {
+            let (owned_symbols, sym_remap) =
+                decode_symbols_with(sym_ends, sym_blob, existing_symbols)?;
+            let files = decode_files(backing, file_slices, &remap, spec.scope_bit)?;
+            let macros = decode_macros(macro_slices, &files, &remap)?;
+            let textuals = decode_textuals(textual_raw, &macros)?;
+            let (outline_crates, name_crates, heads) = decode_crates_inner(
+                outline_slices,
+                name_slices,
+                impl_slices,
+                &files,
+                &macros,
+                &textuals,
+                spec.cached_crates,
+                &remap,
+                Some(&sym_remap),
+            )?;
+            Ok(Some((
+                outline_crates,
+                owned_symbols,
+                name_crates,
+                heads,
+                env_reads,
+            )))
+        }
+    }
 }
 
-fn read_identity(cur: &mut Cursor<'_>) -> Result<CrateIdentity> {
-    let unit_name = read_str(cur)?.to_owned();
-    let pkg_name = read_str(cur)?.to_owned();
-    let pkg_version = read_str(cur)?.to_owned();
-    let side_host = cur.u8()? != 0;
-    let role = cur.u8()?;
-    let feat_len = cur.count()?;
-    let mut features = Vec::with_capacity(feat_len);
-    for _ in 0..feat_len {
-        features.push(read_str(cur)?.to_owned());
-    }
-    let dep_len = cur.count()?;
-    let mut deps = Vec::with_capacity(dep_len);
-    for _ in 0..dep_len {
-        deps.push((read_str(cur)?.to_owned(), cur.u32()?));
-    }
-    Ok(CrateIdentity {
-        unit_name,
-        pkg_name,
-        pkg_version,
-        side_host,
-        role,
-        features,
-        deps,
-    })
-}
-
-fn read_file(
+pub(super) fn read_file(
     cur: &mut Cursor<'_>,
     backing: &Arc<Backing>,
     file_off: usize,

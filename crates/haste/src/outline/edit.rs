@@ -42,6 +42,7 @@ impl Outline {
         let new = Arc::new(new);
         for &(krate, file) in &slots {
             self.crates[krate as usize].files[file as usize] = new.clone();
+            self.crates[krate as usize].cached_included = None;
         }
         Ok(Edit::Bodies(slots))
     }
@@ -72,6 +73,7 @@ impl Outline {
         let new = Arc::new(read(path)?);
         for &(krate, file) in &slots {
             self.crates[krate as usize].files[file as usize] = new.clone();
+            self.crates[krate as usize].cached_included = None;
         }
         Ok(Edit::Bodies(slots))
     }
@@ -79,6 +81,9 @@ impl Outline {
     /// Each file that an `include_str!` or `include_bytes!` call with a literal path in crate `krate` reads, with the file that holds the call.
     pub fn included(&self, krate: usize) -> Vec<(PathBuf, PathBuf)> {
         let tree = &self.crates[krate];
+        if let Some(cached) = &tree.cached_included {
+            return cached.clone();
+        }
         tree.files
             .iter()
             .flat_map(|file| {

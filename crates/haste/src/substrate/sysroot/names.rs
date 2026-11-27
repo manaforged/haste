@@ -26,13 +26,18 @@ fn map_sym(raw: u32, sym_remap: &[Sym]) -> Result<Sym> {
 }
 
 fn read_syms(cur: &mut Cursor<'_>, sym_remap: &[Sym]) -> Result<Box<[Sym]>> {
+    let count = cur.count()?;
+    let byte_len = count.checked_mul(4).context("u32 slice overflow")?;
+    let bytes = cur.take(byte_len)?;
+    let mut out = Vec::with_capacity(count);
     if sym_remap.is_empty() {
-        return Ok(read_u32s_map(cur, Sym)?.into_boxed_slice());
-    }
-    let raw = read_u32s_map(cur, |v| v)?;
-    let mut out = Vec::with_capacity(raw.len());
-    for id in raw {
-        out.push(map_sym(id, sym_remap)?);
+        for c in bytes.chunks_exact(4) {
+            out.push(Sym(u32_le(c, 0)));
+        }
+    } else {
+        for c in bytes.chunks_exact(4) {
+            out.push(map_sym(u32_le(c, 0), sym_remap)?);
+        }
     }
     Ok(out.into_boxed_slice())
 }
@@ -328,37 +333,48 @@ fn decode_scope(slice: &[u8], remap: &[u32], sym_remap: &[Sym]) -> Result<Scope>
     })
 }
 
-fn read_scopes(cur: &mut Cursor<'_>, remap: &[u32], sym_remap: &[Sym]) -> Result<Vec<Scope>> {
+fn read_scopes(
+    cur: &mut Cursor<'_>,
+    remap: &[u32],
+    sym_remap: &[Sym],
+    parallel: bool,
+) -> Result<Vec<Scope>> {
     let scope_len = cur.count()?;
     let end_bytes = cur.take(scope_len.checked_mul(4).context("scope table overflow")?)?;
-    let mut ranges = Vec::with_capacity(scope_len);
-    let mut prev = 0usize;
-    for c in end_bytes.chunks_exact(4) {
-        let end = u32_le(c, 0) as usize;
-        if end < prev {
-            bail!("non-monotonic sysroot scope offset");
-        }
-        ranges.push((prev, end));
-        prev = end;
-    }
     let scope_byte_len = cur.count()?;
-    if prev != scope_byte_len {
-        bail!("sysroot scope table length mismatch");
-    }
     let scope_bytes = cur.take(scope_byte_len)?;
-    if scope_len >= 64 && scope_byte_len >= 64 * 1024 && crate::jobs() > 1 {
-        let slices: Vec<&[u8]> = ranges
-            .into_iter()
-            .map(|(s, e)| &scope_bytes[s..e])
-            .collect();
+    if parallel && scope_len >= 16 && scope_byte_len >= 8 * 1024 && crate::jobs() > 1 {
+        let mut slices = Vec::with_capacity(scope_len);
+        let mut prev = 0usize;
+        for c in end_bytes.chunks_exact(4) {
+            let end = u32_le(c, 0) as usize;
+            if end < prev || end > scope_byte_len {
+                bail!("non-monotonic sysroot scope offset");
+            }
+            slices.push(&scope_bytes[prev..end]);
+            prev = end;
+        }
+        if prev != scope_byte_len {
+            bail!("sysroot scope table length mismatch");
+        }
         crate::sync::parallel_map(slices, |s| decode_scope(s, remap, sym_remap))
             .into_iter()
             .collect::<Result<Vec<_>>>()
     } else {
-        ranges
-            .into_iter()
-            .map(|(s, e)| decode_scope(&scope_bytes[s..e], remap, sym_remap))
-            .collect::<Result<Vec<_>>>()
+        let mut scopes = Vec::with_capacity(scope_len);
+        let mut prev = 0usize;
+        for c in end_bytes.chunks_exact(4) {
+            let end = u32_le(c, 0) as usize;
+            if end < prev || end > scope_byte_len {
+                bail!("non-monotonic sysroot scope offset");
+            }
+            scopes.push(decode_scope(&scope_bytes[prev..end], remap, sym_remap)?);
+            prev = end;
+        }
+        if prev != scope_byte_len {
+            bail!("sysroot scope table length mismatch");
+        }
+        Ok(scopes)
     }
 }
 
@@ -472,8 +488,9 @@ pub(super) fn read_names_crate(
     cur: &mut Cursor<'_>,
     remap: &[u32],
     sym_remap: &[Sym],
+    parallel_scopes: bool,
 ) -> Result<NamesCrate> {
-    let scopes = read_scopes(cur, remap, sym_remap)?;
+    let scopes = read_scopes(cur, remap, sym_remap, parallel_scopes)?;
     let prelude = read_prelude(cur, remap)?;
     let unresolved = read_unresolved(cur)?;
     let externs = read_externs(cur, remap, sym_remap)?;

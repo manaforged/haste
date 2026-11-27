@@ -1,3 +1,4 @@
+mod batch;
 mod decode;
 
 use std::sync::Arc;
@@ -20,6 +21,8 @@ use super::tokens::{
 };
 use super::{CrateIdentity, EnvReads, identity_of};
 
+pub(in crate::substrate) use batch::prepare_wire;
+pub(crate) use batch::{PreparedWire, decode_prepared_batch};
 pub(super) use decode::decode_snapshot;
 pub(in crate::substrate) use decode::{DecodeSpec, DecodedSnapshot};
 

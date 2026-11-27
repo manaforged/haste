@@ -51,6 +51,17 @@ impl Expander {
 }
 
 impl Compilation {
+    #[cfg(test)]
+    pub(crate) fn for_test(outline: Outline, names: Names) -> Self {
+        Self {
+            outline,
+            names,
+            expander: None,
+            substrate: None,
+            sysroot_heads: None,
+        }
+    }
+
     /// Drops the macro expander only when the macro crate graph changed, keeping compiled macro code across settle phases.
     pub fn settle(&mut self) {
         if self
@@ -60,19 +71,6 @@ impl Compilation {
         {
             self.expander = None;
         }
-    }
-}
-
-fn merge_heads(
-    dst: &mut Option<HashMap<u32, std::sync::Arc<crate::sema::impls::Index>>>,
-    src: HashMap<u32, std::sync::Arc<crate::sema::impls::Index>>,
-) {
-    if src.is_empty() {
-        return;
-    }
-    match dst {
-        Some(map) => map.extend(src),
-        None => *dst = Some(src),
     }
 }
 
@@ -98,24 +96,21 @@ fn load_with_sysroot(
     eager_all: bool,
 ) -> Result<Compilation> {
     let mut outline = crate::outline::new(workspace, targets, scripts);
-    let sys_cached = crate::substrate::sysroot::try_load(workspace, targets, &mut outline);
-    let was_miss = sys_cached.is_none();
-    let (mut symbols, mut cached_crates, mut merged_heads) = match sys_cached {
-        Some((syms, names, heads)) => (Some(syms), names, Some(heads)),
-        None => (None, Vec::new(), None),
-    };
-    let deps_cached =
-        crate::substrate::deps_index::try_load(workspace, targets, &mut outline, symbols.as_ref());
-    let deps_miss = deps_cached.is_none();
-    if let Some((deps_syms, deps_names, deps_heads)) = deps_cached {
-        if symbols.is_none() {
-            symbols = deps_syms;
-        }
-        cached_crates.extend(deps_names);
-        merge_heads(&mut merged_heads, deps_heads);
-    }
-    let cached_names = symbols.map(|syms| (syms, cached_crates));
-    let mut sysroot_heads = merged_heads.map(std::sync::Arc::new);
+    let sys_key =
+        crate::substrate::enabled().then(|| crate::substrate::sysroot_key(workspace, targets));
+    let cached = crate::substrate::sysroot::load_cached_crates(
+        workspace,
+        targets,
+        &mut outline,
+        sys_key,
+        scripts.is_empty(),
+    );
+    let was_miss = !cached.sysroot_hit;
+    let deps_miss = !cached.deps_hit;
+    let local_hits = cached.local_hits;
+    let local_keys = cached.local_keys;
+    let cached_names = cached.symbols.map(|syms| (syms, cached.names));
+    let mut sysroot_heads = (!cached.heads.is_empty()).then(|| std::sync::Arc::new(cached.heads));
     let show_sysroot = was_miss
         && crate::substrate::enabled()
         && crate::scripts::sysroot_scripts_settled(workspace);
@@ -140,15 +135,17 @@ fn load_with_sysroot(
         .map(|krate| {
             let sysroot = outline.is_sysroot(krate as u32);
             let pinned_dep = outline.is_fixed(krate as u32) && !sysroot;
+            let local_hit = local_hits.get(krate).copied().unwrap_or(false);
             if eager_all {
-                (!sysroot || was_miss) && (!pinned_dep || deps_miss)
+                (!sysroot || was_miss) && (!pinned_dep || deps_miss) && !local_hit
             } else {
                 (was_miss && sysroot)
                     || (cache_deps && pinned_dep)
-                    || workspace
-                        .graph
-                        .members
-                        .contains(&workspace.graph.units[outline.roots[krate].unit].package)
+                    || (!local_hit
+                        && workspace
+                            .graph
+                            .members
+                            .contains(&workspace.graph.units[outline.roots[krate].unit].package))
             }
         })
         .collect();
@@ -187,22 +184,35 @@ fn load_with_sysroot(
             )
         });
     }
-    if was_miss
-        && crate::scripts::sysroot_scripts_settled(workspace)
-        && let Some(heads) = crate::substrate::sysroot::save(workspace, targets, &compilation)
-    {
-        merge_heads_arc(&mut compilation.sysroot_heads, heads.iter());
-        if let Some(started) = sysroot_started {
-            eprintln!(
-                "haste: standard library cached in {:.1}s",
-                started.elapsed().as_secs_f64()
-            );
+    if let Some(key) = sys_key {
+        if was_miss
+            && crate::scripts::sysroot_scripts_settled(workspace)
+            && let Some(heads) = crate::substrate::sysroot::save(workspace, &compilation, key)
+        {
+            merge_heads_arc(&mut compilation.sysroot_heads, heads.iter());
+            if let Some(started) = sysroot_started {
+                eprintln!(
+                    "haste: standard library cached in {:.1}s",
+                    started.elapsed().as_secs_f64()
+                );
+            }
         }
-    }
-    if cache_deps
-        && let Some(heads) = crate::substrate::deps_index::save(workspace, targets, &compilation)
-    {
-        merge_heads_arc(&mut compilation.sysroot_heads, heads.iter());
+        if cache_deps
+            && let Some(heads) = crate::substrate::deps_index::save(workspace, &compilation, key)
+        {
+            merge_heads_arc(&mut compilation.sysroot_heads, heads.iter());
+        }
+        if scripts.is_empty() {
+            let heads = crate::substrate::local_index::save(
+                workspace,
+                targets,
+                &compilation,
+                key,
+                &local_hits,
+                &local_keys,
+            );
+            merge_heads_arc(&mut compilation.sysroot_heads, heads.iter());
+        }
     }
     let errors = compilation.outline.local_errors(workspace);
     if !errors.is_empty() {
@@ -313,6 +323,30 @@ fn answer_passes<R>(
 
 /// Settles names, then expands every procedural macro call they bind and settles again, until no call is left to bind, then drops the macro expander.
 pub fn resolve(compilation: &mut Compilation) -> Result<()> {
+    if let Some(heads) = &mut compilation.sysroot_heads {
+        let stale = heads.keys().any(|&k| {
+            !compilation.outline.is_fixed(k)
+                && !compilation
+                    .names
+                    .crates
+                    .get(k as usize)
+                    .is_some_and(|c| c.settled)
+        });
+        if stale {
+            let map = std::sync::Arc::make_mut(heads);
+            map.retain(|&k, _| {
+                compilation.outline.is_fixed(k)
+                    || compilation
+                        .names
+                        .crates
+                        .get(k as usize)
+                        .is_some_and(|c| c.settled)
+            });
+            if map.is_empty() {
+                compilation.sysroot_heads = None;
+            }
+        }
+    }
     let done = compilation
         .names
         .resolve(&mut compilation.outline)

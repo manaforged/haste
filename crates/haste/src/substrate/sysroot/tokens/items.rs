@@ -197,17 +197,15 @@ pub(in super::super) fn read_items(cur: &mut Cursor<'_>) -> Result<Items> {
     let item_count = cur.count()?;
     let item_bytes = cur.take(item_count.checked_mul(30).context("items overflow")?)?;
     let mut items = Vec::with_capacity(item_count);
-    let mut attr_indices = Vec::new();
-    for (idx, b) in item_bytes.chunks_exact(30).enumerate() {
+    let mut has_attrs = false;
+    for b in item_bytes.chunks_exact(30) {
         let kind = ITEM_KINDS
             .get(b[0] as usize)
             .copied()
             .context("invalid item kind tag")?;
         let flags = b[1];
         let vis = vis_from_tag(flags & 0x7f, u32_le(b, 26))?;
-        if flags & 0x80 != 0 {
-            attr_indices.push(idx);
-        }
+        has_attrs |= flags & 0x80 != 0;
         items.push(Item {
             kind,
             name: opt_u32_le(b, 2),
@@ -220,8 +218,12 @@ pub(in super::super) fn read_items(cur: &mut Cursor<'_>) -> Result<Items> {
             parent: opt_u32_le(b, 22),
         });
     }
-    for idx in attr_indices {
-        items[idx].attrs = read_attrs(cur)?;
+    if has_attrs {
+        for (item, b) in items.iter_mut().zip(item_bytes.chunks_exact(30)) {
+            if b[1] & 0x80 != 0 {
+                item.attrs = read_attrs(cur)?;
+            }
+        }
     }
     let import_count = cur.count()?;
     let total_paths = cur.count()?;

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use rustc_hash::{FxHashMap as HashMap, FxHasher};
 
-use crate::graph::{Targets, Workspace, store};
+use crate::graph::{Workspace, store};
 use crate::macros::Compilation;
 use crate::names::{Crate as NamesCrate, Symbols};
 use crate::outline::Outline;
@@ -14,12 +14,13 @@ use crate::outline::tree::Profile;
 use crate::sema::impls::Index as ImplIndex;
 
 use super::sysroot::{
-    DecodeSpec, EnvReads, HEADER_LEN, SYSROOT_VERSION, SnapshotSpec, apply_decoded_crates,
-    crate_order, decode_snapshot, encode_snapshot, identity_of, sysroot_crate_order,
+    DecodeSpec, HEADER_LEN, PreparedWire, SYSROOT_VERSION, SnapshotSpec, apply_decoded_crates,
+    collect_env_reads, crate_order, decode_snapshot, encode_snapshot, hash_identity, prepare_wire,
+    sysroot_crate_order,
 };
 
 const DEPS_INDEX_MAGIC: [u8; 8] = *b"HSTDEP01";
-const DEPS_INDEX_VERSION: u32 = 1;
+const DEPS_INDEX_VERSION: u32 = 2;
 const KEPT_DEPS_INDEX: usize = 16;
 const DEPS_SCOPE_BIT: u32 = 1 << 30;
 
@@ -81,7 +82,7 @@ fn ref_crates(workspace: &Workspace, outline: &Outline) -> (Vec<usize>, Vec<usiz
 
 fn deps_index_key(
     workspace: &Workspace,
-    targets: &Targets,
+    sys_key: u64,
     outline: &Outline,
     pinned: &[usize],
     refs: &[usize],
@@ -93,7 +94,7 @@ fn deps_index_key(
     super::MAGIC.hash(&mut hasher);
     super::VERSION.hash(&mut hasher);
     (crate::profile() == Profile::Release).hash(&mut hasher);
-    super::sysroot_key(workspace, targets).hash(&mut hasher);
+    sys_key.hash(&mut hasher);
     super::target_hash(&crate::host_target()).hash(&mut hasher);
     workspace.rustflags.hash(&mut hasher);
     workspace.config_env.hash(&mut hasher);
@@ -105,17 +106,7 @@ fn deps_index_key(
         to_local[krate] = Some(pos as u32);
     }
     for &krate in refs {
-        let ident = identity_of(workspace, outline, krate, &to_local)?;
-        (
-            ident.unit_name,
-            ident.pkg_name,
-            ident.pkg_version,
-            ident.side_host,
-            ident.role,
-            ident.features,
-            ident.deps,
-        )
-            .hash(&mut hasher);
+        hash_identity(workspace, outline, krate, &to_local, &mut hasher)?;
     }
     for &krate in pinned {
         let root = &outline.roots[krate];
@@ -145,13 +136,17 @@ fn deps_index_key(
     Some(hasher.finish())
 }
 
-/// Attempts to load cached settled pinned dependency crates into `outline`, interning symbols into `existing_symbols` if present.
-pub(crate) fn try_load(
+pub(crate) struct PreparedDeps {
+    pub path: PathBuf,
+    pub wire: PreparedWire,
+}
+
+/// Validates and memory-maps the pinned dependency snapshot without requiring `Symbols`.
+pub(crate) fn prepare(
     workspace: &Workspace,
-    targets: &Targets,
-    outline: &mut Outline,
-    existing_symbols: Option<&Symbols>,
-) -> Option<CachedDeps> {
+    outline: &Outline,
+    sys_key: u64,
+) -> Option<PreparedDeps> {
     if !can_cache(outline) {
         return None;
     }
@@ -159,7 +154,7 @@ pub(crate) fn try_load(
     if pinned.is_empty() {
         return None;
     }
-    let key = deps_index_key(workspace, targets, outline, &pinned, &refs)?;
+    let key = deps_index_key(workspace, sys_key, outline, &pinned, &refs)?;
     let path = cache_path(key);
     let backing = Arc::new(super::Backing::open(&path, HEADER_LEN).ok()?);
     let spec = DecodeSpec {
@@ -170,11 +165,8 @@ pub(crate) fn try_load(
         ref_crates: &refs,
         scope_bit: DEPS_SCOPE_BIT,
     };
-    match decode_snapshot(&backing, &spec, existing_symbols, workspace, outline) {
-        Ok(Some((crates, symbols, names, heads, env_reads))) => {
-            apply_decoded_crates(outline, crates, env_reads);
-            Some((symbols, names, heads))
-        }
+    match prepare_wire(backing, &spec, workspace, outline) {
+        Ok(Some(wire)) => Some(PreparedDeps { path, wire }),
         Ok(None) | Err(_) => {
             drop(std::fs::remove_file(&path));
             None
@@ -182,23 +174,47 @@ pub(crate) fn try_load(
     }
 }
 
-fn collect_env_reads(outline: &Outline, pinned: &[usize]) -> Vec<EnvReads> {
-    pinned
-        .iter()
-        .map(|&krate| {
-            let guard = crate::sync::lock(&outline.crates[krate].env.env_reads);
-            let mut reads: EnvReads = guard.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-            reads.sort();
-            reads
-        })
-        .collect()
+/// Attempts to load cached settled pinned dependency crates into `outline`, interning symbols into `existing_symbols` if present.
+pub(crate) fn try_load(
+    workspace: &Workspace,
+    outline: &mut Outline,
+    existing_symbols: Option<&Symbols>,
+    sys_key: u64,
+) -> Option<CachedDeps> {
+    let prep = prepare(workspace, outline, sys_key)?;
+    let (pinned, refs) = ref_crates(workspace, outline);
+    let key = deps_index_key(workspace, sys_key, outline, &pinned, &refs)?;
+    let spec = DecodeSpec {
+        magic: DEPS_INDEX_MAGIC,
+        version: DEPS_INDEX_VERSION,
+        key,
+        cached_crates: &pinned,
+        ref_crates: &refs,
+        scope_bit: DEPS_SCOPE_BIT,
+    };
+    match decode_snapshot(
+        &prep.wire.backing,
+        &spec,
+        existing_symbols,
+        workspace,
+        outline,
+    ) {
+        Ok(Some((crates, symbols, names, heads, env_reads))) => {
+            apply_decoded_crates(outline, crates, env_reads);
+            Some((symbols, names, heads))
+        }
+        Ok(None) | Err(_) => {
+            drop(std::fs::remove_file(&prep.path));
+            None
+        }
+    }
 }
 
 /// Atomically persists settled pinned dependency crates from `compilation` to `$HASTE_HOME/deps-index/` and returns their impl indices.
 pub(crate) fn save(
     workspace: &Workspace,
-    targets: &Targets,
     compilation: &Compilation,
+    sys_key: u64,
 ) -> Option<HashMap<u32, Arc<ImplIndex>>> {
     if !can_cache(&compilation.outline) {
         return None;
@@ -214,7 +230,7 @@ pub(crate) fn save(
     if !all_settled {
         return None;
     }
-    let key = deps_index_key(workspace, targets, &compilation.outline, &pinned, &refs)?;
+    let key = deps_index_key(workspace, sys_key, &compilation.outline, &pinned, &refs)?;
     let path = cache_path(key);
     let env_reads = collect_env_reads(&compilation.outline, &pinned);
     let spec = SnapshotSpec {
@@ -226,7 +242,7 @@ pub(crate) fn save(
         env_reads: &env_reads,
     };
     let (bytes, heads) = encode_snapshot(&spec, workspace, compilation)?;
-    if let Err(error) = super::backing::write_compressed(&path, &[&bytes]) {
+    if let Err(error) = super::backing::write_raw(&path, &bytes) {
         eprintln!("haste: cannot save deps index cache: {error:#}");
         return Some(heads);
     }
