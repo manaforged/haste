@@ -1,5 +1,6 @@
 use std::hash::{Hash as _, Hasher as _};
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet, FxHasher};
@@ -159,11 +160,24 @@ struct InlineWalk<'a, 'b> {
     cx: &'a SemaContext<'b>,
     reached: &'a Reached,
     relocs: &'a [SymbolSource],
-    visited: HashSet<usize>,
+    visited_plans: HashSet<(usize, usize)>,
+    visited_callees: HashSet<usize>,
     out: Vec<(u32, u32)>,
 }
 
 impl InlineWalk<'_, '_> {
+    fn push_item_file(&mut self, item: ItemRef) {
+        if !self.cx.outline.is_fixed(item.krate) {
+            self.out.push((item.krate, item.body_owner().file));
+        }
+    }
+
+    fn push_slot_file(&mut self, idx: usize) {
+        if let Some(((item, _), _)) = self.reached.list.get(idx) {
+            self.push_item_file(*item);
+        }
+    }
+
     fn visit_plan(&mut self, plan: &RelocPlan, index: usize, base: usize) {
         let mut pos = base;
         for step in &plan.steps {
@@ -174,14 +188,13 @@ impl InlineWalk<'_, '_> {
             } = step
             {
                 if let Some(callee_idx) =
-                    resolve_inline_origin(self.reached, index, self.relocs, base, origin)
+                    resolve_inline_origin(self.reached, index, plan, self.relocs, base, origin)
                 {
-                    if let Some(((c_item, _), _)) = self.reached.list.get(callee_idx)
-                        && !self.cx.outline.is_fixed(c_item.krate)
+                    self.push_slot_file(callee_idx);
+                    if self
+                        .visited_plans
+                        .insert((callee_idx, Arc::as_ptr(sub_plan) as usize))
                     {
-                        self.out.push((c_item.krate, c_item.body_owner().file));
-                    }
-                    if self.visited.insert(callee_idx) {
                         self.visit_plan(sub_plan, callee_idx, pos);
                     }
                 } else {
@@ -201,12 +214,18 @@ impl InlineWalk<'_, '_> {
         len: usize,
     ) {
         for sym in self.relocs.get(pos..pos + len).into_iter().flatten() {
-            if let SymbolSource::Slot(c_idx) = *sym
-                && let Some(((c_item, _), _)) = self.reached.list.get(c_idx)
-                && !self.cx.outline.is_fixed(c_item.krate)
-            {
-                self.out.push((c_item.krate, c_item.body_owner().file));
+            if let SymbolSource::Slot(c_idx) = *sym {
+                self.push_slot_file(c_idx);
             }
+        }
+        if matches!(origin, SiteOrigin::DropGlue(_)) && !plan_has_inline(sub_plan) {
+            return;
+        }
+        if self
+            .visited_plans
+            .insert((index, std::ptr::from_ref(sub_plan) as usize))
+        {
+            self.visit_plan(sub_plan, index, pos);
         }
         let Some(typed) = self
             .reached
@@ -218,18 +237,11 @@ impl InlineWalk<'_, '_> {
         };
         match origin {
             SiteOrigin::DropGlue(_) | SiteOrigin::DropFn(_) => {
-                if matches!(origin, SiteOrigin::DropGlue(_)) && !plan_has_inline(sub_plan) {
-                    return;
-                }
                 for res in &typed.drops {
                     if let Res::Fn(item, substs) = *res {
-                        if !self.cx.outline.is_fixed(item.krate) {
-                            self.out.push((item.krate, item.body_owner().file));
-                        }
-                        if let Some(&idx) = self.reached.index.get(&(item, substs))
-                            && self.visited.insert(idx)
-                        {
-                            self.record_direct_local_callees(idx);
+                        self.push_item_file(item);
+                        if let Some(&idx) = self.reached.index.get(&(item, substs)) {
+                            self.record_transitive_local_callees(idx);
                         }
                     }
                 }
@@ -237,18 +249,20 @@ impl InlineWalk<'_, '_> {
             SiteOrigin::PointerFnDef { .. }
             | SiteOrigin::ConstEvalSelect(_)
             | SiteOrigin::VtableMethod { .. } => {
-                self.record_direct_local_callees(index);
+                self.record_transitive_local_callees(index);
             }
             _ => {}
         }
     }
 
-    fn record_direct_local_callees(&mut self, root: usize) {
-        for &v in self.reached.direct_calls(root).into_iter().flatten() {
-            if let Some(((item, _), _)) = self.reached.list.get(v)
-                && !self.cx.outline.is_fixed(item.krate)
-            {
-                self.out.push((item.krate, item.body_owner().file));
+    fn record_transitive_local_callees(&mut self, root: usize) {
+        let mut stack = vec![root];
+        while let Some(u) = stack.pop() {
+            for &v in self.reached.direct_calls(u).into_iter().flatten() {
+                self.push_slot_file(v);
+                if self.visited_callees.insert(v) {
+                    stack.push(v);
+                }
             }
         }
     }
@@ -258,6 +272,19 @@ fn plan_has_inline(plan: &RelocPlan) -> bool {
     plan.steps
         .iter()
         .any(|s| matches!(s, RelocStep::SiteInline { .. }))
+}
+
+pub(super) fn relocs_unwind_digest(
+    cx: &mut SemaContext<'_>,
+    reached: &Reached,
+    relocs: &[SymbolSource],
+) -> u64 {
+    let mut h = FxHasher::default();
+    relocs.len().hash(&mut h);
+    for src in relocs {
+        crate::lower::stencil::sym_may_unwind(cx, reached, Some(src)).hash(&mut h);
+    }
+    h.finish()
 }
 
 pub(super) fn collect_inlined_local_files(
@@ -275,7 +302,8 @@ pub(super) fn collect_inlined_local_files(
         cx,
         reached,
         relocs,
-        visited: HashSet::default(),
+        visited_plans: HashSet::default(),
+        visited_callees: HashSet::default(),
         out: Vec::new(),
     };
     walk.visit_plan(plan, index, 0);
@@ -288,9 +316,33 @@ pub(super) fn collect_inlined_local_files(
     files
 }
 
+fn find_vtable_slot_callee(
+    plan: &RelocPlan,
+    relocs: &[SymbolSource],
+    base: usize,
+    target_expr: crate::body::ExprId,
+    target_slot: u16,
+) -> Option<usize> {
+    let mut step_pos = base;
+    for step in &plan.steps {
+        if let RelocStep::VtableSlot { expr, slot } = *step
+            && expr == target_expr
+            && slot == target_slot
+        {
+            return match relocs.get(step_pos) {
+                Some(&SymbolSource::Slot(idx)) => Some(idx),
+                _ => None,
+            };
+        }
+        step_pos += step.symbols();
+    }
+    None
+}
+
 fn resolve_inline_origin(
     reached: &Reached,
     index: usize,
+    plan: &RelocPlan,
     relocs: &[SymbolSource],
     base: usize,
     origin: &SiteOrigin,
@@ -300,6 +352,9 @@ fn resolve_inline_origin(
             Some(&SymbolSource::Slot(idx)) => Some(idx),
             _ => None,
         };
+    }
+    if let SiteOrigin::VtableMethod { expr, slot } = *origin {
+        return find_vtable_slot_callee(plan, relocs, base, expr, slot);
     }
     let typed = reached.list.get(index)?.1.as_ref().ok()?;
     let (item, substs) = resolve_site_from_typed(typed, origin)?;

@@ -354,9 +354,17 @@ fn shared_tables_and_symbol_sources_round_trip() {
     };
     let inlined_key = stable_file_key(&outline, 0, 1).expect("file key");
     let inlined_stamp = stamps.file(0, 1).expect("file stamp");
+    let unwind_digest = 0x1122_3344_5566_7788_u64;
     let mut enc = BundleEncoder::new(&outline, &types, &reached, &state, &stamps);
-    enc.add_instance(&key, true, &code, &relocs, &[(inlined_key, inlined_stamp)])
-        .expect("add");
+    enc.add_instance(
+        &key,
+        true,
+        &code,
+        &relocs,
+        &[(inlined_key, inlined_stamp)],
+        unwind_digest,
+    )
+    .expect("add");
     let sections = enc.finish().expect("finish");
     let path = tmp.join("tables.aot");
     write_bundle(&path, CACHE_MAGIC, CACHE_VERSION, cfg, &sections).expect("write");
@@ -376,9 +384,10 @@ fn shared_tables_and_symbol_sources_round_trip() {
     let p_len = read_u32_le(backing.as_slice(), rec + 20) as usize;
     let payload = &backing.as_slice()[hdr.blob_off + p_off..hdr.blob_off + p_off + p_len];
     assert_eq!(read_u32_le(payload, 36), 1);
-    assert_eq!(read_u64_le(payload, 40), inlined_key);
-    assert_eq!(read_u64_le(payload, 48), inlined_stamp);
-    let mut cur = Cursor::new(&payload[56..]);
+    assert_eq!(read_u64_le(payload, 40), unwind_digest);
+    assert_eq!(read_u64_le(payload, 48), inlined_key);
+    assert_eq!(read_u64_le(payload, 56), inlined_stamp);
+    let mut cur = Cursor::new(&payload[64..]);
     let dummy = DummySlots {
         rodatas: std::sync::Mutex::new(Vec::new()),
         vtables: std::sync::Mutex::new(Vec::new()),
@@ -485,5 +494,232 @@ fn shared_tables_and_symbol_sources_round_trip() {
     assert!(!should_skip_aot_flush(true, 5600, 128, 5731));
     assert!(!should_skip_aot_flush(true, 100, 10, 100));
     drop(backing);
+    drop(std::fs::remove_dir_all(&tmp));
+}
+
+fn push_test_file(outline: &mut Outline, path: &Path, src: &str) {
+    std::fs::write(path, src).expect("write");
+    let parsed = Source::parse(path.to_path_buf(), src.to_owned()).expect("parse");
+    let items = scan(&parsed).expect("scan");
+    outline.crates[0]
+        .files
+        .push(Arc::new(crate::outline::tree::File::new(
+            parsed, items, false,
+        )));
+}
+
+#[test]
+fn aot_bundle_invalidates_when_non_inlined_callee_may_unwind_changes() {
+    let tmp = std::env::temp_dir().join(format!("haste-aot-unwind-test-{}", std::process::id()));
+    drop(std::fs::remove_dir_all(&tmp));
+    std::fs::create_dir_all(&tmp).expect("mkdir");
+    let main_path = tmp.join("main.rs");
+    let leaf_path = tmp.join("leaf.rs");
+    let mut outline = Outline::file(&main_path, CfgTarget::default());
+    push_test_file(&mut outline, &main_path, "fn main() {}\n");
+    push_test_file(&mut outline, &leaf_path, "fn leaf() {}\n");
+    outline.crates[0].modules[0].file = 0;
+    outline.crates[0].modules[0].state = crate::outline::tree::State::Loaded;
+    outline.crates[0].modules[0].parts.push(1);
+    let names = crate::names::Names::default();
+    let mut cx = Context::new(&outline, &names, crate::sema::Cache::default());
+    let main_item = ItemRef {
+        krate: 0,
+        file: 0,
+        item: 0,
+    };
+    let leaf_item = ItemRef {
+        krate: 0,
+        file: 1,
+        item: 0,
+    };
+    let empty_typed = Arc::new(crate::sema::infer::Typed::default());
+    let mut reached = Reached::default();
+    reached.list.push((
+        (main_item, crate::sema::substs::Substs::EMPTY),
+        Ok(Arc::clone(&empty_typed)),
+    ));
+    reached.list.push((
+        (leaf_item, crate::sema::substs::Substs::EMPTY),
+        Ok(Arc::clone(&empty_typed)),
+    ));
+    reached
+        .index
+        .insert((main_item, crate::sema::substs::Substs::EMPTY), 0);
+    reached
+        .index
+        .insert((leaf_item, crate::sema::substs::Substs::EMPTY), 1);
+    assert!(!reached.may_unwind(&mut cx, 1));
+
+    let stamps = Stamps::compute(&outline, 0, 1);
+    let state = AotState::new(0).into_inner().expect("lock");
+    let code = Arc::new(sample_aot_code());
+    let relocs = vec![SymbolSource::Slot(1)];
+    let cfg = sample_config(0, 1, 2);
+    let item_key = stable_entry_item_key(&outline, &stamps, main_item).expect("item key");
+    let sd = touched_stamps_digest(
+        &cx.types,
+        &stamps,
+        main_item,
+        crate::sema::substs::Substs::EMPTY,
+    )
+    .expect("sd");
+    let (key_hi, key_lo) = hash_entry_128(cfg.config_digest, item_key, 0, sd, 0);
+    let key = CacheInstanceKey {
+        key_hi,
+        key_lo,
+        item_key,
+        substs_hash: 0,
+        stamps_digest: sd,
+        flags: 0,
+    };
+    let unwind_digest = relocs_unwind_digest(&mut cx, &reached, &relocs);
+    let mut enc = BundleEncoder::new(&outline, &cx.types, &reached, &state, &stamps);
+    enc.add_instance(&key, false, &code, &relocs, &[], unwind_digest)
+        .expect("add");
+    let sections = enc.finish().expect("finish");
+    let path = tmp.join("bundle.aot");
+    write_bundle(&path, CACHE_MAGIC, CACHE_VERSION, cfg, &sections).expect("write");
+
+    let view = BundleView::open(&path, CACHE_MAGIC, CACHE_VERSION, cfg);
+    let codes_count = view.header.codes_count;
+    let cache = AotCache {
+        path: path.clone(),
+        config: cfg,
+        stamps: Stamps::compute(&outline, 0, 1),
+        file_index: OnceLock::new(),
+        local_file_stamps: OnceLock::new(),
+        view,
+        decoded_codes: (0..codes_count).map(|_| OnceLock::new()).collect(),
+        compiled_inlined: Mutex::default(),
+        hit_inlined: Mutex::default(),
+        inl: InlCache::open(tmp.join("bundle.inl"), cfg),
+        has_misses: AtomicBool::new(false),
+        stats: CacheStats::default(),
+    };
+    let image = crate::image::Image::create(&reached, crate::image::ImageMode::Aot, (0, 0, 0))
+        .expect("image");
+    assert!(
+        cache
+            .lookup_instance_batched(0, &key, &image, &mut cx, &reached, &mut Vec::new())
+            .is_some()
+    );
+
+    let mut unwinding_reached = Reached::default();
+    unwinding_reached.list.push((
+        (main_item, crate::sema::substs::Substs::EMPTY),
+        Ok(empty_typed),
+    ));
+    unwinding_reached.list.push((
+        (leaf_item, crate::sema::substs::Substs::EMPTY),
+        Err("unwinds".to_owned()),
+    ));
+    unwinding_reached
+        .index
+        .insert((main_item, crate::sema::substs::Substs::EMPTY), 0);
+    unwinding_reached
+        .index
+        .insert((leaf_item, crate::sema::substs::Substs::EMPTY), 1);
+    assert!(!unwinding_reached.may_unwind(&mut cx, 0));
+    assert!(unwinding_reached.may_unwind(&mut cx, 1));
+    let image_unwinding =
+        crate::image::Image::create(&unwinding_reached, crate::image::ImageMode::Aot, (0, 0, 0))
+            .expect("image_unwinding");
+    assert!(
+        cache
+            .lookup_instance_batched(
+                0,
+                &key,
+                &image_unwinding,
+                &mut cx,
+                &unwinding_reached,
+                &mut Vec::new(),
+            )
+            .is_none()
+    );
+    assert_eq!(cache.stats.lookup_meta_mismatch.load(Ordering::Relaxed), 1);
+    drop(cache);
+    drop(std::fs::remove_dir_all(&tmp));
+}
+
+#[test]
+fn collect_inlined_local_files_tracks_drop_vtable_trait_default_and_multihop() {
+    use crate::body::ExprId;
+    use crate::lower::reloc::{RelocPlan, RelocStep, SiteOrigin, TyOrigin};
+    use crate::sema::infer::{Res, SiteKey, Typed};
+    use crate::sema::substs::{PackedMap, Substs};
+
+    let tmp = std::env::temp_dir().join(format!("haste-inlined-walk-test-{}", std::process::id()));
+    drop(std::fs::remove_dir_all(&tmp));
+    std::fs::create_dir_all(&tmp).expect("mkdir");
+    let mut outline = Outline::file(&tmp.join("main.rs"), CfgTarget::default());
+    let file_fns = [
+        ("main.rs", "fn main() {}\n"),
+        ("mid.rs", "fn mid() {}\n"),
+        ("vt_impl.rs", "fn vt_impl() {}\n"),
+        ("leaf.rs", "fn leaf() {}\n"),
+        ("drop_impl.rs", "fn drop_impl() {}\n"),
+        ("trait_def.rs", "fn trait_def() {}\n"),
+    ];
+    for (name, src) in file_fns {
+        push_test_file(&mut outline, &tmp.join(name), src);
+    }
+    let items: Vec<ItemRef> = (0..file_fns.len() as u32)
+        .map(|file| ItemRef {
+            krate: 0,
+            file,
+            item: 0,
+        })
+        .collect();
+    let mut main_typed = Typed::default();
+    main_typed.drops.push(Res::Fn(items[4], Substs::EMPTY));
+    let mut mid_typed = Typed::default();
+    mid_typed.res = PackedMap::pack([(ExprId(5), Res::Fn(items[5], Substs::EMPTY))]);
+    let mut reached = Reached::default();
+    for (idx, &item) in items.iter().enumerate() {
+        let typed = match idx {
+            0 => Arc::new(main_typed.clone()),
+            1 => Arc::new(mid_typed.clone()),
+            _ => Arc::new(Typed::default()),
+        };
+        reached.list.push(((item, Substs::EMPTY), Ok(typed)));
+        reached.index.insert((item, Substs::EMPTY), idx);
+    }
+    let names = crate::names::Names::default();
+    let cx = Context::new(&outline, &names, crate::sema::Cache::default());
+    let empty_plan = Arc::new(RelocPlan::default());
+    let plan = RelocPlan::from_vec(vec![
+        RelocStep::VtableSlot {
+            expr: ExprId(10),
+            slot: 0,
+        },
+        RelocStep::SiteInline {
+            origin: SiteOrigin::VtableMethod {
+                expr: ExprId(10),
+                slot: 0,
+            },
+            plan: Arc::clone(&empty_plan),
+        },
+        RelocStep::SiteInline {
+            origin: SiteOrigin::DropGlue(TyOrigin::Local(0)),
+            plan: Arc::new(RelocPlan::from_vec(vec![RelocStep::SiteInline {
+                origin: SiteOrigin::Known(items[4], Substs::EMPTY),
+                plan: Arc::clone(&empty_plan),
+            }])),
+        },
+        RelocStep::SiteInline {
+            origin: SiteOrigin::Known(items[1], Substs::EMPTY),
+            plan: Arc::new(RelocPlan::from_vec(vec![RelocStep::SiteInline {
+                origin: SiteOrigin::Table(SiteKey::ExprRes(ExprId(5))),
+                plan: Arc::new(RelocPlan::from_vec(vec![RelocStep::SiteInline {
+                    origin: SiteOrigin::Known(items[3], Substs::EMPTY),
+                    plan: Arc::clone(&empty_plan),
+                }])),
+            }])),
+        },
+    ]);
+    let relocs = [SymbolSource::Slot(2)];
+    let files = collect_inlined_local_files(&cx, &reached, &plan, 0, &relocs);
+    assert_eq!(files, vec![(0, 1), (0, 2), (0, 3), (0, 4), (0, 5)]);
     drop(std::fs::remove_dir_all(&tmp));
 }

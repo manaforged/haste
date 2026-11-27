@@ -22,6 +22,7 @@ mod splice;
 mod tally;
 
 use emit::run_with_cycle;
+pub(crate) use emit::sym_may_unwind;
 pub(super) use inline::{Quiet, resolve_inline, resolve_inline_meta};
 use tally::tally;
 pub(super) use tally::{Tally, simplify_tallied};

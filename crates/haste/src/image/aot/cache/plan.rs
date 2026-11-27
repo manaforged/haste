@@ -4,6 +4,7 @@ use rustc_hash::FxHashMap;
 
 use crate::body::ExprId;
 use crate::lower::reloc::{RelocPlan, RelocStep, SiteOrigin, TyOrigin};
+use crate::lower::stencil::Form;
 use crate::lower::{RodataId, Slots, SymbolSource, VtableId};
 use crate::sema::reach::Reached;
 use crate::sema::summary::codec::{
@@ -11,6 +12,7 @@ use crate::sema::summary::codec::{
 };
 use crate::sema::ty::Types;
 
+use super::codec::read_u32_le;
 use super::tables::{BundleEncoder, SharedTables, decode_symbol};
 
 pub(super) fn encode_reloc_plan(enc: &mut BundleEncoder<'_>, plan: &RelocPlan) -> Option<Vec<u8>> {
@@ -328,4 +330,64 @@ where
             _ => return None,
         })
     }
+}
+
+const INL_BODY_HEAD: usize = 13;
+const FORMS: [Form; 4] = [Form::Lean, Form::Loop, Form::Compact, Form::Dense];
+
+pub(super) fn pack_inline_blob(
+    returns: bool,
+    height: u8,
+    size: u16,
+    form: Form,
+    plan_bytes: &[u8],
+    func_bytes: &[u8],
+) -> Option<Vec<u8>> {
+    let plan_len = u32::try_from(plan_bytes.len()).ok()?;
+    let func_len = u32::try_from(func_bytes.len()).ok()?;
+    let mut out = Vec::with_capacity(INL_BODY_HEAD + plan_bytes.len() + func_bytes.len());
+    out.push(u8::from(returns));
+    out.push(height);
+    out.extend_from_slice(&size.to_le_bytes());
+    out.push(form as u8);
+    write_u32(&mut out, plan_len);
+    write_u32(&mut out, func_len);
+    out.extend_from_slice(plan_bytes);
+    out.extend_from_slice(func_bytes);
+    Some(out)
+}
+
+pub(super) fn decode_inline_shape(blob: &[u8]) -> Option<(bool, u8, u16)> {
+    let head = blob.get(..INL_BODY_HEAD)?;
+    let returns = match head[0] {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    let height = head[1];
+    let size = u16::from_le_bytes([head[2], head[3]]);
+    Some((returns, height, size))
+}
+
+pub(super) fn split_inline_blob(blob: &[u8]) -> Option<(bool, u8, u16, Form, &[u8], &[u8])> {
+    let (returns, height, size) = decode_inline_shape(blob)?;
+    let form_tag = blob[4];
+    let form = *FORMS
+        .get(usize::from(form_tag))
+        .filter(|found| **found as u8 == form_tag)?;
+    let plan_len = read_u32_le(blob, 5) as usize;
+    let func_len = read_u32_le(blob, 9) as usize;
+    let plan_end = INL_BODY_HEAD.checked_add(plan_len)?;
+    let func_end = plan_end.checked_add(func_len)?;
+    if func_end != blob.len() {
+        return None;
+    }
+    Some((
+        returns,
+        height,
+        size,
+        form,
+        &blob[INL_BODY_HEAD..plan_end],
+        &blob[plan_end..func_end],
+    ))
 }

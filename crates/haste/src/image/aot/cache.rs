@@ -39,13 +39,13 @@ pub(crate) use inline::InlineCacheHit;
 use inline::{InlCache, inline_bundle_path};
 #[cfg(test)]
 use relocs::stable_file_key;
-use relocs::{LocalFileIndex, collect_inlined_local_files, hash_str};
+use relocs::{LocalFileIndex, collect_inlined_local_files, hash_str, relocs_unwind_digest};
 use stamps::{compute_bundle_key, resolve_aot_fn, should_skip_aot_flush};
 use tables::{BundleEncoder, SharedTables, decode_symbol_list, read_code_span};
 use view::BundleView;
 
 const CACHE_MAGIC: [u8; 8] = *b"HSTAOT03";
-const CACHE_VERSION: u32 = 3;
+const CACHE_VERSION: u32 = 4;
 const HEADER_LEN: usize = 112;
 const RECORD_LEN: usize = 24;
 const MAX_BUNDLES: usize = 16;
@@ -467,7 +467,7 @@ impl AotCache {
         index: usize,
         key: &CacheInstanceKey,
         image: &Image,
-        cx: &Context<'_>,
+        cx: &mut Context<'_>,
         reached: &Reached,
         inlined_batch: &mut Vec<(usize, Vec<(u64, u64)>)>,
     ) -> Option<(AotFn, u32)> {
@@ -486,7 +486,7 @@ impl AotCache {
         let rec = self.view.header.records_off + idx * RECORD_LEN;
         let off = read_u32_le(data, rec + 16);
         let len = read_u32_le(data, rec + 20);
-        let Some(payload) = self.view.blob_slice(off, len).filter(|p| p.len() >= 40) else {
+        let Some(payload) = self.view.blob_slice(off, len).filter(|p| p.len() >= 48) else {
             self.stats.lookup_none.fetch_add(1, Ordering::Relaxed);
             return None;
         };
@@ -509,7 +509,8 @@ impl AotCache {
         let code_id = read_u32_le(payload, 28);
         let reloc_count = read_u32_le(payload, 32) as usize;
         let inlined_count = read_u32_le(payload, 36) as usize;
-        let inlined_end = 40usize.checked_add(inlined_count.checked_mul(16)?)?;
+        let unwind_digest = read_u64_le(payload, 40);
+        let inlined_end = 48usize.checked_add(inlined_count.checked_mul(16)?)?;
         if payload.len() < inlined_end {
             self.stats.lookup_none.fetch_add(1, Ordering::Relaxed);
             return None;
@@ -519,7 +520,7 @@ impl AotCache {
             let local_stamps = self.local_file_stamps(cx.outline);
             inlined_pairs.reserve(inlined_count);
             for i in 0..inlined_count {
-                let at = 40 + i * 16;
+                let at = 48 + i * 16;
                 let f_key = read_u64_le(payload, at);
                 let f_stamp = read_u64_le(payload, at + 8);
                 if local_stamps.get(&f_key).copied() != Some(f_stamp) {
@@ -583,6 +584,13 @@ impl AotCache {
             }
             r
         };
+        if relocs_unwind_digest(cx, reached, &relocs) != unwind_digest {
+            self.stats.lookup_none.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .lookup_meta_mismatch
+                .fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
         if !inlined_pairs.is_empty() {
             inlined_batch.push((index, inlined_pairs));
         }
@@ -657,12 +665,13 @@ impl AotCache {
                     continue;
                 };
                 let inlined = self.inlined_pairs_for(cx.outline, idx, leader);
-                entries.push((key, is_dict, code, relocs, inlined));
+                let unwind_digest = relocs_unwind_digest(cx, reached, relocs);
+                entries.push((key, is_dict, code, relocs, inlined, unwind_digest));
             }
             let mut enc = BundleEncoder::new(cx.outline, &cx.types, reached, state, &self.stamps);
-            for (key, is_dict, code, relocs, inlined) in entries {
+            for (key, is_dict, code, relocs, inlined, unwind_digest) in entries {
                 if enc
-                    .add_instance(&key, is_dict, code, relocs, &inlined)
+                    .add_instance(&key, is_dict, code, relocs, &inlined, unwind_digest)
                     .is_some()
                 {
                     flushed_records += 1;

@@ -168,7 +168,8 @@ fn reloc_span(kind: RelocKind, offset: u32) -> (usize, usize) {
         RelocKind::Abs32 | RelocKind::PcRel32 | RelocKind::Arm64Call26 | RelocKind::ThreadOff32 => {
             (off, off + 4)
         }
-        RelocKind::Abs64 | RelocKind::Arm64AdrpAdd => (off, off + 8),
+        RelocKind::Abs64 => (off.saturating_sub(2), off + 8),
+        RelocKind::Arm64AdrpAdd => (off, off + 8),
         RelocKind::Arm64Movw64 => (off, off + 16),
         RelocKind::Arm64TlvCell => (off, off + 20),
     }
@@ -405,4 +406,36 @@ pub(crate) fn patch_code(relocs: &[CodeReloc], ctx: &PatchCtx<'_>, out: &mut [u8
         res?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn abs64_reloc_span_includes_movabs_prefix_across_partitions() {
+        assert_eq!(reloc_span(RelocKind::Abs64, 10), (8, 18));
+        assert_eq!(reloc_span(RelocKind::Abs64, 0), (0, 8));
+        let r0 = CodeReloc {
+            offset: 2,
+            kind: RelocKind::Abs64,
+            symbol: Symbol::Word(1),
+        };
+        let r1 = CodeReloc {
+            offset: 12,
+            kind: RelocKind::Abs64,
+            symbol: Symbol::Word(2),
+        };
+        let r2 = CodeReloc {
+            offset: 22,
+            kind: RelocKind::Abs64,
+            symbol: Symbol::Word(3),
+        };
+        let sorted = [&r0, &r1, &r2];
+        let bounds = partition_relocs(&sorted, 3);
+        assert_eq!(bounds.len(), 3);
+        assert_eq!(bounds[0], (0, 1, 0));
+        assert_eq!(bounds[1], (1, 2, 10));
+        assert_eq!(bounds[2], (2, 3, 20));
+    }
 }
