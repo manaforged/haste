@@ -16,6 +16,7 @@ fn use_entries(
     prefix: &[u32],
     (from, to): (u32, u32),
     found: &mut Vec<(Vec<u32>, u32)>,
+    globs: &mut Vec<Vec<u32>>,
 ) -> bool {
     let mut at = from;
     while at < to {
@@ -27,7 +28,7 @@ fn use_entries(
                 end + 1
             };
         }
-        if end > at && !use_entry(src, prefix, (at, end), found) {
+        if end > at && !use_entry(src, prefix, (at, end), found, globs) {
             return false;
         }
         at = end + 1;
@@ -46,6 +47,7 @@ fn use_entry(
     prefix: &[u32],
     (from, to): (u32, u32),
     found: &mut Vec<(Vec<u32>, u32)>,
+    globs: &mut Vec<Vec<u32>>,
 ) -> bool {
     let pathlike = |range: std::ops::Range<u32>| range.clone().all(|at| is_use_path_token(src, at));
     let joined = |end: u32| {
@@ -57,7 +59,24 @@ fn use_entry(
     };
     if src.kind(to - 1) == TokenKind::CloseBrace {
         let open = src.pair(to - 1);
-        return pathlike(from..open) && use_entries(src, &joined(open), (open + 1, to - 1), found);
+        return pathlike(from..open)
+            && use_entries(src, &joined(open), (open + 1, to - 1), found, globs);
+    }
+    if src.text(to - 1) == "*" {
+        if to == from + 1 {
+            globs.push(prefix.to_vec());
+            return true;
+        }
+        if to > from + 3
+            && src.kind(to - 2) == TokenKind::Colon
+            && src.kind(to - 3) == TokenKind::Colon
+            && is_name(src.kind(to - 4))
+            && pathlike(from..to - 3)
+        {
+            globs.push(joined(to - 1));
+            return true;
+        }
+        return false;
     }
     let (end, alias) = if to >= from + 3 && src.text(to - 2) == "as" {
         (to - 2, to - 1)
@@ -120,13 +139,20 @@ impl Writer {
             return Ok(None);
         }
         let mut found = Vec::new();
+        let mut globs = Vec::new();
         if !use_entries(
             src,
             &(from..open).collect::<Vec<_>>(),
             (open + 1, close),
             &mut found,
+            &mut globs,
         ) {
             return Ok(None);
+        }
+        for path in globs {
+            let mut copy = Tokens::default();
+            path.into_iter().for_each(|token| copy.copy(src, token));
+            self.globs.push(copy.finish(src.path.clone())?);
         }
         for (path, alias) in found {
             let mut copy = Tokens::default();
@@ -291,5 +317,125 @@ impl Writer {
             Some(found) => Ok(Some(found)),
             None => self.resolve_glob(cx, run.src, path),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use rustc_hash::FxHashMap as HashMap;
+
+    use crate::names::{Crate as NamesCrate, ItemRef, Names, Symbols};
+    use crate::outline::tree::{Crate, Decl, Files, Module, State};
+    use crate::outline::{Outline, Role, Root};
+    use crate::sema::{Cache, Context};
+
+    fn declared_crate(path: PathBuf) -> Crate {
+        Crate {
+            modules: vec![Module {
+                file: usize::MAX,
+                item: None,
+                parent: None,
+                name: String::new(),
+                dir: PathBuf::new(),
+                parts: Vec::new(),
+                vis: crate::outline::item::Vis::Pub,
+                macro_use: false,
+                state: State::Declared(Decl::File {
+                    candidates: vec![path],
+                    by_attr: true,
+                }),
+                textual: None,
+            }],
+            ..Crate::default()
+        }
+    }
+
+    #[test]
+    fn grouped_block_use_with_glob_resolves_exported_and_glob_macros() {
+        let dir = std::env::temp_dir().join(format!("haste_grouped_use_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let dep_path = dir.join("bugreport.rs");
+        let app_path = dir.join("app.rs");
+        std::fs::write(
+            &dep_path,
+            concat!(
+                "#[macro_export] macro_rules! bugreport { () => { 40u32 }; }\n",
+                "#[macro_export] macro_rules! col_m { () => { 2u32 }; }\n",
+                "pub mod collector { pub use crate::col_m; }\n",
+                "pub mod format { pub struct Markdown; }\n",
+            ),
+        )
+        .expect("write bugreport.rs");
+        std::fs::write(
+            &app_path,
+            concat!(
+                "fn invoke_bugreport() -> u32 {\n",
+                "    use bugreport::{bugreport, collector::*, format::Markdown};\n",
+                "    bugreport!() + col_m!()\n",
+                "}\n",
+            ),
+        )
+        .expect("write app.rs");
+
+        let app_deps = vec![("bugreport".to_owned(), 0usize)];
+        let mut outline = Outline {
+            roots: vec![
+                Root {
+                    unit: 0,
+                    name: "bugreport".to_owned(),
+                    path: dep_path.clone(),
+                    role: Role::Lib,
+                    edition: "2021".to_owned(),
+                    proc_macro: false,
+                },
+                Root {
+                    unit: 1,
+                    name: "app".to_owned(),
+                    path: app_path.clone(),
+                    role: Role::Bin,
+                    edition: "2021".to_owned(),
+                    proc_macro: false,
+                },
+            ],
+            crates: vec![declared_crate(dep_path), declared_crate(app_path)],
+            deps: vec![Vec::new(), app_deps],
+            cache: Files::default(),
+            procs: HashMap::default(),
+            pins: vec![None, None],
+        };
+        outline.load_all().expect("load outline");
+
+        let syms = Symbols::default();
+        let dep_sym = syms.intern("bugreport");
+        let mut dep_names = NamesCrate::default();
+        dep_names.edition = "2021".to_owned();
+        dep_names.eager = true;
+        let mut app_names = NamesCrate::default();
+        app_names.edition = "2021".to_owned();
+        app_names.deps = vec![(dep_sym, 0)];
+        app_names.eager = true;
+
+        let mut names = Names {
+            crates: vec![dep_names, app_names],
+            symbols: syms,
+        };
+        names.resolve(&mut outline).expect("resolve names");
+
+        let mut cx = Context::new(&outline, &names, Cache::default());
+        let fn_item = ItemRef {
+            krate: 1,
+            file: 0,
+            item: 0,
+        };
+        let body = cx.body(fn_item).expect("expand body with grouped use");
+        assert!(
+            body.exprs
+                .iter()
+                .all(|expr| !matches!(expr, crate::body::Expr::Macro { .. })),
+            "macros imported via grouped use with wildcard sibling must expand"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
