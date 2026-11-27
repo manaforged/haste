@@ -41,8 +41,10 @@ impl TyOrigin {
             Root::Held(expr) => {
                 if typed.has_await_at(expr) {
                     Self::AwaitFuture(expr)
-                } else {
+                } else if typed.fors.contains_key(&expr) {
                     Self::ForIter(expr)
+                } else {
+                    Self::Expr(expr)
                 }
             }
         }
@@ -572,9 +574,13 @@ fn eval_ty(
             .map(|l| l.ty)
             .ok_or_else(|| anyhow::anyhow!("local {} out of bounds", idx)),
         TyOrigin::Expr(id) => Ok(typed.expr_ty(&cx.types, *id)),
-        TyOrigin::ForIter(id) => typed
-            .for_iter(&cx.types, *id)
-            .ok_or_else(|| anyhow::anyhow!("missing for {}", id.0)),
+        TyOrigin::ForIter(id) => match typed.for_iter(&cx.types, *id) {
+            Some(ty) => Ok(ty),
+            None => match typed.expr_ty(&cx.types, *id) {
+                ty if ty != Ty::NONE => Ok(ty),
+                _ => bail!("missing for {}", id.0),
+            },
+        },
         TyOrigin::AwaitFuture(id) => typed
             .await_future(&cx.types, *id)
             .ok_or_else(|| anyhow::anyhow!("missing await {}", id.0)),
@@ -643,4 +649,103 @@ pub(super) fn type_id_words(cx: &Context<'_>, ty: Ty) -> [SymbolSource; 2] {
         SymbolSource::Word(key & u64::from(u32::MAX)),
         SymbolSource::Word(key >> 32),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::body::ExprId;
+    use crate::names::Primitive;
+    use crate::names::{ItemRef, Names};
+    use crate::outline::Outline;
+    use crate::sema::infer::{BodyTables, For, LazyTables, Res, Typed};
+    use crate::sema::reach::Reached;
+    use crate::sema::substs::PackedMap;
+    use crate::sema::{Cache, Context};
+
+    use super::{Root, Ty, TyOrigin, eval_ty};
+
+    #[test]
+    fn from_root_and_eval_ty_handle_held_non_for_exprs_and_for_loops() {
+        let outline = Outline {
+            roots: Vec::new(),
+            crates: Vec::new(),
+            deps: Vec::new(),
+            cache: Default::default(),
+            procs: Default::default(),
+            pins: Vec::new(),
+        };
+        let names = Names::default();
+        let mut cx = Context::new(&outline, &names, Cache::default());
+        let u32_ty = cx.types.prim(Primitive::U32);
+        let bool_ty = cx.types.bool();
+        let empty = cx.types.intern_substs(&[]);
+        let dummy_res = Res::Fn(
+            ItemRef {
+                krate: 0,
+                file: 0,
+                item: 0,
+            },
+            empty,
+        );
+
+        let mut exprs = vec![Ty::NONE; 8];
+        exprs[7] = u32_ty;
+        let tables = BodyTables {
+            exprs: exprs.into_boxed_slice(),
+            fors: PackedMap::pack([(
+                ExprId(2),
+                For {
+                    into_iter: dummy_res,
+                    next: dummy_res,
+                    iter: bool_ty,
+                    option: Ty::NONE,
+                    some: 0,
+                },
+            )]),
+            ..BodyTables::default()
+        };
+        let typed = Typed {
+            tables: LazyTables::Eager(Arc::new(tables)),
+            ..Typed::default()
+        };
+        let reached = Reached::default();
+
+        let held_expr = TyOrigin::from_root(Root::Held(ExprId(7)), &typed);
+        assert!(matches!(held_expr, TyOrigin::Expr(ExprId(7))));
+        assert_eq!(
+            eval_ty(&mut cx, &reached, &typed, empty, &held_expr).expect("eval held expr"),
+            u32_ty
+        );
+        assert_eq!(
+            eval_ty(
+                &mut cx,
+                &reached,
+                &typed,
+                empty,
+                &TyOrigin::ForIter(ExprId(7))
+            )
+            .expect("eval legacy for_iter fallback"),
+            u32_ty
+        );
+
+        let held_for = TyOrigin::from_root(Root::Held(ExprId(2)), &typed);
+        assert!(matches!(held_for, TyOrigin::ForIter(ExprId(2))));
+        assert_eq!(
+            eval_ty(&mut cx, &reached, &typed, empty, &held_for).expect("eval for_iter"),
+            bool_ty
+        );
+
+        assert!(
+            eval_ty(
+                &mut cx,
+                &reached,
+                &typed,
+                empty,
+                &TyOrigin::ForIter(ExprId(99))
+            )
+            .is_err()
+        );
+    }
 }
