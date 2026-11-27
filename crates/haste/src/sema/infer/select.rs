@@ -1,3 +1,4 @@
+mod auto;
 mod bounds;
 mod cache;
 
