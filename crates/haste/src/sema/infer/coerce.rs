@@ -278,13 +278,19 @@ impl Infer<'_, '_> {
     fn deref_coercion(&mut self, from: Ty, to: Ty, mutability: Mut) -> Result<Option<Coercion>> {
         let (mut ty, to) = (self.resolve(from), self.resolve(to));
         let mut steps = Vec::new();
+        let mut fallback: Option<(Vec<(Ty, Option<Res>)>, Ty)> = None;
         while steps.len() < RECURSION_LIMIT {
-            if self.same_head(ty, to) && self.deref_step_fits(ty, to) {
-                if steps.is_empty() {
-                    return Ok(None);
+            if self.same_head(ty, to) {
+                if self.deref_step_fits(ty, to) {
+                    if steps.is_empty() {
+                        return Ok(None);
+                    }
+                    self.unify(ty, to)?;
+                    return Ok(Some(Coercion::Deref(steps, self.resolve(to))));
                 }
-                self.unify(ty, to)?;
-                return Ok(Some(Coercion::Deref(steps, self.resolve(to))));
+                if fallback.is_none() && self.trial_unify(ty, to) {
+                    fallback = Some((steps.clone(), ty));
+                }
             }
             let next = match self.cx.types.kind(ty).clone() {
                 Kind::Ref(m, inner) if mutability == Mut::Not || m == Mut::Mut => {
@@ -313,10 +319,17 @@ impl Infer<'_, '_> {
                 _ => None,
             };
             let Some((inner, res)) = next else {
-                return Ok(None);
+                break;
             };
             steps.push((ty, res));
             ty = self.resolve(inner);
+        }
+        if let Some((fb_steps, fb_ty)) = fallback {
+            if fb_steps.is_empty() {
+                return Ok(None);
+            }
+            self.unify(fb_ty, to)?;
+            return Ok(Some(Coercion::Deref(fb_steps, self.resolve(to))));
         }
         Ok(None)
     }
@@ -389,7 +402,7 @@ impl Infer<'_, '_> {
 
     fn obligation_stuck(&mut self, of: ItemRef, substs: &[Ty]) -> bool {
         if !substs.iter().any(|&t| self.has_vars(t)) {
-            return true;
+            return !self.any_has_params(substs);
         }
         let self_ty = self.resolve(substs[0]);
         if self.has_vars(self_ty)
