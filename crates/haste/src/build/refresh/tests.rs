@@ -195,6 +195,7 @@ fn incremental_reload_keeps_dependents_and_handles_pubtype_and_error_recovery() 
         &mut build.compilation,
         pre,
         reloaded,
+        &[],
         std::slice::from_ref(&core_lib),
     )
     .expect("resolve_with_dependents")
@@ -319,4 +320,164 @@ fn check_lib_skips_binary_target() {
         build.compile_binary_oneshot(&ws).expect("compile lib only");
         assert_eq!(build.check(Duration::ZERO).expect("check --lib"), 0);
     });
+}
+
+fn write_single_pkg(root: &Path, name: &str, files: &[(&str, &str)]) -> PathBuf {
+    let src_dir = root.join("src");
+    std::fs::create_dir_all(&src_dir).expect("mkdir src");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+    )
+    .expect("write Cargo.toml");
+    std::fs::write(
+        root.join("Cargo.lock"),
+        format!("version = 4\n\n[[package]]\nname = \"{name}\"\nversion = \"0.1.0\"\n"),
+    )
+    .expect("write Cargo.lock");
+    for &(rel, body) in files {
+        std::fs::write(src_dir.join(rel), body).expect("write source file");
+    }
+    src_dir
+}
+
+#[test]
+fn refresh_catches_same_size_same_mtime_edit() {
+    let dir = fresh_dir();
+    let old_src = "fn main() {\n    let _: u32 = 123;\n}\n";
+    let new_src = "fn main() {\n    let _: u32 = \"a\";\n}\n";
+    assert_eq!(old_src.len(), new_src.len());
+    let src_dir = write_single_pkg(&dir.0, "same_stamp_pkg", &[("main.rs", old_src)]);
+    let main_rs = src_dir.join("main.rs");
+
+    let targets = host_targets();
+    let sel = crate::Selection {
+        locked: true,
+        offline: true,
+        ..crate::selection()
+    };
+    let ws = load_workspace(&dir.0, &targets, &sel);
+    let mut build = Build::load(&ws, &targets).expect("load build");
+    build.compile_binary(&ws).expect("compile initial");
+    assert_eq!(build.check(Duration::ZERO).expect("initial check"), 0);
+
+    let orig_mtime = std::fs::metadata(&main_rs)
+        .expect("main.rs metadata")
+        .modified()
+        .expect("main.rs mtime");
+    let orig_stamp = crate::graph::store::file_stamp(&main_rs);
+
+    std::fs::write(&main_rs, new_src).expect("overwrite main.rs");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&main_rs)
+        .expect("open main.rs")
+        .set_modified(orig_mtime)
+        .expect("restore mtime");
+    assert_eq!(
+        std::fs::metadata(&main_rs)
+            .expect("post metadata")
+            .modified()
+            .expect("post mtime"),
+        orig_mtime
+    );
+    assert_ne!(
+        crate::graph::store::file_stamp(&main_rs),
+        orig_stamp,
+        "content hash must distinguish same-size same-mtime edits"
+    );
+
+    build
+        .refresh(&ws, &targets)
+        .expect("refresh same-stamp edit");
+    assert_ne!(build.check(Duration::ZERO).expect("check type mismatch"), 0);
+}
+
+fn setup_two_mod_build(root: &Path) -> (graph::Workspace, Targets, Build, PathBuf, PathBuf) {
+    let src_dir = write_single_pkg(
+        root,
+        "coord_pkg",
+        &[
+            (
+                "main.rs",
+                "mod a;\nmod b;\nfn main() {\n    let _ = b::get();\n}\n",
+            ),
+            ("a.rs", "pub fn get() -> bool {\n    true\n}\n"),
+            (
+                "b.rs",
+                "pub fn get() -> u32 {\n    u32::from(crate::a::get())\n}\n",
+            ),
+        ],
+    );
+    let targets = host_targets();
+    let sel = crate::Selection {
+        locked: true,
+        offline: true,
+        ..crate::selection()
+    };
+    let ws = load_workspace(root, &targets, &sel);
+    let mut build = Build::load(&ws, &targets).expect("load build");
+    build.compile_binary(&ws).expect("compile initial");
+    assert_eq!(build.check(Duration::ZERO).expect("initial check"), 0);
+    (
+        ws,
+        targets,
+        build,
+        src_dir.join("a.rs"),
+        src_dir.join("b.rs"),
+    )
+}
+
+#[test]
+fn refresh_handles_coordinated_two_file_item_and_body_edits() {
+    let new_a = "pub fn get() -> char {\n    'a'\n}\n";
+    let new_b = "pub fn get() -> u32 {\n    crate::a::get() as u32\n}\n";
+
+    let sim_dir = fresh_dir();
+    let (ws, targets, mut sim_build, sim_a, sim_b) = setup_two_mod_build(&sim_dir.0);
+    std::fs::write(&sim_a, new_a).expect("write a.rs");
+    std::fs::write(&sim_b, new_b).expect("write b.rs");
+    sim_build
+        .refresh(&ws, &targets)
+        .expect("refresh coordinated edit");
+    assert_eq!(sim_build.check(Duration::ZERO).expect("check sim"), 0);
+    assert!(
+        sim_build
+            .binary
+            .as_ref()
+            .is_some_and(|bin| bin.reached.all_live_ok()),
+        "simultaneous coordinated edit left stale errors"
+    );
+
+    let ab_dir = fresh_dir();
+    let (ab_ws, ab_targets, mut ab_build, ab_a, ab_b) = setup_two_mod_build(&ab_dir.0);
+    std::fs::write(&ab_a, new_a).expect("write a first");
+    ab_build.refresh(&ab_ws, &ab_targets).expect("refresh a");
+    assert_eq!(ab_build.check(Duration::ZERO).expect("check after a"), 0);
+    std::fs::write(&ab_b, new_b).expect("write b second");
+    ab_build.refresh(&ab_ws, &ab_targets).expect("refresh b");
+    assert_eq!(ab_build.check(Duration::ZERO).expect("check after b"), 0);
+    assert!(
+        ab_build
+            .binary
+            .as_ref()
+            .is_some_and(|bin| bin.reached.all_live_ok()),
+        "sequential a -> b edit left stale errors"
+    );
+
+    let ba_dir = fresh_dir();
+    let (ba_ws, ba_targets, mut ba_build, ba_a, ba_b) = setup_two_mod_build(&ba_dir.0);
+    std::fs::write(&ba_b, new_b).expect("write b first");
+    ba_build.refresh(&ba_ws, &ba_targets).expect("refresh b");
+    assert_eq!(ba_build.check(Duration::ZERO).expect("check after b"), 0);
+    std::fs::write(&ba_a, new_a).expect("write a second");
+    ba_build.refresh(&ba_ws, &ba_targets).expect("refresh a");
+    assert_eq!(ba_build.check(Duration::ZERO).expect("check after a"), 0);
+    assert!(
+        ba_build
+            .binary
+            .as_ref()
+            .is_some_and(|bin| bin.reached.all_live_ok()),
+        "sequential b -> a edit left stale errors"
+    );
 }

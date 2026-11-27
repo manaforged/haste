@@ -330,15 +330,13 @@ pub(super) fn refresh_edits(
         };
         match edit {
             Edit::Same => {}
-            Edit::Bodies(slots)
+            Edit::Bodies(slots) => {
                 if slots
                     .iter()
-                    .any(|&(krate, _)| expands(workspace, outline, krate)) =>
-            {
-                crates.extend(slots.iter().map(|&(krate, _)| krate));
-                paths.push(stamps[idx].path.clone());
-            }
-            Edit::Bodies(slots) => {
+                    .any(|&(krate, _)| expands(workspace, outline, krate))
+                {
+                    crates.extend(slots.iter().map(|&(krate, _)| krate));
+                }
                 stale.extend(slots);
                 paths.push(stamps[idx].path.clone());
             }

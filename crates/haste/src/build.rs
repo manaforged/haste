@@ -389,14 +389,15 @@ impl Build {
         };
         let done = match (stale.is_empty(), crates.is_empty()) {
             (true, true) => return Ok(()),
-            (_, false) => self.reload(
-                workspace,
-                crates
+            (_, false) => {
+                let mut edited: Vec<u32> = crates
                     .into_iter()
                     .chain(stale.iter().map(|&(krate, _)| krate))
-                    .collect(),
-                &paths,
-            )?,
+                    .collect();
+                edited.sort_unstable();
+                edited.dedup();
+                self.reload(workspace, edited, &stale, &paths)?
+            }
             (false, true) => self.again(workspace, &stale),
         };
         if !done {
@@ -425,6 +426,7 @@ impl Build {
         &mut self,
         workspace: &graph::Workspace,
         edited: Vec<u32>,
+        stale_bodies: &[(u32, u32)],
         changed_paths: &[PathBuf],
     ) -> Result<bool> {
         self.run_checked = false;
@@ -440,9 +442,13 @@ impl Build {
         else {
             return Ok(false);
         };
-        let Ok(Some((crates, dependents, scoped))) =
-            refresh::resolve_with_dependents(&mut self.compilation, pre, reloaded, changed_paths)
-        else {
+        let Ok(Some((crates, dependents, scoped))) = refresh::resolve_with_dependents(
+            &mut self.compilation,
+            pre,
+            reloaded,
+            stale_bodies,
+            changed_paths,
+        ) else {
             return Ok(false);
         };
         let errors = self.compilation.outline.local_errors(workspace);

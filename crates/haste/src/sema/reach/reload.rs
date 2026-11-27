@@ -33,13 +33,27 @@ impl ReloadScope {
     }
 
     #[inline]
+    fn dirty_in(&self, items: &HashSet<ItemRef>, mut item: ItemRef) -> bool {
+        if self.is_dirty_file(item.krate, item.file) || items.contains(&item) {
+            return true;
+        }
+        while let Some(owner) = item.declaring_body() {
+            if items.contains(&owner) {
+                return true;
+            }
+            item = owner;
+        }
+        false
+    }
+
+    #[inline]
     pub(crate) fn is_item_dirty(&self, item: ItemRef) -> bool {
-        self.is_dirty_file(item.krate, item.file) || self.all_dirty_items.contains(&item)
+        self.dirty_in(&self.all_dirty_items, item)
     }
 
     #[inline]
     pub(crate) fn is_old_ref_dirty(&self, item: ItemRef) -> bool {
-        self.is_dirty_file(item.krate, item.file) || self.old_dirty_items.contains(&item)
+        self.dirty_in(&self.old_dirty_items, item)
     }
 }
 
