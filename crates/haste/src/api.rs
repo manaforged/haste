@@ -10,6 +10,7 @@ use crate::config::Config;
 use crate::graph::store::FileStamp;
 use crate::graph::{Targets, Workspace, cfg};
 use crate::outline::tree::Profile;
+use crate::serve::WorkspaceWatch;
 
 /// A supported compilation target triple.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -473,22 +474,12 @@ impl Compiler {
 struct LoadedBuild {
     workspace: Workspace,
     build: Build,
-    manifests: Vec<(PathBuf, FileStamp)>,
+    watch: WorkspaceWatch,
     watch_stamps: Vec<FileStamp>,
     test_filters: Option<Vec<String>>,
 }
 
 impl LoadedBuild {
-    fn manifest_stamps(workspace: &Workspace, root: &Path) -> Vec<(PathBuf, FileStamp)> {
-        crate::graph::manifest_paths(workspace, root)
-            .into_iter()
-            .map(|path| {
-                let stamp = crate::graph::store::file_stamp(&path);
-                (path, stamp)
-            })
-            .collect()
-    }
-
     fn capture_watch_stamps(
         workspace: &Workspace,
         build: &Build,
@@ -508,27 +499,18 @@ impl LoadedBuild {
     ) -> Result<Self, Error> {
         let workspace = crate::cli::load_workspace(root, targets).map_err(Error::compile)?;
         let build = Build::load(&workspace, targets).map_err(Error::compile)?;
-        let manifests = Self::manifest_stamps(&workspace, root);
+        let watch = WorkspaceWatch::capture(&workspace, root);
         let watch_stamps = Self::capture_watch_stamps(&workspace, &build, test_filters.as_deref());
         Ok(Self {
             workspace,
             build,
-            manifests,
+            watch,
             watch_stamps,
             test_filters,
         })
     }
 
-    fn is_stale(&self, next_filters: Option<&[String]>) -> bool {
-        let manifests_stale = self
-            .manifests
-            .iter()
-            .any(|(path, kept)| crate::graph::store::file_stamp(path) != *kept);
-        let env_stale = self
-            .build
-            .env_reads()
-            .into_iter()
-            .any(|(name, prev)| crate::process_env_var(&name) != prev);
+    fn filters_require_reload(&self, next_filters: Option<&[String]>) -> bool {
         let filters_stale =
             next_filters.is_some_and(|filters| self.test_filters.as_deref() != Some(filters));
         let filtered_sources_stale = next_filters.is_some_and(|filters| {
@@ -536,7 +518,7 @@ impl LoadedBuild {
                 && self.watch_stamps
                     != Self::capture_watch_stamps(&self.workspace, &self.build, Some(filters))
         });
-        manifests_stale || env_stale || filters_stale || filtered_sources_stale
+        filters_stale || filtered_sources_stale
     }
 
     fn ensure<'a>(
@@ -545,20 +527,42 @@ impl LoadedBuild {
         targets: &Targets,
         next_filters: Option<&[String]>,
     ) -> Result<&'a mut Self, Error> {
-        let needs_reload = slot
+        let reload_all = slot
             .as_ref()
-            .is_none_or(|loaded| loaded.is_stale(next_filters));
-        if needs_reload {
+            .is_none_or(|loaded| loaded.filters_require_reload(next_filters));
+        if reload_all {
             *slot = Some(Self::load(
                 root,
                 targets,
                 next_filters.map(<[String]>::to_vec),
             )?);
         } else if let Some(loaded) = slot.as_mut() {
-            loaded
-                .build
-                .refresh(&loaded.workspace, targets)
-                .map_err(Error::compile)?;
+            if !loaded
+                .watch
+                .is_fresh(&loaded.workspace, Some(&loaded.build))
+            {
+                let workspace_reloaded = loaded
+                    .watch
+                    .refresh_workspace(&mut loaded.workspace, targets)
+                    .map_err(Error::compile)?;
+                let env_stale = !WorkspaceWatch::env_reads_fresh(&loaded.build);
+                if workspace_reloaded || env_stale {
+                    loaded.build =
+                        Build::load(&loaded.workspace, targets).map_err(Error::compile)?;
+                    loaded.watch_stamps =
+                        Self::capture_watch_stamps(&loaded.workspace, &loaded.build, next_filters);
+                } else {
+                    loaded
+                        .build
+                        .refresh(&loaded.workspace, targets)
+                        .map_err(Error::compile)?;
+                }
+            } else {
+                loaded
+                    .build
+                    .refresh(&loaded.workspace, targets)
+                    .map_err(Error::compile)?;
+            }
         }
         slot.as_mut()
             .ok_or_else(|| Error::new(ErrorKind::Compile, "session build missing"))
