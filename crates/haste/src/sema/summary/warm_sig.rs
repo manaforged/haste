@@ -107,7 +107,8 @@ pub(super) fn write_signature(out: &mut Vec<u8>, s: &Signature) {
             | (u8::from(s.opaque) << 1)
             | (u8::from(s.is_async) << 2)
             | (u8::from(s.is_unsafe) << 3)
-            | (u8::from(s.is_safe) << 4),
+            | (u8::from(s.is_safe) << 4)
+            | (u8::from(s.deprecated_safe_2024) << 5),
     );
     write_slice(out, &s.param_starts, |o, v| write_u32(o, *v));
 }
@@ -144,6 +145,7 @@ pub(super) fn read_signature(cur: &mut Cursor<'_>) -> Result<Signature> {
         is_async: flags & 4 != 0,
         is_unsafe: flags & 8 != 0,
         is_safe: flags & 16 != 0,
+        deprecated_safe_2024: flags & 32 != 0,
         param_starts,
     })
 }

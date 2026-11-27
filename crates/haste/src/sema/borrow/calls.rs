@@ -174,7 +174,12 @@ impl Checker<'_, '_> {
         sig: Option<&Signature>,
     ) -> Result<()> {
         if self.unsafe_depth == 0 {
-            let is_unsafe = sig.is_some_and(|s| s.is_unsafe)
+            let safe_before_2024 = sig.is_some_and(|s| s.deprecated_safe_2024)
+                && self
+                    .cx
+                    .crate_edition(self.item.krate)
+                    .is_some_and(|e| e < "2024");
+            let is_unsafe = (sig.is_some_and(|s| s.is_unsafe) && !safe_before_2024)
                 || fn_item.is_some_and(|it| self.cx.foreign(it) && !sig.is_some_and(|s| s.is_safe));
             if is_unsafe {
                 let name = fn_item.map_or("function", |it| self.cx.name(it));
@@ -213,20 +218,7 @@ impl Checker<'_, '_> {
     fn method_recv_borrow(&mut self, expr: ExprId, receiver: ExprId) -> Option<Mut> {
         let adjust = self.typed.adjusts.get(&expr).copied();
         adjust.and_then(|m| m.autoref).or_else(|| {
-            let sig = self.callee_sig(expr, None);
-            let is_by_val = sig
-                .as_deref()
-                .is_some_and(|s| matches!(s.receiver, Some((SelfKind::Value, _))));
-            (!is_by_val && self.is_mut_ref_ty(self.expr_ty(receiver))).then(|| {
-                if sig
-                    .as_deref()
-                    .is_some_and(|s| recv_ref_mut(s) == Some(Mut::Not))
-                {
-                    Mut::Not
-                } else {
-                    Mut::Mut
-                }
-            })
+            self.infer_method_recv_borrow(expr, receiver, adjust.map_or(0, |a| a.derefs))
         })
     }
 
