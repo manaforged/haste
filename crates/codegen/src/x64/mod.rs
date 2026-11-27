@@ -84,6 +84,14 @@ const REGS_WIN64_RBP: Regs<Reg> = Regs {
 const FRAME_REGS: [Reg; 3] = [Reg::Rbp, Reg::Rsp, Reg::R11];
 
 pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> {
+    compile_with_features(func, target, Features::for_target(target))
+}
+
+pub(in crate::x64) fn compile_with_features(
+    func: &Function,
+    target: &Target,
+    features: Features,
+) -> Result<Code, String> {
     let abi_kind = target.abi;
     let keeps = keeps_frame_pointer(func);
     let regs = match (abi_kind, keeps) {
@@ -109,7 +117,6 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         classify(sig, abi_kind)
     })?;
     let func = split.as_ref().unwrap_or(func);
-    let features = Features::for_target(target);
     let (roots, pure_test) = if full {
         let dropped_before = plan.dropped_count();
         let fused = location::fuse(func, &mut plan, &features);

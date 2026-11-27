@@ -477,101 +477,16 @@ impl Emit<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::asm::Asm;
+    use super::super::super::compile_with_features;
     use super::super::super::features::Features;
-    use super::super::super::frame::classify;
-    use super::super::super::{Emit, REGS, REGS_RBP, keeps_frame_pointer, location};
     use crate::Effort;
-    use crate::emit::Tails;
-    use crate::frame::{Prepared, drive, prepare_split, repack_after_elide};
     use crate::ir::{AbiParam, CallConv, Function, IntCC, Signature, Type};
-    use crate::{Code, ConfigScope, FunctionBuilder, Target};
+    use crate::{ConfigScope, FunctionBuilder, Target};
 
     fn x64_full() -> Target {
         let mut target = *Target::find("x86_64-unknown-linux-gnu").expect("x64 linux target");
         target.effort = Effort::Full;
         target
-    }
-
-    fn compile_with_features(
-        func: &Function,
-        target: &Target,
-        features: Features,
-    ) -> Result<Code, String> {
-        let abi_kind = target.abi;
-        let keeps = keeps_frame_pointer(func);
-        let regs = if keeps { &REGS } else { &REGS_RBP };
-        let (
-            split,
-            Prepared {
-                order,
-                copied,
-                abi,
-                mut plan,
-                mut frame,
-                mut framed,
-            },
-        ) = prepare_split(func, regs, (true, false), |sig| classify(sig, abi_kind))?;
-        let func = split.as_ref().unwrap_or(func);
-        let dropped_before = plan.dropped_count();
-        let (roots, pure_test) = location::fuse(func, &mut plan, &features);
-        if plan.dropped_count() != dropped_before {
-            repack_after_elide(func, &plan, &abi, &mut frame, &mut framed, |sig| {
-                classify(sig, abi_kind)
-            })?;
-        }
-        let (base, bias) = if framed && !keeps {
-            (super::Reg::Rsp, frame.size as i32)
-        } else {
-            (super::Reg::Rbp, 0)
-        };
-        let mut asm = Asm::default();
-        asm.avx = features.avx;
-        let blocks = func.blocks.iter().map(|_| asm.label()).collect();
-        let defs = crate::fold::defs(func);
-        let n = func.types.len();
-        let last_block = order.last().copied();
-        let emit = Emit {
-            func,
-            frame,
-            framed,
-            base,
-            bias,
-            abi,
-            abi_kind,
-            asm,
-            blocks,
-            sites: Vec::new(),
-            relocs: Vec::new(),
-            plan,
-            defs,
-            roots,
-            pure_test,
-            flags: None,
-            spills: crate::spills::SpillState::new(crate::spills::pred_totals(
-                func, &order, &copied,
-            )),
-            next: None,
-            last_block,
-            at_end: false,
-            trap_label: None,
-            lines: Vec::new(),
-            features,
-            copied,
-            direct_calls: target.direct_calls,
-            frame_cache: false,
-            cold_calls: Vec::new(),
-            shrink: None,
-            in_fast: false,
-            low_product: None,
-            overflow_read: vec![false; n],
-            adc_sum: vec![false; n],
-            flag_carry: vec![false; n],
-            carry_flags: None,
-            tails: Tails::new(),
-            tail_calls: Vec::new(),
-        };
-        drive(emit, &order)
     }
 
     fn build_float_select_fn(call_conv: CallConv, ty: Type) -> Function {
