@@ -78,11 +78,14 @@ impl HostSymbol {
                 let target = crate::compile_target();
                 if aot
                     && (target.triple != haste_codegen::Target::host().triple
-                        || (target.format == haste_codegen::Format::Pe && lib.is_some()))
+                        || (matches!(
+                            target.format,
+                            haste_codegen::Format::Pe | haste_codegen::Format::MachO
+                        ) && lib.is_some()))
                 {
                     return Some(make_dynamic());
                 }
-                return dynamic(name).map(|_| make_dynamic());
+                return dynamic_in(name, lib).map(|_| make_dynamic());
             }
         };
         Some(built_in)
@@ -153,13 +156,60 @@ impl HostSymbol {
             Self::DropPop => unwind::drop_pop as *const () as usize,
             Self::Math(math) => math.host_addr(),
             Self::X86(x86) => return x86.host_addr(),
-            Self::Dynamic { .. } => return dynamic(self.link_name()),
+            Self::Dynamic { lib, .. } => return dynamic_in(self.link_name(), lib.as_deref()),
         })
     }
 }
 
 /// The object whose address stands for the host program where the linker's hidden `__dso_handle` would, which the C runtime reads as the main program.
 static DSO_HANDLE: u8 = 0;
+
+#[cfg(target_vendor = "apple")]
+fn apple_framework_addr(lib: &str, name: &std::ffi::CStr) -> Option<usize> {
+    let fw = lib
+        .strip_prefix("framework=")
+        .or_else(|| lib.strip_prefix("framework:"))?
+        .trim()
+        .trim_end_matches(".framework");
+    if fw.is_empty() {
+        return None;
+    }
+    let path = CString::new(format!("/System/Library/Frameworks/{fw}.framework/{fw}")).ok()?;
+    static HANDLES: std::sync::OnceLock<std::sync::Mutex<rustc_hash::FxHashMap<String, usize>>> =
+        std::sync::OnceLock::new();
+    let mut map = crate::sync::lock(HANDLES.get_or_init(Default::default));
+    let handle = match map.get(fw).copied() {
+        Some(raw) => raw as *mut core::ffi::c_void,
+        None => {
+            // SAFETY: path is a live NUL-terminated CString naming an Apple framework binary.
+            let opened = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL) };
+            if opened.is_null() {
+                return None;
+            }
+            map.insert(fw.to_owned(), opened as usize);
+            opened
+        }
+    };
+    // SAFETY: handle is an open dlopen handle and name is a NUL-terminated CString.
+    let addr = unsafe { libc::dlsym(handle, name.as_ptr()) };
+    (!addr.is_null()).then_some(addr as usize)
+}
+
+fn dynamic_in(name: &str, lib: Option<&str>) -> Option<usize> {
+    if let Some(addr) = dynamic(name) {
+        return Some(addr);
+    }
+    #[cfg(target_vendor = "apple")]
+    if let Some(lib) = lib
+        && let Ok(cname) = CString::new(name)
+        && let Some(addr) = apple_framework_addr(lib, &cname)
+    {
+        return Some(addr);
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    let _ = lib;
+    None
+}
 
 fn dynamic(name: &str) -> Option<usize> {
     #[cfg(target_vendor = "apple")]
@@ -362,6 +412,38 @@ pub(crate) mod apple_args {
             }
             // SAFETY: guard dropped, restoring libdyld's static argc pointer.
             assert_eq!(unsafe { *get_argc() }, orig_argc);
+        }
+
+        #[test]
+        fn apple_framework_dynamic_resolves_for_aot_and_dlopen_jit() {
+            let jit_sym = HostSymbol::resolve_for_lib(
+                "CFStringGetCStringPtr",
+                Some("framework=CoreFoundation"),
+                false,
+            )
+            .expect("JIT should resolve CoreFoundation symbol via dlopen");
+            assert!(jit_sym.host_addr().is_some());
+            assert!(
+                HostSymbol::resolve_for_lib(
+                    "CFNonexistentSymbol_HasteTest",
+                    Some("framework=CoreFoundation"),
+                    false,
+                )
+                .is_none()
+            );
+            let aot_sym = HostSymbol::resolve_for_lib(
+                "CFStringGetCStringPtr",
+                Some("framework=CoreFoundation"),
+                true,
+            )
+            .expect("AOT should accept framework-linked externs");
+            assert!(matches!(
+                aot_sym,
+                HostSymbol::Dynamic {
+                    lib: Some(ref lib),
+                    ..
+                } if lib.as_ref() == "framework=CoreFoundation"
+            ));
         }
     }
 }

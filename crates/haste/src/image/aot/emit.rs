@@ -300,6 +300,9 @@ impl Image {
             (live, fns, counts)
         });
         let mut exe = Executable::new(target);
+        if target.format == haste_codegen::Format::MachO {
+            collect_macho_frameworks(cx, reached, &live, &mut exe);
+        }
         let thread_slots: HashMap<usize, u64> = live
             .thread_slots
             .list
@@ -469,4 +472,48 @@ fn collect_exe_symbols(
         }
     }
     out
+}
+
+fn collect_macho_frameworks(
+    cx: &crate::sema::Context<'_>,
+    reached: &crate::sema::reach::Reached,
+    live: &AotReach,
+    exe: &mut Executable,
+) {
+    let mut seen_crates = vec![false; cx.outline.crates.len()];
+    let mut queue = Vec::new();
+    for &idx in &live.order {
+        if let Some(((item, _), _)) = reached.list.get(idx) {
+            let k = item.krate as usize;
+            if let Some(slot) = seen_crates.get_mut(k)
+                && !*slot
+            {
+                *slot = true;
+                queue.push(k);
+            }
+        }
+    }
+    while let Some(k) = queue.pop() {
+        if let Some(script) = &cx.outline.crates[k].env.script {
+            for (kind, name) in script.link_libs() {
+                if kind == crate::graph::script::LinkKind::Framework {
+                    let fw = name.trim().trim_end_matches(".framework");
+                    if !fw.is_empty() {
+                        let path = format!("/System/Library/Frameworks/{fw}.framework/{fw}");
+                        if !exe.extra_libs.contains(&path) {
+                            exe.extra_libs.push(path);
+                        }
+                    }
+                }
+            }
+        }
+        for &(_, dep) in &cx.outline.deps[k] {
+            if let Some(slot) = seen_crates.get_mut(dep)
+                && !*slot
+            {
+                *slot = true;
+                queue.push(dep);
+            }
+        }
+    }
 }

@@ -240,13 +240,24 @@ fn build_func_starts(
     buf.0
 }
 
+fn write_bind_dylib(bind: &mut Buf, ordinal: Option<usize>) {
+    match ordinal {
+        Some(ord) if ord <= 15 => bind.u8(0x10 | ord as u8),
+        Some(ord) => {
+            bind.u8(0x20);
+            bind.uleb(ord as u64);
+        }
+        None => bind.u8(0x3E),
+    }
+}
+
 fn build_dyld_info(
     exe: &Executable,
     plan: &Plan<'_>,
     data_in_seg: u64,
     rodata_in_seg: u64,
     tlv_in_seg: Option<u64>,
-    single_lib: bool,
+    ordinals: &[Option<usize>],
 ) -> (Vec<u8>, Vec<u8>) {
     let mut rebase = Buf::new();
     let mut ptrs: Vec<u64> = exe
@@ -268,9 +279,14 @@ fn build_dyld_info(
     }
     let mut bind = Buf::new();
     if !plan.imports.is_empty() || tlv_in_seg.is_some() {
-        bind.u8(if single_lib { 0x11 } else { 0x3E });
         bind.u8(0x51);
+        let mut cur_ord: Option<Option<usize>> = None;
         for (i, imp) in plan.imports.iter().enumerate() {
+            let target_ord = ordinals.get(i).copied().flatten();
+            if cur_ord != Some(target_ord) {
+                write_bind_dylib(&mut bind, target_ord);
+                cur_ord = Some(target_ord);
+            }
             let name = imp.name;
             bind.u8(0x40);
             bind.bytes(exe.target.symbol_prefix.as_bytes());
@@ -334,12 +350,7 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     let plan = Plan::collect(exe, &[])?;
     let (stub_size, tramp_size) = if arch == Arch::X64 { (6, 20) } else { (12, 24) };
 
-    let mut libs = vec!["/usr/lib/libSystem.B.dylib".to_owned()];
-    plan.libs
-        .iter()
-        .filter(|&&l| !l.contains(".so"))
-        .for_each(|l| libs.push(format!("@rpath/lib{l}.dylib")));
-    libs.extend(exe.extra_libs.iter().cloned());
+    let (libs, ordinals, two_level) = plan.macho_libs(&exe.extra_libs);
 
     let tls = if arch == Arch::Arm64 {
         TlsLayout::compute(&plan, exe.thread_slots)
@@ -448,7 +459,7 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
         (data_off - data_seg_off) as u64,
         (rodata_off - data_seg_off) as u64,
         tlv_in_seg,
-        libs.len() == 1,
+        &ordinals,
     );
     let mut strtab = vec![0u8];
     let sym_offs: Vec<u32> = plan
@@ -486,11 +497,7 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     let linkedit_filesz = (sig_off + sig_len) - linkedit_off;
 
     let mut out = Buf(Vec::with_capacity(sig_off + sig_len));
-    let mut flags = if libs.len() == 1 {
-        0x0020_0085
-    } else {
-        0x0020_0005
-    };
+    let mut flags = if two_level { 0x0020_0085 } else { 0x0020_0005 };
     if has_tlv {
         flags |= MH_HAS_TLV_DESCRIPTORS;
     }
@@ -746,10 +753,15 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
         out.words(&[strx, EXT_IN_TEXT]);
         out.u64(addrs.text + u64::from(sym.offset));
     }
-    sym_offs.iter().for_each(|&off| {
-        out.words(&[off, 1]);
+    for (i, &off) in sym_offs.iter().enumerate() {
+        let ord_bits = ordinals
+            .get(i)
+            .copied()
+            .flatten()
+            .map_or(0, |ord| (ord.min(254) as u32) << 24);
+        out.words(&[off, 1 | ord_bits]);
         out.u64(0);
-    });
+    }
     for _ in 0..2 {
         (0..plan.imports.len()).for_each(|idx| out.u32((nlocals + nexports + idx) as u32));
     }

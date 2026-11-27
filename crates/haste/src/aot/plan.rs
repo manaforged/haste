@@ -284,6 +284,45 @@ impl<'a> Plan<'a> {
         Ok(plan)
     }
 
+    pub(super) fn macho_libs(
+        &self,
+        extra_libs: &[String],
+    ) -> (Vec<String>, Vec<Option<usize>>, bool) {
+        let mut libs = vec!["/usr/lib/libSystem.B.dylib".to_owned()];
+        let mut has_untyped_bundle = false;
+        for extra in extra_libs {
+            if !extra.contains(".framework/") {
+                has_untyped_bundle = true;
+            }
+            push_macho_lib(&mut libs, extra.clone());
+        }
+        for &l in self.libs.iter().filter(|&&l| !l.contains(".so")) {
+            push_macho_lib(&mut libs, format!("@rpath/lib{l}.dylib"));
+        }
+        let mut ordinals = Vec::with_capacity(self.imports.len());
+        let mut has_flat = false;
+        for imp in &self.imports {
+            let ord = match imp
+                .link_lib
+                .and_then(|raw| normalize_macho_lib(raw, extra_libs))
+            {
+                Some(path) => Some(push_macho_lib(&mut libs, path)),
+                None if !has_untyped_bundle
+                    && libs.iter().skip(1).all(|l| l.contains(".framework/")) =>
+                {
+                    Some(1)
+                }
+                None if libs.len() == 1 => Some(1),
+                None => {
+                    has_flat = true;
+                    None
+                }
+            };
+            ordinals.push(ord);
+        }
+        (libs, ordinals, !has_flat)
+    }
+
     fn add_unwind_walk(&mut self) {
         if self.has_shim(Shim::StartPanic) {
             self.visit(Binding::Shim(Shim::UnwindWalk));
@@ -406,4 +445,92 @@ pub(crate) fn resolve_sym(
 ) -> Result<u64> {
     plan.resolve_with(sym, addrs, (base_va, shim_offs), stub_va)
         .map(|(_, va)| va)
+}
+
+fn push_macho_lib(libs: &mut Vec<String>, path: String) -> usize {
+    if let Some(idx) = libs.iter().position(|existing| *existing == path) {
+        idx + 1
+    } else {
+        libs.push(path);
+        libs.len()
+    }
+}
+
+const MACOS_FRAMEWORKS: &[&str] = &[
+    "Accelerate",
+    "AppKit",
+    "AudioToolbox",
+    "AVFoundation",
+    "Carbon",
+    "CFNetwork",
+    "Cocoa",
+    "CoreAudio",
+    "CoreFoundation",
+    "CoreGraphics",
+    "CoreMedia",
+    "CoreServices",
+    "CoreText",
+    "CoreVideo",
+    "CryptoTokenKit",
+    "DiskArbitration",
+    "Foundation",
+    "IOKit",
+    "LocalAuthentication",
+    "Metal",
+    "Network",
+    "OpenGL",
+    "QuartzCore",
+    "Security",
+    "ServiceManagement",
+    "SystemConfiguration",
+    "UniformTypeIdentifiers",
+    "UserNotifications",
+];
+
+fn normalize_macho_lib(raw: &str, extra_libs: &[String]) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if raw.starts_with('/') || raw.starts_with('@') {
+        return Some(raw.to_owned());
+    }
+    if let Some(fw) = raw
+        .strip_prefix("framework:")
+        .or_else(|| raw.strip_prefix("framework="))
+        .or_else(|| raw.strip_suffix(".framework"))
+    {
+        let fw = fw.trim().trim_end_matches(".framework");
+        if fw.is_empty() {
+            return None;
+        }
+        return Some(format!("/System/Library/Frameworks/{fw}.framework/{fw}"));
+    }
+    let fw_suffix = format!("/{raw}.framework/{raw}");
+    if let Some(found) = extra_libs.iter().find(|p| p.ends_with(&fw_suffix)) {
+        return Some(found.clone());
+    }
+    if matches!(raw, "c" | "System" | "m" | "pthread" | "dl" | "util") {
+        return Some("/usr/lib/libSystem.B.dylib".to_owned());
+    }
+    let sys_fw = format!("/System/Library/Frameworks/{raw}.framework/{raw}");
+    if MACOS_FRAMEWORKS.contains(&raw)
+        || (cfg!(target_os = "macos") && std::path::Path::new(&sys_fw).exists())
+    {
+        return Some(sys_fw);
+    }
+    Some(if raw.ends_with(".dylib") {
+        if raw.starts_with("lib") {
+            format!("@rpath/{raw}")
+        } else {
+            format!("@rpath/lib{raw}")
+        }
+    } else if matches!(
+        raw,
+        "z" | "bz2" | "lzma" | "sqlite3" | "iconv" | "c++" | "objc" | "xml2"
+    ) {
+        format!("/usr/lib/lib{raw}.dylib")
+    } else {
+        format!("@rpath/lib{raw}.dylib")
+    })
 }
