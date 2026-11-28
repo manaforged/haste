@@ -76,11 +76,31 @@ struct WaveQueue {
     seen: HashMap<Instance, usize>,
     filter: ReachFilter,
     instances: Vec<Instance>,
+    free: Vec<usize>,
+    recycled: Vec<usize>,
     queue: VecDeque<(usize, Instance)>,
     settled: Vec<(usize, Result<Arc<Typed>, String>, Vec<String>, bool)>,
     deferred_items: Vec<(usize, Instance)>,
     active: usize,
     waiting: usize,
+}
+
+impl WaveQueue {
+    fn push_callee(&mut self, callee: Instance) {
+        if let std::collections::hash_map::Entry::Vacant(slot) = self.seen.entry(callee) {
+            let at = if let Some(free) = self.free.pop() {
+                self.instances[free] = callee;
+                self.recycled.push(free);
+                free
+            } else {
+                let end = self.instances.len();
+                self.instances.push(callee);
+                end
+            };
+            slot.insert(at);
+            self.queue.push_back((at, callee));
+        }
+    }
 }
 
 struct ActiveGuard<'a>(&'a Mutex<WaveQueue>, &'a Condvar, usize);
@@ -115,6 +135,7 @@ pub(super) fn parallel_drain(
     let workers = crate::jobs();
     let seen = std::mem::take(&mut reached.index);
     let filter = std::mem::take(&mut reached.filter);
+    let free = std::mem::take(&mut reached.free);
     let instances: Vec<Instance> = reached.list.iter().map(|&(inst, _)| inst).collect();
     let queue: VecDeque<(usize, Instance)> = wave.iter().map(|&at| (at, instances[at])).collect();
     let shared = (
@@ -122,6 +143,8 @@ pub(super) fn parallel_drain(
             seen,
             filter,
             instances,
+            free,
+            recycled: Vec::new(),
             queue,
             settled: Vec::new(),
             deferred_items: Vec::new(),
@@ -131,22 +154,27 @@ pub(super) fn parallel_drain(
         Condvar::new(),
     );
     loop {
+        let seed = {
+            let q = crate::sync::lock(&shared.0);
+            (q.filter.seed_clone(), q.filter.log_lens())
+        };
         let forks: Vec<Context<'_>> = (0..workers - 1).map(|_| cx.fork()).collect();
         let shared_ref = &shared;
+        let seed_ref = &seed;
         cx.in_parallel = true;
         let joined = crate::sync::scope(|scope| {
             let handles: Vec<_> = forks
                 .into_iter()
                 .map(|mut fork| {
                     scope.spawn(move || {
-                        wavefront_worker(&mut fork, shared_ref, workers, force_commit);
+                        wavefront_worker(&mut fork, shared_ref, seed_ref, workers, force_commit);
                         let deferred = fork.take_deferred_evals();
                         let (_, asks) = fork.release();
                         (asks, deferred)
                     })
                 })
                 .collect();
-            wavefront_worker(cx, shared_ref, workers, force_commit);
+            wavefront_worker(cx, shared_ref, seed_ref, workers, force_commit);
             handles
                 .into_iter()
                 .map(|handle| handle.join().map_or(None, Some))
@@ -182,6 +210,11 @@ pub(super) fn parallel_drain(
     let q = crate::sync::into_inner(shared.0);
     reached.index = q.seen;
     reached.filter = q.filter;
+    reached.free = q.free;
+    for at in q.recycled {
+        reached.list[at] = (q.instances[at], Err(String::new()));
+        reached.states[at] = ReachedEntry::Enqueued;
+    }
     let extra = q.instances.len().saturating_sub(reached.list.len());
     reached.list.reserve(extra);
     reached.states.reserve(extra);
@@ -216,12 +249,7 @@ fn drain_serial_tail(cx: &mut Context<'_>, q: &mut WaveQueue, force_commit: bool
         }
         q.settled.push((at, typed, unlaid, blocked));
         for callee in callees.drain(..) {
-            if let std::collections::hash_map::Entry::Vacant(slot) = q.seen.entry(callee) {
-                let next_at = q.instances.len();
-                slot.insert(next_at);
-                q.instances.push(callee);
-                q.queue.push_back((next_at, callee));
-            }
+            q.push_callee(callee);
         }
     }
     q.queue.is_empty()
@@ -230,6 +258,7 @@ fn drain_serial_tail(cx: &mut Context<'_>, q: &mut WaveQueue, force_commit: bool
 fn wavefront_worker(
     cx: &mut Context<'_>,
     (mutex, cvar): &(Mutex<WaveQueue>, Condvar),
+    (seed_filter, seed_lens): &(ReachFilter, (usize, usize)),
     workers: usize,
     force_commit: bool,
 ) {
@@ -239,9 +268,9 @@ fn wavefront_worker(
     let mut pending_callees = Vec::new();
     let mut local_seen = HashSet::default();
     let mut batch_sealed = HashSet::default();
-    let mut local_filter = ReachFilter::default();
-    let mut synced_len = (0usize, 0usize);
-    let sync_filter = false;
+    let mut local_filter = seed_filter.seed_clone();
+    let mut synced_len = *seed_lens;
+    let sync_filter = true;
     let mut active = ActiveGuard(mutex, cvar, 0);
     loop {
         let delta = {
@@ -361,11 +390,6 @@ fn commit_worker_batch(
         if sealed && !q.filter.mark_seen_sealed(callee.0) {
             continue;
         }
-        let next_at = q.instances.len();
-        if let std::collections::hash_map::Entry::Vacant(slot) = q.seen.entry(callee) {
-            slot.insert(next_at);
-            q.instances.push(callee);
-            q.queue.push_back((next_at, callee));
-        }
+        q.push_callee(callee);
     }
 }

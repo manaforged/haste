@@ -18,7 +18,8 @@ mod unwind;
 mod wave;
 
 pub(super) use collect::run_scoped;
-pub use collect::{reach_again, reach_anew, reach_wave};
+pub use collect::{reach_again, reach_anew_in, reach_wave};
+pub use crate_check::check_poly_items;
 pub(crate) use items::lay_out;
 pub(crate) use items::typed_once;
 pub(super) use items::{infer_entry, is_inferring};
@@ -67,6 +68,7 @@ pub struct Reached {
     pinned: Vec<bool>,
     pub(in crate::sema::reach) crate_errors: Vec<usize>,
     pub(in crate::sema::reach) states: Vec<ReachedEntry>,
+    pub(in crate::sema::reach) free: Vec<usize>,
     untyped_count: usize,
     pub(in crate::sema::reach) filter: ReachFilter,
     catch_unwind_state: AtomicUsize,
@@ -232,10 +234,17 @@ impl Reached {
     }
 
     fn push_entry(&mut self, instance: Instance, state: ReachedEntry) -> usize {
-        let at = self.list.len();
+        let at = if let Some(slot) = self.free.pop() {
+            self.list[slot] = (instance, Err(String::new()));
+            self.states[slot] = state;
+            slot
+        } else {
+            let slot = self.list.len();
+            self.list.push((instance, Err(String::new())));
+            self.states.push(state);
+            slot
+        };
         self.index.insert(instance, at);
-        self.list.push((instance, Err(String::new())));
-        self.states.push(state);
         if state == ReachedEntry::Declared {
             self.untyped_count += 1;
         }
@@ -289,6 +298,15 @@ impl Reached {
 
     pub(in crate::sema::reach) fn clear_crate_errors(&mut self) {
         self.crate_errors.clear();
+    }
+
+    pub(in crate::sema::reach) fn retain_crate_errors(
+        &mut self,
+        mut keep_crate: impl FnMut(u32) -> bool,
+    ) {
+        self.crate_errors.retain(|&at| {
+            self.states[at] != ReachedEntry::Replaced && keep_crate(self.list[at].0.0.krate)
+        });
     }
 
     pub(in crate::sema::reach) fn note_crate_error(&mut self, at: usize) {
@@ -348,6 +366,85 @@ impl Reached {
                 self.pinned[id] = true;
             }
         }
+    }
+
+    pub(in crate::sema::reach) fn replace_dead(&mut self, dead: &[usize]) {
+        if dead.is_empty() {
+            return;
+        }
+        self.calls.resize(self.list.len(), Vec::new());
+        self.indirect.resize(self.list.len(), Vec::new());
+        self.call_sites.retract(dead, &self.calls, &self.indirect);
+        let sentinel = (
+            ItemRef {
+                krate: u32::MAX,
+                file: 0,
+                item: 0,
+            },
+            Substs::EMPTY,
+        );
+        let mut min_at = usize::MAX;
+        for &at in dead {
+            self.index.remove(&self.list[at].0);
+            if at < self.pinned.len() {
+                self.pinned[at] = false;
+            }
+            if self.states[at] == ReachedEntry::Declared {
+                self.untyped_count -= 1;
+            }
+            if self.states[at] != ReachedEntry::Replaced {
+                self.states[at] = ReachedEntry::Replaced;
+                self.free.push(at);
+            }
+            self.list[at] = (sentinel, Err(String::new()));
+            self.calls[at].clear();
+            self.indirect[at].clear();
+            min_at = min_at.min(at);
+        }
+        let checked = *self.catch_unwind_state.get_mut() & !CATCH_UNWIND_FOUND;
+        if min_at < checked {
+            *self.catch_unwind_state.get_mut() = min_at;
+            let cache = self
+                .catch_unwind_cache
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.checked_items.clear();
+            cache.checked_callees.clear();
+        }
+        *self
+            .may_unwind_cache
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    pub(in crate::sema::reach) fn trim_replaced(&mut self) {
+        let mut len = self.list.len();
+        while len > 0 && self.states[len - 1] == ReachedEntry::Replaced {
+            len -= 1;
+        }
+        if len == self.list.len() {
+            return;
+        }
+        self.list.truncate(len);
+        self.states.truncate(len);
+        if self.calls.len() > len {
+            self.calls.truncate(len);
+        }
+        if self.indirect.len() > len {
+            self.indirect.truncate(len);
+        }
+        if self.pinned.len() > len {
+            self.pinned.truncate(len);
+        }
+        self.free.retain(|&at| at < len);
+        let checked = *self.catch_unwind_state.get_mut() & !CATCH_UNWIND_FOUND;
+        if len < checked {
+            *self.catch_unwind_state.get_mut() = len;
+        }
+        *self
+            .may_unwind_cache
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     fn link(&mut self, indices: &[usize]) {

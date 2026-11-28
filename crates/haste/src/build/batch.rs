@@ -9,7 +9,7 @@ use crate::image::Image;
 use crate::macros::Compilation;
 use crate::names::ItemRef;
 use crate::outline;
-use crate::sema::reach::{Instance, Reached, reach_again, reach_anew};
+use crate::sema::reach::{Instance, Reached, check_poly_items, reach_again, reach_anew_in};
 use crate::sema::{self, Cache, Edited};
 
 use super::substrate::{
@@ -137,20 +137,13 @@ pub(super) fn check_member_items(
     Ok((store, out))
 }
 
-fn batch_roots(
-    workspace: &graph::Workspace,
-    outline: &outline::Outline,
-    kind: BatchKind,
-) -> (Vec<ItemRef>, Vec<Instance>) {
-    let items = kind.pick(workspace, outline);
-    let roots = items
-        .iter()
-        .map(|item| (*item, sema::substs::Substs::EMPTY))
-        .collect();
-    (items, roots)
-}
-
 fn batch_labels(cx: &mut sema::Context<'_>, kind: BatchKind, items: &[ItemRef]) -> Vec<String> {
+    if matches!(
+        kind,
+        BatchKind::LibCheck | BatchKind::MainCheck | BatchKind::MainAot
+    ) {
+        return Vec::new();
+    }
     items
         .iter()
         .map(|&item| {
@@ -199,18 +192,6 @@ fn main_items(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<I
     items
 }
 
-fn check_poly_items(cx: &mut sema::Context<'_>, items: &[ItemRef]) -> Vec<(ItemRef, String)> {
-    let mut out = Vec::new();
-    for &item in items {
-        if !sema::infer::is_concrete_fn(cx, item)
-            && let Err(err) = sema::summary::check_poly_item(cx, item)
-        {
-            out.push((item, err));
-        }
-    }
-    out
-}
-
 fn check_poly_resolved(
     compilation: &mut Compilation,
     store: Cache,
@@ -236,6 +217,7 @@ fn recompile(
     (cx, reached): (&mut sema::Context<'_>, &Reached),
     fresh: &[usize],
     roots: &[usize],
+    is_check: bool,
 ) {
     let mut expanded = fresh.to_vec();
     if crate::profile() == outline::tree::Profile::Release
@@ -263,6 +245,9 @@ fn recompile(
                 expanded.push(u);
             }
         }
+    }
+    if is_check {
+        expanded.retain(|&idx| !cx.outline.is_fixed(reached.list[idx].0.0.krate));
     }
     expanded.iter().for_each(|at| drop(broken.remove(at)));
     broken.extend(image.compile(cx, reached, &expanded));
@@ -444,16 +429,17 @@ fn finish_batch(
         substrate,
         pre_builder,
     );
+    let dummy = ItemRef {
+        krate: 0,
+        file: 0,
+        item: 0,
+    };
     let tests = start_indices
         .into_iter()
         .map(|start| {
             (
                 TestItem {
-                    item: ItemRef {
-                        krate: 0,
-                        file: 0,
-                        item: 0,
-                    },
+                    item: dummy,
                     ignored: false,
                     should_panic: false,
                     expected: None,
@@ -546,7 +532,12 @@ impl Batch {
         } else if let Some(ref state) = local_check {
             state.dirty_cases(&compilation.outline)
         } else {
-            batch_roots(workspace, &compilation.outline, kind)
+            let items = kind.pick(workspace, &compilation.outline);
+            let roots = items
+                .iter()
+                .map(|item| (*item, sema::substs::Substs::EMPTY))
+                .collect();
+            (items, roots)
         };
         if matches!(kind, BatchKind::Tests | BatchKind::MainAot) {
             let target = (kind == BatchKind::MainAot)
@@ -626,19 +617,21 @@ impl Batch {
                 }
             }
         }
-        let mut has_static_archive = None;
-        for krate_idx in linked_crates {
+        let has_static_archive = linked_crates.into_iter().find_map(|krate_idx| {
             let krate = &compilation.outline.crates[krate_idx];
-            if let Some(script) = &krate.env.script
-                && let Some((_, lib)) = script
-                    .link_libs()
-                    .find(|(kind, _)| *kind == crate::graph::script::LinkKind::Static)
-            {
-                let name = compilation.outline.roots[krate_idx].name.as_str();
-                has_static_archive = Some((lib.to_owned(), name.to_owned()));
-                break;
-            }
-        }
+            krate
+                .env
+                .script
+                .as_ref()?
+                .link_libs()
+                .find(|(kind, _)| *kind == crate::graph::script::LinkKind::Static)
+                .map(|(_, lib)| {
+                    (
+                        lib.to_owned(),
+                        compilation.outline.roots[krate_idx].name.to_owned(),
+                    )
+                })
+        });
         let native_bundle = if let Some((lib, name)) = has_static_archive {
             if cfg!(unix) && crate::compile_target() == haste_codegen::Target::host() {
                 crate::host::native::bundle(&compilation.outline)?
@@ -697,6 +690,7 @@ impl Batch {
             (&mut cx, &self.reached),
             &fresh,
             &self.roots,
+            self.kind.mode() == crate::image::ImageMode::Check,
         );
         self.store = Some(cx.release().0);
         true
@@ -719,7 +713,7 @@ impl Batch {
             self.reached.list.iter().map(|(instance, _)| instance),
             Edited::Crates(crates),
         );
-        let (mut cases, _) = batch_roots(workspace, &compilation.outline, self.kind);
+        let mut cases = self.kind.pick(workspace, &compilation.outline);
         let roots;
         let mut cx = sema::Context::new(&compilation.outline, &compilation.names, store);
         let mut test_starts = Vec::new();
@@ -739,7 +733,15 @@ impl Batch {
                 roots = test_roots;
             }
             BatchKind::LibCheck | BatchKind::MainCheck => {
-                self.poly_failures = check_poly_items(&mut cx, &cases);
+                self.poly_failures
+                    .retain(|(item, _)| !crates.contains(&item.krate));
+                let edited_cases: Vec<ItemRef> = cases
+                    .iter()
+                    .copied()
+                    .filter(|item| crates.contains(&item.krate))
+                    .collect();
+                self.poly_failures
+                    .extend(check_poly_items(&mut cx, &edited_cases));
                 cases.retain(|&item| sema::infer::is_concrete_fn(&mut cx, item));
                 roots = cases
                     .iter()
@@ -757,7 +759,7 @@ impl Batch {
                 roots = pair.to_vec();
             }
         }
-        let fresh = reach_anew(&mut cx, &mut self.reached, &touched, &roots);
+        let fresh = reach_anew_in(&mut cx, &mut self.reached, &touched, &roots, Some(crates));
         if !cx.resolved() {
             return false;
         }
@@ -781,12 +783,14 @@ impl Batch {
                 test_items(workspace, &compilation.outline),
             );
         }
+        touched.iter().for_each(|idx| drop(self.broken.remove(idx)));
         recompile(
             &mut self.image,
             &mut self.broken,
             (&mut cx, &self.reached),
             &fresh,
             &self.roots,
+            self.kind.mode() == crate::image::ImageMode::Check,
         );
         self.store = Some(cx.release().0);
         true

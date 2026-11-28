@@ -1,20 +1,29 @@
-//! Build scripts kept as executables between runs, as Cargo keeps them: a script that runs again starts its executable while its crate and every crate it builds from hash the same, and one that ran before is compiled ahead of time once it runs again.
+//! Build scripts kept as executables between runs, with a pre-outline manifest so warm reruns exec cached binaries directly without loading `sysroot` or `outline`.
 
-use std::hash::BuildHasher as _;
+use std::fs::File;
+use std::hash::{BuildHasher as _, Hash as _, Hasher as _};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::Arc;
 
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHasher};
 
-use crate::graph::{Workspace, store};
+use crate::config::Config;
+use crate::graph::{Side, Targets, Workspace, store};
 use crate::image::Script;
 use crate::macros::Compilation;
 use crate::outline::Outline;
-use crate::substrate::CrateHashes;
+use crate::outline::tree::Profile;
+use crate::substrate::{Backing, CrateHashes};
 
 const EXECUTABLE: &str = "script";
 const KEY: &str = "script.key";
+const FAST: &str = "script.fast";
+const FAST_MAGIC: [u8; 8] = *b"HSTSCR01";
+const FAST_VERSION: u32 = 1;
+const FAST_HEADER_LEN: usize = 24;
 
 /// What the store holds for a script whose crate hashes to its key: its executable, the mark that it does not compile ahead of time, or nothing.
 pub(super) enum Kept {
@@ -23,9 +32,206 @@ pub(super) enum Kept {
     Missing,
 }
 
+/// Runs `f` with `Profile::Debug`, `debug_info = false`, and `symbols = false` so build-script compilation skips Release SSA optimization and inlining overhead.
+pub(super) fn with_script_profile<R>(f: impl FnOnce() -> R) -> R {
+    let cfg = crate::config();
+    if cfg.profile == Profile::Debug && !cfg.debug_info && !cfg.symbols {
+        return f();
+    }
+    let mut script_cfg = (*cfg).clone();
+    script_cfg.profile = Profile::Debug;
+    script_cfg.debug_info = false;
+    script_cfg.symbols = false;
+    crate::with_config(Arc::new(script_cfg), f)
+}
+
+/// Checks whether `unit`'s cached build-script executable is current from `script.fast` alone, without parsing `build.rs` or loading `sysroot`/`outline`.
+pub(super) fn fast_kept(
+    workspace: &Workspace,
+    targets: &Targets,
+    unit: usize,
+    dir: &Path,
+) -> Option<PathBuf> {
+    let executable = dir.join(EXECUTABLE);
+    if !executable.is_file() {
+        return None;
+    }
+    let backing = Backing::open(&dir.join(FAST), FAST_HEADER_LEN).ok()?;
+    let data = backing.as_slice();
+    if data.len() < FAST_HEADER_LEN
+        || data[0..8] != FAST_MAGIC
+        || read_u32(data, 8) != FAST_VERSION
+        || read_u64(data, 12) != fast_meta_hash(workspace, targets, unit)
+    {
+        return None;
+    }
+    let file_count = read_u32(data, 20) as usize;
+    let mut pos = FAST_HEADER_LEN;
+    for _ in 0..file_count {
+        let len = read_u32(read_bytes(data, &mut pos, 4)?, 0) as usize;
+        let raw_path = read_bytes(data, &mut pos, len)?;
+        let expected = match *read_bytes(data, &mut pos, 1)?.first()? {
+            0 => None,
+            1 => {
+                let raw = read_bytes(data, &mut pos, 24)?;
+                Some((read_u64(raw, 0), read_i128(raw, 8)))
+            }
+            _ => return None,
+        };
+        if !stamp_matches_raw(raw_path, expected) {
+            return None;
+        }
+    }
+    (pos == data.len()).then_some(executable)
+}
+
+/// Computes the pre-outline metadata key for `unit`'s compiled build script under the active `Config` and host `targets`.
+pub(super) fn fast_meta_hash(workspace: &Workspace, targets: &Targets, unit: usize) -> u64 {
+    let script_host = haste_codegen::Target::host().effort(Profile::Debug.into());
+    let tc_key = crate::substrate::toolchain_key(workspace, &script_host);
+    let t_hash = crate::substrate::target_hash(&script_host);
+
+    let mut closure: Vec<usize> = crate::outline::build_closure(workspace, &[unit])
+        .into_iter()
+        .collect();
+    if !closure.contains(&unit) {
+        closure.push(unit);
+    }
+    closure.sort_unstable();
+
+    let mut hasher = FxHasher::default();
+    FAST_MAGIC.hash(&mut hasher);
+    FAST_VERSION.hash(&mut hasher);
+    store::program().hash(&mut hasher);
+    tc_key.hash(&mut hasher);
+    t_hash.hash(&mut hasher);
+    (
+        &targets.host.triple,
+        &targets.host.names,
+        &targets.host.pairs,
+        &targets.host.internal,
+    )
+        .hash(&mut hasher);
+    (crate::profile() == Profile::Release).hash(&mut hasher);
+    workspace.rustflags.hash(&mut hasher);
+    workspace.config_env.hash(&mut hasher);
+    (
+        workspace.profile_dev.debug_assertions,
+        workspace.profile_dev.overflow_checks,
+        workspace.profile_release.debug_assertions,
+        workspace.profile_release.overflow_checks,
+    )
+        .hash(&mut hasher);
+    closure.len().hash(&mut hasher);
+    for &u in &closure {
+        let Some(entry) = workspace.graph.units.get(u) else {
+            continue;
+        };
+        let Some(pkg) = workspace.packages.get(entry.package) else {
+            continue;
+        };
+        pkg.locked.name.hash(&mut hasher);
+        pkg.locked.version.to_string().hash(&mut hasher);
+        pkg.locked.source.hash(&mut hasher);
+        pkg.manifest.dir.hash(&mut hasher);
+        pkg.manifest.edition.hash(&mut hasher);
+        pkg.manifest.lib_name.hash(&mut hasher);
+        pkg.manifest.build.hash(&mut hasher);
+        pkg.manifest.links.hash(&mut hasher);
+        (entry.side == Side::Host).hash(&mut hasher);
+        entry.features.hash(&mut hasher);
+        entry.deps.len().hash(&mut hasher);
+        for (dep_name, dep_u, kind) in &entry.deps {
+            let dep_pkg_name = workspace
+                .graph
+                .units
+                .get(*dep_u)
+                .and_then(|du| workspace.packages.get(du.package))
+                .map_or("", |dp| dp.locked.name.as_str());
+            dep_name.hash(&mut hasher);
+            dep_pkg_name.hash(&mut hasher);
+            (*kind as u8).hash(&mut hasher);
+        }
+        if u != unit
+            && let Some(out) = &entry.script
+        {
+            (&out.names, &out.pairs, &out.vars).hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+/// Writes `script.fast` for `unit` given `meta_hash` and the exact source paths read while compiling its crate closure.
+pub(super) fn write_fast_manifest(
+    dir: &Path,
+    meta_hash: u64,
+    paths: &[PathBuf],
+) -> std::io::Result<()> {
+    let stamps = store::file_stamps(paths);
+    let Some(bytes) = encode_fast_manifest(meta_hash, paths, &stamps) else {
+        return Ok(());
+    };
+    store::write_new_bytes(&dir.join(FAST), &bytes)
+}
+
+fn encode_fast_manifest(
+    meta_hash: u64,
+    paths: &[PathBuf],
+    stamps: &[store::FileStamp],
+) -> Option<Vec<u8>> {
+    let count = u32::try_from(paths.len()).ok()?;
+    let mut out = Vec::with_capacity(FAST_HEADER_LEN + paths.len() * 88);
+    out.extend_from_slice(&FAST_MAGIC);
+    out.extend_from_slice(&FAST_VERSION.to_le_bytes());
+    out.extend_from_slice(&meta_hash.to_le_bytes());
+    out.extend_from_slice(&count.to_le_bytes());
+    for (path, &stamp) in paths.iter().zip(stamps) {
+        write_path_ref(&mut out, path)?;
+        match stamp {
+            Some((len, nanos)) => {
+                out.push(1);
+                out.extend_from_slice(&len.to_le_bytes());
+                out.extend_from_slice(&nanos.to_le_bytes());
+            }
+            None => out.push(0),
+        }
+    }
+    Some(out)
+}
+
+fn collect_closure_files(outline: &Outline, krate: usize) -> Vec<PathBuf> {
+    let mut seen = vec![false; outline.crates.len()];
+    let mut stack = vec![krate];
+    let mut paths = Vec::new();
+    while let Some(at) = stack.pop() {
+        if std::mem::replace(&mut seen[at], true) {
+            continue;
+        }
+        if let Some(tree) = outline.crates.get(at)
+            && !tree.env.fixed
+        {
+            for entry in &tree.files {
+                if !entry.expanded {
+                    paths.push(entry.source.path.clone());
+                }
+            }
+            for (inc, _) in outline.included(at) {
+                paths.push(inc);
+            }
+        }
+        stack.extend(outline.deps[at].iter().map(|(_, dep)| *dep));
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
 /// The key of each script unit's executable: the hash of its crate and of every crate that crate reaches, under this toolchain, target, profile and compiler.
 pub(super) struct Binaries {
     keys: HashMap<usize, u64>,
+    dirs: HashMap<usize, PathBuf>,
+    outer_cfg: Arc<Config>,
+    outer_targets: Targets,
 }
 
 impl Binaries {
@@ -34,10 +240,19 @@ impl Binaries {
         workspace: &Workspace,
         outline: &Outline,
         scripts: &[(usize, usize)],
+        dirs: HashMap<usize, PathBuf>,
+        outer_cfg: Arc<Config>,
+        outer_targets: Targets,
     ) -> Binaries {
-        if !scripts.iter().any(|&(unit, _)| ran_before(workspace, unit)) {
+        if !scripts
+            .iter()
+            .any(|&(unit, _)| dirs.get(&unit).is_some_and(|dir| dir_ran_before(dir)))
+        {
             return Binaries {
                 keys: HashMap::default(),
+                dirs,
+                outer_cfg,
+                outer_targets,
             };
         }
         let target = crate::host_target();
@@ -51,12 +266,21 @@ impl Binaries {
                 .iter()
                 .map(|&(unit, krate)| (unit, closure_key(outline, &hashes, krate)))
                 .collect(),
+            dirs,
+            outer_cfg,
+            outer_targets,
         }
+    }
+
+    fn unit_dir(&self, workspace: &Workspace, unit: usize) -> PathBuf {
+        self.dirs.get(&unit).cloned().unwrap_or_else(|| {
+            crate::with_config(Arc::clone(&self.outer_cfg), || store::dir(workspace, unit))
+        })
     }
 
     /// What the store holds for the script of `unit` under its key; the caller holds the unit's lock.
     pub(super) fn kept(&self, workspace: &Workspace, unit: usize) -> Kept {
-        let dir = store::dir(workspace, unit);
+        let dir = self.unit_dir(workspace, unit);
         let Some(key) = self.keys.get(&unit) else {
             return Kept::Missing;
         };
@@ -71,7 +295,7 @@ impl Binaries {
         }
     }
 
-    /// Compiles the scripts `scripts`, each a unit and the crate of its `main`, ahead of time into the store in a detached process that outlives this one, so no run waits on the compile; the keeper lets go of this process's unit locks `locks`.
+    /// Compiles the scripts `scripts`, each a unit and the crate of its `main`, ahead of time into the store in a detached process that outlives this one on Linux, or fast Debug AOT elsewhere; the keeper lets go of this process's unit locks `locks`.
     pub(super) fn keep_detached(
         &self,
         workspace: &Workspace,
@@ -126,10 +350,12 @@ impl Binaries {
         let Some(&key) = self.keys.get(&unit) else {
             return Ok(());
         };
-        let _lock = store::lock(workspace, unit)?;
-        let dir = store::dir(workspace, unit);
+        let dir = self.unit_dir(workspace, unit);
+        let _lock =
+            crate::with_config(Arc::clone(&self.outer_cfg), || store::lock(workspace, unit))?;
         let executable = dir.join(EXECUTABLE);
         store::remove(&dir.join(KEY))?;
+        store::remove(&dir.join(FAST))?;
         store::remove(&executable)?;
         let staged = store::fresh(&executable);
         let built = compilation
@@ -138,7 +364,14 @@ impl Binaries {
             .ok_or_else(|| anyhow::anyhow!("no `fn main`"))
             .and_then(|main| crate::build::emit_main(workspace, compilation, main, &staged));
         match built {
-            Ok(()) => std::fs::rename(&staged, &executable)?,
+            Ok(()) => {
+                std::fs::rename(&staged, &executable)?;
+                let meta = crate::with_config(Arc::clone(&self.outer_cfg), || {
+                    fast_meta_hash(workspace, &self.outer_targets, unit)
+                });
+                let files = collect_closure_files(&compilation.outline, krate);
+                drop(write_fast_manifest(&dir, meta, &files));
+            }
             Err(_) => store::remove(&staged)?,
         }
         store::write_new(&dir.join(KEY), key_text(key))
@@ -184,34 +417,58 @@ fn detach() {
     }
 }
 
-/// Drops the executable of `unit`'s script after it failed, so later runs compile the script on demand and give their own verdict; the caller holds the unit's lock.
+/// Drops the executable and fast manifest of `unit`'s script after it failed, so later runs compile the script on demand and give their own verdict; the caller holds the unit's lock.
 pub(super) fn distrust(workspace: &Workspace, unit: usize) {
-    if let Err(error) = store::remove(&store::dir(workspace, unit).join(EXECUTABLE)) {
-        eprintln!(
-            "cannot drop the executable of {}'s build script: {error}",
-            super::package_name(workspace, unit)
-        );
+    let dir = store::dir(workspace, unit);
+    for file in [EXECUTABLE, FAST] {
+        if let Err(error) = store::remove(&dir.join(file)) {
+            eprintln!(
+                "cannot drop cached build script artifact of {}: {error}",
+                super::package_name(workspace, unit)
+            );
+        }
     }
+}
+
+fn dir_ran_before(dir: &Path) -> bool {
+    dir.join(super::OUT).is_dir()
 }
 
 /// Whether the script of `unit` ran before, so its `OUT_DIR` is there and a change it watches is what runs it again.
 pub(super) fn ran_before(workspace: &Workspace, unit: usize) -> bool {
-    store::dir(workspace, unit).join(super::OUT).is_dir()
+    dir_ran_before(&store::dir(workspace, unit))
+}
+
+fn configure_command(
+    executable: &Path,
+    script: &Script,
+    client_env: Option<&rustc_hash::FxHashMap<String, String>>,
+    log: File,
+) -> Command {
+    let mut cmd = Command::new(executable);
+    cmd.current_dir(&script.dir).stderr(log);
+    if let Some(map) = client_env {
+        cmd.env_clear();
+        cmd.envs(map.iter());
+    }
+    cmd.envs(script.vars.iter().map(|(key, value)| (key, value)));
+    #[cfg(unix)]
+    {
+        cmd.arg0("build-script-build");
+    }
+    cmd
 }
 
 /// Runs `script` from `executable` with `out` as its standard output, as the image runs a script's `main`; returns the exit status when it cannot start.
-pub(super) fn exec(executable: &Path, script: &Script, out: std::fs::File) -> i32 {
-    let Ok(log) = std::fs::File::create(&script.log) else {
+pub(super) fn exec(executable: &Path, script: &Script, out: File) -> i32 {
+    let Ok(log) = File::create(&script.log) else {
         return 101;
     };
-    let mut cmd = std::process::Command::new(executable);
-    cmd.current_dir(&script.dir)
-        .envs(script.vars.iter().map(|(key, value)| (key, value)))
-        .stdout(out)
-        .stderr(log);
+    let mut cmd = configure_command(executable, script, None, log);
+    cmd.stdout(out);
     #[cfg(unix)]
     {
-        let error = cmd.arg0("build-script-build").exec();
+        let error = cmd.exec();
         eprintln!("cannot start {}: {error}", executable.display());
         127
     }
@@ -225,6 +482,22 @@ pub(super) fn exec(executable: &Path, script: &Script, out: std::fs::File) -> i3
             }
         }
     }
+}
+
+/// Runs `script` directly from `executable` via `Command` (without `fork` or `Jit`) and captures `(exit_code, stdout_bytes)`.
+pub(super) fn exec_capture(
+    executable: &Path,
+    script: &Script,
+    client_env: Option<&rustc_hash::FxHashMap<String, String>>,
+) -> Result<(i32, Vec<u8>), String> {
+    let log = File::create(&script.log)
+        .map_err(|error| format!("cannot create {}: {error}", script.log.display()))?;
+    let mut cmd = configure_command(executable, script, client_env, log);
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped());
+    let output = cmd
+        .output()
+        .map_err(|error| format!("cannot start {}: {error}", executable.display()))?;
+    Ok((output.status.code().unwrap_or(1), output.stdout))
 }
 
 /// The hash of crate `krate` and of every crate it reaches in `outline`, since a fixed crate's hash leaves out its build dependencies.
@@ -245,4 +518,58 @@ fn closure_key(outline: &Outline, hashes: &CrateHashes, krate: usize) -> u64 {
 
 fn key_text(key: u64) -> String {
     format!("{key:016x}")
+}
+
+fn read_bytes<'a>(data: &'a [u8], pos: &mut usize, len: usize) -> Option<&'a [u8]> {
+    let end = pos.checked_add(len)?;
+    let slice = data.get(*pos..end)?;
+    *pos = end;
+    Some(slice)
+}
+
+fn read_u32(data: &[u8], offset: usize) -> u32 {
+    let mut buf = [0u8; 4];
+    buf.copy_from_slice(&data[offset..offset + 4]);
+    u32::from_le_bytes(buf)
+}
+
+fn read_u64(data: &[u8], offset: usize) -> u64 {
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&data[offset..offset + 8]);
+    u64::from_le_bytes(buf)
+}
+
+fn read_i128(data: &[u8], offset: usize) -> i128 {
+    let mut buf = [0u8; 16];
+    buf.copy_from_slice(&data[offset..offset + 16]);
+    i128::from_le_bytes(buf)
+}
+
+fn write_path_ref(out: &mut Vec<u8>, path: &Path) -> Option<()> {
+    #[cfg(unix)]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt as _;
+        path.as_os_str().as_bytes()
+    };
+    #[cfg(not(unix))]
+    let bytes = path.to_str()?.as_bytes();
+    let len = u32::try_from(bytes.len()).ok()?;
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(bytes);
+    Some(())
+}
+
+fn stamp_matches_raw(raw_path: &[u8], expected: store::FileStamp) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        store::file_stamp(Path::new(std::ffi::OsStr::from_bytes(raw_path))) == expected
+    }
+    #[cfg(not(unix))]
+    {
+        let Ok(text) = std::str::from_utf8(raw_path) else {
+            return false;
+        };
+        store::file_stamp(Path::new(text)) == expected
+    }
 }

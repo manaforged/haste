@@ -78,8 +78,24 @@ pub(super) fn check_local_crate_items(
     roots: &[Instance],
     force_commit: bool,
 ) {
-    reached.clear_crate_errors();
-    let crates = local_crates(cx, roots);
+    check_local_crate_items_in(cx, reached, roots, force_commit, None);
+}
+
+/// Validates local crate constants, statics, trait impls, and ADTs, optionally limited to `only_crates`.
+pub(super) fn check_local_crate_items_in(
+    cx: &mut Context<'_>,
+    reached: &mut Reached,
+    roots: &[Instance],
+    force_commit: bool,
+    only_crates: Option<&[u32]>,
+) {
+    let mut crates = local_crates(cx, roots);
+    if let Some(filter) = only_crates {
+        reached.retain_crate_errors(|krate| !filter.contains(&krate));
+        crates.retain(|krate| filter.contains(krate));
+    } else {
+        reached.clear_crate_errors();
+    }
     let mut items = Vec::new();
     let mut impls = Vec::new();
     for krate in crates {
@@ -160,6 +176,96 @@ pub(super) fn check_local_crate_items(
             apply_outcome(reached, outcome);
         }
     }
+}
+
+/// Type-checks and borrow-checks polymorphic items across cores, returning items whose summary check errored.
+pub fn check_poly_items(cx: &mut Context<'_>, items: &[ItemRef]) -> Vec<(ItemRef, String)> {
+    let workers = crate::jobs().min(items.len() / 8);
+    if items.len() < 16 || workers <= 1 {
+        let mut out = Vec::new();
+        for &item in items {
+            if !crate::sema::infer::is_concrete_fn(cx, item)
+                && let Err(err) = crate::sema::summary::check_poly_item(cx, item)
+            {
+                out.push((item, err));
+            }
+        }
+        return out;
+    }
+    let forks: Vec<Context<'_>> = (0..workers - 1).map(|_| cx.fork()).collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    cx.in_parallel = true;
+    let worker_loop = |worker: &mut Context<'_>| {
+        let mut out = Vec::new();
+        loop {
+            let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let Some(&item) = items.get(idx) else {
+                break;
+            };
+            if crate::sema::infer::is_concrete_fn(worker, item) {
+                continue;
+            }
+            let d0 = worker.deferred_evals.len();
+            let err = crate::sema::summary::check_poly_item(worker, item).err();
+            let deferred = worker.deferred_evals.len() > d0;
+            if deferred || err.is_some() {
+                out.push((idx, deferred, err));
+            }
+        }
+        out
+    };
+    let (mut results, joined) = crate::sync::scope(|scope| {
+        let handles: Vec<_> = forks
+            .into_iter()
+            .map(|mut fork| {
+                scope.spawn(move || {
+                    let out = worker_loop(&mut fork);
+                    let deferred = fork.take_deferred_evals();
+                    let (_, asks) = fork.release();
+                    (asks, deferred, out)
+                })
+            })
+            .collect();
+        let own = worker_loop(cx);
+        let joined: Vec<_> = handles
+            .into_iter()
+            .map(|h| h.join().map_or(None, Some))
+            .collect();
+        (own, joined)
+    });
+    cx.in_parallel = false;
+    let mut deferred = cx.take_deferred_evals();
+    for (asks, worker_deferred, worker_out) in joined.into_iter().flatten() {
+        cx.asks.repeat(&asks);
+        deferred.extend(worker_deferred);
+        results.extend(worker_out);
+    }
+    if !deferred.is_empty() {
+        super::wave::eval_deferred_list(cx, deferred);
+    }
+    results.sort_unstable_by_key(|&(idx, ..)| idx);
+    let deferred_items: Vec<ItemRef> = results
+        .iter()
+        .filter(|&&(_, deferred, _)| deferred)
+        .map(|&(idx, ..)| items[idx])
+        .collect();
+    if !deferred_items.is_empty() {
+        cx.store
+            .lookups
+            .summaries
+            .retain_keys(|item| !deferred_items.contains(item));
+    }
+    let mut out = Vec::new();
+    for (idx, deferred, err) in results {
+        if deferred {
+            if let Err(err) = crate::sema::summary::check_poly_item(cx, items[idx]) {
+                out.push((items[idx], err));
+            }
+        } else if let Some(err) = err {
+            out.push((items[idx], err));
+        }
+    }
+    out
 }
 
 fn local_crates(cx: &Context<'_>, roots: &[Instance]) -> Vec<u32> {
