@@ -1,5 +1,3 @@
-use rustc_hash::FxHashMap as HashMap;
-
 use super::{Kind, Scan, join_slots};
 use crate::ir::{Binary, Block, Convert, Function, Inst, Op, Type, Value};
 
@@ -26,7 +24,7 @@ struct Load {
 }
 
 struct Local {
-    defs: HashMap<(usize, Block), Value>,
+    var_defs: Vec<Vec<(u32, Value)>>,
     exposed: Vec<Vec<(Block, Load)>>,
     forward: Vec<Vec<(Load, Value)>>,
     store_casts: Vec<Vec<(Inst, Value)>>,
@@ -36,13 +34,14 @@ impl Local {
     fn new(scan: &Scan, fresh: &mut Fresh, subst: &mut Vec<Value>) -> Self {
         let count = scan.vars.len();
         let mut local = Local {
-            defs: HashMap::default(),
+            var_defs: vec![Vec::new(); count],
             exposed: vec![Vec::new(); count],
             forward: vec![Vec::new(); count],
             store_casts: vec![Vec::new(); count],
         };
         for access in &scan.accesses {
-            let key = (access.var, access.block);
+            let block = access.block.0;
+            let defs = &mut local.var_defs[access.var];
             match access.kind {
                 Kind::Store(value) => {
                     let home = scan.vars[access.var].home();
@@ -53,7 +52,11 @@ impl Local {
                     } else {
                         value
                     };
-                    local.defs.insert(key, def);
+                    if let Some(last) = defs.last_mut().filter(|(b, _)| *b == block) {
+                        last.1 = def;
+                    } else {
+                        defs.push((block, def));
+                    }
                 }
                 Kind::Load(result) => {
                     let load = Load {
@@ -61,23 +64,18 @@ impl Local {
                         result,
                         ty: access.ty,
                     };
-                    match local.defs.get(&key) {
-                        Some(def) => local.forward[access.var].push((load, *def)),
-                        None => {
-                            local.exposed[access.var].push((access.block, load));
-                            if access.ty == scan.vars[access.var].home() {
-                                local.defs.insert(key, result);
-                            }
+                    if let Some(&(_, def)) = defs.last().filter(|&&(b, _)| b == block) {
+                        local.forward[access.var].push((load, def));
+                    } else {
+                        local.exposed[access.var].push((access.block, load));
+                        if access.ty == scan.vars[access.var].home() {
+                            defs.push((block, result));
                         }
                     }
                 }
             }
         }
         local
-    }
-
-    fn def(&self, var: usize, block: Block) -> Option<Value> {
-        self.defs.get(&(var, block)).copied()
     }
 }
 
@@ -159,12 +157,30 @@ struct Pass {
     undo: Vec<(u32, Value)>,
     memo: Vec<(u32, Value)>,
     stamp: u32,
+    block_defs: Vec<(u32, Value)>,
+    def_stamp: u32,
     path: Vec<Block>,
     promoted_vars: Vec<bool>,
     kept: Vec<bool>,
 }
 
 impl Pass {
+    fn load_var_defs(&mut self, index: usize) {
+        self.def_stamp = self.def_stamp.wrapping_add(1);
+        if self.def_stamp == 0 {
+            self.block_defs.fill((0, Value(0)));
+            self.def_stamp = 1;
+        }
+        for &(block, val) in &self.local.var_defs[index] {
+            self.block_defs[block as usize] = (self.def_stamp, val);
+        }
+    }
+
+    fn block_def(&self, block: Block) -> Option<Value> {
+        let entry = self.block_defs[block.index()];
+        (entry.0 == self.def_stamp).then_some(entry.1)
+    }
+
     fn resolve(&mut self, value: Value) -> Value {
         let root = crate::merge::find(&self.subst, value);
         let mut at = value;
@@ -221,7 +237,7 @@ impl Pass {
             return Some(Step::Done(self.fresh.zero(&mut self.subst, ty)));
         }
         if let Some(&pred) = preds.first().filter(|&p| preds[1..].iter().all(|q| q == p)) {
-            return Some(match self.local.def(var.index, pred) {
+            return Some(match self.block_def(pred) {
                 Some(def) => Step::Done(def),
                 None => Step::Up(pred),
             });
@@ -261,7 +277,7 @@ impl Pass {
     }
 
     fn exit(&mut self, build: &mut Build, var: SlotVar, block: Block) -> Option<Value> {
-        match self.local.def(var.index, block) {
+        match self.block_def(block) {
             Some(def) => Some(def),
             None => self.entry(build, var, block),
         }
@@ -317,6 +333,7 @@ impl Pass {
 
     fn build_var(&mut self, index: usize) -> Option<Build> {
         self.prepare(1);
+        self.load_var_defs(index);
         let mut build = Build::default();
         let var = SlotVar { local: 0, index };
         let home = self.scan.vars[index].home();
@@ -444,6 +461,7 @@ pub(super) fn promote(func: &mut Function, entry: Block, scan: Scan) -> bool {
     let local = Local::new(&scan, &mut fresh, &mut subst);
     let promoted_vars = vec![false; scan.vars.len()];
     let kept = vec![false; func.insts.len()];
+    let blocks = func.blocks.len();
     let mut pass = Pass {
         cfg: func.cfg(),
         try_target: try_targets(func),
@@ -454,6 +472,8 @@ pub(super) fn promote(func: &mut Function, entry: Block, scan: Scan) -> bool {
         undo: Vec::new(),
         memo: Vec::new(),
         stamp: 0,
+        block_defs: vec![(0, Value(0)); blocks],
+        def_stamp: 0,
         path: Vec::new(),
         promoted_vars,
         kept,

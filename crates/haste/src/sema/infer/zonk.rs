@@ -371,19 +371,38 @@ impl Infer<'_, '_> {
         self.swap_frame(frame);
         self.init_poly_env(item)
     }
+    fn init_poly_if_needed(&mut self, item: ItemRef) {
+        if let Some(count) = super::super::summary::expected_param_count(self.cx, item)
+            && count > 0
+            && count <= u16::MAX as usize
+        {
+            let _ = self.init_poly_for_item(item, count as u16);
+        }
+    }
 }
 
 /// Whether `ty` implements `Copy` in the context of `item`.
 pub fn is_copy(cx: &mut Context<'_>, item: ItemRef, ty: Ty) -> Result<bool> {
     detached(cx, item, |infer| {
-        if infer.cx.types.has_params(ty)
-            && let Some(count) = super::super::summary::expected_param_count(infer.cx, item)
-            && count > 0
-            && count <= u16::MAX as usize
-        {
-            let _ = infer.init_poly_for_item(item, count as u16);
+        if infer.cx.types.has_params(ty) {
+            infer.init_poly_if_needed(item);
         }
         infer.is_copy(ty)
+    })
+}
+
+/// The field types of `adt_item` at `args`, using `item`'s polymorphic bounds when `args` has type parameters.
+pub fn poly_field_types(
+    cx: &mut Context<'_>,
+    item: ItemRef,
+    adt_item: ItemRef,
+    args: &[Ty],
+) -> Result<Fields> {
+    detached(cx, item, |infer| {
+        if args.iter().any(|&a| infer.cx.types.has_params(a)) {
+            infer.init_poly_if_needed(item);
+        }
+        infer.adt_fields(adt_item, args)
     })
 }
 

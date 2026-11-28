@@ -179,13 +179,38 @@ impl Checker<'_, '_> {
         let Kind::Ref(_, pointee) = *self.cx.types.kind(local_ty) else {
             return false;
         };
-        if !self.ty_holds_borrow(pointee) {
+        if !self.ty_holds_borrow(pointee) || self.is_mut_ref_ty(pointee) {
             return false;
         }
         if is_deref && self.leading_ref_depth(res_ty) >= self.leading_ref_depth(local_ty) {
             return false;
         }
         self.ty_max_ref_depth(res_ty) <= self.ty_max_ref_depth(pointee)
+    }
+
+    pub(in super::super) fn expr_derefs_ref(&self, expr: ExprId) -> bool {
+        self.typed.adjusts.get(&expr).is_some_and(|a| a.derefs > 0)
+            || matches!(
+                self.typed.coercions.get(&expr),
+                Some(crate::sema::infer::Coercion::Deref(..))
+            )
+    }
+
+    pub(in super::super) fn is_peeled_static_shared_ref_param(
+        &self,
+        expr: ExprId,
+        local: u32,
+    ) -> bool {
+        let Kind::Ref(_, inner) = *self.cx.types.kind(self.local_ty(local)) else {
+            return false;
+        };
+        self.is_non_static_param(local)
+            && self.param_inner_is_static(local)
+            && self.expr_derefs_ref(expr)
+            && matches!(
+                *self.cx.types.kind(inner),
+                Kind::Ref(crate::sema::ty::Mut::Not, _)
+            )
     }
 
     pub(in super::super) fn promote_param_behind_deref(

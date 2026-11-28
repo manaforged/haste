@@ -475,6 +475,15 @@ fn shared_tables_and_symbol_sources_round_trip() {
     )
     .expect("decode stale");
     assert!(stale_tables.item_at(0).is_none());
+    assert_eq!(
+        stamps.file_key(&outline, 0, 1),
+        stable_file_key(&outline, 0, 1)
+    );
+    assert!(!should_skip_aot_flush(false, 0, 1, 5731));
+    assert!(!should_skip_aot_flush(true, 0, 11, 5731));
+    assert!(should_skip_aot_flush(true, 5720, 11, 5731));
+    assert!(!should_skip_aot_flush(true, 5600, 128, 5731));
+    assert!(!should_skip_aot_flush(true, 100, 10, 100));
     drop(backing);
     drop(std::fs::remove_dir_all(&tmp));
 }

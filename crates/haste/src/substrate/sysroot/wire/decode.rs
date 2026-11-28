@@ -16,8 +16,8 @@ use super::super::impls::read_impl_index;
 use super::super::names::read_names_crate;
 use super::super::outline::read_outline_crate;
 use super::super::tokens::{
-    frag_from_tag, read_items, read_marks, read_opt_u32, read_origins, read_path, read_rules,
-    read_str, u32_le,
+    Reader, frag_from_tag, read_items, read_marks_reader, read_origins, read_rules, read_str,
+    u32_le,
 };
 use super::super::{EnvReads, HEADER_LEN, match_crate_list_wire};
 use super::batch::decode_snapshot_parallel;
@@ -46,28 +46,27 @@ pub(super) struct WireSections<'a> {
     pub sym_blob: &'a [u8],
     pub file_slices: Vec<(usize, &'a [u8], Option<u32>)>,
     pub macro_slices: Vec<&'a [u8]>,
-    pub textual_raw: Vec<(String, u32, Option<u32>)>,
+    pub textual_raw: Vec<(&'a str, u32, Option<u32>)>,
     pub outline_slices: Vec<&'a [u8]>,
     pub name_slices: Vec<&'a [u8]>,
     pub impl_slices: Vec<&'a [u8]>,
 }
 
-fn read_slices<'a>(cur: &mut Cursor<'a>, count: usize) -> Result<Vec<&'a [u8]>> {
-    let table_bytes = count.checked_mul(4).context("slice table overflow")?;
-    let table = cur.take(table_bytes)?;
-    let mut prev = 0usize;
-    for c in table.chunks_exact(4) {
-        let end = u32_le(c, 0) as usize;
-        if end < prev {
-            bail!("non-monotonic sysroot slice offset");
-        }
-        prev = end;
+fn read_slices<'a>(reader: &mut Reader<'a>, count: usize) -> Result<Vec<&'a [u8]>> {
+    if count == 0 {
+        return Ok(Vec::new());
     }
-    let blob = cur.take(prev)?;
+    let table_bytes = count.checked_mul(4).context("slice table overflow")?;
+    let table = reader.take(table_bytes)?;
+    let last_end = u32_le(table, (count - 1) * 4) as usize;
+    let blob = reader.take(last_end)?;
     let mut out = Vec::with_capacity(count);
     let mut start = 0usize;
     for c in table.chunks_exact(4) {
         let end = u32_le(c, 0) as usize;
+        if end < start || end > blob.len() {
+            bail!("non-monotonic sysroot slice offset");
+        }
         out.push(&blob[start..end]);
         start = end;
     }
@@ -75,25 +74,25 @@ fn read_slices<'a>(cur: &mut Cursor<'a>, count: usize) -> Result<Vec<&'a [u8]>> 
 }
 
 fn read_file_slices<'a>(
-    cur: &mut Cursor<'a>,
+    reader: &mut Reader<'a>,
+    data_len: usize,
     count: usize,
 ) -> Result<Vec<(usize, &'a [u8], Option<u32>)>> {
-    let table_bytes = count.checked_mul(8).context("file table overflow")?;
-    let table = cur.take(table_bytes)?;
-    let mut prev = 0usize;
-    for c in table.chunks_exact(8) {
-        let end = u32_le(c, 0) as usize;
-        if end < prev {
-            bail!("non-monotonic sysroot file offset");
-        }
-        prev = end;
+    if count == 0 {
+        return Ok(Vec::new());
     }
-    let blob_off = cur.pos;
-    let blob = cur.take(prev)?;
+    let table_bytes = count.checked_mul(8).context("file table overflow")?;
+    let table = reader.take(table_bytes)?;
+    let last_end = u32_le(table, (count - 1) * 8) as usize;
+    let blob_off = data_len - reader.len();
+    let blob = reader.take(last_end)?;
     let mut out = Vec::with_capacity(count);
     let mut start = 0usize;
     for c in table.chunks_exact(8) {
         let end = u32_le(c, 0) as usize;
+        if end < start || end > blob.len() {
+            bail!("non-monotonic sysroot file offset");
+        }
         out.push((blob_off + start, &blob[start..end], opt_u32_le(c, 4)));
         start = end;
     }
@@ -155,9 +154,17 @@ fn decode_files_seq(
             }
             None => None,
         };
-        let mut fcur = Cursor::new(slice);
-        let file = read_file(&mut fcur, backing, file_off, base, remap, scope_bit)?;
-        if fcur.pos != slice.len() {
+        let mut freader = Reader::new(slice);
+        let file = read_file(
+            &mut freader,
+            slice.len(),
+            backing,
+            file_off,
+            base,
+            remap,
+            scope_bit,
+        )?;
+        if !freader.is_empty() {
             bail!("trailing bytes in snapshot file");
         }
         files.push(Arc::new(file));
@@ -172,17 +179,17 @@ fn decode_macros_seq(
 ) -> Result<Vec<Arc<Macro>>> {
     let mut macros = Vec::with_capacity(macro_slices.len());
     for slice in macro_slices {
-        let mut mcur = Cursor::new(slice);
+        let mut mreader = Reader::new(slice);
         let file = Arc::clone(
             files
-                .get(mcur.u32()? as usize)
+                .get(mreader.u32()? as usize)
                 .context("macro file out of bounds")?,
         );
         let krate = *remap
-            .get(mcur.u32()? as usize)
+            .get(mreader.u32()? as usize)
             .context("macro crate out of bounds")? as usize;
-        let rules = read_rules(&mut mcur, remap)?;
-        if mcur.pos != slice.len() {
+        let rules = read_rules(&mut mreader, remap)?;
+        if !mreader.is_empty() {
             bail!("trailing bytes in snapshot macro");
         }
         macros.push(Arc::new(Macro { file, rules, krate }));
@@ -209,27 +216,27 @@ fn decode_crates_seq(
     let parallel_scopes = crate_count < 4;
     let mut outline_crates = Vec::with_capacity(crate_count);
     for (&k, slice) in local_crates.iter().zip(outline_slices) {
-        let mut ccur = Cursor::new(slice);
-        let krate = read_outline_crate(&mut ccur, files, macros, textuals, remap)?;
-        if ccur.pos != slice.len() {
+        let mut creader = Reader::new(slice);
+        let krate = read_outline_crate(&mut creader, files, macros, textuals, remap)?;
+        if !creader.is_empty() {
             bail!("trailing bytes in snapshot outline crate");
         }
         outline_crates.push((k, krate));
     }
     let mut name_crates = Vec::with_capacity(crate_count);
     for (&k, slice) in local_crates.iter().zip(name_slices) {
-        let mut ccur = Cursor::new(slice);
-        let krate = read_names_crate(&mut ccur, remap, sym_remap, parallel_scopes)?;
-        if ccur.pos != slice.len() {
+        let mut creader = Reader::new(slice);
+        let krate = read_names_crate(&mut creader, remap, sym_remap, parallel_scopes)?;
+        if !creader.is_empty() {
             bail!("trailing bytes in snapshot names crate");
         }
         name_crates.push((k, krate));
     }
     let mut heads = HashMap::default();
     for (&k, slice) in local_crates.iter().zip(impl_slices) {
-        let mut ccur = Cursor::new(slice);
-        let index = read_impl_index(&mut ccur, k as u32, remap)?;
-        if ccur.pos != slice.len() {
+        let mut creader = Reader::new(slice);
+        let index = read_impl_index(&mut creader, k as u32, remap)?;
+        if !creader.is_empty() {
             bail!("trailing bytes in snapshot impl index");
         }
         if let Some(index) = index {
@@ -305,28 +312,28 @@ pub(super) fn read_header_and_match(
 }
 
 pub(super) fn read_sections<'a>(
-    cur: &mut Cursor<'a>,
+    reader: &mut Reader<'a>,
     data_len: usize,
     crate_count: usize,
     magic: [u8; 8],
 ) -> Result<WireSections<'a>> {
-    let sym_count = cur.count()?;
-    let sym_blob_len = cur.count()?;
-    let sym_ends = cur.take(sym_count.checked_mul(4).context("symbol ends overflow")?)?;
-    let sym_blob = cur.take(sym_blob_len)?;
-    let file_count = cur.count()?;
-    let file_slices = read_file_slices(cur, file_count)?;
-    let macro_count = cur.count()?;
-    let macro_slices = read_slices(cur, macro_count)?;
-    let textual_count = cur.count()?;
+    let sym_count = reader.count()?;
+    let sym_blob_len = reader.count()?;
+    let sym_ends = reader.take(sym_count.checked_mul(4).context("symbol ends overflow")?)?;
+    let sym_blob = reader.take(sym_blob_len)?;
+    let file_count = reader.count()?;
+    let file_slices = read_file_slices(reader, data_len, file_count)?;
+    let macro_count = reader.count()?;
+    let macro_slices = read_slices(reader, macro_count)?;
+    let textual_count = reader.count()?;
     let mut textual_raw = Vec::with_capacity(textual_count);
     for _ in 0..textual_count {
-        textual_raw.push((read_str(cur)?.to_owned(), cur.u32()?, read_opt_u32(cur)?));
+        textual_raw.push((reader.str()?, reader.u32()?, reader.opt_u32()?));
     }
-    let outline_slices = read_slices(cur, crate_count)?;
-    let name_slices = read_slices(cur, crate_count)?;
-    let impl_slices = read_slices(cur, crate_count)?;
-    if cur.take(magic.len())? != magic || cur.pos != data_len {
+    let outline_slices = read_slices(reader, crate_count)?;
+    let name_slices = read_slices(reader, crate_count)?;
+    let impl_slices = read_slices(reader, crate_count)?;
+    if reader.take(magic.len())? != magic || !reader.is_empty() {
         bail!("trailing bytes in snapshot cache");
     }
     Ok(WireSections {
@@ -343,11 +350,11 @@ pub(super) fn read_sections<'a>(
 }
 
 pub(super) fn decode_textuals(
-    textual_raw: Vec<(String, u32, Option<u32>)>,
+    textual_raw: &[(&str, u32, Option<u32>)],
     macros: &[Arc<Macro>],
 ) -> Result<Vec<Arc<Textual>>> {
     let mut textuals: Vec<Arc<Textual>> = Vec::with_capacity(textual_raw.len());
-    for (name, def_id, next_id) in textual_raw {
+    for &(name, def_id, next_id) in textual_raw {
         let def = Arc::clone(
             macros
                 .get(def_id as usize)
@@ -361,7 +368,11 @@ pub(super) fn decode_textuals(
             )),
             None => None,
         };
-        textuals.push(Arc::new(Textual { name, def, next }));
+        textuals.push(Arc::new(Textual {
+            name: name.to_owned(),
+            def,
+            next,
+        }));
     }
     Ok(textuals)
 }
@@ -379,7 +390,13 @@ pub(in super::super) fn decode_snapshot(
         return Ok(None);
     };
     let remap: Vec<u32> = spec.ref_crates.iter().map(|&k| k as u32).collect();
-    let sections = read_sections(&mut cur, data.len(), spec.cached_crates.len(), spec.magic)?;
+    let mut sreader = Reader::new(&data[cur.pos..]);
+    let sections = read_sections(
+        &mut sreader,
+        data.len(),
+        spec.cached_crates.len(),
+        spec.magic,
+    )?;
     if crate::jobs() > 1 && sections.sym_count >= 2048 {
         let owned = existing_symbols.is_none().then(Symbols::default);
         let syms = existing_symbols
@@ -400,7 +417,7 @@ pub(in super::super) fn decode_snapshot(
         decode_symbols_with(sections.sym_ends, sections.sym_blob, existing_symbols)?;
     let files = decode_files_seq(backing, sections.file_slices, &remap, spec.scope_bit)?;
     let macros = decode_macros_seq(sections.macro_slices, &files, &remap)?;
-    let textuals = decode_textuals(sections.textual_raw, &macros)?;
+    let textuals = decode_textuals(&sections.textual_raw, &macros)?;
     let (outline_crates, name_crates, heads) = decode_crates_seq(
         sections.outline_slices,
         sections.name_slices,
@@ -422,48 +439,54 @@ pub(in super::super) fn decode_snapshot(
 }
 
 pub(super) fn read_file(
-    cur: &mut Cursor<'_>,
+    reader: &mut Reader<'_>,
+    slice_len: usize,
     backing: &Arc<Backing>,
     file_off: usize,
     base: Option<Arc<File>>,
     remap: &[u32],
     scope_bit: u32,
 ) -> Result<File> {
-    let path = read_path(cur)?;
-    let text = match cur.u8()? {
+    let path = reader.path()?;
+    let text = match reader.u8()? {
         1 => {
-            let text_len = cur.u32()? as usize;
-            let tail = read_str(cur)?.to_owned().into_boxed_str();
+            let text_len = reader.u32()? as usize;
+            let tail = Box::<str>::from(reader.str()?);
             let disk = Arc::new(DiskSource::new(path.clone(), text_len, tail));
             SourceText::disk(disk)
         }
         0 => {
-            let text_len = cur.count()?;
-            let text_start = file_off + cur.pos;
-            cur.take(text_len)?;
-            let text_end = file_off + cur.pos;
+            let text_len = reader.count()?;
+            let text_start = file_off + (slice_len - reader.len());
+            reader.take(text_len)?;
+            let text_end = file_off + (slice_len - reader.len());
             SourceText::mapped_trusted(Arc::clone(backing), text_start, text_end)?
         }
         _ => bail!("invalid sysroot file storage tag"),
     };
-    let tok_count = cur.u32()? as usize;
-    let tok_bytes = cur.count()?;
-    let tok_start = file_off + cur.pos;
-    cur.take(tok_bytes)?;
-    let tok_end = file_off + cur.pos;
+    let tok_count = reader.u32()? as usize;
+    let tok_bytes = reader.count()?;
+    let tok_start = file_off + (slice_len - reader.len());
+    reader.take(tok_bytes)?;
+    let tok_end = file_off + (slice_len - reader.len());
     let tokens = SourceTokens::compact(Arc::clone(backing), tok_start, tok_end, tok_count)?;
-    let marks = read_marks(cur, remap, scope_bit)?;
-    let opaque_len = cur.count()?;
-    let opaque_bytes = cur.take(opaque_len.checked_mul(9).context("opaque overflow")?)?;
-    let mut opaque = Vec::with_capacity(opaque_len);
-    for c in opaque_bytes.chunks_exact(9) {
-        opaque.push((u32_le(c, 0), u32_le(c, 4), frag_from_tag(c[8])?));
-    }
-    let offset = cur.u32()?;
-    let origins = read_origins(cur)?;
-    let items = read_items(cur)?;
-    let expanded = cur.u8()? != 0;
-    let expand_origin = cur.u64()?;
+    let marks = read_marks_reader(reader, remap, scope_bit)?;
+    let opaque_len = reader.count()?;
+    let opaque = if opaque_len == 0 {
+        Vec::new()
+    } else {
+        let opaque_bytes = reader.take(opaque_len.checked_mul(9).context("opaque overflow")?)?;
+        let mut opaque = Vec::with_capacity(opaque_len);
+        for c in opaque_bytes.chunks_exact(9) {
+            opaque.push((u32_le(c, 0), u32_le(c, 4), frag_from_tag(c[8])?));
+        }
+        opaque
+    };
+    let offset = reader.u32()?;
+    let origins = read_origins(reader)?;
+    let items = read_items(reader)?;
+    let expanded = reader.u8()? != 0;
+    let expand_origin = reader.u64()?;
     let source = Source {
         path,
         text,

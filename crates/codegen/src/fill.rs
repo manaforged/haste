@@ -369,22 +369,33 @@ pub(crate) fn run(func: &mut Function) -> Domain {
     let vec_chunks = slot_vec_chunks(func, &slots);
     let mut changed = false;
     for block in 0..func.blocks.len() {
+        let has_cand = func.blocks[block]
+            .insts
+            .iter()
+            .any(|&i| matches!(func.insts[i.index()].op, Op::Call { .. } | Op::Copy(..)));
+        if !has_cand {
+            continue;
+        }
         let insts = func.blocks[block].insts.clone();
         let mut out = Vec::with_capacity(insts.len());
+        let mut block_changed = false;
         for inst in insts {
             if let Some(found) = fill(func, &defs, inst) {
                 stores(func, &slots, &vec_chunks, found, &mut out);
-                changed = true;
+                block_changed = true;
             } else if let Some(found) = compare(func, &defs, inst) {
                 compare_inline(func, found, &mut out);
-                changed = true;
+                block_changed = true;
             } else if expand_copy(func, &defs, &slots, &vec_chunks, inst, &mut out) {
-                changed = true;
+                block_changed = true;
             } else {
                 out.push(inst);
             }
         }
-        func.blocks[block].insts = out;
+        if block_changed {
+            func.blocks[block].insts = out;
+            changed = true;
+        }
     }
     if changed {
         Domain::MEM | Domain::VALUES

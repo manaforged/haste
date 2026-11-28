@@ -512,6 +512,15 @@ pub(crate) fn prepare_split<R: Copy + PartialEq + std::fmt::Debug>(
         return Ok((None, first));
     }
     let plan = &first.plan;
+    let has_spilled_reg = plan.locations.iter().enumerate().any(|(i, loc)| {
+        matches!(loc, Location::Slot) && !plan.elided[i] && !plan.fused[i] && {
+            let ty = func.types[i];
+            ty.is_small_int() || ty.in_float_register()
+        }
+    });
+    if !has_spilled_reg || func.cfg().loops().list.is_empty() {
+        return Ok((None, first));
+    }
     let mut split = func.clone();
     let made = crate::loopargs::run(&mut split, |_, v| {
         v.index() < plan.locations.len()

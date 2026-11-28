@@ -22,7 +22,7 @@ use super::codec::{
     Stamps, find_record, prune_stale_bundles, read_u32_le, read_u64_le, write_bundle,
 };
 use super::plan::{decode_reloc_plan, encode_reloc_plan};
-use super::relocs::{LocalFileIndex, collect_inlined_local_files, stable_file_key};
+use super::relocs::{LocalFileIndex, collect_inlined_local_files};
 use super::tables::{BundleEncoder, CARRY_BIT, read_code_span};
 use super::{AotConfigKey, BundleView, MAX_BUNDLES, RECORD_LEN};
 
@@ -580,7 +580,7 @@ fn convert_inlined_pairs(
 ) -> Vec<(u64, u64)> {
     let mut pairs: Vec<(u64, u64)> = files
         .iter()
-        .filter_map(|&(k, f)| Some((stable_file_key(outline, k, f)?, stamps.file(k, f)?)))
+        .filter_map(|&(k, f)| Some((stamps.file_key(outline, k, f)?, stamps.file(k, f)?)))
         .collect();
     pairs.sort_unstable();
     pairs.dedup();

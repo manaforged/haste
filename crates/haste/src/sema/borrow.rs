@@ -620,6 +620,27 @@ impl Checker<'_, '_> {
         }
     }
 
+    pub(super) fn is_mem_take(&mut self, mut expr: ExprId) -> bool {
+        loop {
+            match *self.body.expr(expr) {
+                Expr::Paren(inner) => expr = inner,
+                Expr::Block {
+                    stmts,
+                    tail: Some(tail),
+                    label: None,
+                    kind,
+                } if kind.is_plain_scope() && self.body.list(stmts).is_empty() => expr = tail,
+                Expr::Call(callee, _) => {
+                    return self.call_sig_fn_item(expr, callee).is_some_and(|item| {
+                        self.item_in_std_mod(item, "mem")
+                            && matches!(self.cx.name(item), "take" | "replace")
+                    });
+                }
+                _ => return false,
+            }
+        }
+    }
+
     pub(super) fn check_static_mut(&self, expr: ExprId, extra_deref: bool) -> Result<()> {
         if let Some((item, mut mr, bs)) = self.static_root(expr) {
             if extra_deref && self.is_mut_ref_ty(self.expr_ty(expr)) && !bs {

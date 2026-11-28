@@ -2,10 +2,11 @@ use std::ops::Range;
 use std::path::Path;
 
 use anyhow::{Result, bail};
-use haste_codegen::{Arch, Format, Os, RelocKind, RuntimeSymbol, Target};
+use haste_codegen::{Arch, Format, RelocKind, RuntimeSymbol, Target};
 
 use crate::host::HostSymbol;
 
+mod codesign;
 mod dwarf;
 mod elf;
 mod macho;
@@ -191,10 +192,23 @@ impl Executable {
                 })
                 .count()
         };
-        let at = (0..=LOOP_SHIFT / align)
-            .map(|step| base + step * align)
-            .min_by_key(|&at| split(at))
-            .unwrap_or(base);
+        let at = if loops.is_empty() || split(base) == 0 {
+            base
+        } else {
+            let mut best = (split(base), base);
+            for step in 1..=(LOOP_SHIFT / align) {
+                let cand = base + step * align;
+                let count = split(cand);
+                if count == 0 {
+                    best = (0, cand);
+                    break;
+                }
+                if count < best.0 {
+                    best = (count, cand);
+                }
+            }
+            best.1
+        };
         self.text.resize(at as usize, 0);
         let placed = append_aligned(&mut self.text, bytes, align);
         self.lines.extend(
@@ -280,20 +294,6 @@ impl Executable {
             let mut perms = std::fs::metadata(path)?.permissions();
             perms.set_mode(0o755);
             std::fs::set_permissions(path, perms)?;
-        }
-        if self.target.os == Os::Darwin && cfg!(target_os = "macos") {
-            let signed = std::process::Command::new("codesign")
-                .args(["--force", "--sign", "-"])
-                .arg(path)
-                .output()?;
-            if !signed.status.success() {
-                bail!(
-                    "codesign failed: {}",
-                    std::str::from_utf8(&signed.stderr)
-                        .unwrap_or("<non-utf8 stderr>")
-                        .trim()
-                );
-            }
         }
         Ok(())
     }

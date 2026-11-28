@@ -376,11 +376,13 @@ impl Infer<'_, '_> {
                 .chain(frame.self_ty.map(|ty| ("Self", ty)))
                 .collect();
             self.with_frame(frame, |infer| {
+                let defer_vars =
+                    collect_param_vars(&sig.body, src, &sig.params, &infer.generics, infer);
                 for (name, ty) in params {
                     for bound in
                         named_bounds(&sig.body, src, (&sig.generics, &sig.predicates), name)
                     {
-                        infer.bind_bound(&sig.body, home, (bound, ty), enforce)?;
+                        infer.bind_bound(&sig.body, home, (bound, ty), enforce, &defer_vars)?;
                     }
                 }
                 for (ty, bound) in infer.typed_predicates(&sig.body, src, &sig.predicates) {
@@ -390,7 +392,7 @@ impl Infer<'_, '_> {
                     {
                         continue;
                     }
-                    infer.bind_bound(&sig.body, home, (bound, ty), enforce)?;
+                    infer.bind_bound(&sig.body, home, (bound, ty), enforce, &defer_vars)?;
                 }
                 Ok(())
             })?;
@@ -478,6 +480,7 @@ impl Infer<'_, '_> {
         home: ModRef,
         (bound, ty): (u32, Ty),
         enforce: bool,
+        defer_vars: &[Ty],
     ) -> Result<()> {
         let Some((of, path)) = self.bound_trait_at(arena, bound, home) else {
             return Ok(());
@@ -486,10 +489,12 @@ impl Infer<'_, '_> {
             return self.bind_callable(arena, (of, path), ty);
         }
         let args = self.bound_args(of, arena, path, ty)?;
+        let scalar_self = matches!(self.cx.types.kind(self.resolve(ty)), Kind::Prim(_));
         if !self.compiler_trait(of)
             && !self.has_vars(ty)
             && !self.has_params(ty)
             && args.iter().any(|&a| self.has_vars(a))
+            && (scalar_self || !args.iter().any(|&a| self.mentions_var(a, defer_vars)))
         {
             let _ = self.select(of, ty, &args)?;
         }
@@ -521,6 +526,20 @@ impl Infer<'_, '_> {
         self.bind_constraints((arena, home), (of, path, &args), ty, enforce)
     }
 
+    fn mentions_var(&self, ty: Ty, vars: &[Ty]) -> bool {
+        if vars.is_empty() || !self.cx.types.has_var_flag(ty) {
+            return false;
+        }
+        let ty = self.resolve(ty);
+        vars.contains(&ty)
+            || self
+                .cx
+                .types
+                .kind(ty)
+                .children(&self.cx.types)
+                .any(|child| self.mentions_var(child, vars))
+    }
+
     fn bind_callable(&mut self, arena: &Body, (of, path): (ItemRef, PathId), ty: Ty) -> Result<()> {
         if angle_args(arena, path).is_some() {
             let args = self.bound_args(of, arena, path, ty)?;
@@ -544,7 +563,7 @@ impl Infer<'_, '_> {
             };
             let assoc = self.project(owner, ty, owner_args, &name)?;
             for &bound in arena.list(bounds) {
-                self.bind_bound(arena, home, (bound, assoc), enforce)?;
+                self.bind_bound(arena, home, (bound, assoc), enforce, &[])?;
             }
         }
         Ok(())
@@ -635,5 +654,116 @@ impl Infer<'_, '_> {
         };
         let found = self.project(owner, ty, owner_args, name)?;
         Ok(self.unifies(found, bound))
+    }
+}
+
+fn collect_param_vars(
+    arena: &Body,
+    src: &Source,
+    sig_params: &[(crate::body::PatId, TyId)],
+    generics: &[(&str, Ty)],
+    infer: &Infer<'_, '_>,
+) -> Vec<Ty> {
+    if sig_params.is_empty() {
+        return Vec::new();
+    }
+    let mut names = Vec::new();
+    for &(_, ty) in sig_params {
+        collect_syntax_param_names(arena, src, ty, &mut names);
+    }
+    generics
+        .iter()
+        .filter(|(name, ty)| {
+            names.iter().any(|seen| same_param(name, seen))
+                && matches!(infer.cx.types.kind(infer.resolve(*ty)), Kind::Var(_))
+        })
+        .map(|&(_, ty)| ty)
+        .collect()
+}
+
+fn collect_syntax_param_names<'s>(arena: &Body, src: &'s Source, ty: TyId, out: &mut Vec<&'s str>) {
+    use crate::body::{Bound, Ty as SyntaxTy};
+    match *arena.ty(ty) {
+        SyntaxTy::Path(path) => {
+            if let Some(name) = one_name(arena, src, ty) {
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+                return;
+            }
+            collect_path_arg_names(arena, src, path, out);
+        }
+        SyntaxTy::Ref { ty, .. }
+        | SyntaxTy::Ptr { ty, .. }
+        | SyntaxTy::Slice(ty)
+        | SyntaxTy::Array(ty, _)
+        | SyntaxTy::Paren(ty)
+        | SyntaxTy::Pat(ty, _) => collect_syntax_param_names(arena, src, ty, out),
+        SyntaxTy::Tuple(list) => collect_ty_list(arena, src, list, out),
+        SyntaxTy::Fn { params, ret, .. } => {
+            collect_ty_list(arena, src, params, out);
+            if let Some(ret) = ret {
+                collect_syntax_param_names(arena, src, ret, out);
+            }
+        }
+        SyntaxTy::DynTrait(list) => {
+            for &b in arena.list(list) {
+                if let Bound::Trait { path, .. } = arena.bounds[b as usize] {
+                    collect_path_arg_names(arena, src, path, out);
+                }
+            }
+        }
+        SyntaxTy::ImplTrait(..)
+        | SyntaxTy::Never
+        | SyntaxTy::Infer
+        | SyntaxTy::Macro { .. }
+        | SyntaxTy::Const(_) => {}
+    }
+}
+
+fn collect_ty_list<'s>(
+    arena: &Body,
+    src: &'s Source,
+    list: crate::body::List,
+    out: &mut Vec<&'s str>,
+) {
+    for &inner in arena.list(list) {
+        collect_syntax_param_names(arena, src, TyId(inner), out);
+    }
+}
+
+fn collect_path_arg_names<'s>(arena: &Body, src: &'s Source, path: PathId, out: &mut Vec<&'s str>) {
+    use crate::body::{Args, Bound, GenericArg};
+    let p = arena.path(path);
+    if let Some((qself, _)) = p.qself {
+        collect_syntax_param_names(arena, src, qself, out);
+    }
+    for &seg_id in arena.list(p.segments) {
+        match arena.segments[seg_id as usize].args {
+            Some(Args::Angle(list)) => {
+                for &at in arena.list(list) {
+                    match arena.args[at as usize] {
+                        GenericArg::Ty(inner) | GenericArg::Binding { ty: inner, .. } => {
+                            collect_syntax_param_names(arena, src, inner, out);
+                        }
+                        GenericArg::Constraint { bounds, .. } => {
+                            for &b in arena.list(bounds) {
+                                if let Bound::Trait { path, .. } = arena.bounds[b as usize] {
+                                    collect_path_arg_names(arena, src, path, out);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some(Args::Paren { inputs, output }) => {
+                collect_ty_list(arena, src, inputs, out);
+                if let Some(ret) = output {
+                    collect_syntax_param_names(arena, src, ret, out);
+                }
+            }
+            Some(Args::ReturnType) | None => {}
+        }
     }
 }

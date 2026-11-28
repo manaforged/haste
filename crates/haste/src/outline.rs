@@ -208,6 +208,7 @@ impl Outline {
                 .collect();
             self.load_many(&modules)?;
         }
+        self.retry_waiting()?;
         Ok(())
     }
 

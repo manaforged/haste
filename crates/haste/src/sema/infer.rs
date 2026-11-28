@@ -656,7 +656,7 @@ pub fn discriminants(
 
 #[cfg(feature = "diff-harness")]
 pub use zonk::is_case_sig;
-pub use zonk::{is_concrete_fn, is_copy, test_sig};
+pub use zonk::{is_concrete_fn, is_copy, poly_field_types, test_sig};
 
 /// The return type of the non-generic function `item`.
 pub fn return_type(cx: &mut Context<'_>, item: ItemRef) -> Result<Ty> {

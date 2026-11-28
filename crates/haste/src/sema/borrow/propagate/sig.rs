@@ -574,7 +574,7 @@ impl<'a> Checker<'_, 'a> {
             } else {
                 self.expr_borrow_sources(recv, state)
             };
-            let inner_only = !ret_lts.has_elided
+            let inner_only = (!ret_lts.has_elided || ctx.flags.is_owned_copy_fn)
                 && matches!(sig.receiver, Some((SelfKind::Ref | SelfKind::RefMut, _)))
                 && sig.receiver_lifetime.is_none();
             if inner_only {

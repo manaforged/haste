@@ -599,7 +599,7 @@ pub(super) fn commit_filter_caller(
         && matches!(typed.tables, LazyTables::Poly(_) | LazyTables::CheckOnly(_))
     {
         filter.seen_fixed_poly.insert(caller.0);
-        if cx.outline.is_fixed(caller.0.krate) {
+        if cx.store.lookups.skip_warm_sysroot_bodies && cx.outline.is_fixed(caller.0.krate) {
             filter.mark_seen_sealed(caller.0);
         }
     }

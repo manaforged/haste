@@ -153,7 +153,7 @@ impl super::super::Checker<'_, '_> {
                         _ => false,
                     }
         );
-        let can_peel = !mut_ret_from_mut
+        let can_peel = (!mut_ret_from_mut || self.is_mem_take(expr))
             && !borrows_owned_field
             && self.expr_plain_local(expr) != Some(src.target)
             && inner_ty.is_some_and(|inner| {
@@ -676,6 +676,7 @@ impl super::super::Checker<'_, '_> {
             Expr::Path(_) => {
                 if let Some(local) = self.expr_plain_local(expr)
                     && self.is_non_static_param(local)
+                    && !self.is_peeled_static_shared_ref_param(expr, local)
                 {
                     return Err(self.borrow_err(
                         Some(expr),

@@ -769,7 +769,9 @@ fn simplify_inline(
     if func.size() > pre_cap {
         return Err(Miss::Shape);
     }
-    haste_codegen::split_coroutine(&mut func);
+    if func.is_coroutine() {
+        haste_codegen::split_coroutine(&mut func);
+    }
     if !simplified {
         simplify_tallied(&mut func, Tally::Built);
     }

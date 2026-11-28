@@ -143,7 +143,7 @@ pub(super) enum ShuffleKey {
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum Key {
-    Const(Type, i64),
+    Const(u32, Type, i64),
     Unary(Unary, Operand),
     Binary(Binary, Operand, Operand),
     Convert(Convert, Type, Operand),
@@ -194,8 +194,7 @@ pub(super) fn unwrap_bool_neg(
 
 pub(super) fn key(
     op: &Op,
-    consts: &[Option<i64>],
-    bool_neg: &[Option<Value>],
+    (consts, bool_neg, const_epoch): (&[Option<i64>], &[Option<Value>], u32),
     types: &[Type],
     ty: Type,
     subst: &[Value],
@@ -203,6 +202,7 @@ pub(super) fn key(
     let opnd = |value: Value| operand(consts, types, subst, value);
     Some(match *op {
         Op::Const(imm) => Key::Const(
+            const_epoch,
             ty,
             if ty.is_small_int() {
                 extend(imm, ty, false)

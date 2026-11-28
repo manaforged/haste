@@ -144,6 +144,16 @@ pub(super) fn write_preserving(
 impl<'a> BlockWrites<'a> {
     /// Collects potentially clobbering memory operations per block.
     pub(super) fn new(func: &Function, cfg: &'a Cfg, prov: &'a Provenance) -> Self {
+        if func.blocks.len() <= 1 {
+            return Self {
+                cfg,
+                prov,
+                rank: Vec::new(),
+                writes: Vec::new(),
+                visit: Vec::new(),
+                epoch: 0,
+            };
+        }
         let mut writes = vec![Vec::new(); func.blocks.len()];
         for (b_idx, block) in func.blocks.iter().enumerate() {
             for &inst in &block.insts {
@@ -180,8 +190,11 @@ impl<'a> BlockWrites<'a> {
 
     /// Immediate dominator of `cur` when neither it nor any block on a path from it to `cur` has writes.
     pub(super) fn write_free_idom(&self, cur: Block) -> Option<Block> {
+        if self.writes.is_empty() {
+            return None;
+        }
         let dom = self.cfg.idom[cur.index()]?;
-        if self.has_writes(dom) {
+        if dom == cur || self.has_writes(dom) {
             return None;
         }
         if self.cfg.single_pred(cur) == Some(dom) {

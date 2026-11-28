@@ -232,6 +232,7 @@ fn run_pass(
 struct PassState {
     fold_clean: bool,
     merge_clean: bool,
+    fill_clean: bool,
     loops_rev: Option<u32>,
     has_loops: bool,
 }
@@ -241,6 +242,7 @@ impl PassState {
         Self {
             fold_clean: false,
             merge_clean: false,
+            fill_clean: false,
             loops_rev: None,
             has_loops: false,
         }
@@ -258,6 +260,7 @@ impl PassState {
         if !changed.is_empty() {
             self.fold_clean = false;
             self.merge_clean = false;
+            self.fill_clean = false;
         }
     }
 }
@@ -355,7 +358,11 @@ fn run_step(func: &mut Function, plan: &Plan, state: &mut PassState, pass: Pass)
 fn run_fixpoint(func: &mut Function, plan: &Plan, state: &mut PassState) {
     let mut dirty = [Domain::NONE; Pass::ALL.len()];
     for rule in plan.rules {
-        dirty[rule.pass as usize] = rule.reads;
+        dirty[rule.pass as usize] = if rule.pass == Pass::Fill && state.fill_clean {
+            Domain::NONE
+        } else {
+            rule.reads
+        };
     }
     let mut remaining = plan.budget;
     while remaining > 0 {
@@ -457,8 +464,7 @@ pub(crate) fn sink_compares(func: &mut Function) -> bool {
                     if gap > 0
                         && matches!(func.insts[block.insts[at + 1 + gap].index()].op, Op::Brif(c, ..) | Op::Select(c, ..) if c == cond) =>
                 {
-                    let inst = block.insts.remove(at);
-                    block.insts.insert(at + gap, inst);
+                    block.insts[at..=at + gap].rotate_left(1);
                     moved = true;
                 }
                 _ => at += 1,
@@ -654,6 +660,7 @@ pub(crate) fn run(func: &mut Function, moves: promote::Moves, target: &crate::Ta
     let merge_init = run_step(func, &plan, &mut state, INIT[2]);
     state.fold_clean = fold_init.is_empty() && merge_init.is_empty();
     state.merge_clean = merge_init.is_empty();
+    state.fill_clean = state.fold_clean;
     if moves != promote::Moves::Guided
         && (plan.effort == Effort::Full || func.elide_drops)
         && func.elide_dead_unwind_drops_post_init(false)
@@ -668,6 +675,7 @@ pub(crate) fn run(func: &mut Function, moves: promote::Moves, target: &crate::Ta
         verify_stage(func, target, "loads_elide_early");
         state.fold_clean = false;
         state.merge_clean = false;
+        state.fill_clean = false;
     }
     run_fixpoint(func, &plan, &mut state);
     run_late_lowering(func, &plan, &mut state);

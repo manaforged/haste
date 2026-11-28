@@ -2,6 +2,7 @@ mod codec;
 mod inline;
 mod plan;
 mod relocs;
+mod stamps;
 mod tables;
 mod view;
 
@@ -36,7 +37,10 @@ use codec::{
 };
 pub(crate) use inline::InlineCacheHit;
 use inline::{InlCache, inline_bundle_path};
-use relocs::{LocalFileIndex, collect_inlined_local_files, hash_str, stable_file_key};
+#[cfg(test)]
+use relocs::stable_file_key;
+use relocs::{LocalFileIndex, collect_inlined_local_files, hash_str};
+use stamps::{compute_bundle_key, resolve_aot_fn, should_skip_aot_flush};
 use tables::{BundleEncoder, SharedTables, decode_symbol_list, read_code_span};
 use view::BundleView;
 
@@ -184,7 +188,7 @@ impl AotCache {
             cx.global_allocator(),
             dict,
         );
-        let bundle_key = compute_bundle_key(cx.outline, reached, roots, config);
+        let bundle_key = compute_bundle_key(cx.outline, reached, roots, config.config_digest);
         let path = bundle_path(bundle_key);
         let view = BundleView::open(&path, CACHE_MAGIC, CACHE_VERSION, config);
         let decoded_codes = (0..view.header.codes_count)
@@ -219,8 +223,10 @@ impl AotCache {
         self.has_misses.store(true, Ordering::Relaxed);
     }
 
-    pub(in crate::image) fn note_hit(&self) {
-        self.stats.hits.fetch_add(1, Ordering::Relaxed);
+    pub(in crate::image) fn note_hits(&self, n: usize) {
+        if n > 0 {
+            self.stats.hits.fetch_add(n, Ordering::Relaxed);
+        }
     }
 
     pub(in crate::image) fn note_miss(&self) {
@@ -397,7 +403,7 @@ impl AotCache {
                     continue;
                 }
                 for file in 0..tree.files.len() as u32 {
-                    if let Some(key) = stable_file_key(outline, krate as u32, file)
+                    if let Some(key) = self.stamps.file_key(outline, krate as u32, file)
                         && let Some(stamp) = self.stamps.file(krate as u32, file)
                     {
                         map.insert(key, stamp);
@@ -443,13 +449,27 @@ impl AotCache {
         .clone()
     }
 
-    pub(in crate::image) fn lookup_instance(
+    pub(in crate::image) fn record_hit_inlined_batch(
+        &self,
+        entries: Vec<(usize, Vec<(u64, u64)>)>,
+    ) {
+        if entries.is_empty() {
+            return;
+        }
+        let mut map = lock(&self.hit_inlined);
+        for (index, pairs) in entries {
+            map.insert(index, pairs);
+        }
+    }
+
+    pub(in crate::image) fn lookup_instance_batched(
         &self,
         index: usize,
         key: &CacheInstanceKey,
         image: &Image,
         cx: &Context<'_>,
         reached: &Reached,
+        inlined_batch: &mut Vec<(usize, Vec<(u64, u64)>)>,
     ) -> Option<(AotFn, u32)> {
         let backing = self.view.backing.as_ref()?;
         let data = backing.as_slice();
@@ -564,7 +584,7 @@ impl AotCache {
             r
         };
         if !inlined_pairs.is_empty() {
-            lock(&self.hit_inlined).insert(index, inlined_pairs);
+            inlined_batch.push((index, inlined_pairs));
         }
         let len_u32 = code.bytes().len() as u32;
         let entry = if is_dict {
@@ -584,7 +604,10 @@ impl AotCache {
             let mut pairs: Vec<(u64, u64)> = files
                 .into_iter()
                 .filter_map(|(k, f)| {
-                    Some((stable_file_key(outline, k, f)?, self.stamps.file(k, f)?))
+                    Some((
+                        self.stamps.file_key(outline, k, f)?,
+                        self.stamps.file(k, f)?,
+                    ))
                 })
                 .collect();
             pairs.sort_unstable();
@@ -614,7 +637,13 @@ impl AotCache {
         let aot_records = self.view.header.records_count;
         let mut flushed_records = 0usize;
         let mut flush_us = 0usize;
-        if should_write && self.has_misses.load(Ordering::Relaxed) {
+        let skip_rewrite = should_skip_aot_flush(
+            aot_loaded,
+            self.stats.hits.load(Ordering::Relaxed),
+            self.stats.misses.load(Ordering::Relaxed),
+            aot_records,
+        );
+        if should_write && self.has_misses.load(Ordering::Relaxed) && !skip_rewrite {
             let started = Instant::now();
             drop(self.view.backing.take());
             let mut ty_memo = HashMap::default();
@@ -714,21 +743,6 @@ impl AotCache {
     }
 }
 
-fn resolve_aot_fn(
-    functions: &[Option<AotFn>],
-    mut idx: usize,
-) -> Option<(usize, bool, &Arc<AotCode>, &[SymbolSource])> {
-    for _ in 0..functions.len() {
-        match functions.get(idx).and_then(Option::as_ref)? {
-            AotFn::Alias(next) if *next < functions.len() => idx = *next,
-            AotFn::Direct { code, relocs } => return Some((idx, false, code, relocs)),
-            AotFn::Dict { body, relocs } => return Some((idx, true, body, relocs)),
-            AotFn::Alias(_) => return None,
-        }
-    }
-    None
-}
-
 fn open_bundle(
     path: &Path,
     magic: [u8; 8],
@@ -738,37 +752,6 @@ fn open_bundle(
     let backing = Backing::open(path, HEADER_LEN).ok()?;
     let header = parse_bundle_header(backing.as_slice(), magic, version, config)?;
     Some((backing, header))
-}
-
-fn compute_bundle_key(
-    outline: &Outline,
-    reached: &Reached,
-    roots: &[usize],
-    config: AotConfigKey,
-) -> u64 {
-    let mut locals: Vec<(&str, u8, &Path)> = outline
-        .crates
-        .iter()
-        .zip(&outline.roots)
-        .filter(|(c, _)| !c.env.fixed)
-        .map(|(_, r)| (r.name.as_str(), r.role as u8, r.path.as_path()))
-        .collect();
-    locals.sort_unstable();
-    let mut root_tags: Vec<(&str, &Path, u32, u32)> = roots
-        .iter()
-        .take(2)
-        .filter_map(|&idx| {
-            let (item, _) = reached.list.get(idx)?.0;
-            let r = outline.roots.get(item.krate as usize)?;
-            Some((r.name.as_str(), r.path.as_path(), item.file, item.item))
-        })
-        .collect();
-    root_tags.sort_unstable();
-    let mut h = FxHasher::default();
-    config.config_digest.hash(&mut h);
-    locals.hash(&mut h);
-    root_tags.hash(&mut h);
-    h.finish()
 }
 
 #[cfg(test)]

@@ -2,10 +2,10 @@ use anyhow::{Context as _, Result, bail};
 
 use crate::graph::cfg::Cfg;
 use crate::outline::item::{Attr, Import, Item, ItemKind, Items, Leaf};
-use crate::sema::summary::codec::{Cursor, write_u32};
+use crate::sema::summary::codec::write_u32;
 
 use super::super::wire::opt_u32_le;
-use super::{read_str, u32_le, vis_from_tag, vis_tag, write_opt_u32, write_str, write_usize};
+use super::{Reader, u32_le, vis_from_tag, vis_tag, write_opt_u32, write_str, write_usize};
 
 const ITEM_KINDS: [ItemKind; 17] = [
     ItemKind::Mod,
@@ -35,11 +35,14 @@ fn write_cfg_list(out: &mut Vec<u8>, list: &[Cfg]) -> Option<()> {
     Some(())
 }
 
-fn read_cfg_list(cur: &mut Cursor<'_>) -> Result<Vec<Cfg>> {
-    let len = cur.count()?;
+fn read_cfg_list(reader: &mut Reader<'_>) -> Result<Vec<Cfg>> {
+    let len = reader.count()?;
+    if len == 0 {
+        return Ok(Vec::new());
+    }
     let mut list = Vec::with_capacity(len);
     for _ in 0..len {
-        list.push(read_cfg(cur)?);
+        list.push(read_cfg(reader)?);
     }
     Ok(list)
 }
@@ -71,13 +74,13 @@ fn write_cfg(out: &mut Vec<u8>, cfg: &Cfg) -> Option<()> {
     Some(())
 }
 
-fn read_cfg(cur: &mut Cursor<'_>) -> Result<Cfg> {
-    Ok(match cur.u8()? {
-        0 => Cfg::Name(read_str(cur)?.to_owned()),
-        1 => Cfg::KeyValue(read_str(cur)?.to_owned(), read_str(cur)?.to_owned()),
-        2 => Cfg::All(read_cfg_list(cur)?),
-        3 => Cfg::Any(read_cfg_list(cur)?),
-        4 => Cfg::Not(Box::new(read_cfg(cur)?)),
+fn read_cfg(reader: &mut Reader<'_>) -> Result<Cfg> {
+    Ok(match reader.u8()? {
+        0 => Cfg::Name(reader.str()?.to_owned()),
+        1 => Cfg::KeyValue(reader.str()?.to_owned(), reader.str()?.to_owned()),
+        2 => Cfg::All(read_cfg_list(reader)?),
+        3 => Cfg::Any(read_cfg_list(reader)?),
+        4 => Cfg::Not(Box::new(read_cfg(reader)?)),
         _ => bail!("invalid cfg tag"),
     })
 }
@@ -120,21 +123,25 @@ fn write_attrs(out: &mut Vec<u8>, attrs: &[Attr]) -> Option<()> {
     Some(())
 }
 
-fn read_attrs(cur: &mut Cursor<'_>) -> Result<Vec<Attr>> {
-    let len = cur.count()?;
+#[inline(always)]
+fn read_attrs(reader: &mut Reader<'_>) -> Result<Vec<Attr>> {
+    let len = reader.count()?;
+    if len == 0 {
+        return Ok(Vec::new());
+    }
     let mut attrs = Vec::with_capacity(len);
     for _ in 0..len {
-        attrs.push(match cur.u8()? {
-            0 => Attr::Cfg(read_cfg(cur)?),
-            1 => Attr::CfgAttr(read_cfg(cur)?, read_attrs(cur)?),
-            2 => Attr::Path(read_str(cur)?.to_owned()),
+        attrs.push(match reader.u8()? {
+            0 => Attr::Cfg(read_cfg(reader)?),
+            1 => Attr::CfgAttr(read_cfg(reader)?, read_attrs(reader)?),
+            2 => Attr::Path(reader.str()?.to_owned()),
             3 => Attr::MacroUse,
-            4 => Attr::MacroExport(cur.u8()? != 0),
-            5 => Attr::Derive(cur.u32()?),
+            4 => Attr::MacroExport(reader.u8()? != 0),
+            5 => Attr::Derive(reader.u32()?),
             6 => Attr::NoStd,
             7 => Attr::NoCore,
             8 => Attr::NoImplicitPrelude,
-            9 => Attr::Other(cur.u32()?),
+            9 => Attr::Other(reader.u32()?),
             _ => bail!("invalid attr tag"),
         });
     }
@@ -192,16 +199,16 @@ pub(in super::super) fn write_items(out: &mut Vec<u8>, items: &Items) -> Option<
     Some(())
 }
 
-pub(in super::super) fn read_items(cur: &mut Cursor<'_>) -> Result<Items> {
-    let inner = read_attrs(cur)?;
-    let item_count = cur.count()?;
-    let item_bytes = cur.take(item_count.checked_mul(30).context("items overflow")?)?;
+pub(in super::super) fn read_items(reader: &mut Reader<'_>) -> Result<Items> {
+    let inner = read_attrs(reader)?;
+    let item_count = reader.count()?;
+    let item_bytes = reader.take(item_count.checked_mul(30).context("items overflow")?)?;
     let mut items = Vec::with_capacity(item_count);
     let mut has_attrs = false;
-    for b in item_bytes.chunks_exact(30) {
-        let kind = ITEM_KINDS
+    for chunk in item_bytes.chunks_exact(30) {
+        let b: &[u8; 30] = chunk.try_into()?;
+        let kind = *ITEM_KINDS
             .get(b[0] as usize)
-            .copied()
             .context("invalid item kind tag")?;
         let flags = b[1];
         let vis = vis_from_tag(flags & 0x7f, u32_le(b, 26))?;
@@ -221,36 +228,44 @@ pub(in super::super) fn read_items(cur: &mut Cursor<'_>) -> Result<Items> {
     if has_attrs {
         for (item, b) in items.iter_mut().zip(item_bytes.chunks_exact(30)) {
             if b[1] & 0x80 != 0 {
-                item.attrs = read_attrs(cur)?;
+                item.attrs = read_attrs(reader)?;
             }
         }
     }
-    let import_count = cur.count()?;
-    let total_paths = cur.count()?;
-    let import_bytes = cur.take(import_count.checked_mul(13).context("imports overflow")?)?;
-    let path_bytes = cur.take(
+    let import_count = reader.count()?;
+    let total_paths = reader.count()?;
+    let import_bytes = reader.take(import_count.checked_mul(13).context("imports overflow")?)?;
+    let path_bytes = reader.take(
         total_paths
             .checked_mul(4)
             .context("import paths overflow")?,
     )?;
     let mut imports = Vec::with_capacity(import_count);
     let mut path_pos = 0usize;
-    for b in import_bytes.chunks_exact(13) {
+    for chunk in import_bytes.chunks_exact(13) {
+        let b: &[u8; 13] = chunk.try_into()?;
         let flags = b[0];
         let item = u32_le(b, 1);
         let alias = u32_le(b, 5);
         let path_len = u32_le(b, 9) as usize;
-        let path_byte_len = path_len
-            .checked_mul(4)
-            .context("import path length overflow")?;
-        let path_end = path_pos
-            .checked_add(path_byte_len)
-            .context("import path overflow")?;
-        let seg_slice = path_bytes
-            .get(path_pos..path_end)
-            .context("import path out of bounds")?;
-        path_pos = path_end;
-        let path = seg_slice.chunks_exact(4).map(|p| u32_le(p, 0)).collect();
+        let path = if path_len == 0 {
+            Vec::new()
+        } else {
+            let path_byte_len = path_len
+                .checked_mul(4)
+                .context("import path length overflow")?;
+            let path_end = path_pos
+                .checked_add(path_byte_len)
+                .context("import path overflow")?;
+            let seg_slice = path_bytes
+                .get(path_pos..path_end)
+                .context("import path out of bounds")?;
+            path_pos = path_end;
+            seg_slice
+                .chunks_exact(4)
+                .map(|p| u32::from_le_bytes([p[0], p[1], p[2], p[3]]))
+                .collect()
+        };
         let leaf = match flags & 3 {
             0 => Leaf::Name((alias != u32::MAX).then_some(alias)),
             1 => Leaf::Underscore,
@@ -267,11 +282,16 @@ pub(in super::super) fn read_items(cur: &mut Cursor<'_>) -> Result<Items> {
     if path_pos != path_bytes.len() {
         bail!("trailing bytes in import paths");
     }
-    let mark_count = cur.count()?;
-    let mark_bytes = cur.take(mark_count.checked_mul(6).context("item marks overflow")?)?;
+    let mark_count = reader.count()?;
+    let mark_bytes = reader.take(mark_count.checked_mul(6).context("item marks overflow")?)?;
     let marks = mark_bytes
         .chunks_exact(6)
-        .map(|c| (u32_le(c, 0), u16::from_le_bytes([c[4], c[5]])))
+        .map(|c| {
+            (
+                u32::from_le_bytes([c[0], c[1], c[2], c[3]]),
+                u16::from_le_bytes([c[4], c[5]]),
+            )
+        })
         .collect();
     Ok(Items {
         inner,

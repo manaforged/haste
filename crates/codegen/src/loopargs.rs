@@ -7,12 +7,17 @@ pub(crate) fn run(
     wanted: impl Fn(Block, Value) -> bool,
 ) -> Vec<(Value, Value, Block)> {
     let mut made = Vec::new();
-    let mut origin: Vec<Value> = (0..func.types.len() as u32).map(Value).collect();
     let cfg = func.cfg();
     let depths = &cfg.loops().depths;
     let mut loops: Vec<&Loop> = cfg.loops().list.iter().collect();
+    if loops.is_empty() {
+        return made;
+    }
+    let mut origin: Vec<Value> = (0..func.types.len() as u32).map(Value).collect();
     loops.sort_by_key(|each| (each.depth, each.head.index()));
     loops.dedup_by_key(|each| each.head);
+    let mut defined_inside = Vec::new();
+    let mut outside_def = Vec::new();
     for each in loops {
         if Some(each.head) == func.entry
             || !cfg
@@ -35,9 +40,13 @@ pub(crate) fn run(
             .collect();
         outside_preds.sort_unstable();
         outside_preds.dedup();
-        for value in reads(func, (each, depths), &|v| {
-            wanted(each.head, origin[v.index()])
-        }) {
+        let candidates = reads(
+            func,
+            (each, depths),
+            (&mut defined_inside, &mut outside_def),
+            &|v| wanted(each.head, origin[v.index()]),
+        );
+        for value in candidates {
             let root = origin[value.index()];
             let param = func.value(func.ty(value));
             origin.push(root);
@@ -69,10 +78,13 @@ fn inside(each: &Loop, block: Block) -> bool {
 fn reads(
     func: &Function,
     (each, depths): (&Loop, &[u32]),
+    (defined_inside, outside_def): (&mut Vec<bool>, &mut Vec<bool>),
     wanted: &impl Fn(Value) -> bool,
 ) -> Vec<Value> {
-    let mut defined_inside = vec![false; func.types.len()];
-    let mut outside_def = vec![false; func.types.len()];
+    defined_inside.clear();
+    defined_inside.resize(func.types.len(), false);
+    outside_def.clear();
+    outside_def.resize(func.types.len(), false);
     for (at, data) in func.blocks.iter().enumerate() {
         let local = inside(each, Block(at as u32));
         for &param in &data.params {

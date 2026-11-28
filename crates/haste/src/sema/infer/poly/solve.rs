@@ -192,23 +192,28 @@ impl Infer<'_, '_> {
         args: &[Ty],
         (name, own): (&str, &[Ty]),
     ) -> Result<Option<Ty>> {
-        if self.has_vars(ty)
-            || args.iter().any(|&a| self.has_vars(a))
-            || own.iter().any(|&o| self.has_vars(o))
-        {
+        if args.iter().any(|&a| self.has_vars(a)) || own.iter().any(|&o| self.has_vars(o)) {
             return Ok(None);
         }
-        let ty = self.zonk(ty);
-        let args: Vec<Ty> = args.iter().map(|&a| self.zonk(a)).collect();
-        let own: Vec<Ty> = own.iter().map(|&o| self.zonk(o)).collect();
-        if self.cx.lang(of) == Some("discriminant_kind") {
+        let has_vars = self.has_vars(ty);
+        let norm = |infer: &mut Self, t: Ty| {
+            if has_vars {
+                infer.substitute(t)
+            } else {
+                infer.zonk(t)
+            }
+        };
+        let ty = norm(self, ty);
+        let args: Vec<Ty> = args.iter().map(|&a| norm(self, a)).collect();
+        let own: Vec<Ty> = own.iter().map(|&o| norm(self, o)).collect();
+        if !has_vars && self.cx.lang(of) == Some("discriminant_kind") {
             return self.discriminant_ty(ty);
         }
         let interned_args = self.cx.types.intern_substs(&args);
         if let Some(fast) = self.poly_fast_alias(of, ty, interned_args, (name, &own))? {
             return Ok(Some(fast));
         }
-        self.poly_selected_or_proj(of, ty, (&args, interned_args), (name, &own))
+        self.poly_selected_or_proj(of, ty, (&args, interned_args), (name, &own), has_vars)
     }
 
     fn poly_fast_alias(
@@ -232,6 +237,7 @@ impl Infer<'_, '_> {
         ty: Ty,
         (args, interned_args): (&[Ty], Substs),
         (name, own): (&str, &[Ty]),
+        has_vars: bool,
     ) -> Result<Option<Ty>> {
         let selected = self.select(of, ty, args)?;
         if let Some(picked) = &selected {
@@ -242,7 +248,7 @@ impl Infer<'_, '_> {
                 return Ok(Some(concrete));
             }
         }
-        if selected.is_none() && !self.poly_holds_in_env(of, ty, args)? {
+        if has_vars || (selected.is_none() && !self.poly_holds_in_env(of, ty, args)?) {
             return Ok(None);
         }
         let Some(assoc) = self.cx.trait_member(of, name) else {
@@ -341,7 +347,10 @@ impl Infer<'_, '_> {
             }
             return Ok(true);
         }
-        if self.compiler_impl(of, self_ty) || self.object_holds(of, self_ty, args) == Some(true) {
+        if self.compiler_impl(of, self_ty)
+            || self.object_holds(of, self_ty, args) == Some(true)
+            || self.check_callable_obligation(of, self_ty, args)?
+        {
             return Ok(true);
         }
         if self.poly_holds_in_env(of, self_ty, args)? {

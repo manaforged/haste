@@ -282,13 +282,15 @@ impl Image {
         let (debug_info, symbols, fn_align) =
             crate::with_cfg(|c| (c.debug_info, c.symbols, c.fn_align));
         let mut aot_roots = vec![lang_start, user_main];
+        let mut pre_exports: HashMap<usize, String> = HashMap::default();
         for (idx, (instance, _)) in reached.list.iter().enumerate() {
-            if idx != lang_start
-                && idx != user_main
-                && state.functions.get(idx).is_some_and(Option::is_some)
-                && export_name(cx, *instance).is_some()
+            if state.functions.get(idx).is_some_and(Option::is_some)
+                && let Some(name) = export_name(cx, *instance)
             {
-                aot_roots.push(idx);
+                pre_exports.insert(idx, name);
+                if idx != lang_start && idx != user_main {
+                    aot_roots.push(idx);
+                }
             }
         }
         let (live, vmask) = vdce::VtableMask::converge(cx, reached, &state.vtables, |vmask| {
@@ -334,6 +336,9 @@ impl Image {
             thread_slots: &thread_slots,
         };
         let dict_bodies = emit_dict_bodies(&state, &live.order, (debug_info, fn_align), &mut exe)?;
+        exe.text.reserve(live.order.len().saturating_mul(64));
+        exe.relocs.reserve(live.order.len().saturating_mul(4));
+        exe.fn_starts.reserve(live.order.len());
         let fn_offs = emit_functions(
             &state,
             &live,
@@ -379,7 +384,7 @@ impl Image {
                     .collect(),
             );
         }
-        let syms = collect_exe_symbols(&live, &fn_offs, symbols, cx, reached);
+        let syms = collect_exe_symbols(&live, &fn_offs, symbols, &pre_exports, cx, reached);
         if !syms.is_empty() {
             exe.symbols(syms);
         }
@@ -426,6 +431,7 @@ fn collect_exe_symbols(
     live: &AotReach,
     fn_offs: &[Option<u32>],
     include_locals: bool,
+    pre_exports: &HashMap<usize, String>,
     cx: &mut crate::sema::Context<'_>,
     reached: &crate::sema::reach::Reached,
 ) -> Vec<ExeSymbol> {
@@ -436,13 +442,11 @@ fn collect_exe_symbols(
         let Some(off) = fn_offs[index] else {
             continue;
         };
-        if let Some((instance, _)) = reached.list.get(index)
-            && let Some(name) = export_name(cx, *instance)
-        {
+        if let Some(name) = pre_exports.get(&index) {
             if seen_exports.insert(name.clone()) {
                 out.push(ExeSymbol {
                     offset: off,
-                    name,
+                    name: name.clone(),
                     exported: true,
                 });
             }

@@ -450,11 +450,6 @@ impl Cache {
         &self.lookups.warm
     }
 
-    /// Drops cached final function outcomes while keeping resolved types, lookups, and summaries.
-    pub fn clear_finals(&mut self) {
-        self.finals.clear();
-    }
-
     /// Returns whether any new sysroot `PolySummary` or concrete sysroot instance was built in this session.
     pub fn has_new_sysroot_summaries(&self) -> bool {
         let l = &self.lookups;

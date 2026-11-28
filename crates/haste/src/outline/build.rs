@@ -191,27 +191,27 @@ impl Loader<'_> {
     }
 
     fn macro_use_externs(&mut self) {
-        let Some(file) = self
-            .out
-            .modules
-            .first()
-            .filter(|root| root.loaded())
-            .map(|root| self.out.files[root.file].clone())
-        else {
+        let Some(root) = self.out.modules.first().filter(|root| root.loaded()) else {
             return;
         };
-        let externs = file.items.items.iter().filter(|item| {
-            item.kind == ItemKind::ExternCrate
-                && item.parent.is_none()
-                && item.attrs.contains(&Attr::MacroUse)
-        });
-        for item in externs {
-            let name = file.source.text(item.start + 2);
-            let Some(&(_, at)) = self.deps.iter().find(|(dep, _)| dep == name) else {
-                continue;
-            };
-            if !self.out.macro_use.contains(&at) {
-                self.out.macro_use.push(at);
+        let files: Vec<Arc<File>> = std::iter::once(root.file)
+            .chain(root.parts.iter().copied())
+            .filter_map(|idx| self.out.files.get(idx).cloned())
+            .collect();
+        for file in files {
+            let externs = file.items.items.iter().filter(|item| {
+                item.kind == ItemKind::ExternCrate
+                    && item.parent.is_none()
+                    && item.attrs.contains(&Attr::MacroUse)
+            });
+            for item in externs {
+                let name = file.source.text(item.start + 2);
+                let Some(&(_, at)) = self.deps.iter().find(|(dep, _)| dep == name) else {
+                    continue;
+                };
+                if !self.out.macro_use.contains(&at) {
+                    self.out.macro_use.push(at);
+                }
             }
         }
     }

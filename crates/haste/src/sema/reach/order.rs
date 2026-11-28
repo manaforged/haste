@@ -34,18 +34,20 @@ impl Reached {
                 }
             }
         }
-        let mut rest: Vec<usize> = (0..len).filter(|&at| !seen[at]).collect();
-        rest.sort_by_cached_key(|&at| instance_key(cx, self.list[at].0));
-        order.extend(rest);
+        if order.len() < len {
+            let mut rest: Vec<usize> = (0..len).filter(|&at| !seen[at]).collect();
+            rest.sort_by_cached_key(|&at| instance_key(cx, self.list[at].0));
+            order.extend(rest);
+        }
         let mut new_of = vec![0; len];
         for (new, &old) in order.iter().enumerate() {
             new_of[old] = new;
         }
         permute_by_order(&mut self.list, &order);
-        permute_by_order(&mut self.states, &order);
-        permute_by_order(&mut self.pinned, &order);
-        permute_by_order(&mut self.calls, &order);
-        permute_by_order(&mut self.indirect, &order);
+        permute_copy(&mut self.states, &order);
+        permute_copy(&mut self.pinned, &order);
+        permute_vecs(&mut self.calls, &order);
+        permute_vecs(&mut self.indirect, &order);
         for edges in self.calls.iter_mut().chain(self.indirect.iter_mut()) {
             edges.iter_mut().for_each(|at| *at = new_of[*at]);
         }
@@ -83,5 +85,18 @@ fn permute_by_order<T>(items: &mut Vec<T>, order: &[usize]) {
         if let Some(item) = slots[old].take() {
             items.push(item);
         }
+    }
+}
+
+fn permute_copy<T: Copy>(items: &mut Vec<T>, order: &[usize]) {
+    let reordered: Vec<T> = order.iter().map(|&old| items[old]).collect();
+    *items = reordered;
+}
+
+fn permute_vecs<T>(items: &mut Vec<Vec<T>>, order: &[usize]) {
+    let mut old_items = std::mem::take(items);
+    items.reserve(order.len());
+    for &old in order {
+        items.push(std::mem::take(&mut old_items[old]));
     }
 }
