@@ -366,7 +366,7 @@ fn decode_macros_batch(
             }
             Ok((item_idx, mac_idx, Arc::new(Macro { file, rules, krate })))
         };
-    let decoded = if tasks.len() >= 16 {
+    let decoded = if tasks.len() >= 4 && crate::jobs() > 1 {
         crate::sync::parallel_map(tasks, decode_one)
     } else {
         tasks.into_iter().map(decode_one).collect()

@@ -16,6 +16,9 @@ pub(crate) mod tally;
 mod trim;
 mod wire;
 
+#[cfg(test)]
+pub(crate) static TEST_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub(crate) use backing::Backing;
 pub(super) use backing::{bytes_to_path, path_to_bytes};
 pub use inline::{InlineKey, InlineShape};

@@ -158,4 +158,8 @@ impl Slots for Image {
     ) -> Option<lower::RelocPlan> {
         self.decode_aot_reloc_plan(cx.outline, &cx.types, reached, is_sysroot, bytes)
     }
+
+    fn aot_cache(&self) -> Option<std::sync::Arc<crate::image::aot_cache::AotCache>> {
+        Image::aot_cache(self)
+    }
 }

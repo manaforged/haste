@@ -15,6 +15,7 @@ mod stub;
 pub mod watch;
 mod workers;
 
+pub(crate) use aot::cache as aot_cache;
 pub(super) use backend::ImageBackend;
 pub use backend::ImageMode;
 pub use expand::{Job, run_macros};

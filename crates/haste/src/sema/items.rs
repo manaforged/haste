@@ -272,6 +272,9 @@ impl<'a> Context<'a> {
                 if let Some(block) = self.owner_impl(item) {
                     return self.impl_module(block);
                 }
+                if let Some(owner) = self.owner_trait(item) {
+                    return self.module_of(owner);
+                }
             }
             None => {}
         }

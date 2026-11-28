@@ -4,7 +4,9 @@ use anyhow::{Context as _, Result, bail};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::image::aot::{AotCode, AotState};
-use crate::lower::{RodataId, RodataTarget, Slots, SymbolSource, VtableEntry, VtableId, Word};
+use crate::lower::{
+    RodataId, RodataReloc, RodataTarget, Slots, SymbolSource, VtableEntry, VtableId, Word,
+};
 use crate::names::ItemRef;
 use crate::outline::Outline;
 use crate::sema::reach::Reached;
@@ -44,12 +46,16 @@ pub(super) struct BundleSections {
     pub(super) blob: Vec<u8>,
 }
 
+pub(super) const CARRY_BIT: u32 = 1 << 31;
+
 pub(super) struct BundleEncoder<'a> {
     outline: &'a Outline,
     types: &'a Types,
     reached: &'a Reached,
     state: &'a AotState,
     stamps: &'a Stamps,
+    extra_rodata: &'a [(Vec<u8>, Vec<RodataReloc>)],
+    extra_vtables: &'a [Vec<VtableEntry>],
     item_map: HashMap<ItemRef, u32>,
     items: Vec<(LocalItemRecord, u32)>,
     tys: TyTable,
@@ -73,12 +79,26 @@ impl<'a> BundleEncoder<'a> {
         state: &'a AotState,
         stamps: &'a Stamps,
     ) -> Self {
+        Self::with_extras(outline, types, reached, state, stamps, &[], &[])
+    }
+
+    pub(super) fn with_extras(
+        outline: &'a Outline,
+        types: &'a Types,
+        reached: &'a Reached,
+        state: &'a AotState,
+        stamps: &'a Stamps,
+        extra_rodata: &'a [(Vec<u8>, Vec<RodataReloc>)],
+        extra_vtables: &'a [Vec<VtableEntry>],
+    ) -> Self {
         Self {
             outline,
             types,
             reached,
             state,
             stamps,
+            extra_rodata,
+            extra_vtables,
             item_map: HashMap::default(),
             items: Vec::new(),
             tys: TyTable::default(),
@@ -95,14 +115,25 @@ impl<'a> BundleEncoder<'a> {
         }
     }
 
-    fn push_blob(&mut self, bytes: &[u8]) -> Option<(u32, u32)> {
+    pub(super) fn push_blob(&mut self, bytes: &[u8]) -> Option<(u32, u32)> {
         let off = u32::try_from(self.blob.len()).ok()?;
         let len = u32::try_from(bytes.len()).ok()?;
         self.blob.extend_from_slice(bytes);
         Some((off, len))
     }
 
-    fn item_id(&mut self, item: ItemRef) -> Option<u32> {
+    pub(super) fn push_code_bytes(&mut self, key_ptr: usize, bytes: &[u8]) -> Option<u32> {
+        if let Some(&id) = self.code_map.get(&key_ptr) {
+            return Some(id);
+        }
+        let (code_off, code_len) = self.push_blob(bytes)?;
+        let id = u32::try_from(self.codes.len()).ok()?;
+        self.codes.push(CodeEntrySpan { code_off, code_len });
+        self.code_map.insert(key_ptr, id);
+        Some(id)
+    }
+
+    pub(super) fn item_id(&mut self, item: ItemRef) -> Option<u32> {
         intern_item(
             self.outline,
             self.stamps,
@@ -112,7 +143,7 @@ impl<'a> BundleEncoder<'a> {
         )
     }
 
-    fn substs_ids(&mut self, substs: Substs) -> Option<Vec<u32>> {
+    pub(super) fn substs_ids(&mut self, substs: Substs) -> Option<Vec<u32>> {
         let (outline, stamps, item_map, items) = (
             self.outline,
             self.stamps,
@@ -124,7 +155,7 @@ impl<'a> BundleEncoder<'a> {
         })
     }
 
-    fn reached_ref(&mut self, index: usize) -> Option<(u32, Vec<u32>)> {
+    pub(super) fn reached_ref(&mut self, index: usize) -> Option<(u32, Vec<u32>)> {
         let ((item, substs), _) = self.reached.list.get(index)?;
         Some((self.item_id(*item)?, self.substs_ids(*substs)?))
     }
@@ -135,11 +166,7 @@ impl<'a> BundleEncoder<'a> {
             return Some(id);
         }
         let encoded = encode_code_blob(code)?;
-        let (code_off, code_len) = self.push_blob(&encoded)?;
-        let id = u32::try_from(self.codes.len()).ok()?;
-        self.codes.push(CodeEntrySpan { code_off, code_len });
-        self.code_map.insert(ptr, id);
-        Some(id)
+        self.push_code_bytes(ptr, &encoded)
     }
 
     fn rodata_id(&mut self, id: RodataId) -> Option<u32> {
@@ -150,7 +177,11 @@ impl<'a> BundleEncoder<'a> {
             return None;
         }
         let res = (|| {
-            let (bytes, relocs) = self.state.rodata.get(id.0 as usize)?;
+            let (bytes, relocs) = if id.0 & CARRY_BIT != 0 {
+                self.extra_rodata.get((id.0 & !CARRY_BIT) as usize)?
+            } else {
+                self.state.rodata.get(id.0 as usize)?
+            };
             let mut reloc_buf = Vec::new();
             for reloc in relocs {
                 write_u32(&mut reloc_buf, reloc.offset);
@@ -192,7 +223,11 @@ impl<'a> BundleEncoder<'a> {
             return None;
         }
         let res = (|| {
-            let entries = self.state.vtables.get(id.0 as usize)?;
+            let entries = if id.0 & CARRY_BIT != 0 {
+                self.extra_vtables.get((id.0 & !CARRY_BIT) as usize)?
+            } else {
+                self.state.vtables.get(id.0 as usize)?
+            };
             let mut entry_buf = Vec::new();
             for entry in entries {
                 match *entry {
@@ -226,7 +261,7 @@ impl<'a> BundleEncoder<'a> {
         res
     }
 
-    fn write_symbol(&mut self, out: &mut Vec<u8>, src: &SymbolSource) -> Option<()> {
+    pub(super) fn write_symbol(&mut self, out: &mut Vec<u8>, src: &SymbolSource) -> Option<()> {
         match src {
             SymbolSource::Slot(index) => {
                 out.push(0);
@@ -272,6 +307,12 @@ impl<'a> BundleEncoder<'a> {
                 write_u32s(out, &substs);
             }
         }
+        Some(())
+    }
+
+    pub(super) fn add_raw_record(&mut self, key: (u64, u64), payload: &[u8]) -> Option<()> {
+        let (payload_off, payload_len) = self.push_blob(payload)?;
+        self.records.push((key.0, key.1, payload_off, payload_len));
         Some(())
     }
 
@@ -565,6 +606,37 @@ pub(super) fn read_code_span(
     })
 }
 
+pub(super) fn decode_symbol(
+    tables: &SharedTables,
+    types: &Types,
+    reached: &Reached,
+    slots: &dyn Slots,
+    cur: &mut Cursor<'_>,
+    decode_rodata: &mut impl FnMut(u32) -> Option<RodataId>,
+    decode_vtable: &mut impl FnMut(u32) -> Option<VtableId>,
+) -> Option<SymbolSource> {
+    Some(match cur.u8().ok()? {
+        0 => SymbolSource::Slot(tables.read_instance(types, reached, slots, cur)?),
+        1 => SymbolSource::Vtable(decode_vtable(cur.u32().ok()?)?),
+        2 => SymbolSource::Rodata(decode_rodata(cur.u32().ok()?)?),
+        3 => {
+            let index = tables.read_instance(types, reached, slots, cur)?;
+            let size = cur.u32().ok()?;
+            SymbolSource::StaticCell { index, size }
+        }
+        4 => {
+            let owner = tables.read_instance(types, reached, slots, cur)?;
+            let seq = cur.u32().ok()?;
+            let size = cur.u32().ok()?;
+            SymbolSource::PromotedCell { owner, seq, size }
+        }
+        5 => SymbolSource::Host(read_host(cur).ok()?),
+        6 => SymbolSource::Word(cur.u64().ok()?),
+        7 => SymbolSource::ThreadSlot(tables.read_instance(types, reached, slots, cur)?),
+        _ => return None,
+    })
+}
+
 pub(super) fn decode_symbol_list(
     tables: &SharedTables,
     types: &Types,
@@ -577,27 +649,15 @@ pub(super) fn decode_symbol_list(
 ) -> Option<Vec<SymbolSource>> {
     let mut out = Vec::with_capacity(count.min(4096));
     for _ in 0..count {
-        let sym = match cur.u8().ok()? {
-            0 => SymbolSource::Slot(tables.read_instance(types, reached, slots, cur)?),
-            1 => SymbolSource::Vtable(decode_vtable(cur.u32().ok()?)?),
-            2 => SymbolSource::Rodata(decode_rodata(cur.u32().ok()?)?),
-            3 => {
-                let index = tables.read_instance(types, reached, slots, cur)?;
-                let size = cur.u32().ok()?;
-                SymbolSource::StaticCell { index, size }
-            }
-            4 => {
-                let owner = tables.read_instance(types, reached, slots, cur)?;
-                let seq = cur.u32().ok()?;
-                let size = cur.u32().ok()?;
-                SymbolSource::PromotedCell { owner, seq, size }
-            }
-            5 => SymbolSource::Host(read_host(cur).ok()?),
-            6 => SymbolSource::Word(cur.u64().ok()?),
-            7 => SymbolSource::ThreadSlot(tables.read_instance(types, reached, slots, cur)?),
-            _ => return None,
-        };
-        out.push(sym);
+        out.push(decode_symbol(
+            tables,
+            types,
+            reached,
+            slots,
+            cur,
+            &mut decode_rodata,
+            &mut decode_vtable,
+        )?);
     }
     Some(out)
 }

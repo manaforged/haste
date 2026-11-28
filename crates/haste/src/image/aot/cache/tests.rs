@@ -4,7 +4,9 @@ use haste_codegen::{CodeUnwindDrop, RelocKind, Site, StencilReloc, UnwindArg};
 use crate::graph::cfg::Target as CfgTarget;
 use crate::host::HostSymbol;
 use crate::image::aot::AotCode;
-use crate::lower::{RodataReloc, RodataTarget, SymbolSource, VtableEntry, Word};
+use crate::lower::{
+    RodataId, RodataReloc, RodataTarget, SymbolSource, VtableEntry, VtableId, Word,
+};
 use crate::names::Primitive;
 use crate::outline::scan::scan;
 use crate::outline::source::Source;
@@ -45,7 +47,7 @@ fn sample_aot_code() -> AotCode {
     }
 }
 
-fn sample_config(flags_bits: u64, target_hash: u64, triple_hash: u64) -> AotConfigKey {
+pub(super) fn sample_config(flags_bits: u64, target_hash: u64, triple_hash: u64) -> AotConfigKey {
     let dict_cfg = (512, 8);
     let mut h = FxHasher::default();
     CACHE_MAGIC.hash(&mut h);
@@ -121,9 +123,10 @@ fn bundle_round_trip_and_key_invalidation() {
         records: vec![(key_hi, key_lo, code_blob.len() as u32, payload.len() as u32)],
         blob: [code_blob, payload].concat(),
     };
-    write_bundle(&path, base_cfg, &sections).expect("write");
+    write_bundle(&path, CACHE_MAGIC, CACHE_VERSION, base_cfg, &sections).expect("write");
 
-    let (backing, hdr) = open_bundle(&path, base_cfg).expect("open valid");
+    let (backing, hdr) =
+        open_bundle(&path, CACHE_MAGIC, CACHE_VERSION, base_cfg).expect("open valid");
     assert!(
         find_record(
             backing.as_slice(),
@@ -134,27 +137,27 @@ fn bundle_round_trip_and_key_invalidation() {
         .is_some()
     );
     let diff_triple = sample_config(base_cfg.flags_bits, base_cfg.target_hash, 0x9999_0000);
-    assert!(open_bundle(&path, diff_triple).is_none());
+    assert!(open_bundle(&path, CACHE_MAGIC, CACHE_VERSION, diff_triple).is_none());
     let diff_cpu = sample_config(
         base_cfg.flags_bits ^ 1,
         base_cfg.target_hash,
         base_cfg.triple_hash,
     );
-    assert!(open_bundle(&path, diff_cpu).is_none());
+    assert!(open_bundle(&path, CACHE_MAGIC, CACHE_VERSION, diff_cpu).is_none());
     let diff_profile = sample_config(
         base_cfg.flags_bits ^ (1 << 1),
         base_cfg.target_hash,
         base_cfg.triple_hash,
     );
-    assert!(open_bundle(&path, diff_profile).is_none());
+    assert!(open_bundle(&path, CACHE_MAGIC, CACHE_VERSION, diff_profile).is_none());
     let diff_unwind = sample_config(
         base_cfg.flags_bits ^ (1 << 2),
         base_cfg.target_hash,
         base_cfg.triple_hash,
     );
-    assert!(open_bundle(&path, diff_unwind).is_none());
+    assert!(open_bundle(&path, CACHE_MAGIC, CACHE_VERSION, diff_unwind).is_none());
     let diff_stamp = sample_config(base_cfg.flags_bits, 0x1111_2222, base_cfg.triple_hash);
-    assert!(open_bundle(&path, diff_stamp).is_none());
+    assert!(open_bundle(&path, CACHE_MAGIC, CACHE_VERSION, diff_stamp).is_none());
 
     let (bad_hi, bad_lo) = hash_entry_128(
         base_cfg.config_digest,
@@ -175,10 +178,10 @@ fn bundle_round_trip_and_key_invalidation() {
 
     let mut bad_magic = backing.as_slice().to_vec();
     bad_magic[0..4].copy_from_slice(b"NOPE");
-    assert!(parse_bundle_header(&bad_magic, base_cfg).is_none());
+    assert!(parse_bundle_header(&bad_magic, CACHE_MAGIC, CACHE_VERSION, base_cfg).is_none());
     let mut bad_ver = backing.as_slice().to_vec();
     bad_ver[8..12].copy_from_slice(&999u32.to_le_bytes());
-    assert!(parse_bundle_header(&bad_ver, base_cfg).is_none());
+    assert!(parse_bundle_header(&bad_ver, CACHE_MAGIC, CACHE_VERSION, base_cfg).is_none());
     drop(backing);
     drop(std::fs::remove_dir_all(&tmp));
 }
@@ -196,7 +199,7 @@ fn bundle_stale_prune_keeps_newest() {
     std::fs::write(&b, b"b").expect("write b");
     std::thread::sleep(std::time::Duration::from_millis(20));
     std::fs::write(&c, b"c").expect("write c");
-    prune_stale_bundles(&tmp, &a, 1);
+    prune_stale_bundles(&tmp, &a, "aot", 1);
     assert!(a.exists());
     assert!(c.exists());
     assert!(!b.exists());
@@ -356,8 +359,8 @@ fn shared_tables_and_symbol_sources_round_trip() {
         .expect("add");
     let sections = enc.finish().expect("finish");
     let path = tmp.join("tables.aot");
-    write_bundle(&path, cfg, &sections).expect("write");
-    let (backing, hdr) = open_bundle(&path, cfg).expect("open");
+    write_bundle(&path, CACHE_MAGIC, CACHE_VERSION, cfg, &sections).expect("write");
+    let (backing, hdr) = open_bundle(&path, CACHE_MAGIC, CACHE_VERSION, cfg).expect("open");
     let file_index = LocalFileIndex::build(&outline);
     let shared = SharedTables::decode(
         backing.as_slice(),
