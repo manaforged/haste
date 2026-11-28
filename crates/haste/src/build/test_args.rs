@@ -179,64 +179,110 @@ pub(super) fn map_tests(
         .collect()
 }
 
+fn keep_check_crate(outline: &Outline, target: Option<usize>, krate: usize) -> bool {
+    target.is_none() || target == Some(krate) || outline.roots[krate].role == outline::Role::Lib
+}
+
+pub(super) fn checked_member_crates(
+    workspace: &Workspace,
+    outline: &Outline,
+    target: Option<usize>,
+) -> Vec<usize> {
+    outline
+        .members(workspace)
+        .filter(|&k| keep_check_crate(outline, target, k))
+        .collect()
+}
+
+pub(super) fn check_target(
+    workspace: &Workspace,
+    outline: &Outline,
+    is_main: bool,
+) -> Option<usize> {
+    if !is_main {
+        return None;
+    }
+    let sel = crate::selection();
+    (sel.bin.is_some() || sel.example.is_some())
+        .then(|| super::main_item(workspace, outline).map(|m| m.krate as usize))
+        .flatten()
+}
+
 pub(super) fn check_fn_items(
     workspace: &Workspace,
     outline: &Outline,
     target: Option<usize>,
 ) -> Vec<ItemRef> {
-    let keep_krate = |k: usize| {
-        target.is_none() || target == Some(k) || outline.roots[k].role == outline::Role::Lib
-    };
-    let mut out: Vec<ItemRef> = crate::cli::lib_fn_items(workspace, outline)
+    let crates: Vec<(usize, Option<&[usize]>)> = checked_member_crates(workspace, outline, target)
         .into_iter()
-        .filter(|item| keep_krate(item.krate as usize))
+        .map(|k| (k, None))
         .collect();
-    for krate in outline.members(workspace) {
-        if !keep_krate(krate) {
+    check_fn_items_in(outline, &crates)
+}
+
+fn push_file_check_items(
+    tree: &outline::tree::Crate,
+    krate: usize,
+    file_at: usize,
+    file: &outline::tree::File,
+    out: &mut Vec<ItemRef>,
+) {
+    let items = &file.items.items;
+    for (at, item) in items.iter().enumerate() {
+        let is_fn = item.kind == ItemKind::Fn && item.body.is_some();
+        let is_const = item.kind == ItemKind::Const
+            && !item
+                .parent
+                .is_some_and(|p| items[p as usize].kind == ItemKind::Trait);
+        if (!is_fn && !is_const)
+            || (!tree.env.test && crate::cli::is_test_only_fn(tree, file, item))
+        {
             continue;
         }
+        let mut ok = true;
+        let mut cur = Some(at);
+        while let Some(idx) = cur {
+            let cur_item = &items[idx];
+            if !tree.env.enabled(&cur_item.attrs)
+                || (idx != at
+                    && !matches!(
+                        cur_item.kind,
+                        ItemKind::Mod | ItemKind::Impl | ItemKind::Trait
+                    ))
+            {
+                ok = false;
+                break;
+            }
+            cur = cur_item.parent.map(|p| p as usize);
+        }
+        if ok {
+            out.push(ItemRef {
+                krate: krate as u32,
+                file: file_at as u32,
+                item: at as u32,
+            });
+        }
+    }
+}
+
+pub(super) fn check_fn_items_in(
+    outline: &Outline,
+    crates: &[(usize, Option<&[usize]>)],
+) -> Vec<ItemRef> {
+    let mut out = Vec::new();
+    for &(krate, only_files) in crates {
         let tree = &outline.crates[krate];
-        for (file_at, file) in tree.files.iter().enumerate() {
-            let items = &file.items.items;
-            for (at, item) in items.iter().enumerate() {
-                let is_fn = item.kind == ItemKind::Fn && item.body.is_some();
-                let is_impl_const = item.kind == ItemKind::Const
-                    && item
-                        .parent
-                        .is_some_and(|p| items[p as usize].kind == ItemKind::Impl);
-                if !is_fn && !is_impl_const {
-                    continue;
-                }
-                if !tree.env.test && crate::cli::is_test_only_fn(tree, file, item) {
-                    continue;
-                }
-                if !item.parent.is_some_and(|p| {
-                    matches!(items[p as usize].kind, ItemKind::Impl | ItemKind::Trait)
-                }) {
-                    continue;
-                }
-                let mut ok = true;
-                let mut cur = Some(at);
-                while let Some(idx) = cur {
-                    let cur_item = &items[idx];
-                    if !tree.env.enabled(&cur_item.attrs)
-                        || (idx != at
-                            && !matches!(
-                                cur_item.kind,
-                                ItemKind::Mod | ItemKind::Impl | ItemKind::Trait
-                            ))
-                    {
-                        ok = false;
-                        break;
+        match only_files {
+            Some(indices) => {
+                for &file_at in indices {
+                    if let Some(file) = tree.files.get(file_at) {
+                        push_file_check_items(tree, krate, file_at, file, &mut out);
                     }
-                    cur = cur_item.parent.map(|p| p as usize);
                 }
-                if ok {
-                    out.push(ItemRef {
-                        krate: krate as u32,
-                        file: file_at as u32,
-                        item: at as u32,
-                    });
+            }
+            None => {
+                for (file_at, file) in tree.files.iter().enumerate() {
+                    push_file_check_items(tree, krate, file_at, file, &mut out);
                 }
             }
         }

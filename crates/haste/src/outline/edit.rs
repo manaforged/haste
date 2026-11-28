@@ -1,5 +1,6 @@
 //! Reading a source file again after an edit, in place when only function bodies or token places changed.
 
+use std::hash::Hash as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -41,6 +42,7 @@ impl Outline {
         let new = Arc::new(new);
         for &(krate, file) in &slots {
             self.crates[krate as usize].files[file as usize] = new.clone();
+            self.crates[krate as usize].cached_included = None;
         }
         Ok(Edit::Bodies(slots))
     }
@@ -71,6 +73,7 @@ impl Outline {
         let new = Arc::new(read(path)?);
         for &(krate, file) in &slots {
             self.crates[krate as usize].files[file as usize] = new.clone();
+            self.crates[krate as usize].cached_included = None;
         }
         Ok(Edit::Bodies(slots))
     }
@@ -78,6 +81,9 @@ impl Outline {
     /// Each file that an `include_str!` or `include_bytes!` call with a literal path in crate `krate` reads, with the file that holds the call.
     pub fn included(&self, krate: usize) -> Vec<(PathBuf, PathBuf)> {
         let tree = &self.crates[krate];
+        if let Some(cached) = &tree.cached_included {
+            return cached.clone();
+        }
         tree.files
             .iter()
             .flat_map(|file| {
@@ -131,8 +137,7 @@ fn same_places(old: &File, new: &File) -> bool {
         })
 }
 
-/// The tokens of `file` outside the bodies that callers cannot see: those of functions that are not `const` or `async` and name no `impl Trait`, whose body decides a value or type that callers use.
-fn outside_bodies(file: &File) -> Vec<&str> {
+fn body_skipped(file: &File) -> Vec<bool> {
     let src = &file.source;
     let mut skipped = vec![false; src.tokens.len()];
     for item in file
@@ -143,12 +148,32 @@ fn outside_bodies(file: &File) -> Vec<&str> {
     {
         if let Some(open) = item.body
             && (item.start..open).all(|at| !matches!(src.text(at), "const" | "async" | "impl"))
+            && (item.lead..item.start).all(|at| src.text(at) != "define_opaque")
         {
             skipped[open as usize + 1..src.pair(open) as usize].fill(true);
         }
     }
+    skipped
+}
+
+/// The tokens of `file` outside the bodies that callers cannot see: those of functions that are not `const` or `async` and name no `impl Trait`, whose body decides a value or type that callers use.
+fn outside_bodies(file: &File) -> Vec<&str> {
+    let src = &file.source;
+    let skipped = body_skipped(file);
     (0..src.tokens.len() as u32)
         .filter(|at| !skipped[*at as usize])
         .map(|at| src.text(at))
         .collect()
+}
+
+/// Hashes all tokens of `file` outside regular function bodies into `hasher`.
+pub(crate) fn hash_outside_bodies(file: &File, hasher: &mut impl std::hash::Hasher) {
+    let src = &file.source;
+    let skipped = body_skipped(file);
+    let mut count = 0usize;
+    for at in (0..src.tokens.len() as u32).filter(|at| !skipped[*at as usize]) {
+        src.text(at).hash(hasher);
+        count += 1;
+    }
+    count.hash(hasher);
 }

@@ -18,7 +18,7 @@ use crate::outline::tree::{PROC_MACRO_ROOT, Profile};
 use crate::sema::reach::{Instance, Reached, reach_wave};
 use crate::sema::{Answer, Cache, Context};
 
-use expand::{Call, dep_closure, macro_graph_stamp, run};
+use expand::{Call, dep_closure, infer_caller, macro_graph_stamp, run};
 
 const ENTRIES: [&str; 2] = ["__haste_expand1", "__haste_expand2"];
 
@@ -51,6 +51,17 @@ impl Expander {
 }
 
 impl Compilation {
+    #[cfg(test)]
+    pub(crate) fn for_test(outline: Outline, names: Names) -> Self {
+        Self {
+            outline,
+            names,
+            expander: None,
+            substrate: None,
+            sysroot_heads: None,
+        }
+    }
+
     /// Drops the macro expander only when the macro crate graph changed, keeping compiled macro code across settle phases.
     pub fn settle(&mut self) {
         if self
@@ -63,6 +74,21 @@ impl Compilation {
     }
 }
 
+fn merge_heads_arc<'a>(
+    dst: &mut Option<std::sync::Arc<HashMap<u32, std::sync::Arc<crate::sema::impls::Index>>>>,
+    src: impl Iterator<Item = (&'a u32, &'a std::sync::Arc<crate::sema::impls::Index>)>,
+) {
+    let mut iter = src.peekable();
+    if iter.peek().is_none() {
+        return;
+    }
+    let map = dst.get_or_insert_with(|| std::sync::Arc::new(HashMap::default()));
+    let inner = std::sync::Arc::make_mut(map);
+    for (&k, v) in iter {
+        inner.insert(k, std::sync::Arc::clone(v));
+    }
+}
+
 fn load_with_sysroot(
     workspace: &Workspace,
     targets: &Targets,
@@ -70,12 +96,21 @@ fn load_with_sysroot(
     eager_all: bool,
 ) -> Result<Compilation> {
     let mut outline = crate::outline::new(workspace, targets, scripts);
-    let cached = crate::substrate::sysroot::try_load(workspace, targets, &mut outline);
-    let was_miss = cached.is_none();
-    let (cached_names, mut sysroot_heads) = match cached {
-        Some((symbols, names, heads)) => (Some((symbols, names)), Some(std::sync::Arc::new(heads))),
-        None => (None, None),
-    };
+    let sys_key =
+        crate::substrate::enabled().then(|| crate::substrate::sysroot_key(workspace, targets));
+    let cached = crate::substrate::sysroot::load_cached_crates(
+        workspace,
+        targets,
+        &mut outline,
+        sys_key,
+        scripts.is_empty(),
+    );
+    let was_miss = !cached.sysroot_hit;
+    let deps_miss = !cached.deps_hit;
+    let local_hits = cached.local_hits;
+    let local_keys = cached.local_keys;
+    let cached_names = cached.symbols.map(|syms| (syms, cached.names));
+    let mut sysroot_heads = (!cached.heads.is_empty()).then(|| std::sync::Arc::new(cached.heads));
     let show_sysroot = was_miss
         && crate::substrate::enabled()
         && crate::scripts::sysroot_scripts_settled(workspace);
@@ -88,24 +123,29 @@ fn load_with_sysroot(
         };
         eprintln!("haste: indexing standard library ({mode}, one-time)...");
     }
-    if !eager_all {
+    if !eager_all && deps_miss {
         if was_miss {
             crate::substrate::preload_fixed_files(workspace, &targets.target.triple, &outline);
         } else {
             crate::substrate::preload_dep_files(workspace, &targets.target.triple, &outline);
         }
     }
+    let cache_deps = deps_miss && crate::substrate::deps_index::can_cache(&outline);
     let selected: Vec<bool> = (0..outline.crates.len())
         .map(|krate| {
             let sysroot = outline.is_sysroot(krate as u32);
+            let pinned_dep = outline.is_fixed(krate as u32) && !sysroot;
+            let local_hit = local_hits.get(krate).copied().unwrap_or(false);
             if eager_all {
-                !sysroot || was_miss
+                (!sysroot || was_miss) && (!pinned_dep || deps_miss) && !local_hit
             } else {
                 (was_miss && sysroot)
-                    || workspace
-                        .graph
-                        .members
-                        .contains(&workspace.graph.units[outline.roots[krate].unit].package)
+                    || (cache_deps && pinned_dep)
+                    || (!local_hit
+                        && workspace
+                            .graph
+                            .members
+                            .contains(&workspace.graph.units[outline.roots[krate].unit].package))
             }
         })
         .collect();
@@ -144,14 +184,34 @@ fn load_with_sysroot(
             )
         });
     }
-    if was_miss && crate::scripts::sysroot_scripts_settled(workspace) {
-        compilation.sysroot_heads =
-            crate::substrate::sysroot::save(workspace, targets, &compilation);
-        if let Some(started) = sysroot_started {
-            eprintln!(
-                "haste: standard library cached in {:.1}s",
-                started.elapsed().as_secs_f64()
+    if let Some(key) = sys_key {
+        if was_miss
+            && crate::scripts::sysroot_scripts_settled(workspace)
+            && let Some(heads) = crate::substrate::sysroot::save(workspace, &compilation, key)
+        {
+            merge_heads_arc(&mut compilation.sysroot_heads, heads.iter());
+            if let Some(started) = sysroot_started {
+                eprintln!(
+                    "haste: standard library cached in {:.1}s",
+                    started.elapsed().as_secs_f64()
+                );
+            }
+        }
+        if cache_deps
+            && let Some(heads) = crate::substrate::deps_index::save(workspace, &compilation, key)
+        {
+            merge_heads_arc(&mut compilation.sysroot_heads, heads.iter());
+        }
+        if scripts.is_empty() {
+            let heads = crate::substrate::local_index::save(
+                workspace,
+                targets,
+                &compilation,
+                key,
+                &local_hits,
+                &local_keys,
             );
+            merge_heads_arc(&mut compilation.sysroot_heads, heads.iter());
         }
     }
     let errors = compilation.outline.local_errors(workspace);
@@ -263,6 +323,30 @@ fn answer_passes<R>(
 
 /// Settles names, then expands every procedural macro call they bind and settles again, until no call is left to bind, then drops the macro expander.
 pub fn resolve(compilation: &mut Compilation) -> Result<()> {
+    if let Some(heads) = &mut compilation.sysroot_heads {
+        let stale = heads.keys().any(|&k| {
+            !compilation.outline.is_fixed(k)
+                && !compilation
+                    .names
+                    .crates
+                    .get(k as usize)
+                    .is_some_and(|c| c.settled)
+        });
+        if stale {
+            let map = std::sync::Arc::make_mut(heads);
+            map.retain(|&k, _| {
+                compilation.outline.is_fixed(k)
+                    || compilation
+                        .names
+                        .crates
+                        .get(k as usize)
+                        .is_some_and(|c| c.settled)
+            });
+            if map.is_empty() {
+                compilation.sysroot_heads = None;
+            }
+        }
+    }
     let done = compilation
         .names
         .resolve(&mut compilation.outline)
@@ -376,14 +460,15 @@ pub fn load(compilation: &mut Compilation, asks: Requests) -> Result<Answer> {
     if !procs.is_empty() {
         let calls: Vec<Call> = procs
             .iter()
-            .map(|(run, _)| {
+            .map(|(run, text)| {
                 let file = &compilation.outline.crates[run.krate as usize].files[run.file as usize];
                 let kind = crate::names::collect::proc_kind(
                     &file.source,
                     &file.items.items[run.item as usize],
                 )
                 .map_or(ProcKind::Bang, |(_, kind)| kind);
-                (*run, kind, usize::MAX)
+                let caller = infer_caller(&compilation.outline, *run, kind, text);
+                (*run, kind, caller)
             })
             .collect();
         let inputs: Vec<Vec<String>> = procs.iter().map(|(_, text)| vec![text.clone()]).collect();
@@ -477,16 +562,18 @@ fn inputs(outline: &Outline, call: &Bound) -> Vec<String> {
                 )
             })]
         }
-        Site::Derive(held) => vec![derive_input(
+        Site::Derive(held) => vec![derive_input_in(
             &held.file.source,
             &held.file.items.items[held.at as usize],
             &outline.crates[call.krate].env,
+            Some((&outline.deps[call.krate], call.krate)),
         )],
         Site::Attribute(held) => {
             let src = &held.file.source;
+            let scope = Some((outline.deps[call.krate].as_slice(), call.krate));
             let after = held.path.1 + 1;
             let args = if matches!(src.text(after), "(" | "[" | "{") {
-                inside(src, after)
+                render_tokens(scope, src, after + 1, src.pair(after))
             } else {
                 String::new()
             };
@@ -495,6 +582,7 @@ fn inputs(outline: &Outline, call: &Bound) -> Vec<String> {
                 item_text(
                     src,
                     &held.file.items.items[held.at as usize],
+                    scope,
                     &|path| path != held.path.0,
                     None,
                 ),
@@ -509,9 +597,19 @@ pub(crate) fn derive_input(
     item: &crate::outline::item::Item,
     env: &crate::outline::tree::Env,
 ) -> String {
+    derive_input_in(src, item, env, None)
+}
+
+fn derive_input_in(
+    src: &Source,
+    item: &crate::outline::item::Item,
+    env: &crate::outline::tree::Env,
+    scope: Option<(&[(String, usize)], usize)>,
+) -> String {
     item_text(
         src,
         item,
+        scope,
         &|path| !crate::outline::attr::is_derive_at(src, path, src.pair(path - 1)),
         Some(&|attrs| env.enabled(attrs)),
     )
@@ -524,25 +622,46 @@ pub(crate) fn bang_input(
     src: &Source,
     open: u32,
 ) -> String {
-    let close = src.pair(open);
-    let (mut parts, mut from) = (Vec::new(), open + 1);
-    for at in open + 1..close {
+    render_tokens(Some((deps, krate)), src, open + 1, src.pair(open))
+}
+
+fn push_raw_span(parts: &mut Vec<String>, src: &Source, from: u32, to: u32) {
+    if from >= to {
+        return;
+    }
+    if from < src.offset && to > src.offset {
+        parts.push(src.span(from, src.offset - 1).to_owned());
+        parts.push(src.span(src.offset, to - 1).to_owned());
+    } else {
+        parts.push(src.span(from, to - 1).to_owned());
+    }
+}
+
+fn render_tokens(
+    scope: Option<(&[(String, usize)], usize)>,
+    src: &Source,
+    from: u32,
+    to: u32,
+) -> String {
+    let mut parts = Vec::new();
+    let Some((deps, krate)) = scope else {
+        push_raw_span(&mut parts, src, from, to);
+        return parts.join(" ");
+    };
+    let mut cursor = from;
+    for at in from..to {
         let Some(path) = src
             .dollar(at)
-            .filter(|_| at >= from)
+            .filter(|_| at >= cursor && at + 1 < to)
             .and_then(|named| crate_path(deps, krate, named as usize))
         else {
             continue;
         };
-        if at > from {
-            parts.push(src.span(from, at - 1).to_owned());
-        }
+        push_raw_span(&mut parts, src, cursor, at);
         parts.push(path);
-        from = at + 2;
+        cursor = at + 2;
     }
-    if close > from {
-        parts.push(src.span(from, close - 1).to_owned());
-    }
+    push_raw_span(&mut parts, src, cursor, to);
     parts.join(" ")
 }
 
@@ -556,20 +675,11 @@ fn crate_path(deps: &[(String, usize)], krate: usize, named: usize) -> Option<St
         .map(|(name, _)| format!("::{name}"))
 }
 
-/// The tokens between the delimiter that opens at `open` and its pair.
-fn inside(src: &Source, open: u32) -> String {
-    let close = src.pair(open);
-    if close > open + 1 {
-        src.span(open + 1, close - 1).to_owned()
-    } else {
-        String::new()
-    }
-}
-
 /// The text of `item` with the outer attributes whose path starts at a token that `keep` rejects left out, and, as a derive sees it, the fields or variants whose attributes `enabled` rejects.
 fn item_text(
     src: &Source,
     item: &crate::outline::item::Item,
+    scope: Option<(&[(String, usize)], usize)>,
     keep: &dyn Fn(u32) -> bool,
     enabled: Option<&dyn Fn(&[Attr]) -> bool>,
 ) -> String {
@@ -578,27 +688,32 @@ fn item_text(
     while at < item.start && src.text(at) == "#" {
         let close = src.pair(at + 1);
         if keep(at + 2) {
-            parts.push(src.span(at, close).to_owned());
+            parts.push(render_tokens(scope, src, at, close + 1));
         }
         at = close + 1;
     }
     match item
         .body
         .zip(enabled)
-        .and_then(|(open, enabled)| Some((open, configured(src, open, enabled)?)))
+        .and_then(|(open, enabled)| Some((open, configured(src, scope, open, enabled)?)))
     {
         Some((open, members)) => parts.extend([
-            src.span(at, open).to_owned(),
+            render_tokens(scope, src, at, open + 1),
             members,
-            src.span(src.pair(open), item.end - 1).to_owned(),
+            render_tokens(scope, src, src.pair(open), item.end),
         ]),
-        None => parts.push(src.span(at, item.end - 1).to_owned()),
+        None => parts.push(render_tokens(scope, src, at, item.end)),
     }
     parts.join(" ")
 }
 
 /// The members inside the delimiter that opens at `open` whose attributes `enabled` accepts, or none when it accepts them all.
-fn configured(src: &Source, open: u32, enabled: &dyn Fn(&[Attr]) -> bool) -> Option<String> {
+fn configured(
+    src: &Source,
+    scope: Option<(&[(String, usize)], usize)>,
+    open: u32,
+    enabled: &dyn Fn(&[Attr]) -> bool,
+) -> Option<String> {
     let (mut kept, mut dropped) = (Vec::new(), false);
     for (from, to) in split_commas(src, open + 1, src.pair(open))
         .into_iter()
@@ -607,7 +722,11 @@ fn configured(src: &Source, open: u32, enabled: &dyn Fn(&[Attr]) -> bool) -> Opt
         let mut attrs = Vec::new();
         attr::attrs(src, from, false, &mut attrs).ok()?;
         if enabled(&attrs) {
-            kept.push(src.spelled((from, to)))
+            kept.push(if scope.is_some() {
+                render_tokens(scope, src, from, to)
+            } else {
+                src.spelled((from, to))
+            });
         } else {
             dropped = true
         }

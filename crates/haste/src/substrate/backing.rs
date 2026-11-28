@@ -1,7 +1,9 @@
 #[cfg(unix)]
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, Read as _, Write as _};
+#[cfg(not(unix))]
+use std::io::Read as _;
+use std::io::{self, Write as _};
 #[cfg(unix)]
 use std::os::fd::AsRawFd as _;
 #[cfg(unix)]
@@ -37,6 +39,29 @@ pub(crate) fn write_compressed(path: &Path, chunks: &[&[u8]]) -> Result<()> {
     .with_context(|| format!("writing {}", path.display()))
 }
 
+/// Atomically writes raw uncompressed `bytes` to `path`.
+pub(crate) fn write_raw(path: &Path, bytes: &[u8]) -> Result<()> {
+    crate::graph::store::write_new_bytes(path, bytes)
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+fn decompress_slice(bytes: &[u8], min_len: usize) -> Result<Box<[u8]>> {
+    let raw_len = usize::try_from(u64::from_le_bytes([
+        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+    ]))
+    .context("compressed backing size exceeds address space")?;
+    if raw_len < min_len {
+        bail!("backing file smaller than header");
+    }
+    let decoded = lz4_flex::block::decompress(&bytes[COMPRESSED_HEADER..], raw_len)
+        .map_err(|err| anyhow::anyhow!("decompress backing failed: {err}"))?;
+    if decoded.len() != raw_len {
+        bail!("decompressed backing length mismatch");
+    }
+    Ok(decoded.into_boxed_slice())
+}
+
+#[cfg(not(unix))]
 fn try_open_compressed(file: &mut File, len_u64: u64, min_len: usize) -> Result<Option<Box<[u8]>>> {
     if len_u64 < COMPRESSED_HEADER as u64 {
         return Ok(None);
@@ -46,23 +71,12 @@ fn try_open_compressed(file: &mut File, len_u64: u64, min_len: usize) -> Result<
     if hdr[..8] != COMPRESSED_MAGIC {
         return Ok(None);
     }
-    let raw_len = usize::try_from(u64::from_le_bytes([
-        hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13], hdr[14], hdr[15],
-    ]))
-    .context("compressed backing size exceeds address space")?;
-    if raw_len < min_len {
-        bail!("backing file smaller than header");
-    }
     let payload_len = usize::try_from(len_u64 - COMPRESSED_HEADER as u64)
         .context("compressed payload exceeds address space")?;
-    let mut payload = Vec::with_capacity(payload_len);
-    file.read_to_end(&mut payload)?;
-    let decoded = lz4_flex::block::decompress(&payload, raw_len)
-        .map_err(|err| anyhow::anyhow!("decompress backing failed: {err}"))?;
-    if decoded.len() != raw_len {
-        bail!("decompressed backing length mismatch");
-    }
-    Ok(Some(decoded.into_boxed_slice()))
+    let mut bytes = Vec::with_capacity(COMPRESSED_HEADER + payload_len);
+    bytes.extend_from_slice(&hdr);
+    file.read_to_end(&mut bytes)?;
+    Ok(Some(decompress_slice(&bytes, min_len)?))
 }
 
 #[cfg(unix)]
@@ -91,15 +105,12 @@ impl Drop for Backing {
 #[cfg(unix)]
 impl Backing {
     pub(crate) fn open(path: &Path, min_len: usize) -> Result<Self> {
-        let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+        let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
         let meta = file
             .metadata()
             .with_context(|| format!("stat {}", path.display()))?;
         let len_u64 = meta.len();
-        if let Some(decoded) = try_open_compressed(&mut file, len_u64, min_len)? {
-            return Ok(Backing::Owned(decoded));
-        }
-        if len_u64 < min_len as u64 {
+        if len_u64 < min_len.min(COMPRESSED_HEADER) as u64 {
             bail!("backing file smaller than header");
         }
         let len = usize::try_from(len_u64).context("backing file exceeds address space")?;
@@ -120,7 +131,15 @@ impl Backing {
         }
         let ptr =
             NonNull::new(raw.cast::<u8>()).ok_or_else(|| anyhow!("mmap returned null pointer"))?;
-        Ok(Backing::Mmap { ptr, len })
+        let backing = Backing::Mmap { ptr, len };
+        let slice = backing.as_slice();
+        if slice.len() >= COMPRESSED_HEADER && slice[..8] == COMPRESSED_MAGIC {
+            return Ok(Backing::Owned(decompress_slice(slice, min_len)?));
+        }
+        if len < min_len {
+            bail!("backing file smaller than header");
+        }
+        Ok(backing)
     }
 
     pub(crate) fn as_slice(&self) -> &[u8] {

@@ -1,3 +1,4 @@
+mod batch;
 mod decode;
 
 use std::sync::Arc;
@@ -11,18 +12,30 @@ use crate::outline::tree::{File, Macro, Textual};
 use crate::sema::impls::Index as ImplIndex;
 use crate::sema::summary::codec::{write_u32, write_u64};
 
-use super::impls::{build_sysroot_heads, write_impl_index};
+use super::impls::{build_module_heads, write_impl_index};
 use super::names::write_names_crate;
 use super::outline::write_outline_crate;
 use super::tokens::{
     u32_le, write_compact_tokens, write_frag, write_items, write_marks, write_opt_u32,
     write_origins, write_path, write_rules, write_str, write_usize,
 };
-use super::{CrateIdentity, SYSROOT_MAGIC, SYSROOT_VERSION, identity_of};
+use super::{CrateIdentity, EnvReads, identity_of};
 
-pub(super) use decode::decode_sysroot;
+pub(in crate::substrate) use batch::prepare_wire;
+pub(crate) use batch::{PreparedWire, decode_prepared_batch};
+pub(super) use decode::decode_snapshot;
+pub(in crate::substrate) use decode::{DecodeSpec, DecodedSnapshot};
 
-const FIXED_SYM_COUNT: u32 = 23;
+pub(super) const FIXED_SYM_COUNT: u32 = 23;
+
+pub(in crate::substrate) struct SnapshotSpec<'a> {
+    pub magic: [u8; 8],
+    pub version: u32,
+    pub key: u64,
+    pub cached_crates: &'a [usize],
+    pub ref_crates: &'a [usize],
+    pub env_reads: &'a [EnvReads],
+}
 
 pub(super) struct Tables<'a> {
     to_local: Vec<Option<u32>>,
@@ -134,26 +147,29 @@ fn write_chunked<T>(
     Some((ends, blob))
 }
 
-pub(super) fn encode_sysroot(
-    key: u64,
+pub(in super::super) fn encode_snapshot(
+    spec: &SnapshotSpec<'_>,
     workspace: &Workspace,
     compilation: &Compilation,
-    sysroot_crates: &[usize],
-) -> Option<(Vec<u8>, Arc<HashMap<u32, Arc<ImplIndex>>>)> {
+) -> Option<(Vec<u8>, HashMap<u32, Arc<ImplIndex>>)> {
+    if spec.ref_crates.get(..spec.cached_crates.len()) != Some(spec.cached_crates) {
+        return None;
+    }
     let mut tables = Tables::new(
         compilation.outline.crates.len(),
-        sysroot_crates,
+        spec.ref_crates,
         &compilation.names.symbols,
     );
-    let (crate_ends, crates_blob) = write_chunked(sysroot_crates, |buf, &krate| {
+    let (crate_ends, crates_blob) = write_chunked(spec.cached_crates, |buf, &krate| {
         write_outline_crate(buf, &compilation.outline.crates[krate], &mut tables)
     })?;
-    let (name_ends, names_blob) = write_chunked(sysroot_crates, |buf, &krate| {
+    let (name_ends, names_blob) = write_chunked(spec.cached_crates, |buf, &krate| {
         write_names_crate(buf, &compilation.names.crates[krate], &mut tables)
     })?;
-    let built_heads = build_sysroot_heads(compilation, sysroot_crates);
+    let built_heads = build_module_heads(compilation, spec.cached_crates);
     let (impl_ends, impls_blob) = write_chunked(
-        &sysroot_crates
+        &spec
+            .cached_crates
             .iter()
             .copied()
             .zip(built_heads.iter())
@@ -161,7 +177,7 @@ pub(super) fn encode_sysroot(
         |buf, &(krate, index)| write_impl_index(buf, index.as_ref(), krate as u32, &tables),
     )?;
     let mut heads_map = HashMap::default();
-    for (&krate, index) in sysroot_crates.iter().zip(built_heads) {
+    for (&krate, index) in spec.cached_crates.iter().zip(built_heads) {
         if let Some(index) = index {
             heads_map.insert(krate as u32, Arc::new(index));
         }
@@ -198,17 +214,19 @@ pub(super) fn encode_sysroot(
             + sym_blob_len
             + 65536,
     );
-    out.extend_from_slice(&SYSROOT_MAGIC);
-    write_u32(&mut out, SYSROOT_VERSION);
-    write_u32(&mut out, u32::try_from(sysroot_crates.len()).ok()?);
-    write_u64(&mut out, key);
+    out.extend_from_slice(&spec.magic);
+    write_u32(&mut out, spec.version);
+    write_u32(&mut out, u32::try_from(spec.cached_crates.len()).ok()?);
+    write_u32(&mut out, u32::try_from(spec.ref_crates.len()).ok()?);
+    write_u64(&mut out, spec.key);
     let len_at = out.len();
     write_u64(&mut out, 0);
 
-    for &krate in sysroot_crates {
+    for &krate in spec.ref_crates {
         let ident = identity_of(workspace, &compilation.outline, krate, &tables.to_local)?;
         write_identity(&mut out, &ident)?;
     }
+    write_env_reads_list(&mut out, spec.env_reads)?;
 
     write_usize(&mut out, tables.extra_syms.len())?;
     write_usize(&mut out, sym_blob_len)?;
@@ -257,10 +275,28 @@ pub(super) fn encode_sysroot(
         write_u32(&mut out, end);
     }
     out.extend_from_slice(&impls_blob);
-    out.extend_from_slice(&SYSROOT_MAGIC);
+    out.extend_from_slice(&spec.magic);
     let total_len = out.len() as u64;
     out[len_at..len_at + 8].copy_from_slice(&total_len.to_le_bytes());
-    Some((out, Arc::new(heads_map)))
+    Some((out, heads_map))
+}
+
+fn write_env_reads_list(out: &mut Vec<u8>, env_reads: &[EnvReads]) -> Option<()> {
+    write_usize(out, env_reads.len())?;
+    for reads in env_reads {
+        write_usize(out, reads.len())?;
+        for (name, value) in reads {
+            write_str(out, name)?;
+            match value {
+                Some(v) => {
+                    out.push(1);
+                    write_str(out, v)?;
+                }
+                None => out.push(0),
+            }
+        }
+    }
+    Some(())
 }
 
 fn write_identity(out: &mut Vec<u8>, ident: &CrateIdentity) -> Option<()> {

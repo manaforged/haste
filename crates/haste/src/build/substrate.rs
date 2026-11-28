@@ -2,16 +2,21 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
+use rustc_hash::FxHashSet as HashSet;
 
 use crate::graph;
 use crate::image::Image;
+use crate::names::ItemRef;
 use crate::outline;
 use crate::sema::{self, Cache};
 use crate::substrate::{
-    Substrate, SubstrateBuilder, deps_key, enabled, target_hash, toolchain_key, workspace_key,
+    Substrate, SubstrateBuilder, deps_key, enabled, local, target_hash, toolchain_key,
+    workspace_key,
 };
 
 use super::BatchKind;
+use super::batch::Batch;
+use super::test_args::{check_fn_items_in, check_target, checked_member_crates};
 
 pub(crate) struct SubstrateSlot {
     toolchain_key: u64,
@@ -327,4 +332,134 @@ pub(super) fn save_batch_substrate(
     {
         eprintln!("haste: cannot save substrate: {error:#}");
     }
+}
+
+pub(super) struct LocalCheckState {
+    hits: Vec<usize>,
+    dirty: Vec<local::DirtyCrate>,
+}
+
+fn check_crates(
+    workspace: &graph::Workspace,
+    outline: &outline::Outline,
+    is_main: bool,
+) -> Vec<usize> {
+    let target = check_target(workspace, outline, is_main);
+    let mut seen = vec![false; outline.crates.len()];
+    let mut stack = checked_member_crates(workspace, outline, target);
+    let mut out = Vec::new();
+    while let Some(k) = stack.pop() {
+        if std::mem::replace(&mut seen[k], true) || outline.is_fixed(k as u32) {
+            continue;
+        }
+        out.push(k);
+        for &(_, dep) in &outline.deps[k] {
+            if !outline.is_fixed(dep as u32) && outline.roots[dep].role == outline::Role::Lib {
+                stack.push(dep);
+            }
+        }
+    }
+    out
+}
+
+pub(super) fn load_local_check_crates(
+    workspace: &graph::Workspace,
+    compilation: &mut crate::macros::Compilation,
+    is_main: bool,
+) -> Result<()> {
+    super::load_members(workspace, compilation)?;
+    if !local::active() {
+        return Ok(());
+    }
+    let crates = check_crates(workspace, &compilation.outline, is_main);
+    let mut loaded_more = false;
+    for k in crates {
+        if compilation.outline.crates[k].partial() {
+            compilation.outline.load_crate(k)?;
+            loaded_more = true;
+        }
+    }
+    if loaded_more {
+        crate::macros::resolve(compilation)?;
+        let errors = compilation.outline.local_errors(workspace);
+        if !errors.is_empty() {
+            anyhow::bail!("{}", errors.join("\n"));
+        }
+    }
+    Ok(())
+}
+
+impl LocalCheckState {
+    pub(super) fn all_cached(&self) -> bool {
+        self.dirty.is_empty()
+    }
+
+    pub(super) fn dirty_cases(
+        &self,
+        outline: &outline::Outline,
+    ) -> (Vec<ItemRef>, Vec<sema::reach::Instance>) {
+        let dirty: Vec<(usize, Option<&[usize]>)> = self
+            .dirty
+            .iter()
+            .map(|entry| (entry.krate, entry.dirty_files.as_deref()))
+            .collect();
+        let items = check_fn_items_in(outline, &dirty);
+        let roots = items
+            .iter()
+            .map(|&item| (item, sema::substs::Substs::EMPTY))
+            .collect();
+        (items, roots)
+    }
+
+    pub(super) fn set_fixed(&self, outline: &mut outline::Outline, fixed: bool) {
+        for &k in &self.hits {
+            outline.crates[k].env.fixed = fixed;
+        }
+    }
+
+    pub(super) fn record_batch(&self, outline: &outline::Outline, batch: &Batch) {
+        if !batch.reached.unlaid.is_empty() || !batch.member_errors.is_empty() {
+            return;
+        }
+        let mut failed_crates = HashSet::default();
+        for ((item, _), res) in &batch.reached.list {
+            if res.is_err() {
+                failed_crates.insert(item.krate);
+            }
+        }
+        for &idx in batch.broken.keys() {
+            failed_crates.insert(batch.reached.list[idx].0.0.krate);
+        }
+        for &(item, _) in &batch.poly_failures {
+            failed_crates.insert(item.krate);
+        }
+        local::record(outline, &self.dirty, &failed_crates);
+    }
+}
+
+pub(super) fn prepare_local_check(
+    workspace: &graph::Workspace,
+    outline: &outline::Outline,
+    is_main: bool,
+    slot: Option<&SubstrateSlot>,
+) -> Option<LocalCheckState> {
+    if !local::active() {
+        return None;
+    }
+    let crates = check_crates(workspace, outline, is_main);
+    if crates.is_empty() {
+        return None;
+    }
+    let (tc_key, tgt_key) = match slot {
+        Some(s) => (s.toolchain_key, s.target_key),
+        None => {
+            let target = crate::host_target();
+            (toolchain_key(workspace, &target), target_hash(&target))
+        }
+    };
+    let part = local::partition(workspace, outline, &crates, (tc_key, tgt_key));
+    Some(LocalCheckState {
+        hits: part.hits,
+        dirty: part.dirty,
+    })
 }

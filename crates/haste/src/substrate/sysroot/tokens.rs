@@ -484,7 +484,7 @@ fn read_frag(cur: &mut Cursor<'_>) -> Result<Frag> {
     frag_from_tag(cur.u8()?)
 }
 
-pub(super) fn write_marks(
+pub(in crate::substrate) fn write_marks(
     out: &mut Vec<u8>,
     marks: &[(u32, Mark)],
     to_local: &[Option<u32>],
@@ -540,36 +540,70 @@ pub(super) fn write_marks(
     Some(())
 }
 
-pub(super) fn read_marks(cur: &mut Cursor<'_>, remap: &[u32]) -> Result<Vec<(u32, Mark)>> {
-    const CACHED_SCOPE_BIT: u32 = 1 << 31;
-    let map_scope = |s: u32| if s == 0 { 0 } else { s | CACHED_SCOPE_BIT };
+#[inline]
+fn read_varint_bytes(data: &[u8], pos: &mut usize) -> Result<u32> {
+    let b0 = *data.get(*pos).context("unexpected eof")?;
+    *pos += 1;
+    if b0 < 0x80 {
+        return Ok(u32::from(b0));
+    }
+    let mut val = u32::from(b0 & 0x7f);
+    let mut shift = 7u32;
+    loop {
+        let byte = *data.get(*pos).context("unexpected eof")?;
+        *pos += 1;
+        val |= u32::from(byte & 0x7f) << shift;
+        if byte < 0x80 {
+            return Ok(val);
+        }
+        shift += 7;
+        if shift >= 35 {
+            bail!("varint overflow");
+        }
+    }
+}
+
+pub(in crate::substrate) fn read_marks(
+    cur: &mut Cursor<'_>,
+    remap: &[u32],
+    scope_bit: u32,
+) -> Result<Vec<(u32, Mark)>> {
+    const SCOPE_BITS_MASK: u32 = (1 << 31) | (1 << 30) | (1 << 29);
+    let map_scope = |s: u32| {
+        if s == 0 || (s & SCOPE_BITS_MASK) != 0 {
+            s
+        } else {
+            s | scope_bit
+        }
+    };
     let count = cur.count()?;
     let byte_len = cur.count()?;
     let data = cur.take(byte_len)?;
-    let mut sub = Cursor::new(data);
+    let mut pos = 0usize;
     let mut marks = Vec::with_capacity(count);
     let mut prev_at = 0u32;
     let mut prev_mark: Option<Mark> = None;
     for _ in 0..count {
-        let tag = sub.u8()?;
-        let at = prev_at.wrapping_add(read_varint(&mut sub)?);
+        let tag = *data.get(pos).context("unexpected eof")?;
+        pos += 1;
+        let at = prev_at.wrapping_add(read_varint_bytes(data, &mut pos)?);
         let mark = match tag {
             3 => prev_mark.context("repeat mark without previous mark")?,
             0 => Mark::Crate(
                 *remap
-                    .get(read_varint(&mut sub)? as usize)
+                    .get(read_varint_bytes(data, &mut pos)? as usize)
                     .context("mark crate out of bounds")?,
             ),
             1 => Mark::Home {
                 krate: *remap
-                    .get(read_varint(&mut sub)? as usize)
+                    .get(read_varint_bytes(data, &mut pos)? as usize)
                     .context("mark home crate out of bounds")?,
-                file: read_varint(&mut sub)?,
-                item: read_varint(&mut sub)?,
+                file: read_varint_bytes(data, &mut pos)?,
+                item: read_varint_bytes(data, &mut pos)?,
             },
             2 => Mark::Scope {
-                id: map_scope(read_varint(&mut sub)?),
-                parent: map_scope(read_varint(&mut sub)?),
+                id: map_scope(read_varint_bytes(data, &mut pos)?),
+                parent: map_scope(read_varint_bytes(data, &mut pos)?),
             },
             _ => bail!("invalid mark tag"),
         };
@@ -577,7 +611,7 @@ pub(super) fn read_marks(cur: &mut Cursor<'_>, remap: &[u32]) -> Result<Vec<(u32
         prev_mark = Some(mark);
         marks.push((at, mark));
     }
-    if sub.pos != data.len() {
+    if pos != data.len() {
         bail!("trailing bytes in sysroot marks");
     }
     Ok(marks)

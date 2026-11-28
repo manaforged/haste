@@ -278,6 +278,7 @@ pub struct Crate {
     pub consumed: rustc_hash::FxHashSet<(u32, u32)>,
     pub macro_use: Vec<usize>,
     pub expansions: usize,
+    pub cached_included: Option<Vec<(PathBuf, PathBuf)>>,
 }
 
 /// What a loader of another crate sees of one crate: its exported macros and whether it may still export more.

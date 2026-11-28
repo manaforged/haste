@@ -22,7 +22,9 @@ mod watch;
 use batch::{Batch, BatchKind};
 use substrate::{cache_with_substrate, save_jit_substrate};
 use test_args::map_tests;
-use watch::{Stamp, Watch, body_edits, edits, paths, pre_stamps, stamps};
+use watch::{
+    Stamp, Watch, body_edits, edits, paths, pre_stamps, stamps, stamps_with_pre, stamps_with_seen,
+};
 
 /// A loaded workspace kept between requests: its compilation, the `case_` functions and the binary's reach once a request needs them, and the binary once a request runs it.
 pub struct Build {
@@ -170,12 +172,7 @@ impl Build {
         let outline_clock = sema::census::Clock::now();
         let pre = pre_stamps(workspace);
         let compilation = crate::macros::load_lazy(workspace, targets)?;
-        let mut stamps = stamps(workspace, &compilation.outline);
-        for watch in &mut stamps {
-            if let Some(&old) = pre.get(&watch.path) {
-                watch.stamp = old;
-            }
-        }
+        let stamps = stamps_with_pre(workspace, &compilation.outline, &pre);
         let outline_span = outline_clock.elapsed();
         Ok(Build {
             compilation,
@@ -400,12 +397,7 @@ impl Build {
             .iter()
             .map(|watch| (watch.path.clone(), watch.stamp))
             .collect();
-        self.stamps = stamps(workspace, &self.compilation.outline);
-        for watch in &mut self.stamps {
-            if let Some(&stamp) = seen.get(&watch.path) {
-                watch.stamp = stamp;
-            }
-        }
+        self.stamps = stamps_with_seen(workspace, &self.compilation.outline, &seen);
         let compilation = &self.compilation;
         [&mut self.cases, &mut self.binary]
             .into_iter()

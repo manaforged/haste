@@ -13,12 +13,12 @@ use crate::sema::{Cache, Context};
 use super::tokens::{read_u32s_map, write_usize};
 use super::wire::Tables;
 
-pub(super) fn build_sysroot_heads(
+pub(super) fn build_module_heads(
     compilation: &Compilation,
-    sysroot_crates: &[usize],
+    crates: &[usize],
 ) -> Vec<Option<Index>> {
     let mut cx = Context::new(&compilation.outline, &compilation.names, Cache::default());
-    sysroot_crates
+    crates
         .iter()
         .map(|&krate| {
             let index = cx.index_module_impls(krate as u32);

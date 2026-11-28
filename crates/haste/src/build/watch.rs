@@ -17,8 +17,34 @@ pub(super) struct Watch {
     pub(super) by: Option<PathBuf>,
 }
 
-/// The source files of every crate whose package is local, which an edit can change, the files `include!` read into them, and the files their `include_str!` and `include_bytes!` calls read.
-pub(super) fn stamps(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<Watch> {
+fn collect_included(local: &[usize], outline: &outline::Outline) -> Vec<(PathBuf, PathBuf)> {
+    let mut out = Vec::new();
+    let mut uncached = Vec::new();
+    for &krate in local {
+        if let Some(cached) = &outline.crates[krate].cached_included {
+            out.extend(cached.iter().cloned());
+        } else {
+            uncached.push(krate);
+        }
+    }
+    if uncached.len() > 1 && crate::jobs() > 1 {
+        for chunk in crate::sync::parallel_map(uncached, |krate| outline.included(krate)) {
+            out.extend(chunk);
+        }
+    } else {
+        for krate in uncached {
+            out.extend(outline.included(krate));
+        }
+    }
+    out
+}
+
+fn build_stamps(
+    workspace: &graph::Workspace,
+    outline: &outline::Outline,
+    reuse: Option<&HashMap<PathBuf, Stamp>>,
+    extra_sources: Vec<PathBuf>,
+) -> Vec<Watch> {
     let local: Vec<usize> = (0..outline.roots.len())
         .filter(|&krate| outline.package(workspace, krate).local())
         .collect();
@@ -30,24 +56,73 @@ pub(super) fn stamps(workspace: &graph::Workspace, outline: &outline::Outline) -
                 .iter()
                 .map(|file| file.source.path.clone())
         })
-        .chain(local_source_paths(workspace))
+        .chain(extra_sources)
         .collect();
     sources.sort();
     sources.dedup();
-    let included = local
-        .iter()
-        .flat_map(|&krate| outline.included(krate))
-        .map(|(path, by)| (path, Some(by)));
-    sources
+    let included = collect_included(&local, outline);
+    let mut pending = Vec::with_capacity(sources.len() + included.len());
+    let mut missing = Vec::new();
+    for (path, by) in sources
         .into_iter()
         .map(|path| (path, None))
-        .chain(included)
-        .map(|(path, by)| Watch {
-            stamp: stamp(&path),
-            path,
-            by,
-        })
-        .collect()
+        .chain(included.into_iter().map(|(path, by)| (path, Some(by))))
+    {
+        if let Some(&cached) = reuse.and_then(|map| map.get(&path)) {
+            pending.push(Some(Watch {
+                path,
+                stamp: cached,
+                by,
+            }));
+        } else {
+            let slot = pending.len();
+            pending.push(None);
+            missing.push((slot, path, by));
+        }
+    }
+    if missing.len() >= 64 && crate::jobs() > 1 {
+        let computed = crate::sync::parallel_map(missing, |(slot, path, by)| {
+            let s = stamp(&path);
+            (slot, Watch { path, stamp: s, by })
+        });
+        for (slot, watch) in computed {
+            pending[slot] = Some(watch);
+        }
+    } else {
+        for (slot, path, by) in missing {
+            let s = stamp(&path);
+            pending[slot] = Some(Watch { path, stamp: s, by });
+        }
+    }
+    pending.into_iter().flatten().collect()
+}
+
+/// The source files of every crate whose package is local, which an edit can change, the files `include!` read into them, and the files their `include_str!` and `include_bytes!` calls read.
+pub(super) fn stamps(workspace: &graph::Workspace, outline: &outline::Outline) -> Vec<Watch> {
+    build_stamps(workspace, outline, None, local_source_paths(workspace))
+}
+
+/// Like [`stamps`], reusing paths and stamps already gathered by [`pre_stamps`].
+pub(super) fn stamps_with_pre(
+    workspace: &graph::Workspace,
+    outline: &outline::Outline,
+    pre: &HashMap<PathBuf, Stamp>,
+) -> Vec<Watch> {
+    build_stamps(workspace, outline, Some(pre), pre.keys().cloned().collect())
+}
+
+/// Like [`stamps`], reusing existing stamps from `seen` for unchanged paths across reloads.
+pub(super) fn stamps_with_seen(
+    workspace: &graph::Workspace,
+    outline: &outline::Outline,
+    seen: &HashMap<PathBuf, Stamp>,
+) -> Vec<Watch> {
+    build_stamps(
+        workspace,
+        outline,
+        Some(seen),
+        local_source_paths(workspace),
+    )
 }
 
 /// The path of each file of `stamps`.
@@ -96,13 +171,22 @@ fn local_source_paths(workspace: &graph::Workspace) -> Vec<PathBuf> {
 }
 
 pub(super) fn pre_stamps(workspace: &graph::Workspace) -> HashMap<PathBuf, Stamp> {
-    local_source_paths(workspace)
-        .into_iter()
-        .map(|path| {
-            let s = stamp(&path);
-            (path, s)
-        })
-        .collect()
+    let paths = local_source_paths(workspace);
+    if paths.len() < 64 || crate::jobs() <= 1 {
+        return paths
+            .into_iter()
+            .map(|path| {
+                let s = stamp(&path);
+                (path, s)
+            })
+            .collect();
+    }
+    crate::sync::parallel_map(paths, |path| {
+        let s = stamp(&path);
+        (path, s)
+    })
+    .into_iter()
+    .collect()
 }
 
 fn collect_edits(

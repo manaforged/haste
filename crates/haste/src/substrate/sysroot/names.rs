@@ -11,7 +11,36 @@ use super::tokens::{
     read_str, read_u32s_map, read_vis, u32_le, vis_from_tag, vis_tag, write_opt_u32, write_str,
     write_usize, write_vis,
 };
-use super::wire::{Tables, opt_u32_le};
+use super::wire::{FIXED_SYM_COUNT, Tables, opt_u32_le};
+
+#[inline]
+fn map_sym(raw: u32, sym_remap: &[Sym]) -> Result<Sym> {
+    if sym_remap.is_empty() || raw < FIXED_SYM_COUNT {
+        Ok(Sym(raw))
+    } else {
+        sym_remap
+            .get((raw - FIXED_SYM_COUNT) as usize)
+            .copied()
+            .context("symbol id out of bounds")
+    }
+}
+
+fn read_syms(cur: &mut Cursor<'_>, sym_remap: &[Sym]) -> Result<Box<[Sym]>> {
+    let count = cur.count()?;
+    let byte_len = count.checked_mul(4).context("u32 slice overflow")?;
+    let bytes = cur.take(byte_len)?;
+    let mut out = Vec::with_capacity(count);
+    if sym_remap.is_empty() {
+        for c in bytes.chunks_exact(4) {
+            out.push(Sym(u32_le(c, 0)));
+        }
+    } else {
+        for c in bytes.chunks_exact(4) {
+            out.push(map_sym(u32_le(c, 0), sym_remap)?);
+        }
+    }
+    Ok(out.into_boxed_slice())
+}
 
 const ORIGIN_KINDS: [Origin; 3] = [Origin::Item, Origin::Import, Origin::Glob];
 const DEF_BYTES: [usize; 4] = [8, 12, 16, 1];
@@ -263,13 +292,13 @@ pub(super) fn write_names_crate(
     Some(())
 }
 
-fn decode_scope(slice: &[u8], remap: &[u32]) -> Result<Scope> {
+fn decode_scope(slice: &[u8], remap: &[u32], sym_remap: &[Sym]) -> Result<Scope> {
     let mut reader = SliceReader::new(slice);
     let name_len = reader.u32()? as usize;
     let mut names = HashMap::with_capacity_and_hasher(name_len, Default::default());
     for _ in 0..name_len {
         let b = reader.take(5)?;
-        let sym = Sym(u32_le(b, 0));
+        let sym = map_sym(u32_le(b, 0), sym_remap)?;
         let mask = b[4];
         let types = if mask & 1 != 0 {
             Some(read_binding(&mut reader, remap)?)
@@ -304,37 +333,48 @@ fn decode_scope(slice: &[u8], remap: &[u32]) -> Result<Scope> {
     })
 }
 
-fn read_scopes(cur: &mut Cursor<'_>, remap: &[u32]) -> Result<Vec<Scope>> {
+fn read_scopes(
+    cur: &mut Cursor<'_>,
+    remap: &[u32],
+    sym_remap: &[Sym],
+    parallel: bool,
+) -> Result<Vec<Scope>> {
     let scope_len = cur.count()?;
     let end_bytes = cur.take(scope_len.checked_mul(4).context("scope table overflow")?)?;
-    let mut ranges = Vec::with_capacity(scope_len);
-    let mut prev = 0usize;
-    for c in end_bytes.chunks_exact(4) {
-        let end = u32_le(c, 0) as usize;
-        if end < prev {
-            bail!("non-monotonic sysroot scope offset");
-        }
-        ranges.push((prev, end));
-        prev = end;
-    }
     let scope_byte_len = cur.count()?;
-    if prev != scope_byte_len {
-        bail!("sysroot scope table length mismatch");
-    }
     let scope_bytes = cur.take(scope_byte_len)?;
-    if scope_len >= 64 && scope_byte_len >= 64 * 1024 && crate::jobs() > 1 {
-        let slices: Vec<&[u8]> = ranges
-            .into_iter()
-            .map(|(s, e)| &scope_bytes[s..e])
-            .collect();
-        crate::sync::parallel_map(slices, |s| decode_scope(s, remap))
+    if parallel && scope_len >= 16 && scope_byte_len >= 8 * 1024 && crate::jobs() > 1 {
+        let mut slices = Vec::with_capacity(scope_len);
+        let mut prev = 0usize;
+        for c in end_bytes.chunks_exact(4) {
+            let end = u32_le(c, 0) as usize;
+            if end < prev || end > scope_byte_len {
+                bail!("non-monotonic sysroot scope offset");
+            }
+            slices.push(&scope_bytes[prev..end]);
+            prev = end;
+        }
+        if prev != scope_byte_len {
+            bail!("sysroot scope table length mismatch");
+        }
+        crate::sync::parallel_map(slices, |s| decode_scope(s, remap, sym_remap))
             .into_iter()
             .collect::<Result<Vec<_>>>()
     } else {
-        ranges
-            .into_iter()
-            .map(|(s, e)| decode_scope(&scope_bytes[s..e], remap))
-            .collect::<Result<Vec<_>>>()
+        let mut scopes = Vec::with_capacity(scope_len);
+        let mut prev = 0usize;
+        for c in end_bytes.chunks_exact(4) {
+            let end = u32_le(c, 0) as usize;
+            if end < prev || end > scope_byte_len {
+                bail!("non-monotonic sysroot scope offset");
+            }
+            scopes.push(decode_scope(&scope_bytes[prev..end], remap, sym_remap)?);
+            prev = end;
+        }
+        if prev != scope_byte_len {
+            bail!("sysroot scope table length mismatch");
+        }
+        Ok(scopes)
     }
 }
 
@@ -364,21 +404,21 @@ fn read_unresolved(cur: &mut Cursor<'_>) -> Result<Vec<Unresolved>> {
         .collect())
 }
 
-fn read_externs(cur: &mut Cursor<'_>, remap: &[u32]) -> Result<Vec<(Sym, Def)>> {
+fn read_externs(cur: &mut Cursor<'_>, remap: &[u32], sym_remap: &[Sym]) -> Result<Vec<(Sym, Def)>> {
     let ext_len = cur.count()?;
     let mut externs = Vec::with_capacity(ext_len);
     for _ in 0..ext_len {
-        externs.push((Sym(cur.u32()?), read_def(cur, remap)?));
+        externs.push((map_sym(cur.u32()?, sym_remap)?, read_def(cur, remap)?));
     }
     Ok(externs)
 }
 
-fn read_deps(cur: &mut Cursor<'_>, remap: &[u32]) -> Result<Vec<(Sym, usize)>> {
+fn read_deps(cur: &mut Cursor<'_>, remap: &[u32], sym_remap: &[Sym]) -> Result<Vec<(Sym, usize)>> {
     let dep_len = cur.count()?;
     let dep_bytes = cur.take(dep_len.checked_mul(8).context("names deps overflow")?)?;
     let mut deps = Vec::with_capacity(dep_len);
     for c in dep_bytes.chunks_exact(8) {
-        let sym = Sym(u32_le(c, 0));
+        let sym = map_sym(u32_le(c, 0), sym_remap)?;
         let dep = *remap
             .get(u32_le(c, 4) as usize)
             .context("names dep crate out of bounds")? as usize;
@@ -387,7 +427,7 @@ fn read_deps(cur: &mut Cursor<'_>, remap: &[u32]) -> Result<Vec<(Sym, usize)>> {
     Ok(deps)
 }
 
-fn read_pending(cur: &mut Cursor<'_>, remap: &[u32]) -> Result<Vec<Pending>> {
+fn read_pending(cur: &mut Cursor<'_>, remap: &[u32], sym_remap: &[Sym]) -> Result<Vec<Pending>> {
     let pend_len = cur.count()?;
     let mut pending = Vec::with_capacity(pend_len);
     for _ in 0..pend_len {
@@ -403,8 +443,10 @@ fn read_pending(cur: &mut Cursor<'_>, remap: &[u32]) -> Result<Vec<Pending>> {
             ),
             None => None,
         };
-        let name = opt_u32_le(b, 16).map(Sym);
-        let segments = read_u32s_map(cur, Sym)?.into_boxed_slice();
+        let name = opt_u32_le(b, 16)
+            .map(|id| map_sym(id, sym_remap))
+            .transpose()?;
+        let segments = read_syms(cur, sym_remap)?;
         let absolute = cur.u8()? != 0;
         let vis = read_vis(cur)?;
         let stamp = if cur.u8()? != 0 {
@@ -430,29 +472,34 @@ fn read_pending(cur: &mut Cursor<'_>, remap: &[u32]) -> Result<Vec<Pending>> {
     Ok(pending)
 }
 
-fn read_enums(cur: &mut Cursor<'_>) -> Result<HashMap<(u32, u32), Box<[Sym]>>> {
+fn read_enums(cur: &mut Cursor<'_>, sym_remap: &[Sym]) -> Result<HashMap<(u32, u32), Box<[Sym]>>> {
     let enum_len = cur.count()?;
     let mut enums = HashMap::with_capacity_and_hasher(enum_len, Default::default());
     for _ in 0..enum_len {
         let b = cur.take(8)?;
         let key = (u32_le(b, 0), u32_le(b, 4));
-        let variants = read_u32s_map(cur, Sym)?.into_boxed_slice();
+        let variants = read_syms(cur, sym_remap)?;
         enums.insert(key, variants);
     }
     Ok(enums)
 }
 
-pub(super) fn read_names_crate(cur: &mut Cursor<'_>, remap: &[u32]) -> Result<NamesCrate> {
-    let scopes = read_scopes(cur, remap)?;
+pub(super) fn read_names_crate(
+    cur: &mut Cursor<'_>,
+    remap: &[u32],
+    sym_remap: &[Sym],
+    parallel_scopes: bool,
+) -> Result<NamesCrate> {
+    let scopes = read_scopes(cur, remap, sym_remap, parallel_scopes)?;
     let prelude = read_prelude(cur, remap)?;
     let unresolved = read_unresolved(cur)?;
-    let externs = read_externs(cur, remap)?;
-    let deps = read_deps(cur, remap)?;
+    let externs = read_externs(cur, remap, sym_remap)?;
+    let deps = read_deps(cur, remap, sym_remap)?;
     let edition_2015 = cur.u8()? != 0;
     let edition = read_str(cur)?.to_owned();
     let collected = read_u32s_map(cur, |v| (v != u32::MAX).then_some(v as usize))?;
-    let pending = read_pending(cur, remap)?;
-    let enums = read_enums(cur)?;
+    let pending = read_pending(cur, remap, sym_remap)?;
+    let enums = read_enums(cur, sym_remap)?;
     let eager = cur.u8()? != 0;
     let mut out = NamesCrate::default();
     out.scopes = scopes;
