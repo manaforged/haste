@@ -277,6 +277,7 @@ fn inline_template_bundle_round_trip_and_invalidation() {
         Some(&template),
         &plan,
         &relocs,
+        None,
     );
     inl.record(
         (&mut cx, &reached),
@@ -287,6 +288,7 @@ fn inline_template_bundle_round_trip_and_invalidation() {
         None,
         &RelocPlan::default(),
         &[],
+        None,
     );
     let (flushed, _) = inl.flush(
         &state,
@@ -533,6 +535,7 @@ fn inline_cache_invalidates_when_slot_callee_may_unwind_flips() {
         Some(&template),
         &plan,
         &[],
+        None,
     );
     inl.record(
         (&mut cx, &reached),
@@ -543,6 +546,7 @@ fn inline_cache_invalidates_when_slot_callee_may_unwind_flips() {
         Some(&template),
         &plan,
         &relocs,
+        None,
     );
     let (flushed, _) = inl.flush(
         &state,
@@ -618,6 +622,7 @@ fn inline_cache_invalidates_when_slot_callee_may_unwind_flips() {
         None,
         &RelocPlan::default(),
         &[],
+        None,
     );
     let (carried_flushed, _) = carry_inl.flush(
         &state,

@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -9,8 +9,16 @@ pub(crate) enum StaticInit {
     Poisoned = 3,
 }
 
+pub(crate) const fn static_flag_offset(size: u32) -> u32 {
+    (size + 7) & !7
+}
+
+pub(crate) const fn static_cell_size(size: u32) -> u32 {
+    static_flag_offset(size) + 8
+}
+
 struct FillGuard<'a> {
-    state: &'a AtomicU8,
+    state: &'a AtomicU64,
     flag: usize,
     done: bool,
 }
@@ -20,7 +28,7 @@ impl Drop for FillGuard<'_> {
         thread_state().filling.retain(|&at| at != self.flag);
         if !self.done {
             self.state
-                .store(StaticInit::Poisoned as u8, Ordering::Release);
+                .store(StaticInit::Poisoned as u64, Ordering::Release);
         }
     }
 }
@@ -98,12 +106,12 @@ fn thread_state() -> &'static mut ThreadState {
 
 /// Runs the initializer at `code` of the static whose state byte is at `flag`, unless another call filled it.
 pub(crate) extern "C" fn fill_once(flag: usize, code: usize) {
-    // SAFETY: flag is the state byte after a static's value in a cell that lives as long as the program.
-    let state = unsafe { &*(flag as *const AtomicU8) };
+    // SAFETY: flag is the 8-byte aligned state word after a static's value in a cell that lives as long as the program.
+    let state = unsafe { &*(flag as *const AtomicU64) };
     loop {
         match state.compare_exchange(
-            StaticInit::Empty as u8,
-            StaticInit::Filling as u8,
+            StaticInit::Empty as u64,
+            StaticInit::Filling as u64,
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
@@ -119,11 +127,11 @@ pub(crate) extern "C" fn fill_once(flag: usize, code: usize) {
                     unsafe { std::mem::transmute::<usize, extern "C" fn()>(code) };
                 fill();
                 guard.done = true;
-                state.store(StaticInit::Filled as u8, Ordering::Release);
+                state.store(StaticInit::Filled as u64, Ordering::Release);
                 return;
             }
-            Err(v) if v == StaticInit::Filled as u8 => return,
-            Err(v) if v == StaticInit::Poisoned as u8 => panic!("static initializer panicked"),
+            Err(v) if v == StaticInit::Filled as u64 => return,
+            Err(v) if v == StaticInit::Poisoned as u64 => panic!("static initializer panicked"),
             Err(_) if thread_state().filling.contains(&flag) => return,
             Err(_) => std::thread::yield_now(),
         }

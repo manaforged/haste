@@ -9,6 +9,7 @@ pub(crate) struct PatchCtx<'a> {
     pub(crate) text_base: usize,
     pub(crate) text_va: u64,
     pub(crate) pie_arm64: bool,
+    pub(crate) pie_x64: bool,
     pub(crate) addrs: SectionAddrs,
     pub(crate) base_va: u64,
     pub(crate) shim_offs: &'a [usize],
@@ -179,6 +180,7 @@ fn reloc_span(kind: RelocKind, offset: u32) -> (usize, usize) {
 struct PatchEnv<'a> {
     text_va: u64,
     pie_arm64: bool,
+    pie_x64: bool,
     addrs: SectionAddrs,
     base_va: u64,
     shim_offs: &'a [usize],
@@ -216,17 +218,20 @@ impl<'a> PatchEnv<'a> {
         Ok(())
     }
 
-    fn patch_abs64_got(&self, reloc: &CodeReloc, at: usize, out: &mut [u8]) -> Result<bool> {
-        let (load_got, slot) = self.resolve(&reloc.symbol, self.got_vas)?;
-        if !load_got {
+    fn patch_abs64_rip(&self, reloc: &CodeReloc, at: usize, out: &mut [u8]) -> Result<bool> {
+        if matches!(reloc.symbol, Symbol::Word(_)) {
+            return Ok(false);
+        }
+        let (load_got, target) = self.resolve(&reloc.symbol, self.got_vas)?;
+        if !load_got && !self.pie_x64 {
             return Ok(false);
         }
         let next_ip = self.text_va + u64::from(reloc.offset) + 5;
-        let delta = i32::try_from(slot as i64 - next_ip as i64)
-            .context("Abs64 import GOT slot out of range")?;
+        let delta = i32::try_from(target as i64 - next_ip as i64)
+            .context("Abs64 RIP-relative target out of range")?;
         let reg = out[at - 1] & 7;
         out[at - 2] = 0x48 | ((out[at - 2] & 1) << 2);
-        out[at - 1] = 0x8B;
+        out[at - 1] = if load_got { 0x8B } else { 0x8D };
         out[at] = 0x05 | (reg << 3);
         out[at + 1..at + 5].copy_from_slice(&delta.to_le_bytes());
         out[at + 5..at + 8].copy_from_slice(&[0x0F, 0x1F, 0x00]);
@@ -272,7 +277,7 @@ impl<'a> PatchEnv<'a> {
             && at >= 2
             && out[at - 2] & 0xF8 == 0x48
             && out[at - 1] & 0xF8 == 0xB8
-            && self.patch_abs64_got(reloc, at, out)?
+            && self.patch_abs64_rip(reloc, at, out)?
         {
             return Ok(());
         }
@@ -355,6 +360,7 @@ pub(crate) fn patch_code(relocs: &[CodeReloc], ctx: &PatchCtx<'_>, out: &mut [u8
     let env = PatchEnv {
         text_va: ctx.text_va,
         pie_arm64: ctx.pie_arm64,
+        pie_x64: ctx.pie_x64,
         addrs: ctx.addrs,
         base_va: ctx.base_va,
         shim_offs: ctx.shim_offs,

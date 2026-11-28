@@ -162,7 +162,10 @@ impl Image {
                             .quietly(cx, |cx| lower::lower_stencil(cx, reached, self, index).ok())
                             .and_then(|out| {
                                 Some((
-                                    haste_codegen::compile(
+                                    super::super::stencil::compile_traced(
+                                        cx,
+                                        reached,
+                                        index,
                                         out.func,
                                         &self.compile_target_for(cx, item),
                                     )
@@ -262,7 +265,10 @@ impl Image {
         }
         Ok((
             (
-                Arc::new(haste_codegen::compile(
+                Arc::new(super::super::stencil::compile_traced(
+                    cx,
+                    reached,
+                    index,
                     out.func,
                     &self.compile_target_for(cx, reached.list[index].0.0),
                 )?),

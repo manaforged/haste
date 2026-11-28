@@ -13,7 +13,9 @@ keywords.workspace = true
 categories.workspace = true
 
 [features]
-default = []
+default = ["jemalloc", "x86-host-shims"]
+jemalloc = ["dep:tikv-jemallocator"]
+x86-host-shims = []
 diff-harness = []
 
 [dependencies]
@@ -30,7 +32,7 @@ rustc_index = { package = "ra-ap-rustc_index", version = "0.184", default-featur
 rustc_lexer = { package = "ra-ap-rustc_lexer", version = "0.180", default-features = false }
 
 [target.'cfg(any(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"), target_os = "macos"))'.dependencies]
-tikv-jemallocator = "=0.7.0"
+tikv-jemallocator = { version = "=0.7.0", optional = true }
 
 [lints]
 workspace = true

@@ -353,7 +353,7 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
     let (libs, ordinals, two_level) = plan.macho_libs(&exe.extra_libs);
 
     let tls = if arch == Arch::Arm64 {
-        TlsLayout::compute(&plan, exe.thread_slots)
+        TlsLayout::compute(&plan, exe.thread_slots, true)
     } else {
         TlsLayout::default()
     };
@@ -703,6 +703,7 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
         text_base: text_off,
         text_va: addrs.text,
         pie_arm64: arch == Arch::Arm64,
+        pie_x64: false,
         addrs,
         base_va: MACH_BASE,
         shim_offs: &shim_offs,

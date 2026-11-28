@@ -18,14 +18,14 @@ pub(super) struct TlsLayout {
 }
 
 impl TlsLayout {
-    pub(super) fn compute(plan: &Plan<'_>, thread_slots: u32) -> Self {
+    pub(super) fn compute(plan: &Plan<'_>, thread_slots: u32, alloc_cache: bool) -> Self {
         let mut cursor = 0_u64;
         let unwind_off = cursor;
         if plan.has_unwind() {
             cursor += UNWIND_STATE_BYTES;
         }
         let frame_off = cursor;
-        if plan.has_frame_cache() {
+        if plan.has_frame_cache() || (alloc_cache && plan.has_alloc_cache()) {
             cursor += FRAME_CACHE_BYTES;
         }
         let cells_off = cursor;

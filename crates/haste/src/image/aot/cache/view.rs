@@ -38,6 +38,17 @@ impl BundleView {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn empty() -> Self {
+        Self {
+            backing: None,
+            header: LoadedHeader::empty(),
+            tables: OnceLock::new(),
+            rodatas: Box::new([]),
+            vtables: Box::new([]),
+        }
+    }
+
     pub(super) fn has_backing(&self) -> bool {
         self.backing.is_some()
     }

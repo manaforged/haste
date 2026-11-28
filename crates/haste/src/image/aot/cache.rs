@@ -1,18 +1,19 @@
 mod codec;
+mod config;
 mod inline;
 mod plan;
 mod relocs;
 mod stamps;
 mod tables;
+mod toolchain;
 mod view;
 
-use std::hash::{Hash as _, Hasher as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use rustc_hash::{FxHashMap as HashMap, FxHasher};
+use rustc_hash::FxHashMap as HashMap;
 
 use crate::graph::store::home;
 use crate::image::Image;
@@ -20,9 +21,7 @@ use crate::image::aot::{AotCode, AotFn, AotState};
 use crate::image::stencil::DictConfig;
 use crate::lower::stencil::InlineTemplate;
 use crate::lower::{FootprintId, RelocPlan, Slots, SymbolSource};
-use crate::names::ItemRef;
 use crate::outline::Outline;
-use crate::outline::tree::Profile;
 use crate::sema::Context;
 use crate::sema::reach::Reached;
 use crate::sema::summary::codec::Cursor;
@@ -30,27 +29,36 @@ use crate::sema::ty::Ty;
 use crate::substrate::{Backing, target_hash};
 use crate::sync::lock;
 
-use codec::{
-    CacheInstanceKey, LoadedHeader, Stamps, decode_code_blob, find_record, hash_entry_128,
-    parse_bundle_header, prune_stale_bundles, read_u32_le, read_u64_le, stable_entry_item_key,
-    stable_substs_hash, touched_stamps_digest, write_bundle,
-};
+#[cfg(test)]
+use crate::names::ItemRef;
+use codec::{CacheInstanceKey, LoadedHeader, decode_code_blob, parse_bundle_header, write_bundle};
+pub(crate) use codec::{find_record, prune_stale_bundles, read_u32_le, read_u64_le};
+use config::AotConfigKey;
 pub(crate) use inline::InlineCacheHit;
 use inline::{InlCache, inline_bundle_path};
 #[cfg(test)]
 use relocs::stable_file_key;
-use relocs::{LocalFileIndex, collect_inlined_local_files, hash_str, relocs_unwind_digest};
+pub(crate) use relocs::{LocalFileIndex, hash_str};
+use relocs::{TransitiveLocalFiles, collect_inlined_local_files_cached, relocs_unwind_digest};
+#[cfg(test)]
+use rustc_hash::FxHasher;
+pub(crate) use stamps::{
+    Stamps, hash_entry_128, stable_entry_item_key, stable_substs_hash, touched_stamps_digest,
+};
 use stamps::{compute_bundle_key, resolve_aot_fn, should_skip_aot_flush};
+#[cfg(test)]
+use std::hash::{Hash as _, Hasher as _};
 use tables::{BundleEncoder, SharedTables, decode_symbol_list, read_code_span};
+use toolchain::ToolchainAotLayer;
 use view::BundleView;
 
 const CACHE_MAGIC: [u8; 8] = *b"HSTAOT03";
-const CACHE_VERSION: u32 = 4;
+const CACHE_VERSION: u32 = 6;
 const HEADER_LEN: usize = 112;
 const RECORD_LEN: usize = 24;
 const MAX_BUNDLES: usize = 16;
 
-pub(in crate::image) fn enabled() -> bool {
+pub(crate) fn enabled() -> bool {
     !crate::env_flag("HASTE_NO_AOT_CACHE") && !crate::image::verify_stencil()
 }
 
@@ -65,67 +73,6 @@ fn cache_dir() -> PathBuf {
 
 fn bundle_path(bundle_key: u64) -> PathBuf {
     cache_dir().join(format!("{bundle_key:016x}.aot"))
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct AotConfigKey {
-    target_hash: u64,
-    triple_hash: u64,
-    flags_bits: u64,
-    global_alloc_stamp: u64,
-    dict_cfg: (usize, usize),
-    config_digest: u64,
-}
-
-impl AotConfigKey {
-    fn compute(
-        outline: &Outline,
-        stamps: &Stamps,
-        unwind_enabled: bool,
-        global_alloc: Option<ItemRef>,
-        dict: DictConfig,
-    ) -> Self {
-        let target = crate::host_target().direct_calls(true);
-        let t_hash = target_hash(&target);
-        let triple_hash = hash_str(target.triple);
-        let release = crate::profile() == Profile::Release;
-        let x64_baseline = crate::with_cfg(|c| c.x64_baseline);
-        let allow_inline = release;
-        let low_entries = true;
-        let flags_bits = u64::from(target.wide_vectors())
-            | (u64::from(release) << 1)
-            | (u64::from(unwind_enabled) << 2)
-            | (u64::from(global_alloc.is_some()) << 3)
-            | (u64::from(low_entries) << 4)
-            | (u64::from(allow_inline) << 5)
-            | (u64::from(x64_baseline) << 6);
-        let global_alloc_stamp = global_alloc
-            .and_then(|item| {
-                let k = stable_entry_item_key(outline, stamps, item)?;
-                let mut h = FxHasher::default();
-                k.hash(&mut h);
-                stamps.iface(item.krate).hash(&mut h);
-                Some(h.finish())
-            })
-            .unwrap_or(0);
-        let dict_cfg = (dict.min_bytes, dict.min_fanout);
-        let mut h = FxHasher::default();
-        CACHE_MAGIC.hash(&mut h);
-        CACHE_VERSION.hash(&mut h);
-        t_hash.hash(&mut h);
-        triple_hash.hash(&mut h);
-        flags_bits.hash(&mut h);
-        global_alloc_stamp.hash(&mut h);
-        dict_cfg.hash(&mut h);
-        Self {
-            target_hash: t_hash,
-            triple_hash,
-            flags_bits,
-            global_alloc_stamp,
-            dict_cfg,
-            config_digest: h.finish(),
-        }
-    }
 }
 
 #[derive(Default)]
@@ -156,8 +103,10 @@ pub(crate) struct AotCache {
     stamps: Stamps,
     file_index: OnceLock<LocalFileIndex>,
     local_file_stamps: OnceLock<HashMap<u64, u64>>,
+    transitive_local: OnceLock<TransitiveLocalFiles>,
     view: BundleView,
     decoded_codes: Box<[OnceLock<Option<Arc<AotCode>>>]>,
+    tc: ToolchainAotLayer,
     compiled_inlined: Mutex<HashMap<usize, Vec<(u32, u32)>>>,
     hit_inlined: Mutex<HashMap<usize, Vec<(u64, u64)>>>,
     inl: InlCache,
@@ -178,7 +127,12 @@ impl AotCache {
         let started = Instant::now();
         let target = crate::host_target().direct_calls(true);
         let t_hash = target_hash(&target);
-        let tc_key = cx.store().substrate().map_or(0, |s| s.toolchain_hash());
+        let tc_key = cx
+            .store()
+            .substrate()
+            .map(|s| s.toolchain_hash())
+            .or_else(|| cx.store().warm_state().toolchain_key())
+            .unwrap_or(0);
         let stamps = Stamps::compute(cx.outline, tc_key, t_hash);
         let unwind_enabled = crate::sema::reach::unwind_enabled(cx, reached);
         let config = AotConfigKey::compute(
@@ -194,6 +148,7 @@ impl AotCache {
         let decoded_codes = (0..view.header.codes_count)
             .map(|_| OnceLock::new())
             .collect();
+        let tc = ToolchainAotLayer::open(tc_key, config);
         let inl = InlCache::open(inline_bundle_path(&path), config);
         let stats = CacheStats::default();
         stats
@@ -205,8 +160,10 @@ impl AotCache {
             stamps,
             file_index: OnceLock::new(),
             local_file_stamps: OnceLock::new(),
+            transitive_local: OnceLock::new(),
             view,
             decoded_codes,
+            tc,
             compiled_inlined: Mutex::default(),
             hit_inlined: Mutex::default(),
             inl,
@@ -216,7 +173,7 @@ impl AotCache {
     }
 
     pub(in crate::image) fn has_loaded_bundle(&self) -> bool {
-        self.view.has_backing()
+        self.view.has_backing() || self.tc.has_backing()
     }
 
     pub(in crate::image) fn mark_miss(&self) {
@@ -245,7 +202,14 @@ impl AotCache {
         index: usize,
         relocs: &[SymbolSource],
     ) {
-        let files = collect_inlined_local_files(cx, reached, plan, index, relocs);
+        let files = collect_inlined_local_files_cached(
+            cx,
+            reached,
+            plan,
+            index,
+            relocs,
+            Some(&self.transitive_local),
+        );
         if !files.is_empty() {
             lock(&self.compiled_inlined).insert(index, files);
         }
@@ -392,6 +356,7 @@ impl AotCache {
             template,
             plan,
             relocs,
+            Some(&self.transitive_local),
         );
     }
 
@@ -471,7 +436,11 @@ impl AotCache {
         reached: &Reached,
         inlined_batch: &mut Vec<(usize, Vec<(u64, u64)>)>,
     ) -> Option<(AotFn, u32)> {
-        let backing = self.view.backing.as_ref()?;
+        let Some(backing) = self.view.backing.as_ref() else {
+            return self
+                .tc
+                .lookup(key, image, cx, reached, &self.file_index, &self.stamps);
+        };
         let data = backing.as_slice();
         let Some(idx) = find_record(
             data,
@@ -479,6 +448,17 @@ impl AotCache {
             self.view.header.records_count,
             (key.key_hi, key.key_lo),
         ) else {
+            if self.tc.has_backing()
+                && reached
+                    .list
+                    .get(index)
+                    .is_some_and(|((item, _), _)| cx.outline.is_sysroot(item.krate))
+                && let Some(hit) =
+                    self.tc
+                        .lookup(key, image, cx, reached, &self.file_index, &self.stamps)
+            {
+                return Some(hit);
+            }
             self.stats.lookup_none.fetch_add(1, Ordering::Relaxed);
             self.stats.lookup_find_miss.fetch_add(1, Ordering::Relaxed);
             return None;
@@ -666,17 +646,23 @@ impl AotCache {
                 };
                 let inlined = self.inlined_pairs_for(cx.outline, idx, leader);
                 let unwind_digest = relocs_unwind_digest(cx, reached, relocs);
-                entries.push((key, is_dict, code, relocs, inlined, unwind_digest));
+                entries.push((idx, key, is_dict, code, relocs, inlined, unwind_digest));
             }
             let mut enc = BundleEncoder::new(cx.outline, &cx.types, reached, state, &self.stamps);
-            for (key, is_dict, code, relocs, inlined, unwind_digest) in entries {
+            for (_, key, is_dict, code, relocs, inlined, unwind_digest) in &entries {
                 if enc
-                    .add_instance(&key, is_dict, code, relocs, &inlined, unwind_digest)
+                    .add_instance(key, *is_dict, code, relocs, inlined, *unwind_digest)
                     .is_some()
                 {
                     flushed_records += 1;
                 }
             }
+            let tc_refs: Vec<_> = entries
+                .iter()
+                .map(|(i, k, d, c, r, inl, u)| (*i, k, *d, *c, *r, inl.as_slice(), *u))
+                .collect();
+            self.tc
+                .flush_pure_sysroot(self.config, state, cx, reached, &self.stamps, &tc_refs);
             if let Some(sections) = enc.finish()
                 && write_bundle(
                     &self.path,

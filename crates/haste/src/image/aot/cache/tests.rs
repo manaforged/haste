@@ -589,8 +589,10 @@ fn aot_bundle_invalidates_when_non_inlined_callee_may_unwind_changes() {
         stamps: Stamps::compute(&outline, 0, 1),
         file_index: OnceLock::new(),
         local_file_stamps: OnceLock::new(),
+        transitive_local: OnceLock::new(),
         view,
         decoded_codes: (0..codes_count).map(|_| OnceLock::new()).collect(),
+        tc: ToolchainAotLayer::empty(),
         compiled_inlined: Mutex::default(),
         hit_inlined: Mutex::default(),
         inl: InlCache::open(tmp.join("bundle.inl"), cfg),
@@ -719,7 +721,17 @@ fn collect_inlined_local_files_tracks_drop_vtable_trait_default_and_multihop() {
         },
     ]);
     let relocs = [SymbolSource::Slot(2)];
-    let files = collect_inlined_local_files(&cx, &reached, &plan, 0, &relocs);
+    let files = relocs::collect_inlined_local_files(&cx, &reached, &plan, 0, &relocs);
+    let cached_cell = OnceLock::new();
+    let files_cached = relocs::collect_inlined_local_files_cached(
+        &cx,
+        &reached,
+        &plan,
+        0,
+        &relocs,
+        Some(&cached_cell),
+    );
+    assert_eq!(files, files_cached);
     assert_eq!(files, vec![(0, 1), (0, 2), (0, 3), (0, 4), (0, 5)]);
     drop(std::fs::remove_dir_all(&tmp));
 }

@@ -26,14 +26,6 @@ impl ImageBackend {
         }
     }
 
-    pub(crate) fn mode(&self) -> ImageMode {
-        match self {
-            Self::Check => ImageMode::Check,
-            Self::EagerJit { .. } | Self::LazyJit { .. } => ImageMode::Jit,
-            Self::Aot(_) => ImageMode::Aot,
-        }
-    }
-
     pub(crate) fn is_jit(&self) -> bool {
         matches!(self, Self::EagerJit { .. } | Self::LazyJit { .. })
     }
@@ -66,23 +58,29 @@ impl ImageBackend {
     }
 
     pub(crate) fn stencil_tag(&self) -> u64 {
-        match self {
-            Self::Aot(_) => 0xA070_A070_A070_A070,
+        let base = match self {
+            Self::Aot(_) => {
+                let mut tag = 0xA070_A070_A070_A070_u64;
+                if crate::with_cfg(|c| c.debug_info) {
+                    tag ^= 0xD860_0000_D860_0000;
+                }
+                tag
+            }
             Self::LazyJit { fast, optimize } => {
-                let base = if *optimize {
+                if *optimize {
                     0x1A27_0000_1A27_0000
                 } else if *fast || crate::profile() != crate::outline::tree::Profile::Release {
                     0x1A27_FA57_1A27_FA57
                 } else {
                     0x1A27_0000_1A27_0000
-                };
-                if crate::in_host_target() {
-                    base ^ 0x4057_0000_4057_0000
-                } else {
-                    base
                 }
             }
-            Self::Check | Self::EagerJit { .. } => 0,
+            Self::Check | Self::EagerJit { .. } => return 0,
+        };
+        if crate::in_host_target() {
+            base ^ 0x4057_0000_4057_0000
+        } else {
+            base
         }
     }
 

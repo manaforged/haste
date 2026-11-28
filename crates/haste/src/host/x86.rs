@@ -15,7 +15,7 @@ macro_rules! x86 {
             $($variant,)*
         }
 
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", feature = "x86-host-shims"))]
         mod code {
             use std::arch::x86_64::*;
 
@@ -62,11 +62,11 @@ macro_rules! x86 {
 
             /// The address of the host function of this intrinsic, which exists on x86-64 hosts only.
             pub fn host_addr(self) -> Option<usize> {
-                #[cfg(target_arch = "x86_64")]
+                #[cfg(all(target_arch = "x86_64", feature = "x86-host-shims"))]
                 return Some(match self {
                     $(Self::$variant => code::$name as unsafe extern "C" fn(*mut $out, $($ty),*) as usize,)*
                 });
-                #[cfg(not(target_arch = "x86_64"))]
+                #[cfg(not(all(target_arch = "x86_64", feature = "x86-host-shims")))]
                 None
             }
         }
@@ -106,7 +106,7 @@ impl Ret for u64 {
     const SCALAR: Option<u32> = Some(8);
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "x86-host-shims"))]
 mod load {
     use std::arch::x86_64::*;
 

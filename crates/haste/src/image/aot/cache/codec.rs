@@ -76,12 +76,12 @@ pub(in crate::image) struct CacheInstanceKey {
 }
 
 #[inline]
-pub(super) fn read_u32_le(data: &[u8], at: usize) -> u32 {
+pub(crate) fn read_u32_le(data: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]])
 }
 
 #[inline]
-pub(super) fn read_u64_le(data: &[u8], at: usize) -> u64 {
+pub(crate) fn read_u64_le(data: &[u8], at: usize) -> u64 {
     u64::from_le_bytes([
         data[at],
         data[at + 1],
@@ -224,7 +224,7 @@ pub(super) fn parse_bundle_header(
     })
 }
 
-pub(super) fn find_record(
+pub(crate) fn find_record(
     data: &[u8],
     base: usize,
     count: usize,
@@ -397,11 +397,9 @@ fn decode_unwind_drops(raw: &[u8]) -> Option<Vec<CodeUnwindDrop>> {
     Some(out)
 }
 
-pub(super) use super::stamps::{
-    Stamps, hash_entry_128, stable_entry_item_key, stable_substs_hash, touched_stamps_digest,
-};
+pub(super) use super::stamps::Stamps;
 
-pub(super) fn prune_stale_bundles(dir: &Path, keep: &Path, ext: &str, keep_others: usize) {
+pub(crate) fn prune_stale_bundles(dir: &Path, keep: &Path, ext: &str, keep_others: usize) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -409,7 +407,11 @@ pub(super) fn prune_stale_bundles(dir: &Path, keep: &Path, ext: &str, keep_other
         .filter_map(|entry| {
             let entry = entry.ok()?;
             let path = entry.path();
-            if path == keep || path.extension().and_then(|e| e.to_str()) != Some(ext) {
+            let is_tc = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("tc-"));
+            if is_tc || path == keep || path.extension().and_then(|e| e.to_str()) != Some(ext) {
                 return None;
             }
             let meta = entry.metadata().ok()?;

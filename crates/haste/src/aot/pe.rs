@@ -460,6 +460,7 @@ pub(super) fn emit(exe: &Executable, (lang_start, user_main): (u32, u32)) -> Res
         text_base: text_raw_off + text_in_text,
         text_va: addrs.text,
         pie_arm64: false,
+        pie_x64: false,
         addrs,
         base_va: text_base_va,
         shim_offs: &shim_offs,

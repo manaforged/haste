@@ -26,7 +26,7 @@ use super::codec::{
 use super::plan::{
     decode_inline_shape, decode_reloc_plan, encode_reloc_plan, pack_inline_blob, split_inline_blob,
 };
-use super::relocs::{LocalFileIndex, collect_inlined_local_files};
+use super::relocs::{LocalFileIndex, TransitiveLocalFiles, collect_inlined_local_files_cached};
 use super::tables::{BundleEncoder, CARRY_BIT, SharedTables, read_code_span};
 use super::{AotConfigKey, BundleView, MAX_BUNDLES, RECORD_LEN};
 
@@ -227,6 +227,7 @@ impl InlCache {
         template: Option<&Arc<InlineTemplate>>,
         plan: &RelocPlan,
         relocs: &[SymbolSource],
+        transitive: Option<&OnceLock<TransitiveLocalFiles>>,
     ) {
         if template.is_some() && relocs.is_empty() && (plan.has_calls() || plan.reloc_len() > 0) {
             return;
@@ -241,7 +242,7 @@ impl InlCache {
         let inlined = if relocs.is_empty() {
             Vec::new()
         } else {
-            collect_inlined_local_files(cx, reached, plan, index, relocs)
+            collect_inlined_local_files_cached(cx, reached, plan, index, relocs, transitive)
         };
         let mut no_unwind = Vec::new();
         if template.is_some() {

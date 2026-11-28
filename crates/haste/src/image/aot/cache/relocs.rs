@@ -1,6 +1,6 @@
 use std::hash::{Hash as _, Hasher as _};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context as _, Result, bail};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet, FxHasher};
@@ -20,12 +20,12 @@ use crate::substrate::file_key;
 use super::codec::Stamps;
 
 #[derive(Default)]
-pub(super) struct LocalFileIndex {
+pub(crate) struct LocalFileIndex {
     files: HashMap<u64, (u32, u32)>,
 }
 
 impl LocalFileIndex {
-    pub(super) fn build(outline: &Outline) -> Self {
+    pub(crate) fn build(outline: &Outline) -> Self {
         let mut files = HashMap::default();
         for (krate, tree) in outline.crates.iter().enumerate() {
             for file in 0..tree.files.len() as u32 {
@@ -37,7 +37,7 @@ impl LocalFileIndex {
         Self { files }
     }
 
-    pub(super) fn resolve(
+    pub(crate) fn resolve(
         &self,
         outline: &Outline,
         stamps: &Stamps,
@@ -56,14 +56,14 @@ impl LocalFileIndex {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct LocalItemRecord {
+pub(crate) struct LocalItemRecord {
     file: u64,
     item: u32,
     key: u64,
 }
 
 impl LocalItemRecord {
-    pub(super) fn of(outline: &Outline, stamps: &Stamps, item: ItemRef) -> Option<Self> {
+    pub(crate) fn of(outline: &Outline, stamps: &Stamps, item: ItemRef) -> Option<Self> {
         let file = stable_file_key(outline, item.krate, item.file)?;
         let key = item_check_key(outline, stamps, file, item)?;
         Some(Self {
@@ -73,13 +73,13 @@ impl LocalItemRecord {
         })
     }
 
-    pub(super) fn write(self, out: &mut Vec<u8>) {
+    pub(crate) fn write(self, out: &mut Vec<u8>) {
         write_u64(out, self.file);
         write_u32(out, self.item);
         write_u64(out, self.key);
     }
 
-    pub(super) fn read(cur: &mut Cursor<'_>) -> Result<Self> {
+    pub(crate) fn read(cur: &mut Cursor<'_>) -> Result<Self> {
         Ok(Self {
             file: cur.u64()?,
             item: cur.u32()?,
@@ -88,7 +88,7 @@ impl LocalItemRecord {
     }
 }
 
-pub(super) use crate::graph::store::hash_str;
+pub(crate) use crate::graph::store::hash_str;
 
 pub(super) fn stable_file_key(outline: &Outline, krate: u32, file: u32) -> Option<u64> {
     let tree = outline.crates.get(krate as usize)?;
@@ -156,12 +156,207 @@ pub(super) fn item_check_key(
     Some(h.finish())
 }
 
+pub(super) struct TransitiveLocalFiles {
+    files: Vec<(u32, u32)>,
+    words: usize,
+    scc_of: Vec<u32>,
+    scc_bits: Vec<u64>,
+}
+
+impl TransitiveLocalFiles {
+    pub(super) fn build(cx: &SemaContext<'_>, reached: &Reached) -> Self {
+        let n = reached.list.len();
+        let mut files: Vec<(u32, u32)> = Vec::new();
+        let mut file_id: HashMap<(u32, u32), u32> = HashMap::default();
+        let mut slot_file = vec![u32::MAX; n];
+        for (i, ((item, _), _)) in reached.list.iter().enumerate() {
+            if !cx.outline.is_fixed(item.krate) {
+                let kf = (item.krate, item.body_owner().file);
+                let id = *file_id.entry(kf).or_insert_with(|| {
+                    let next = files.len() as u32;
+                    files.push(kf);
+                    next
+                });
+                slot_file[i] = id;
+            }
+        }
+        if files.is_empty() {
+            return Self {
+                files,
+                words: 0,
+                scc_of: Vec::new(),
+                scc_bits: Vec::new(),
+            };
+        }
+        let words = files.len().div_ceil(64);
+        let (scc_of, scc_bits) = build_scc_bits(reached, &slot_file, words);
+        Self {
+            files,
+            words,
+            scc_of,
+            scc_bits,
+        }
+    }
+
+    fn push_callees(&self, reached: &Reached, root: usize, out: &mut Vec<(u32, u32)>) {
+        if self.words == 0 {
+            return;
+        }
+        let Some(callees) = reached.direct_calls(root) else {
+            return;
+        };
+        if callees.is_empty() {
+            return;
+        }
+        if self.words == 1 {
+            let mut bits = 0_u64;
+            for &v in callees {
+                if let Some(&c) = self.scc_of.get(v) {
+                    bits |= self.scc_bits[c as usize];
+                }
+            }
+            push_bits_word(bits, 0, &self.files, out);
+            return;
+        }
+        let mut acc = vec![0_u64; self.words];
+        for &v in callees {
+            if let Some(&c) = self.scc_of.get(v) {
+                let base = c as usize * self.words;
+                for (dst, &src) in acc.iter_mut().zip(&self.scc_bits[base..base + self.words]) {
+                    *dst |= src;
+                }
+            }
+        }
+        for (w, bits) in acc.into_iter().enumerate() {
+            push_bits_word(bits, w * 64, &self.files, out);
+        }
+    }
+}
+
+fn push_bits_word(mut bits: u64, base_idx: usize, files: &[(u32, u32)], out: &mut Vec<(u32, u32)>) {
+    while bits != 0 {
+        let tz = bits.trailing_zeros() as usize;
+        out.push(files[base_idx + tz]);
+        bits &= bits - 1;
+    }
+}
+
+fn finalize_scc(
+    reached: &Reached,
+    slot_file: &[u32],
+    words: usize,
+    members: &[usize],
+    scc_id: u32,
+    scc_of: &mut [u32],
+    scc_bits: &mut Vec<u64>,
+) {
+    let base = scc_bits.len();
+    scc_bits.resize(base + words, 0);
+    for &u in members {
+        scc_of[u] = scc_id;
+    }
+    for &u in members {
+        let fid = slot_file[u];
+        if fid != u32::MAX {
+            let idx = fid as usize;
+            scc_bits[base + (idx / 64)] |= 1_u64 << (idx % 64);
+        }
+        for &v in reached.direct_calls(u).into_iter().flatten() {
+            if let Some(&cv) = scc_of.get(v)
+                && cv != scc_id
+            {
+                let src_base = cv as usize * words;
+                for w in 0..words {
+                    scc_bits[base + w] |= scc_bits[src_base + w];
+                }
+            }
+        }
+    }
+}
+
+fn build_scc_bits(reached: &Reached, slot_file: &[u32], words: usize) -> (Vec<u32>, Vec<u64>) {
+    let n = slot_file.len();
+    let mut disc = vec![0_u32; n];
+    let mut low = vec![0_u32; n];
+    let mut on_stack = vec![false; n];
+    let mut tarjan_stack: Vec<usize> = Vec::new();
+    let mut call_stack: Vec<(usize, usize)> = Vec::new();
+    let mut members: Vec<usize> = Vec::new();
+    let mut scc_of = vec![u32::MAX; n];
+    let mut scc_bits: Vec<u64> = Vec::new();
+    let mut next_disc = 0_u32;
+    let mut next_scc = 0_u32;
+
+    for start in 0..n {
+        if disc[start] != 0 {
+            continue;
+        }
+        next_disc += 1;
+        disc[start] = next_disc;
+        low[start] = next_disc;
+        on_stack[start] = true;
+        tarjan_stack.push(start);
+        call_stack.push((start, 0));
+
+        while let Some((u, ei)) = call_stack.last_mut() {
+            let u = *u;
+            let edges = reached.direct_calls(u).unwrap_or(&[]);
+            if *ei < edges.len() {
+                let v = edges[*ei];
+                *ei += 1;
+                if v >= n {
+                    continue;
+                }
+                if disc[v] == 0 {
+                    next_disc += 1;
+                    disc[v] = next_disc;
+                    low[v] = next_disc;
+                    on_stack[v] = true;
+                    tarjan_stack.push(v);
+                    call_stack.push((v, 0));
+                } else if on_stack[v] && disc[v] < low[u] {
+                    low[u] = disc[v];
+                }
+            } else {
+                call_stack.pop();
+                if let Some(&(parent, _)) = call_stack.last()
+                    && low[u] < low[parent]
+                {
+                    low[parent] = low[u];
+                }
+                if low[u] == disc[u] {
+                    members.clear();
+                    while let Some(w) = tarjan_stack.pop() {
+                        on_stack[w] = false;
+                        members.push(w);
+                        if w == u {
+                            break;
+                        }
+                    }
+                    finalize_scc(
+                        reached,
+                        slot_file,
+                        words,
+                        &members,
+                        next_scc,
+                        &mut scc_of,
+                        &mut scc_bits,
+                    );
+                    next_scc += 1;
+                }
+            }
+        }
+    }
+    (scc_of, scc_bits)
+}
+
 struct InlineWalk<'a, 'b> {
     cx: &'a SemaContext<'b>,
     reached: &'a Reached,
     relocs: &'a [SymbolSource],
+    transitive: Option<&'a OnceLock<TransitiveLocalFiles>>,
     visited_plans: HashSet<(usize, usize)>,
-    visited_callees: HashSet<usize>,
+    visited_callees: Vec<u64>,
     out: Vec<(u32, u32)>,
 }
 
@@ -256,12 +451,27 @@ impl InlineWalk<'_, '_> {
     }
 
     fn record_transitive_local_callees(&mut self, root: usize) {
+        if let Some(cell) = self.transitive {
+            let cache = cell.get_or_init(|| TransitiveLocalFiles::build(self.cx, self.reached));
+            cache.push_callees(self.reached, root, &mut self.out);
+            return;
+        }
+        let n = self.reached.list.len();
+        let words = n.div_ceil(64);
+        if self.visited_callees.len() < words {
+            self.visited_callees.resize(words, 0);
+        }
         let mut stack = vec![root];
         while let Some(u) = stack.pop() {
             for &v in self.reached.direct_calls(u).into_iter().flatten() {
-                self.push_slot_file(v);
-                if self.visited_callees.insert(v) {
-                    stack.push(v);
+                if v < n {
+                    let mask = 1_u64 << (v % 64);
+                    let slot = &mut self.visited_callees[v / 64];
+                    if (*slot & mask) == 0 {
+                        *slot |= mask;
+                        self.push_slot_file(v);
+                        stack.push(v);
+                    }
                 }
             }
         }
@@ -287,12 +497,24 @@ pub(super) fn relocs_unwind_digest(
     h.finish()
 }
 
+#[cfg(test)]
 pub(super) fn collect_inlined_local_files(
     cx: &SemaContext<'_>,
     reached: &Reached,
     plan: &RelocPlan,
     index: usize,
     relocs: &[SymbolSource],
+) -> Vec<(u32, u32)> {
+    collect_inlined_local_files_cached(cx, reached, plan, index, relocs, None)
+}
+
+pub(super) fn collect_inlined_local_files_cached(
+    cx: &SemaContext<'_>,
+    reached: &Reached,
+    plan: &RelocPlan,
+    index: usize,
+    relocs: &[SymbolSource],
+    transitive: Option<&OnceLock<TransitiveLocalFiles>>,
 ) -> Vec<(u32, u32)> {
     let owner = reached
         .list
@@ -302,8 +524,9 @@ pub(super) fn collect_inlined_local_files(
         cx,
         reached,
         relocs,
+        transitive,
         visited_plans: HashSet::default(),
-        visited_callees: HashSet::default(),
+        visited_callees: Vec::new(),
         out: Vec::new(),
     };
     walk.visit_plan(plan, index, 0);

@@ -158,6 +158,10 @@ impl WarmState {
         guard.attempted_save = false;
     }
 
+    pub(crate) fn toolchain_key(&self) -> Option<u64> {
+        crate::sync::lock(&self.inner).key.map(|k| k.toolchain_key)
+    }
+
     #[cfg(test)]
     pub(super) fn set_bytes_for_test(&self, key: WarmKey, bytes: Vec<u8>) {
         let mut guard = crate::sync::lock(&self.inner);

@@ -14,7 +14,7 @@ use crate::sync::lock;
 
 use super::aot::{self as image_aot, bucket_by_item, lpt_chunks};
 use super::global_asm::Foreign;
-use super::stencil::{DictConfig, mode_stencil_key};
+use super::stencil::DictConfig;
 use super::{Image, Pass, resolve_host_symbol, weak};
 
 const MIN_PARALLEL: usize = 64;
@@ -91,8 +91,7 @@ impl Image {
 
     fn persist_inline(&self, cfg: DictConfig) {
         if !self.backend.is_lazy_jit() && crate::prep::decided().is_none() {
-            self.bodies
-                .persist(mode_stencil_key(self.backend.mode(), 0), cfg.verify);
+            self.bodies.persist(self.backend.stencil_tag(), cfg.verify);
         }
     }
 

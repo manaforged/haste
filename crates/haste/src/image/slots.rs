@@ -107,7 +107,7 @@ impl Slots for Image {
         if let Some(&address) = cells.get(&index) {
             return address;
         }
-        let address = self.zeroed(size as usize + 1);
+        let address = self.zeroed(crate::image::static_cell_size(size) as usize);
         cells.insert(index, address);
         address
     }

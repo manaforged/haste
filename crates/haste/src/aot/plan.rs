@@ -436,6 +436,13 @@ impl<'a> Plan<'a> {
         self.has_shim(Shim::FrameAlloc) || self.has_shim(Shim::FrameFree)
     }
 
+    pub(in crate::aot) fn has_alloc_cache(&self) -> bool {
+        self.has_shim(Shim::Alloc)
+            || self.has_shim(Shim::Dealloc)
+            || self.has_shim(Shim::AllocZeroed)
+            || self.has_shim(Shim::Realloc)
+    }
+
     pub(crate) fn bss_layout(&self, bss: u32) -> (u32, u32) {
         if !(self.has_shim(Shim::ThreadCell) || self.has_unwind()) {
             return (bss, bss);

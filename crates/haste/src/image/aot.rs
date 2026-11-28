@@ -19,6 +19,7 @@ mod emit;
 mod icf;
 mod queue;
 mod reach;
+mod rodata;
 mod vdce;
 
 pub(super) use queue::{AotQueue, AotWork, bucket_by_item, collect_warm_callees, lpt_chunks};
@@ -77,6 +78,19 @@ impl AotCode {
 
     pub(super) fn unwind_drops(&self) -> &[CodeUnwindDrop] {
         &self.unwind_drops
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(bytes: Vec<u8>, relocs: Vec<StencilReloc>) -> Arc<Self> {
+        Arc::new(Self {
+            bytes,
+            sites: Vec::new(),
+            relocs,
+            loops: Vec::new(),
+            lines: Vec::new(),
+            unwind_drops: Vec::new(),
+            saved_regs: 0,
+        })
     }
 }
 
@@ -263,7 +277,7 @@ impl AotState {
 
     fn collect_new_targets(&mut self, entry: &AotFn, queue: &AotQueue) -> Vec<usize> {
         let (mut out, mut vstack, mut rstack) = (Vec::new(), Vec::new(), Vec::new());
-        for_each_fn_edge(entry, |edge| match edge {
+        for_each_fn_edge(entry, true, |edge| match edge {
             FnEdge::Sym(
                 SymbolSource::Slot(idx) | SymbolSource::StaticCell { index: idx, .. },
                 _,
@@ -307,7 +321,7 @@ impl Image {
         let mut state = lock(aot);
         state.ensure_len(reached.list.len());
         let mask = vdce::VtableMask::all_live();
-        let live = AotReach::collect(&state, &roots, &mask);
+        let live = AotReach::collect(&state, &roots, &mask, true);
         live.order
             .into_iter()
             .filter(|&idx| {

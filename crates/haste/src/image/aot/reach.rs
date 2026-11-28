@@ -13,7 +13,11 @@ pub(super) enum FnEdge<'a> {
     Alias(usize),
 }
 
-pub(super) fn for_each_fn_edge(entry: &AotFn, mut on_edge: impl FnMut(FnEdge<'_>)) {
+pub(super) fn for_each_fn_edge(
+    entry: &AotFn,
+    include_unwind_drops: bool,
+    mut on_edge: impl FnMut(FnEdge<'_>),
+) {
     match entry {
         AotFn::Direct { code, relocs } => {
             for reloc in code.relocs() {
@@ -27,9 +31,11 @@ pub(super) fn for_each_fn_edge(entry: &AotFn, mut on_edge: impl FnMut(FnEdge<'_>
                     ));
                 }
             }
-            for drop in code.unwind_drops() {
-                if let Some(sym) = relocs.get(drop.drop_sym as usize) {
-                    on_edge(FnEdge::Sym(sym, true));
+            if include_unwind_drops {
+                for drop in code.unwind_drops() {
+                    if let Some(sym) = relocs.get(drop.drop_sym as usize) {
+                        on_edge(FnEdge::Sym(sym, true));
+                    }
                 }
             }
         }
@@ -114,11 +120,16 @@ impl AotReach {
         this
     }
 
-    pub(super) fn collect(state: &AotState, roots: &[usize], vmask: &VtableMask) -> Self {
+    pub(super) fn collect(
+        state: &AotState,
+        roots: &[usize],
+        vmask: &VtableMask,
+        include_unwind_drops: bool,
+    ) -> Self {
         let mut this = Self::new(state.functions.len(), roots);
         this.rodata.resize(state.rodata.len(), false);
         this.vtables.resize(state.vtables.len(), false);
-        this.drain(state, None, vmask);
+        this.drain(state, None, vmask, include_unwind_drops);
         this
     }
 
@@ -162,7 +173,12 @@ impl AotReach {
         }
     }
 
-    fn drain_fns(&mut self, state: &AotState, pending: &mut Option<(&[bool], &mut Vec<usize>)>) {
+    fn drain_fns(
+        &mut self,
+        state: &AotState,
+        pending: &mut Option<(&[bool], &mut Vec<usize>)>,
+        include_unwind_drops: bool,
+    ) {
         while let Some(idx) = self.work_fns.pop() {
             if let Some((compiled, next_wave)) = pending.as_mut()
                 && !compiled.get(idx).copied().unwrap_or(true)
@@ -173,7 +189,7 @@ impl AotReach {
             let Some(entry) = state.functions.get(idx).and_then(Option::as_ref) else {
                 continue;
             };
-            for_each_fn_edge(entry, |edge| match edge {
+            for_each_fn_edge(entry, include_unwind_drops, |edge| match edge {
                 FnEdge::Sym(sym, direct) => {
                     if direct && let SymbolSource::Slot(callee) = *sym {
                         self.mark_fn(callee);
@@ -224,12 +240,13 @@ impl AotReach {
         state: &AotState,
         mut pending: Option<(&[bool], &mut Vec<usize>)>,
         vmask: &VtableMask,
+        include_unwind_drops: bool,
     ) {
         while !self.work_fns.is_empty()
             || !self.work_rodata.is_empty()
             || !self.work_vtables.is_empty()
         {
-            self.drain_fns(state, &mut pending);
+            self.drain_fns(state, &mut pending, include_unwind_drops);
             self.drain_rodata_vtables(state, vmask);
         }
         if let Some((_, next_wave)) = pending {

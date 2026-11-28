@@ -5,12 +5,12 @@ use anyhow::{Context, Result};
 use haste_codegen::{RelocKind, UnwindArg};
 use rustc_hash::{FxHashMap as HashMap, FxHasher};
 
-use crate::aot::{Executable, Symbol, UNWIND_FN_REC_BYTES};
+use crate::aot::{Executable, Symbol};
 use crate::host::HostSymbol;
-use crate::lower::{RodataTarget, SymbolSource, VtableEntry, VtableId, Word};
+use crate::lower::{SymbolSource, VtableEntry, Word};
 
 use super::vdce::VtableMask;
-use super::{AotCode, AotFn, AotReach, AotState};
+use super::{AotFn, AotReach, AotState};
 
 pub(super) struct PreSyms<'a> {
     pub(super) rodata_offs: &'a [Option<u32>],
@@ -58,7 +58,7 @@ impl PreSyms<'_> {
 enum RelocTargetKey {
     FnSlot(bool),
     ForeignSlot(bool, Symbol),
-    Vtable(VtableId),
+    Vtable,
     Sym(Symbol),
 }
 
@@ -78,6 +78,15 @@ enum StaticFnKey<'a> {
 enum SlotKey {
     Fn(usize),
     Sym(Symbol),
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum VtableStaticSlot {
+    Dead,
+    Int(u64),
+    FnSlot,
+    Foreign(Symbol),
+    SuperSlot,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -115,6 +124,13 @@ struct PreparedFn {
     idx: usize,
     static_hash: u64,
     fn_slots: Vec<usize>,
+    vtable_slots: Vec<usize>,
+}
+
+struct PreparedVtable {
+    id: usize,
+    fn_slots: Vec<usize>,
+    super_slots: Vec<usize>,
 }
 
 fn slot_static_target(
@@ -140,12 +156,16 @@ fn sym_static_target(
     pre: &PreSyms<'_>,
     roots: &[usize],
     fn_slots: &mut Vec<usize>,
+    vtable_slots: &mut Vec<usize>,
 ) -> Result<RelocTargetKey> {
     Ok(match sym {
         SymbolSource::Slot(callee) => {
             slot_static_target(self_idx, (*callee, direct), state, roots, fn_slots)
         }
-        SymbolSource::Vtable(id) => RelocTargetKey::Vtable(*id),
+        SymbolSource::Vtable(id) => {
+            vtable_slots.push(id.0 as usize);
+            RelocTargetKey::Vtable
+        }
         other => RelocTargetKey::Sym(pre.translate(other)?),
     })
 }
@@ -158,6 +178,7 @@ fn prepare_fn(
 ) -> Result<Option<PreparedFn>> {
     let mut h = FxHasher::default();
     let mut fn_slots = Vec::new();
+    let mut vtable_slots = Vec::new();
     match &state.functions[idx] {
         Some(AotFn::Direct { code, relocs }) => {
             0u8.hash(&mut h);
@@ -184,6 +205,7 @@ fn prepare_fn(
                         pre,
                         roots,
                         &mut fn_slots,
+                        &mut vtable_slots,
                     )?;
                     target.hash(&mut h);
                 }
@@ -198,6 +220,7 @@ fn prepare_fn(
                     pre,
                     roots,
                     &mut fn_slots,
+                    &mut vtable_slots,
                 )?;
                 target.hash(&mut h);
             }
@@ -207,8 +230,15 @@ fn prepare_fn(
             (Arc::as_ptr(body) as usize).hash(&mut h);
             relocs.len().hash(&mut h);
             for sym in relocs {
-                let target =
-                    sym_static_target(idx, (sym, false), state, pre, roots, &mut fn_slots)?;
+                let target = sym_static_target(
+                    idx,
+                    (sym, false),
+                    state,
+                    pre,
+                    roots,
+                    &mut fn_slots,
+                    &mut vtable_slots,
+                )?;
                 target.hash(&mut h);
             }
         }
@@ -218,6 +248,7 @@ fn prepare_fn(
         idx,
         static_hash: h.finish(),
         fn_slots,
+        vtable_slots,
     }))
 }
 
@@ -227,7 +258,8 @@ fn build_static_key<'a>(
     pre: &PreSyms<'_>,
     roots: &[usize],
 ) -> Result<Option<StaticFnKey<'a>>> {
-    let mut unused = Vec::new();
+    let mut unused_fn = Vec::new();
+    let mut unused_vt = Vec::new();
     Ok(match &state.functions[idx] {
         Some(AotFn::Direct { code, relocs }) => {
             let mut sig = Vec::with_capacity(code.relocs().len());
@@ -242,7 +274,8 @@ fn build_static_key<'a>(
                         state,
                         pre,
                         roots,
-                        &mut unused,
+                        &mut unused_fn,
+                        &mut unused_vt,
                     )?
                 };
                 sig.push((reloc.offset, reloc.kind, target));
@@ -255,7 +288,8 @@ fn build_static_key<'a>(
                     state,
                     pre,
                     roots,
-                    &mut unused,
+                    &mut unused_fn,
+                    &mut unused_vt,
                 )?;
                 drops.push((d.local_off, d.flag_off, target, d.arg));
             }
@@ -281,7 +315,8 @@ fn build_static_key<'a>(
                     state,
                     pre,
                     roots,
-                    &mut unused,
+                    &mut unused_fn,
+                    &mut unused_vt,
                 )?);
             }
             Some(StaticFnKey::Dict(Arc::as_ptr(body) as usize, sig))
@@ -290,70 +325,239 @@ fn build_static_key<'a>(
     })
 }
 
-pub(super) fn fold_functions(
+fn prepare_live_fns(
+    live_roots: &[usize],
     state: &AotState,
-    live_fns: &[bool],
     pre: &PreSyms<'_>,
     roots: &[usize],
-) -> Result<Vec<usize>> {
-    let mut canon = roots.to_vec();
-    let live_roots: Vec<usize> = (0..state.functions.len())
-        .filter(|&idx| live_fns[idx] && roots[idx] == idx && state.functions[idx].is_some())
-        .collect();
-    if live_roots.len() < 2 {
-        return Ok(canon);
-    }
+) -> Result<Vec<PreparedFn>> {
     let workers = crate::jobs().min(live_roots.len() / 64);
-    let prepared: Vec<PreparedFn> = if workers <= 1 {
+    if workers <= 1 {
         let mut out = Vec::with_capacity(live_roots.len());
-        for &idx in &live_roots {
+        for &idx in live_roots {
             if let Some(p) = prepare_fn(idx, state, pre, roots)? {
                 out.push(p);
             }
         }
-        out
-    } else {
-        let chunk_len = live_roots.len().div_ceil(workers).max(1);
-        let chunks: Result<Vec<Vec<PreparedFn>>> = crate::sync::scope(|scope| {
-            let handles: Vec<_> = live_roots
-                .chunks(chunk_len)
-                .map(|chunk| {
-                    scope.spawn(move || {
-                        let mut local = Vec::with_capacity(chunk.len());
-                        for &idx in chunk {
-                            if let Some(p) = prepare_fn(idx, state, pre, roots)? {
-                                local.push(p);
-                            }
+        return Ok(out);
+    }
+    let chunk_len = live_roots.len().div_ceil(workers).max(1);
+    let chunks: Result<Vec<Vec<PreparedFn>>> = crate::sync::scope(|scope| {
+        let handles: Vec<_> = live_roots
+            .chunks(chunk_len)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    let mut local = Vec::with_capacity(chunk.len());
+                    for &idx in chunk {
+                        if let Some(p) = prepare_fn(idx, state, pre, roots)? {
+                            local.push(p);
                         }
-                        Ok::<_, anyhow::Error>(local)
-                    })
+                    }
+                    Ok::<_, anyhow::Error>(local)
+                })
+            })
+            .collect();
+        let mut out = Vec::with_capacity(handles.len());
+        for h in handles {
+            let res = h.join().map_err(|panic| {
+                anyhow::anyhow!(
+                    "AOT ICF prepare worker panicked: {}",
+                    crate::sync::panic_text(&*panic)
+                )
+            })??;
+            out.push(res);
+        }
+        Ok(out)
+    });
+    let mut out = Vec::with_capacity(live_roots.len());
+    for part in chunks? {
+        out.extend(part);
+    }
+    Ok(out)
+}
+
+fn prepare_vtable_groups(
+    state: &AotState,
+    order: &[usize],
+    vmask: &VtableMask,
+    roots: &[usize],
+) -> (Vec<PreparedVtable>, Vec<Vec<usize>>, Vec<usize>) {
+    let mut vt_class: Vec<usize> = (0..state.vtables.len()).collect();
+    let mut prepared = Vec::with_capacity(order.len());
+    let mut by_key: HashMap<Vec<VtableStaticSlot>, Vec<usize>> = HashMap::default();
+    for &id in order {
+        let Some(entries) = state.vtables.get(id) else {
+            continue;
+        };
+        let mut key = Vec::with_capacity(entries.len());
+        let mut fn_slots = Vec::new();
+        let mut super_slots = Vec::new();
+        for (slot, entry) in entries.iter().enumerate() {
+            if !vmask.slot_live(id, slot) {
+                key.push(VtableStaticSlot::Dead);
+                continue;
+            }
+            match *entry {
+                VtableEntry::Word(Word::Int(val)) => key.push(VtableStaticSlot::Int(val)),
+                VtableEntry::Word(Word::Code(fn_idx)) => {
+                    let root = roots.get(fn_idx).copied().unwrap_or(fn_idx);
+                    if state.functions.get(root).and_then(Option::as_ref).is_some() {
+                        fn_slots.push(root);
+                        key.push(VtableStaticSlot::FnSlot);
+                    } else {
+                        key.push(VtableStaticSlot::Foreign(foreign_sym(
+                            &state.foreign_fns,
+                            fn_idx,
+                        )));
+                    }
+                }
+                VtableEntry::Super(super_id) => {
+                    super_slots.push(super_id.0 as usize);
+                    key.push(VtableStaticSlot::SuperSlot);
+                }
+            }
+        }
+        let pos = prepared.len();
+        prepared.push(PreparedVtable {
+            id,
+            fn_slots,
+            super_slots,
+        });
+        by_key.entry(key).or_default().push(pos);
+    }
+    let mut groups = Vec::new();
+    for (_, mut members) in by_key {
+        if members.len() < 2 {
+            continue;
+        }
+        members.sort_unstable_by_key(|&pos| prepared[pos].id);
+        let leader = prepared[members[0]].id;
+        for &pos in &members {
+            vt_class[prepared[pos].id] = leader;
+        }
+        if !prepared[members[0]].fn_slots.is_empty() || !prepared[members[0]].super_slots.is_empty()
+        {
+            groups.push(members);
+        }
+    }
+    (prepared, groups, vt_class)
+}
+
+fn refine_fn_groups(
+    groups: &mut Vec<Vec<usize>>,
+    prepared: &[PreparedFn],
+    prev_fn: &[usize],
+    prev_vt: &[usize],
+    fn_class: &mut [usize],
+) -> bool {
+    let mut split = false;
+    let mut next_groups = Vec::with_capacity(groups.len());
+    for group in groups.drain(..) {
+        let mut buckets: HashMap<(Vec<usize>, Vec<usize>), Vec<usize>> =
+            HashMap::with_capacity_and_hasher(group.len(), Default::default());
+        for pos in group {
+            let p = &prepared[pos];
+            let f_sig: Vec<usize> = p
+                .fn_slots
+                .iter()
+                .map(|&r| {
+                    if r == usize::MAX {
+                        usize::MAX
+                    } else {
+                        prev_fn[r]
+                    }
                 })
                 .collect();
-            let mut out = Vec::with_capacity(handles.len());
-            for h in handles {
-                let res = h.join().map_err(|panic| {
-                    anyhow::anyhow!(
-                        "AOT ICF prepare worker panicked: {}",
-                        crate::sync::panic_text(&*panic)
-                    )
-                })??;
-                out.push(res);
-            }
-            Ok(out)
-        });
-        let mut out = Vec::with_capacity(live_roots.len());
-        for part in chunks? {
-            out.extend(part);
+            let v_sig: Vec<usize> = p
+                .vtable_slots
+                .iter()
+                .map(|&vt| prev_vt.get(vt).copied().unwrap_or(vt))
+                .collect();
+            buckets.entry((f_sig, v_sig)).or_default().push(pos);
         }
-        out
-    };
+        if buckets.len() == 1 {
+            next_groups.extend(buckets.into_values());
+            continue;
+        }
+        split = true;
+        for (_, mut sub) in buckets {
+            sub.sort_unstable_by_key(|&pos| prepared[pos].idx);
+            let leader = prepared[sub[0]].idx;
+            for &pos in &sub {
+                fn_class[prepared[pos].idx] = leader;
+            }
+            if sub.len() >= 2 {
+                next_groups.push(sub);
+            }
+        }
+    }
+    *groups = next_groups;
+    split
+}
 
+fn refine_vt_groups(
+    groups: &mut Vec<Vec<usize>>,
+    prepared: &[PreparedVtable],
+    prev_fn: &[usize],
+    prev_vt: &[usize],
+    vt_class: &mut [usize],
+) -> bool {
+    let mut split = false;
+    let mut next_groups = Vec::with_capacity(groups.len());
+    for group in groups.drain(..) {
+        let mut buckets: HashMap<(Vec<usize>, Vec<usize>), Vec<usize>> =
+            HashMap::with_capacity_and_hasher(group.len(), Default::default());
+        for pos in group {
+            let p = &prepared[pos];
+            let f_sig: Vec<usize> = p.fn_slots.iter().map(|&r| prev_fn[r]).collect();
+            let s_sig: Vec<usize> = p
+                .super_slots
+                .iter()
+                .map(|&vt| prev_vt.get(vt).copied().unwrap_or(vt))
+                .collect();
+            buckets.entry((f_sig, s_sig)).or_default().push(pos);
+        }
+        if buckets.len() == 1 {
+            next_groups.extend(buckets.into_values());
+            continue;
+        }
+        split = true;
+        for (_, mut sub) in buckets {
+            sub.sort_unstable_by_key(|&pos| prepared[pos].id);
+            let leader = prepared[sub[0]].id;
+            for &pos in &sub {
+                vt_class[prepared[pos].id] = leader;
+            }
+            if sub.len() >= 2 {
+                next_groups.push(sub);
+            }
+        }
+    }
+    *groups = next_groups;
+    split
+}
+
+pub(super) fn fold_functions(
+    state: &AotState,
+    live: &AotReach,
+    vmask: &VtableMask,
+    pre: &PreSyms<'_>,
+    roots: &[usize],
+) -> Result<Vec<usize>> {
+    let mut fn_class = roots.to_vec();
+    let live_roots: Vec<usize> = (0..state.functions.len())
+        .filter(|&idx| live.fns[idx] && roots[idx] == idx && state.functions[idx].is_some())
+        .collect();
+    if live_roots.len() < 2 {
+        return Ok(fn_class);
+    }
+    let prepared = prepare_live_fns(&live_roots, state, pre, roots)?;
     let mut by_hash: HashMap<u64, Vec<usize>> = HashMap::default();
     for (pos, p) in prepared.iter().enumerate() {
         by_hash.entry(p.static_hash).or_default().push(pos);
     }
 
-    let mut cand_groups: Vec<Vec<usize>> = Vec::new();
+    let mut fn_groups: Vec<Vec<usize>> = Vec::new();
     for (_, bucket) in by_hash {
         if bucket.len() < 2 {
             continue;
@@ -375,146 +579,41 @@ pub(super) fn fold_functions(
                 continue;
             }
             members.sort_unstable_by_key(|&pos| prepared[pos].idx);
-            if prepared[members[0]].fn_slots.is_empty() {
-                let leader = prepared[members[0]].idx;
-                for &pos in &members {
-                    canon[prepared[pos].idx] = leader;
-                }
-            } else {
-                cand_groups.push(members);
+            let leader = prepared[members[0]].idx;
+            for &pos in &members {
+                fn_class[prepared[pos].idx] = leader;
+            }
+            if !prepared[members[0]].fn_slots.is_empty()
+                || !prepared[members[0]].vtable_slots.is_empty()
+            {
+                fn_groups.push(members);
             }
         }
     }
-    if cand_groups.is_empty() {
-        return Ok(canon);
+    if fn_groups.is_empty() {
+        return Ok(fn_class);
     }
 
-    for _ in 0..5 {
-        let prev = canon.clone();
-        let mut changed = false;
-        for group in &cand_groups {
-            let mut seen: HashMap<Vec<usize>, usize> =
-                HashMap::with_capacity_and_hasher(group.len(), Default::default());
-            for &pos in group {
-                let p = &prepared[pos];
-                let resolved: Vec<usize> = p
-                    .fn_slots
-                    .iter()
-                    .map(|&r| if r == usize::MAX { usize::MAX } else { prev[r] })
-                    .collect();
-                let leader = *seen.entry(resolved).or_insert(p.idx);
-                if canon[p.idx] != leader {
-                    canon[p.idx] = leader;
-                    changed = true;
-                }
-            }
-        }
-        if !changed {
+    let (vt_prepared, mut vt_groups, mut vt_class) =
+        prepare_vtable_groups(state, &live.vtable_order, vmask, roots);
+
+    loop {
+        let prev_fn = fn_class.clone();
+        let prev_vt = vt_class.clone();
+        let fn_split =
+            refine_fn_groups(&mut fn_groups, &prepared, &prev_fn, &prev_vt, &mut fn_class);
+        let vt_split = refine_vt_groups(
+            &mut vt_groups,
+            &vt_prepared,
+            &prev_fn,
+            &prev_vt,
+            &mut vt_class,
+        );
+        if !fn_split && !vt_split {
             break;
         }
     }
-    Ok(canon)
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum RodataRef {
-    Rodata(u32),
-    Fn(usize),
-}
-
-type RodataKey<'a> = (&'a [u8], Vec<(u32, RodataRef)>);
-type VtablePlacement = (Vec<Option<u32>>, Vec<(u32, usize)>);
-
-fn emit_rodata_relocs(
-    base: u32,
-    resolved: &[(u32, RodataRef)],
-    exe: &mut Executable,
-    fn_relocs: &mut Vec<(u32, usize)>,
-) {
-    for &(reloc_off, target) in resolved {
-        match target {
-            RodataRef::Rodata(child_off) => {
-                exe.pointer(true, base + reloc_off, Symbol::Rodata(child_off))
-            }
-            RodataRef::Fn(fn_idx) => fn_relocs.push((base + reloc_off, fn_idx)),
-        }
-    }
-}
-
-fn place_rodata_node<'a>(
-    id: usize,
-    state: &'a AotState,
-    rodata_offs: &mut [Option<u32>],
-    visiting: &mut [bool],
-    seen: &mut HashMap<RodataKey<'a>, u32>,
-    fn_relocs: &mut Vec<(u32, usize)>,
-    exe: &mut Executable,
-) -> Result<u32> {
-    if let Some(off) = rodata_offs[id] {
-        return Ok(off);
-    }
-    let entry = state.rodata.get(id).context("missing rodata entry")?;
-    if visiting[id] {
-        let off = exe.rodata(&entry.0, 16);
-        rodata_offs[id] = Some(off);
-        return Ok(off);
-    }
-    visiting[id] = true;
-    let mut resolved = Vec::with_capacity(entry.1.len());
-    for reloc in &entry.1 {
-        let target = match reloc.target {
-            RodataTarget::Rodata(child) => RodataRef::Rodata(place_rodata_node(
-                child.0 as usize,
-                state,
-                rodata_offs,
-                visiting,
-                seen,
-                fn_relocs,
-                exe,
-            )?),
-            RodataTarget::Fn(fn_idx) => RodataRef::Fn(fn_idx),
-        };
-        resolved.push((reloc.offset, target));
-    }
-    visiting[id] = false;
-    if let Some(off) = rodata_offs[id] {
-        emit_rodata_relocs(off, &resolved, exe, fn_relocs);
-        return Ok(off);
-    }
-    let off = match seen.entry((entry.0.as_slice(), resolved)) {
-        std::collections::hash_map::Entry::Occupied(hit) => *hit.get(),
-        std::collections::hash_map::Entry::Vacant(slot) => {
-            let fresh = exe.rodata(&entry.0, 16);
-            emit_rodata_relocs(fresh, &slot.key().1, exe, fn_relocs);
-            slot.insert(fresh);
-            fresh
-        }
-    };
-    rodata_offs[id] = Some(off);
-    Ok(off)
-}
-
-pub(super) fn emit_rodata(
-    state: &AotState,
-    live: &AotReach,
-    exe: &mut Executable,
-) -> Result<(Vec<Option<u32>>, Vec<(u32, usize)>)> {
-    let mut rodata_offs = vec![None; state.rodata.len()];
-    let mut visiting = vec![false; state.rodata.len()];
-    let mut seen: HashMap<RodataKey<'_>, u32> = HashMap::default();
-    let mut fn_relocs = Vec::new();
-    for &id in &live.rodata_order {
-        place_rodata_node(
-            id,
-            state,
-            &mut rodata_offs,
-            &mut visiting,
-            &mut seen,
-            &mut fn_relocs,
-            exe,
-        )?;
-    }
-    Ok((rodata_offs, fn_relocs))
+    Ok(fn_class)
 }
 
 pub(super) fn alloc_slots(
@@ -551,6 +650,8 @@ struct VtableAlloc<'a> {
     roots: &'a [usize],
     canon: &'a [usize],
 }
+
+type VtablePlacement = (Vec<Option<u32>>, Vec<(u32, usize)>);
 
 fn place_vtable_node(
     id: usize,
@@ -621,94 +722,66 @@ pub(super) fn alloc_vtables(
     Ok((alloc.vtable_offs, alloc.unique))
 }
 
-pub(super) fn emit_unwind_table(
-    state: &AotState,
-    live: &AotReach,
-    (roots, canon): (&[usize], &[usize]),
-    (fn_offs, dict_bodies): (&[Option<u32>], &HashMap<usize, u32>),
-    exe: &mut Executable,
-) {
-    let mut seen: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
-    let mut seen_dict: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
-    let mut fns: Vec<(u32, u32, u32, Vec<(i32, i32, u32, u32)>)> = Vec::new();
-    let mut sites: Vec<(u32, u32, u32, u32)> = Vec::new();
-    let push_fn = |base_off: u32,
-                   code: &AotCode,
-                   drops: Vec<(i32, i32, u32, u32)>,
-                   sites: &mut Vec<(u32, u32, u32, u32)>,
-                   fns: &mut Vec<(u32, u32, u32, Vec<(i32, i32, u32, u32)>)>| {
-        for s in code.sites() {
-            sites.push((base_off + s.ret, base_off + s.handler, s.frame_offset, 0));
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::image::aot::{AotCode, AotFn};
+    use haste_codegen::StencilReloc;
+
+    #[test]
+    fn icf_bisimulation_runs_to_fixpoint_past_16_hops() {
+        const HOPS: usize = 18;
+        let diff_a = HOPS * 2;
+        let diff_b = HOPS * 2 + 1;
+        let total = diff_b + 1;
+
+        let mut state = AotState::new(total).into_inner().expect("lock");
+        let call_reloc = StencilReloc {
+            offset: 1,
+            symbol: 0,
+            kind: RelocKind::PcRel32,
+        };
+        let hop_code = AotCode::for_test(vec![0xE8, 0, 0, 0, 0, 0xC3], vec![call_reloc]);
+        let leaf_a = AotCode::for_test(vec![0x90, 0xC3], Vec::new());
+        let leaf_b = AotCode::for_test(vec![0xCC, 0xC3], Vec::new());
+
+        for i in 0..HOPS {
+            let next_a = if i + 1 < HOPS { i + 1 } else { diff_a };
+            let next_b = if i + 1 < HOPS { HOPS + i + 1 } else { diff_b };
+            state.functions[i] = Some(AotFn::Direct {
+                code: Arc::clone(&hop_code),
+                relocs: vec![SymbolSource::Slot(next_a)],
+            });
+            state.functions[HOPS + i] = Some(AotFn::Direct {
+                code: Arc::clone(&hop_code),
+                relocs: vec![SymbolSource::Slot(next_b)],
+            });
         }
-        if !drops.is_empty() || code.saved_regs() != 0 {
-            fns.push((
-                base_off,
-                base_off + code.bytes().len() as u32,
-                code.saved_regs(),
-                drops,
-            ));
-        }
-    };
-    for &idx in &live.order {
-        let leader = canon[roots[idx]];
-        if !seen.insert(leader) {
-            continue;
-        }
-        match &state.functions[leader] {
-            Some(AotFn::Direct { code, relocs }) => {
-                let Some(fn_start) = fn_offs.get(leader).copied().flatten() else {
-                    continue;
-                };
-                let mut drops = Vec::with_capacity(code.unwind_drops().len());
-                for d in code.unwind_drops() {
-                    if let Some(&SymbolSource::Slot(callee_idx)) = relocs.get(d.drop_sym as usize)
-                        && let Some(drop_off) = fn_offs.get(callee_idx).copied().flatten()
-                    {
-                        drops.push((d.local_off, d.flag_off, drop_off, u32::from(d.arg.as_u8())));
-                    }
-                }
-                push_fn(fn_start, code, drops, &mut sites, &mut fns);
-            }
-            Some(AotFn::Dict { body, .. }) => {
-                let ptr = Arc::as_ptr(body) as usize;
-                if seen_dict.insert(ptr)
-                    && let Some(&body_off) = dict_bodies.get(&ptr)
-                {
-                    push_fn(body_off, body, Vec::new(), &mut sites, &mut fns);
-                }
-            }
-            _ => {}
-        }
-    }
-    if fns.is_empty() && sites.is_empty() {
-        return;
-    }
-    fns.sort_unstable_by_key(|&(start, _, _, _)| start);
-    sites.sort_unstable_by_key(|&(ret, _, _, _)| ret);
-    let total_drops: usize = fns.iter().map(|(_, _, _, d)| d.len()).sum();
-    let sites_off = 24 + fns.len() * UNWIND_FN_REC_BYTES + total_drops * 16;
-    let mut buf = Vec::with_capacity(sites_off + sites.len() * 16);
-    buf.extend_from_slice(&(fns.len() as u64).to_le_bytes());
-    buf.extend_from_slice(&(sites.len() as u64).to_le_bytes());
-    buf.extend_from_slice(&(sites_off as u64).to_le_bytes());
-    let mut cursor = 0u32;
-    for &(start, end, saved_regs, ref drops) in &fns {
-        for word in [start, end, cursor, drops.len() as u32, saved_regs] {
-            buf.extend_from_slice(&word.to_le_bytes());
-        }
-        cursor += drops.len() as u32;
-    }
-    for (_, _, _, drops) in fns {
-        for (local_off, flag_off, drop_off, ind) in drops {
-            for word in [local_off as u32, flag_off as u32, drop_off, ind] {
-                buf.extend_from_slice(&word.to_le_bytes());
-            }
+        state.functions[diff_a] = Some(AotFn::Direct {
+            code: leaf_a,
+            relocs: Vec::new(),
+        });
+        state.functions[diff_b] = Some(AotFn::Direct {
+            code: leaf_b,
+            relocs: Vec::new(),
+        });
+
+        let roots: Vec<usize> = (0..total).collect();
+        let live = AotReach::new(total, &roots);
+        let pre = PreSyms {
+            rodata_offs: &[],
+            static_syms: &HashMap::default(),
+            promoted_syms: &HashMap::default(),
+            thread_slots: &HashMap::default(),
+        };
+        let canon = fold_functions(&state, &live, &VtableMask::all_live(), &pre, &roots)
+            .expect("fold_functions");
+        for i in 0..HOPS {
+            assert_ne!(
+                canon[i],
+                canon[HOPS + i],
+                "hop {i} must not merge across 18-hop distinct leaves"
+            );
         }
     }
-    for (ret, handler, frame_offset, pad) in sites {
-        for word in [ret, handler, frame_offset, pad] {
-            buf.extend_from_slice(&word.to_le_bytes());
-        }
-    }
-    exe.unwind_table_off = Some(exe.rodata(&buf, 8));
 }

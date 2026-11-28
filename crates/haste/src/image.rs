@@ -24,7 +24,9 @@ pub(crate) use run::interrupted;
 #[cfg(unix)]
 pub(crate) use run::{close_on_exec, fork_child, pipe, wait};
 pub use script::Script;
-pub(crate) use statics::{StaticInit, fill_once, thread_cell};
+pub(crate) use statics::{
+    StaticInit, fill_once, static_cell_size, static_flag_offset, thread_cell,
+};
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};

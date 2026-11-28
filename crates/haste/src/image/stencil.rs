@@ -12,7 +12,7 @@ use crate::outline::tree::Profile;
 use crate::sema::Context;
 use crate::sema::reach::Reached;
 
-use super::{Image, ImageMode};
+use super::Image;
 
 mod compile;
 mod data;
@@ -280,15 +280,7 @@ pub(super) fn mode_dict_key(direct_key: u64) -> u64 {
     direct_key ^ 0xD1C7_A070_D1C7_A070
 }
 
-pub(super) fn mode_stencil_key(mode: ImageMode, item_key: u64) -> u64 {
-    if mode == ImageMode::Aot {
-        item_key ^ 0xA070_A070_A070_A070
-    } else {
-        item_key
-    }
-}
-
-fn compile_traced(
+pub(super) fn compile_traced(
     cx: &mut Context<'_>,
     reached: &Reached,
     index: usize,

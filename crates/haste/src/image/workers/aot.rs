@@ -95,15 +95,19 @@ impl Image {
                 if deferred.is_empty() || eval_requests.is_empty() {
                     break;
                 }
-                prime_eval_requests(cx, eval_requests);
+                if !eval_requests.is_empty() {
+                    prime_eval_requests(cx, eval_requests);
+                }
                 if wave + 1 == MAX_PARALLEL_WAVES || deferred.len() < AOT_MIN_PARALLEL {
                     break;
                 }
                 deferred.sort_unstable();
+                deferred.dedup();
                 queue.reseed_buckets(lpt_chunks(bucket_work(reached, &deferred), AOT_MAX_BUCKET));
             }
             if !deferred.is_empty() {
                 deferred.sort_unstable();
+                deferred.dedup();
                 queue.reseed_buckets(lpt_chunks(bucket_work(reached, &deferred), AOT_MAX_BUCKET));
                 let was_parallel = std::mem::replace(&mut cx.in_parallel, false);
                 image.drain_aot_serial(cx, reached, &queue, plan, &mut broken);
@@ -145,6 +149,7 @@ impl Image {
                 break;
             }
             batch.sort_unstable();
+            batch.dedup();
             let mut batch_errors = Vec::new();
             let work = self.prepare_work(cx, reached, &batch, (&mut batch_errors, None));
             for (idx, err) in batch_errors {

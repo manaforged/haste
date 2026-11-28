@@ -178,7 +178,7 @@ fn elf_structure_relocs_dynamic_table_and_debug_line_toggle() {
         assert_eq!(&bytes[0..4], b"\x7fELF");
         assert_eq!(bytes[4], 2);
         assert_eq!(bytes[5], 1);
-        assert_eq!(read_u16(&bytes, 16), 2);
+        assert_eq!(read_u16(&bytes, 16), 3);
         assert_eq!(read_u16(&bytes, 18), expected_machine);
 
         let entry = read_u64(&bytes, 24);
@@ -780,3 +780,4 @@ fn decode_func_starts(bytes: &[u8]) -> Vec<u64> {
 mod exports;
 mod macho_framework;
 mod panic_abort;
+mod pie;

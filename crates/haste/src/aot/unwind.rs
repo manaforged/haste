@@ -21,6 +21,8 @@ const CLEANUP_FP_OFFSET: i32 = 32;
 /// Byte size of one function record in the AOT unwind table (`start, end, drop_start, drop_count, saved_regs`).
 pub(crate) const UNWIND_FN_REC_BYTES: usize = 20;
 
+pub(crate) const UNWIND_REC12_BYTES: usize = 12;
+
 fn scale_fn_rec_index(
     b: &mut FunctionBuilder<'_>,
     idx: haste_codegen::Value,
@@ -31,6 +33,18 @@ fn scale_fn_rec_index(
     let b16 = b.ins().ishl(idx, c4);
     let b4 = b.ins().ishl(idx, c2);
     b.ins().iadd(b16, b4)
+}
+
+fn scale_rec12_index(
+    b: &mut FunctionBuilder<'_>,
+    idx: haste_codegen::Value,
+    c3: haste_codegen::Value,
+    c2: haste_codegen::Value,
+) -> haste_codegen::Value {
+    const _: () = assert!(UNWIND_REC12_BYTES == (1 << 3) + (1 << 2));
+    let b8 = b.ins().ishl(idx, c3);
+    let b4 = b.ins().ishl(idx, c2);
+    b.ins().iadd(b8, b4)
 }
 
 /// Compiles and appends the native frame-table unwind walker `fn(cur_fp, stop_fp, text_base, table_ptr)`.
@@ -234,7 +248,7 @@ fn build_unwind_walk() -> Function {
     let s_diff = b.ins().isub(shi, slo);
     let s_half = b.ins().ushr(s_diff, c1);
     let s_mid = b.ins().iadd(slo, s_half);
-    let s_off = b.ins().ishl(s_mid, c4);
+    let s_off = scale_rec12_index(&mut b, s_mid, c3, c2);
     let s_ptr = b.ins().iadd(sites_base, s_off);
     let s_ret32 = b.ins().load(Type::I32, s_ptr, 0);
     let s_ret = b.ins().uextend(Type::I64, s_ret32);
@@ -431,7 +445,7 @@ fn build_unwind_walk() -> Function {
 
     b.switch_to_block(drop_step);
     let next_idx = b.ins().iadd_imm(idx, -1);
-    let doff = b.ins().ishl(next_idx, c4);
+    let doff = scale_rec12_index(&mut b, next_idx, c3, c2);
     let dptr = b.ins().iadd(drops_base, doff);
     let flag_off32 = b.ins().load(Type::I32, dptr, 4);
     let flag_off = b.ins().sextend(Type::I64, flag_off32);
@@ -445,7 +459,9 @@ fn build_unwind_walk() -> Function {
     let local_off32 = b.ins().load(Type::I32, dptr, 0);
     let local_off = b.ins().sextend(Type::I64, local_off32);
     let slot_ptr = b.ins().iadd(next_fp, local_off);
-    let ind32 = b.ins().load(Type::I32, dptr, 12);
+    let drop_word32 = b.ins().load(Type::I32, dptr, 8);
+    let ind_mask32 = b.ins().iconst(Type::I32, 3);
+    let ind32 = b.ins().band(drop_word32, ind_mask32);
     let is_ind = b.ins().icmp_imm(IntCC::NotEqual, ind32, 0);
     b.ins()
         .brif(is_ind, load_ind, &[], do_call, &[slot_ptr, zero]);
@@ -465,7 +481,9 @@ fn build_unwind_walk() -> Function {
     b.ins().jump(do_call, &[deref_ptr, wide_meta]);
 
     b.switch_to_block(do_call);
-    let fn_off32 = b.ins().load(Type::I32, dptr, 8);
+    let drop_word_call = b.ins().load(Type::I32, dptr, 8);
+    let fn_mask32 = b.ins().iconst(Type::I32, !3i64);
+    let fn_off32 = b.ins().band(drop_word_call, fn_mask32);
     let fn_off = b.ins().uextend(Type::I64, fn_off32);
     let drop_fn = b.ins().iadd(text_base, fn_off);
     b.ins().store(my_fp, state_ptr, CLEANUP_FP_OFFSET);

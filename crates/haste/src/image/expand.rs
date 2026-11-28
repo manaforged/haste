@@ -126,47 +126,78 @@ impl Driver for Shares<'_, '_> {
     }
 }
 
+const MACRO_CHILD_STACK_SIZE: usize = 64 * 1024 * 1024;
+
 impl Image {
-    fn macros_in_child(&self, jobs: &[&Job<'_>], mut out: std::fs::File) -> std::io::Result<()> {
+    fn macros_in_child(&self, jobs: &[&Job<'_>], out: std::fs::File) -> std::io::Result<()> {
         if let Some(first) = jobs.first() {
             for (key, value) in first.vars {
                 // SAFETY: single-threaded forked child process before invoking procedural macro code.
                 unsafe { std::env::set_var(key, value) };
             }
         }
-        for job in jobs {
-            let (entry, run) = (
-                self.slot(job.entry).load(Ordering::Acquire),
-                self.slot(job.run).load(Ordering::Acquire),
-            );
-            let mut result = [0usize; 2];
-            match job.texts[..] {
-                [one] => {
-                    // SAFETY: entry is the code of `__haste_expand1`, or a stub that compiles it, whose native signature is this one, and run is the code of a `fn(TokenStream) -> TokenStream`.
-                    let call: One = unsafe { std::mem::transmute::<usize, One>(entry) };
-                    call(run, one.as_ptr(), one.len(), result.as_mut_ptr());
-                }
-                [attr, item] => {
-                    // SAFETY: entry is the code of `__haste_expand2`, or a stub that compiles it, whose native signature is this one, and run is the code of a `fn(TokenStream, TokenStream) -> TokenStream`.
-                    let call: Two = unsafe { std::mem::transmute::<usize, Two>(entry) };
-                    call(
-                        run,
-                        attr.as_ptr(),
-                        attr.len(),
-                        item.as_ptr(),
-                        item.len(),
-                        result.as_mut_ptr(),
-                    );
-                }
-                _ => return Err(std::io::Error::other("a macro job takes one or two texts")),
+        let slots: Vec<(_, _, &[&[u8]])> = jobs
+            .iter()
+            .map(|job| {
+                (
+                    self.slot(job.entry),
+                    self.slot(job.run),
+                    job.texts.as_slice(),
+                )
+            })
+            .collect();
+        std::thread::scope(|scope| {
+            let handle = std::thread::Builder::new()
+                .stack_size(MACRO_CHILD_STACK_SIZE)
+                .spawn_scoped(scope, move || run_macro_slots(&slots, out))?;
+            match handle.join() {
+                Ok(res) => res,
+                Err(payload) => std::panic::resume_unwind(payload),
             }
-            // SAFETY: the entry wrote the address and length of the output text it leaked into result.
-            let text = unsafe { std::slice::from_raw_parts(result[0] as *const u8, result[1]) };
-            out.write_all(&(text.len() as u64).to_le_bytes())?;
-            out.write_all(text)?;
-        }
-        Ok(())
+        })
     }
+}
+
+fn run_macro_slots(
+    slots: &[(
+        &std::sync::atomic::AtomicUsize,
+        &std::sync::atomic::AtomicUsize,
+        &[&[u8]],
+    )],
+    mut out: std::fs::File,
+) -> std::io::Result<()> {
+    for &(entry_slot, run_slot, texts) in slots {
+        let (entry, run) = (
+            entry_slot.load(Ordering::Acquire),
+            run_slot.load(Ordering::Acquire),
+        );
+        let mut result = [0usize; 2];
+        match texts {
+            [one] => {
+                // SAFETY: entry is the code of `__haste_expand1`, or a stub that compiles it, whose native signature is this one, and run is the code of a `fn(TokenStream) -> TokenStream`.
+                let call: One = unsafe { std::mem::transmute::<usize, One>(entry) };
+                call(run, one.as_ptr(), one.len(), result.as_mut_ptr());
+            }
+            [attr, item] => {
+                // SAFETY: entry is the code of `__haste_expand2`, or a stub that compiles it, whose native signature is this one, and run is the code of a `fn(TokenStream, TokenStream) -> TokenStream`.
+                let call: Two = unsafe { std::mem::transmute::<usize, Two>(entry) };
+                call(
+                    run,
+                    attr.as_ptr(),
+                    attr.len(),
+                    item.as_ptr(),
+                    item.len(),
+                    result.as_mut_ptr(),
+                );
+            }
+            _ => return Err(std::io::Error::other("a macro job takes one or two texts")),
+        }
+        // SAFETY: the entry wrote the address and length of the output text it leaked into result.
+        let text = unsafe { std::slice::from_raw_parts(result[0] as *const u8, result[1]) };
+        out.write_all(&(text.len() as u64).to_le_bytes())?;
+        out.write_all(text)?;
+    }
+    Ok(())
 }
 
 fn frames(mut bytes: &[u8]) -> Vec<Vec<u8>> {

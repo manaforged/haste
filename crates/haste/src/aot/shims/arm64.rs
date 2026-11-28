@@ -212,7 +212,52 @@ fn emit_arm64_thread_cell(c: &Emit<'_>, key_va: u64, out: &mut Buf) -> Result<()
     Ok(())
 }
 
-fn emit_arm64_alloc(c: &Emit<'_>, out: &mut Buf) -> Result<()> {
+const ALLOC_CACHE_MAX_M1: u32 = haste_codegen::FRAME_CACHE_LIMIT - 17;
+
+fn emit_arm64_frame_base(c: &Emit<'_>, addrs: SectionAddrs, out: &mut Buf) {
+    tls::emit_arm64_tlv_base(c, addrs.tlv_desc, out);
+    if addrs.frame_tls != 0 {
+        out.u32(0x9100_0000 | ((addrs.frame_tls as u32 & 0xFFF) << 10));
+    }
+}
+
+fn emit_arm64_dealloc(c: &Emit<'_>, addrs: SectionAddrs, out: &mut Buf) -> Result<()> {
+    if c.win || addrs.tlv_desc == 0 {
+        return c.tail(c.pick("_aligned_free", "free"), out);
+    }
+    let over_align = arm64_jcc(&[0xF100_405F], 0x5400_0008, out);
+    let big = arm64_jcc(
+        &[0xD100_0429, 0xF100_013F | (ALLOC_CACHE_MAX_M1 << 10)],
+        0x5400_0008,
+        out,
+    );
+    out.words(&[0x9100_3C2B, 0x927C_ED6B, 0xAA00_03E9, 0xAA1E_03EA]);
+    emit_arm64_frame_base(c, addrs, out);
+    let full = arm64_jcc(
+        &[
+            0x8B0B_0002,
+            0xF940_0448,
+            0xF100_011F | (u32::from(haste_codegen::FRAME_CACHE_DEPTH) << 10),
+        ],
+        0x5400_0002,
+        out,
+    );
+    out.words(&[
+        0xF940_004B,
+        0xF900_012B,
+        0xF900_0049,
+        0x9100_0508,
+        0xF900_0448,
+        0xAA0A_03FE,
+        0xD65F_03C0,
+    ]);
+    arm64_here(&[full], out);
+    out.words(&[0xAA09_03E0, 0xAA0A_03FE]);
+    arm64_here(&[over_align, big], out);
+    c.tail("free", out)
+}
+
+fn emit_arm64_alloc(c: &Emit<'_>, addrs: SectionAddrs, out: &mut Buf) -> Result<()> {
     if c.win {
         return c.words_tail(
             &[
@@ -226,17 +271,44 @@ fn emit_arm64_alloc(c: &Emit<'_>, out: &mut Buf) -> Result<()> {
             out,
         );
     }
-    c.words_tail(
-        &[
-            0xF100_001F,
-            0xD280_0029,
-            0x9A89_1000,
-            0xF100_403F,
-            0x5400_0048,
-        ],
-        "malloc",
-        out,
-    )?;
+    if addrs.tlv_desc != 0 {
+        let over_align = arm64_jcc(&[0xF100_403F], 0x5400_0008, out);
+        let big = arm64_jcc(
+            &[0xD100_0409, 0xF100_013F | (ALLOC_CACHE_MAX_M1 << 10)],
+            0x5400_0008,
+            out,
+        );
+        out.words(&[0x9100_3C09, 0x927C_ED29, 0xAA1E_03EA]);
+        emit_arm64_frame_base(c, addrs, out);
+        let miss = arm64_jcc(&[0x8B09_0002, 0xF940_0040], 0xB400_0000, out);
+        out.words(&[
+            0xF940_0008,
+            0xF900_0048,
+            0xF940_0449,
+            0xD100_0529,
+            0xF900_0449,
+            0xAA0A_03FE,
+            0xD65F_03C0,
+        ]);
+        arm64_here(&[miss], out);
+        c.words_tail(&[0xAA09_03E0, 0xAA0A_03FE], "malloc", out)?;
+        arm64_here(&[big], out);
+        c.words_tail(&[0xF100_001F, 0xD280_0029, 0x9A89_1000], "malloc", out)?;
+        arm64_here(&[over_align], out);
+        out.words(&[0xF100_001F, 0xD280_0029, 0x9A89_1000]);
+    } else {
+        c.words_tail(
+            &[
+                0xF100_001F,
+                0xD280_0029,
+                0x9A89_1000,
+                0xF100_403F,
+                0x5400_0048,
+            ],
+            "malloc",
+            out,
+        )?;
+    }
     c.words_call(
         &[
             0xD100_83FF,
@@ -258,7 +330,7 @@ fn emit_arm64_alloc(c: &Emit<'_>, out: &mut Buf) -> Result<()> {
     Ok(())
 }
 
-fn emit_arm64_alloc_zeroed(c: &Emit<'_>, out: &mut Buf) -> Result<()> {
+fn emit_arm64_alloc_zeroed(c: &Emit<'_>, addrs: SectionAddrs, out: &mut Buf) -> Result<()> {
     if c.win {
         c.words_call(
             &[
@@ -280,19 +352,60 @@ fn emit_arm64_alloc_zeroed(c: &Emit<'_>, out: &mut Buf) -> Result<()> {
         out.words(&[0xF940_0BF3, 0xA8C2_7BFD, 0xD65F_03C0]);
         return Ok(());
     }
-    c.words_tail(
-        &[
-            0xF100_001F,
-            0xD280_0029,
-            0x9A89_1000,
-            0xF100_403F,
-            0x5400_0068,
-            0xAA00_03E1,
-            0xD280_0020,
-        ],
-        "calloc",
-        out,
-    )?;
+    if addrs.tlv_desc != 0 {
+        let over_align = arm64_jcc(&[0xF100_403F], 0x5400_0008, out);
+        let big = arm64_jcc(
+            &[0xD100_0409, 0xF100_013F | (ALLOC_CACHE_MAX_M1 << 10)],
+            0x5400_0008,
+            out,
+        );
+        out.words(&[0x9100_3C09, 0x927C_ED29, 0xAA1E_03EA]);
+        emit_arm64_frame_base(c, addrs, out);
+        let miss = arm64_jcc(&[0x8B09_0002, 0xF940_0040], 0xB400_0000, out);
+        out.words(&[
+            0xF940_0008,
+            0xF900_0048,
+            0xF940_0448,
+            0xD100_0508,
+            0xF900_0448,
+            0xAA00_03EB,
+        ]);
+        let zero_loop = out.pos();
+        out.words(&[0xA881_7D7F, 0xF100_4129]);
+        let back = arm64_fwd(0x5400_0001, out);
+        arm64_patch(back, zero_loop, out);
+        out.words(&[0xAA0A_03FE, 0xD65F_03C0]);
+        arm64_here(&[miss], out);
+        c.words_tail(&[0xAA09_03E1, 0xD280_0020, 0xAA0A_03FE], "calloc", out)?;
+        arm64_here(&[big], out);
+        c.words_tail(
+            &[
+                0xF100_001F,
+                0xD280_0029,
+                0x9A89_1000,
+                0xAA00_03E1,
+                0xD280_0020,
+            ],
+            "calloc",
+            out,
+        )?;
+        arm64_here(&[over_align], out);
+        out.words(&[0xF100_001F, 0xD280_0029, 0x9A89_1000]);
+    } else {
+        c.words_tail(
+            &[
+                0xF100_001F,
+                0xD280_0029,
+                0x9A89_1000,
+                0xF100_403F,
+                0x5400_0088,
+                0xAA00_03E1,
+                0xD280_0020,
+            ],
+            "calloc",
+            out,
+        )?;
+    }
     c.words_call(
         &[
             0xD100_83FF,
@@ -321,7 +434,7 @@ fn emit_arm64_alloc_zeroed(c: &Emit<'_>, out: &mut Buf) -> Result<()> {
     Ok(())
 }
 
-fn emit_arm64_realloc(c: &Emit<'_>, out: &mut Buf) -> Result<()> {
+fn emit_arm64_realloc(c: &Emit<'_>, addrs: SectionAddrs, out: &mut Buf) -> Result<()> {
     if c.win {
         return c.words_tail(
             &[
@@ -335,18 +448,41 @@ fn emit_arm64_realloc(c: &Emit<'_>, out: &mut Buf) -> Result<()> {
             out,
         );
     }
-    c.words_tail(
-        &[
-            0xF100_007F,
-            0xD280_0029,
-            0x9A89_1063,
-            0xF100_405F,
-            0x5400_0068,
-            0xAA03_03E1,
-        ],
-        "realloc",
-        out,
-    )?;
+    if addrs.tlv_desc != 0 {
+        let over_align = arm64_jcc(&[0xF100_405F], 0x5400_0008, out);
+        let big_new = arm64_jcc(
+            &[0xD100_0469, 0xF100_013F | (ALLOC_CACHE_MAX_M1 << 10)],
+            0x5400_0008,
+            out,
+        );
+        out.words(&[0x9100_3C63, 0x927C_EC63]);
+        let big_old = arm64_jcc(
+            &[0xD100_0429, 0xF100_013F | (ALLOC_CACHE_MAX_M1 << 10)],
+            0x5400_0008,
+            out,
+        );
+        let diff_class = arm64_jcc(&[0x9100_3C29, 0x927C_ED29, 0xEB03_013F], 0x5400_0001, out);
+        out.u32(0xD65F_03C0);
+        arm64_here(&[big_new], out);
+        out.words(&[0xF100_007F, 0xD280_0029, 0x9A89_1063]);
+        arm64_here(&[big_old, diff_class], out);
+        c.words_tail(&[0xAA03_03E1], "realloc", out)?;
+        arm64_here(&[over_align], out);
+        out.words(&[0xF100_007F, 0xD280_0029, 0x9A89_1063]);
+    } else {
+        c.words_tail(
+            &[
+                0xF100_007F,
+                0xD280_0029,
+                0x9A89_1063,
+                0xF100_405F,
+                0x5400_0068,
+                0xAA03_03E1,
+            ],
+            "realloc",
+            out,
+        )?;
+    }
     c.words_call(
         &[
             0xD100_C3FF,
@@ -388,26 +524,33 @@ fn emit_arm64_realloc(c: &Emit<'_>, out: &mut Buf) -> Result<()> {
     Ok(())
 }
 
-fn emit_arm64_fill_once(c: &Emit<'_>, out: &mut Buf) -> Result<()> {
+fn emit_arm64_fill_once(c: &Emit<'_>, os: Os, out: &mut Buf) -> Result<()> {
     out.words(&[
-        0xA9BE_7BFD,
+        0xA9BD_7BFD,
         0xA901_53F3,
+        0xF900_13F5,
         0xAA00_03F3,
         0xAA01_03F4,
-        0x5280_004A,
     ]);
+    match os {
+        Os::Darwin => out.words(&[0xD53B_D075, 0x927D_F2B5]),
+        Os::Windows => out.u32(0xAA12_03F5),
+        Os::Linux => out.u32(0xD53B_D055),
+    }
     let retry = out.pos();
     c.words_call(
         &[
-            0x085F_FE68,
-            0x3500_00E8,
-            0x0809_FE6A,
+            0xC85F_FE68,
+            0xB500_00E8,
+            0xC809_FE75,
             0x35FF_FFA9,
             0xD63F_0280,
-            0x5280_0028,
-            0x089F_FE68,
-            0x1400_0005,
-            0x7100_051F,
+            0xD280_0028,
+            0xC89F_FE68,
+            0x1400_0007,
+            0xF100_051F,
+            0x5400_00A0,
+            0xEB15_011F,
             0x5400_0060,
         ],
         c.pick("SwitchToThread", "sched_yield"),
@@ -416,8 +559,9 @@ fn emit_arm64_fill_once(c: &Emit<'_>, out: &mut Buf) -> Result<()> {
     let back = ((retry as isize - out.pos() as isize) >> 2) as u32;
     out.words(&[
         0x1400_0000 | (back & 0x03FF_FFFF),
+        0xF940_13F5,
         0xA941_53F3,
-        0xA8C2_7BFD,
+        0xA8C3_7BFD,
         0xD65F_03C0,
     ]);
     Ok(())
@@ -451,7 +595,7 @@ pub(super) fn emit_shim_arm64(
         ]),
         Shim::Cpuid => out.words(&[0xA900_7C1F, 0xD65F_03C0]),
         Shim::ExtendedState => out.words(&[0xD280_0000, 0xD65F_03C0]),
-        Shim::Dealloc => c.tail(c.pick("_aligned_free", "free"), out)?,
+        Shim::Dealloc => emit_arm64_dealloc(&c, addrs, out)?,
         Shim::FrameAlloc | Shim::FrameFree if addrs.tlv_desc != 0 => {
             tls::emit_arm64_tlv_frame_cache(
                 &c,
@@ -469,10 +613,10 @@ pub(super) fn emit_shim_arm64(
             },
             out,
         )?,
-        Shim::Alloc => emit_arm64_alloc(&c, out)?,
-        Shim::AllocZeroed => emit_arm64_alloc_zeroed(&c, out)?,
-        Shim::Realloc => emit_arm64_realloc(&c, out)?,
-        Shim::FillOnce => emit_arm64_fill_once(&c, out)?,
+        Shim::Alloc => emit_arm64_alloc(&c, addrs, out)?,
+        Shim::AllocZeroed => emit_arm64_alloc_zeroed(&c, addrs, out)?,
+        Shim::Realloc => emit_arm64_realloc(&c, addrs, out)?,
+        Shim::FillOnce => emit_arm64_fill_once(&c, os, out)?,
         Shim::ThreadCell if addrs.tlv_desc != 0 => {
             tls::emit_arm64_tlv_thread_cell(&c, addrs.tlv_desc, addrs.thread_tls, out)?
         }

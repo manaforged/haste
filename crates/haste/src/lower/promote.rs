@@ -243,10 +243,11 @@ impl Lower<'_, '_> {
     }
 
     fn ensure_static_filled(&mut self, index: usize, address: Value, size: i32) -> Result<()> {
-        let flag = self.ins().iadd_imm(address, i64::from(size));
+        let flag_off = crate::image::static_flag_offset(size as u32);
+        let flag = self.ins().iadd_imm(address, i64::from(flag_off));
         let state = self
             .ins()
-            .atomic_load(Type::I8, flag, haste_codegen::AtomicOrd::Acquire);
+            .atomic_load(Type::I64, flag, haste_codegen::AtomicOrd::Acquire);
         let filled = self.ins().icmp_imm(
             IntCC::Equal,
             state,

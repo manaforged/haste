@@ -22,13 +22,12 @@ mod wide;
 
 pub(super) use patch::{PatchCtx, Veneers, patch_code, plan_veneers};
 pub(super) use plan::{Plan, resolve_sym};
-pub(crate) use unwind::UNWIND_FN_REC_BYTES;
+pub(crate) use unwind::{UNWIND_FN_REC_BYTES, UNWIND_REC12_BYTES};
 
-pub(super) const ELF_BASE: u64 = 0x0040_0000;
 pub(super) const MACH_BASE: u64 = 0x1_0000_0000;
 pub(super) const MACH_PAGE: u64 = 0x4000;
 const LOOP_PAGE: u32 = 0x1000;
-const LOOP_SHIFT: u32 = 256;
+const LOOP_SHIFT: u32 = 64;
 
 /// A relocation target inside a standalone AOT executable.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -167,6 +166,10 @@ impl Executable {
         syms.iter()
             .map(|sym| push_name(strtab, &[prefix, &sym.name]))
             .collect()
+    }
+
+    pub(crate) fn rodata_bytes(&self) -> &[u8] {
+        &self.rodata
     }
 
     /// Appends 16-byte-aligned machine code to `.text` and returns its section offset.

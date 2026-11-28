@@ -10,16 +10,12 @@ use crate::lower::{SymbolSource, VtableEntry, Word};
 use crate::sync::lock;
 
 use super::super::Image;
-use super::{AotCode, AotFn, AotReach, AotState, AotStatic, icf, vdce};
+use super::{AotCode, AotFn, AotReach, AotState, AotStatic, icf, rodata, vdce};
 
-const FN_ALIGN: u32 = 64;
+const FN_ALIGN: u32 = 16;
 
 fn place(exe: &mut Executable, code: &AotCode, debug_info: bool, fn_align: Option<u32>) -> u32 {
-    let align = fn_align.unwrap_or(if code.loops().is_empty() {
-        16
-    } else {
-        FN_ALIGN
-    });
+    let align = fn_align.unwrap_or(if code.loops().is_empty() { 4 } else { FN_ALIGN });
     exe.function(
         code.bytes(),
         align,
@@ -208,7 +204,9 @@ fn emit_static_syms(
             continue;
         };
         let sym = match entry {
-            AotStatic::Local(size) => Symbol::Bss(exe.bss(*size + 1, 16)),
+            AotStatic::Local(size) => {
+                Symbol::Bss(exe.bss(crate::image::static_cell_size(*size), 16))
+            }
             AotStatic::Foreign {
                 weak: false,
                 host: Some(host),
@@ -294,14 +292,15 @@ impl Image {
                 }
             }
         }
+        let panic_abort = user_panic_abort(cx, reached, user_main);
         let (live, vmask) = vdce::VtableMask::converge(cx, reached, &state.vtables, |vmask| {
-            let live = AotReach::collect(&state, &aot_roots, vmask);
+            let live = AotReach::collect(&state, &aot_roots, vmask, !panic_abort);
             let counts = (live.order.len(), live.vtable_order.len());
             let fns = live.fns.clone();
             (live, fns, counts)
         });
         let mut exe = Executable::new(target);
-        exe.panic_abort = user_panic_abort(cx, reached, user_main);
+        exe.panic_abort = panic_abort;
         if target.format == haste_codegen::Format::MachO {
             collect_macho_frameworks(cx, reached, &live, &mut exe);
         }
@@ -313,7 +312,7 @@ impl Image {
             .map(|(rank, &index)| (index, (rank + 1) as u64))
             .collect();
         exe.thread_slots = live.thread_slots.list.len() as u32 + 1;
-        let (rodata_offs, rodata_fns) = icf::emit_rodata(&state, &live, &mut exe)?;
+        let (rodata_offs, rodata_fns) = rodata::emit_rodata(&state, &live, &mut exe)?;
         let (static_syms, promoted_syms) = emit_static_syms(&state, &live, &mut exe);
         let pre = icf::PreSyms {
             rodata_offs: &rodata_offs,
@@ -322,7 +321,7 @@ impl Image {
             thread_slots: &thread_slots,
         };
         let roots = icf::alias_roots(&state.functions);
-        let canon = icf::fold_functions(&state, &live.fns, &pre, &roots)?;
+        let canon = icf::fold_functions(&state, &live, &vmask, &pre, &roots)?;
         let (slot_offs, unique_slots) =
             icf::alloc_slots(&state, &live.slots.list, (&roots, &canon), &mut exe);
         let (vtable_offs, unique_vtables) = icf::alloc_vtables(
@@ -352,13 +351,15 @@ impl Image {
             (&roots, &canon),
             &mut exe,
         )?;
-        icf::emit_unwind_table(
-            &state,
-            &live,
-            (&roots, &canon),
-            (&fn_offs, &dict_bodies),
-            &mut exe,
-        );
+        if !exe.panic_abort {
+            rodata::emit_unwind_table(
+                &state,
+                &live,
+                (&roots, &canon),
+                (&fn_offs, &dict_bodies),
+                &mut exe,
+            );
+        }
         patch_vtables(
             &state,
             &vmask,

@@ -61,7 +61,9 @@ impl HostSymbol {
             "__rust_no_alloc_shim_is_unstable_v2"
             | "llvm.x86.sse2.pause"
             | "llvm.x86.avx.vzeroupper"
-            | "llvm.aarch64.hint" => Self::Noop,
+            | "llvm.aarch64.hint"
+            | "llvm.prefetch"
+            | "llvm.prefetch.p0" => Self::Noop,
             "llvm.aarch64.isb" | "llvm.aarch64.dmb" | "llvm.aarch64.dsb" => Self::Barrier,
             "llvm.x86.xgetbv" => Self::ExtendedState,
             "__rust_alloc_error_handler" => Self::Abort,

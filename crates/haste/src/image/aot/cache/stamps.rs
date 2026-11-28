@@ -18,18 +18,14 @@ use crate::sync::lock;
 use super::relocs::{hash_str, item_check_key, stable_file_key};
 use crate::lower::SymbolSource;
 
-pub(in crate::image::aot::cache) struct Stamps {
+pub(crate) struct Stamps {
     iface: Vec<u64>,
     files: Vec<Vec<u64>>,
     file_keys: Vec<OnceLock<Vec<Option<u64>>>>,
 }
 
 impl Stamps {
-    pub(in crate::image::aot::cache) fn compute(
-        outline: &Outline,
-        tc_key: u64,
-        target_key: u64,
-    ) -> Self {
+    pub(crate) fn compute(outline: &Outline, tc_key: u64, target_key: u64) -> Self {
         let n = outline.crates.len();
         let mut iface = vec![0u64; n];
         let mut files = vec![Vec::new(); n];
@@ -47,7 +43,7 @@ impl Stamps {
         }
     }
 
-    pub(in crate::image::aot::cache) fn iface(&self, krate: u32) -> Option<u64> {
+    pub(crate) fn iface(&self, krate: u32) -> Option<u64> {
         self.iface.get(krate as usize).copied()
     }
 
@@ -192,7 +188,7 @@ fn resolve_crate_stamps(
     digest
 }
 
-pub(in crate::image::aot::cache) fn stable_entry_item_key(
+pub(crate) fn stable_entry_item_key(
     outline: &Outline,
     stamps: &Stamps,
     item: ItemRef,
@@ -270,7 +266,7 @@ fn collect_substs_crates(types: &Types, substs: Substs, out: &mut Vec<u32>) {
     }
 }
 
-pub(in crate::image::aot::cache) fn touched_stamps_digest(
+pub(crate) fn touched_stamps_digest(
     types: &Types,
     stamps: &Stamps,
     item: ItemRef,
@@ -296,7 +292,7 @@ pub(in crate::image::aot::cache) fn touched_stamps_digest(
     Some(h.finish())
 }
 
-pub(in crate::image::aot::cache) fn stable_substs_hash(
+pub(crate) fn stable_substs_hash(
     outline: &Outline,
     types: &Types,
     stamps: &Stamps,
@@ -436,7 +432,7 @@ fn stable_ty_hash(
     Some(val)
 }
 
-pub(in crate::image::aot::cache) fn hash_entry_128(
+pub(crate) fn hash_entry_128(
     config_digest: u64,
     item_key: u64,
     substs_hash: u64,
