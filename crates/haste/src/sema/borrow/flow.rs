@@ -6,11 +6,13 @@ use crate::body::{BinOp, BlockKind, Expr, ExprId, List, Pat, PatId, Stmt};
 use super::bind::{push_loan, push_source_loans};
 use super::checks::{is_temp_target, merge_break_states, retain_non_loop_state};
 use super::places::PlaceStep;
-use super::propagate::BorrowSource;
+use super::propagate::{BorrowSource, TupleSources};
 use super::{
     BreakFrame, Checker, Loan, STMT_TEMP_OFFSET, State, join_moved, merge_branch, merge_states,
     prune_dead_loans, prune_moved_loans,
 };
+
+type LoopPat<'a> = (PatId, &'a [BorrowSource], Option<&'a TupleSources>);
 
 impl Checker<'_, '_> {
     pub(super) fn check_block(
@@ -511,6 +513,7 @@ impl Checker<'_, '_> {
                 if !guard_else.diverged {
                     join_moved(&mut fallthrough_state, &guard_else);
                 }
+                prune_dead_loans(&mut arm_state, &guard_live);
                 if !arm_state.diverged {
                     self.bind_pat_moves(
                         arm.pat,
@@ -595,20 +598,12 @@ impl Checker<'_, '_> {
             push_source_loans(&mut state.loans, Some(id), &iter_sources, Some(iter));
             Some(id)
         };
-        let item_sources: Vec<BorrowSource> = if self.for_iter_item_is_static(iter) {
-            Vec::new()
-        } else {
-            iter_sources
-                .iter()
-                .filter(|s| !s.env_only)
-                .cloned()
-                .collect()
-        };
+        let (item_sources, item_tuple) = self.for_iter_item_sources(iter, &iter_sources, state);
         self.check_loop(
             None,
             label,
             None,
-            Some((pat, &item_sources)),
+            Some((pat, &item_sources, item_tuple.as_ref())),
             iter_temp,
             body,
             state,
@@ -626,7 +621,7 @@ impl Checker<'_, '_> {
         expr_id: Option<ExprId>,
         label: Option<u32>,
         cond: Option<ExprId>,
-        pat: Option<(PatId, &[BorrowSource])>,
+        pat: Option<LoopPat<'_>>,
         iter_holder: Option<u32>,
         body: ExprId,
         state: &mut State,
@@ -639,13 +634,19 @@ impl Checker<'_, '_> {
         if let Some(c) = cond {
             self.collect_declared_locals_expr(c, &mut loop_locals);
         }
-        if let Some((p, _)) = pat {
+        if let Some((p, ..)) = pat {
             self.collect_pat_locals(p, &mut loop_locals);
         }
         self.collect_declared_locals_expr(body, &mut loop_locals);
         let targets = self.active_live_targets();
-        let mut loop_live =
-            self.compute_loop_live(label, cond, pat.map(|(p, _)| p), body, outer_live, &targets);
+        let mut loop_live = self.compute_loop_live(
+            label,
+            cond,
+            pat.map(|(p, ..)| p),
+            body,
+            outer_live,
+            &targets,
+        );
         for l in &loop_locals {
             loop_live.remove(l);
         }
@@ -686,13 +687,14 @@ impl Checker<'_, '_> {
                         exit_cond_states.push(cond_dummy);
                     }
                 }
-                if let Some((p, sources)) = pat {
-                    this.bind_pat(
+                if let Some((p, sources, elem_tuple)) = pat {
+                    this.bind_pat_with_tuple(
                         p,
                         None,
                         None,
                         &[],
                         sources,
+                        elem_tuple,
                         &mut iter_state,
                         (true, true, loop_depth),
                     )?;

@@ -56,24 +56,38 @@ impl<'a> Infer<'_, 'a> {
         self.selecting.push(query);
         let found = self.applicable(of, self_ty, args, depth);
         self.selecting.pop();
-        let Ok([(picked, vars)]) = <[_; 1]>::try_from(found?) else {
+        let Ok([entry]) = <[_; 1]>::try_from(found?) else {
             return Ok(None);
         };
+        if self.defers_open_blanket(of, self_ty, args, &entry)? {
+            return Ok(None);
+        }
+        let (picked, vars) = entry;
+        self.adopt(vars);
+        Ok(Some(picked))
+    }
+
+    pub(super) fn defers_open_blanket(
+        &mut self,
+        of: ItemRef,
+        self_ty: Ty,
+        args: &[Ty],
+        (picked, vars): &(Picked, Vars),
+    ) -> Result<bool> {
         let mark = self.mark_vars();
         self.apply_var_delta(vars.base_len, &vars.updates, &vars.added, &vars.diverges);
         let open_arg = args
             .iter()
             .any(|&a| matches!(self.cx.types.kind(self.resolve(a)), Kind::Var(_)));
         self.rollback_vars(mark);
-        if open_arg
-            && of.krate != self.home.krate
+        let caller_krate = self
+            .instance
+            .map(|(item, _)| item.krate)
+            .unwrap_or(self.home.krate);
+        Ok(open_arg
+            && of.krate != caller_krate
             && head(self.cx.types.kind(self.resolve(self_ty))).is_some()
-            && self.blanket(picked.0)?
-        {
-            return Ok(None);
-        }
-        self.adopt(vars);
-        Ok(Some(picked))
+            && self.blanket(picked.0)?)
     }
 
     /// Whether some impl of trait `of` at `args` may apply to `self_ty`, even when inference cannot pick one yet.
@@ -627,3 +641,6 @@ impl Specialty {
         other.direct.iter().all(|of| self.implied.contains(of))
     }
 }
+
+#[cfg(test)]
+mod tests;

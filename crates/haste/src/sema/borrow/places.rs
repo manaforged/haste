@@ -1,6 +1,6 @@
 mod capture;
 
-use crate::body::{Expr, ExprId, List, PatId, UnOp};
+use crate::body::{BlockKind, Expr, ExprId, List, PatId, UnOp};
 use crate::names::ItemRef;
 use crate::outline::item::ItemKind;
 use crate::sema::infer::Res;
@@ -592,6 +592,53 @@ impl Checker<'_, '_> {
                 (PatId(id), step)
             })
             .collect()
+    }
+
+    pub(super) fn return_allows_reborrow(&self, v: ExprId) -> bool {
+        match *self.body.expr(v) {
+            Expr::Paren(inner) => return self.return_allows_reborrow(inner),
+            Expr::Block {
+                kind,
+                tail: Some(inner),
+                ..
+            } if kind != BlockKind::Const => return self.return_allows_reborrow(inner),
+            Expr::If(_, then_e, Some(else_e)) => {
+                return self.branch_allows_reborrow(then_e) && self.branch_allows_reborrow(else_e);
+            }
+            Expr::Match(_, arms) => {
+                let arm_ids = self.body.list(arms);
+                return !arm_ids.is_empty()
+                    && arm_ids
+                        .iter()
+                        .all(|&id| self.branch_allows_reborrow(self.body.arms[id as usize].body));
+            }
+            _ => {}
+        }
+        if !self.is_mut_ref_ty(self.expr_ty(v)) {
+            return false;
+        }
+        self.typed
+            .ret
+            .is_some_and(|r| match *self.cx.types.kind(r) {
+                Kind::Ref(Mut::Not, _) => true,
+                Kind::Ref(Mut::Mut, _) => !self.place_behind_shared_ref(v),
+                _ => false,
+            })
+    }
+
+    fn branch_allows_reborrow(&self, expr: ExprId) -> bool {
+        let ty = self.expr_ty(expr);
+        if ty != Ty::NONE && matches!(*self.cx.types.kind(ty), Kind::Never) {
+            return true;
+        }
+        if self.typed.ret.is_some_and(|r| {
+            matches!(*self.cx.types.kind(r), Kind::Ref(Mut::Not, _))
+                && ty != Ty::NONE
+                && matches!(*self.cx.types.kind(ty), Kind::Ref(Mut::Not, _))
+        }) {
+            return true;
+        }
+        self.return_allows_reborrow(expr)
     }
 }
 

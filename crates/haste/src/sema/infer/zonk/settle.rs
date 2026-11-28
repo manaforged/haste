@@ -5,7 +5,30 @@ use crate::names::{ItemRef, Primitive};
 
 use super::super::super::substs::Substs;
 use super::super::super::ty::{Kind, Ty};
+use super::super::poly::PolyPhase;
 use super::super::{Infer, Res};
+
+const INT_DEFAULTS: [Primitive; 12] = [
+    Primitive::I32,
+    Primitive::Usize,
+    Primitive::U32,
+    Primitive::U64,
+    Primitive::I64,
+    Primitive::U8,
+    Primitive::U16,
+    Primitive::I8,
+    Primitive::I16,
+    Primitive::Isize,
+    Primitive::U128,
+    Primitive::I128,
+];
+
+const FLOAT_DEFAULTS: [Primitive; 4] = [
+    Primitive::F64,
+    Primitive::F32,
+    Primitive::F16,
+    Primitive::F128,
+];
 
 impl Infer<'_, '_> {
     pub(super) fn settle_all(&mut self) -> Result<()> {
@@ -154,8 +177,8 @@ impl Infer<'_, '_> {
                 continue;
             }
             let fallback = match self.cx.types.kind(ty) {
-                Kind::IntVar(_) => Primitive::I32,
-                Kind::FloatVar(_) => Primitive::F64,
+                Kind::IntVar(_) => self.default_num_var(ty, &INT_DEFAULTS),
+                Kind::FloatVar(_) => self.default_num_var(ty, &FLOAT_DEFAULTS),
                 kind => {
                     stack.extend(kind.children(&self.cx.types));
                     continue;
@@ -165,6 +188,81 @@ impl Infer<'_, '_> {
             self.unify(ty, prim)?;
         }
         Ok(())
+    }
+
+    fn default_num_var(&mut self, var: Ty, candidates: &[Primitive]) -> Primitive {
+        let default = candidates[0];
+        let relevant: Vec<(ItemRef, Vec<Ty>)> = self
+            .obligations
+            .iter()
+            .filter(|(of, substs)| {
+                (self.captures_settled || !self.is_thread_auto_trait(*of))
+                    && substs
+                        .iter()
+                        .any(|&ty| self.ty_mentions_var(ty, var, &mut HashSet::default()))
+            })
+            .cloned()
+            .collect();
+        if relevant.is_empty() || self.probe_num_candidate(var, default, &relevant) {
+            return default;
+        }
+        let mut matched = None;
+        for &prim in &candidates[1..] {
+            if self.probe_num_candidate(var, prim, &relevant) {
+                if matched.is_some() {
+                    return default;
+                }
+                matched = Some(prim);
+            }
+        }
+        matched.unwrap_or(default)
+    }
+
+    fn probe_num_candidate(
+        &mut self,
+        var: Ty,
+        prim: Primitive,
+        relevant: &[(ItemRef, Vec<Ty>)],
+    ) -> bool {
+        let prim_ty = self.cx.types.prim(prim);
+        let saved = self.save_deferred();
+        let saved_poly = saved.2;
+        let ok = self.probe(|infer| {
+            if !infer.unifies(var, prim_ty) {
+                return false;
+            }
+            infer.obligations = relevant.to_vec();
+            if infer.settle_projection_loop().is_err() || !infer.obligations.is_empty() {
+                return false;
+            }
+            !saved_poly.is_some_and(|(was, _)| {
+                was != PolyPhase::Fallback
+                    && infer
+                        .poly
+                        .as_ref()
+                        .is_some_and(|p| p.phase == PolyPhase::Fallback)
+            })
+        });
+        self.restore_deferred(saved);
+        ok
+    }
+
+    fn ty_mentions_var(&self, ty: Ty, var: Ty, seen: &mut HashSet<Ty>) -> bool {
+        if !self.cx.types.has_var_flag(ty) {
+            return false;
+        }
+        let ty = self.resolve(ty);
+        if ty == var {
+            return true;
+        }
+        if !self.cx.types.has_var_flag(ty) || !seen.insert(ty) {
+            return false;
+        }
+        self.cx
+            .types
+            .kind(ty)
+            .children(&self.cx.types)
+            .any(|child| self.ty_mentions_var(child, var, seen))
     }
 
     fn fall_back_residuals(&mut self) -> Result<()> {

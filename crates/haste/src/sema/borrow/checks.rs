@@ -721,6 +721,54 @@ impl Checker<'_, '_> {
             _ => ty,
         }
     }
+
+    pub(super) fn assign_reborrow_or_place_ctx(&mut self, lhs: ExprId, rhs: ExprId) -> bool {
+        if matches!(*self.body.expr(lhs), Expr::Underscore) && self.root_place(rhs).is_some() {
+            return true;
+        }
+        self.is_mut_ref_ty(self.expr_ty(lhs)) && self.is_mut_ref_ty(self.expr_ty(rhs))
+    }
+
+    pub(super) fn check_tuple_or_array_list(
+        &mut self,
+        list: List,
+        state: &mut State,
+        outer_live: &HashSet<u32>,
+        depth: u32,
+    ) -> Result<()> {
+        let ids: Vec<u32> = self.body.list(list).to_vec();
+        let tys = self
+            .current_expr
+            .and_then(|e| match *self.cx.types.kind(self.expr_ty(e)) {
+                Kind::Tuple(elems) => Some(self.cx.types.substs(elems).to_vec()),
+                Kind::Array(elem, _) => Some(vec![elem; ids.len()]),
+                _ => None,
+            });
+        if let Some(mut arg_tys) = tys {
+            let mut param_refs = Vec::with_capacity(arg_tys.len());
+            for (&id, ty) in ids.iter().zip(arg_tys.iter_mut()) {
+                let e = ExprId(id);
+                let pr = (self.typed.coercions.contains_key(&e) || self.place_behind_ref(e, false))
+                    .then(|| self.ptr_or_ref_mut(*ty))
+                    .flatten();
+                if pr.is_none() {
+                    *ty = Ty::NONE;
+                }
+                param_refs.push(pr);
+            }
+            if param_refs.iter().any(Option::is_some) {
+                return self.check_arg_list_expected_tys(
+                    &ids,
+                    &param_refs,
+                    &arg_tys,
+                    state,
+                    outer_live,
+                    depth,
+                );
+            }
+        }
+        self.check_arg_list_with_refs(&ids, None, None, state, outer_live, depth)
+    }
 }
 
 pub(super) fn retain_non_loop_state(state: &mut State, loop_locals: &HashSet<u32>) {

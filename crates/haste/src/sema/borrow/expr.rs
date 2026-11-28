@@ -272,8 +272,7 @@ impl Checker<'_, '_> {
     ) -> Result<()> {
         let mut after_rhs = outer_live.clone();
         self.collect_live_expr(lhs, &mut after_rhs);
-        let reborrow_mut =
-            self.is_mut_ref_ty(self.expr_ty(lhs)) && self.is_mut_ref_ty(self.expr_ty(rhs));
+        let reborrow_mut = self.assign_reborrow_or_place_ctx(lhs, rhs);
         self.check_expr(rhs, state, reborrow_mut, &after_rhs, true, depth)?;
         if !state.diverged {
             self.check_mut_ref_reborrow(lhs, rhs, state)?;
@@ -617,21 +616,7 @@ impl Checker<'_, '_> {
         outer_live: &HashSet<u32>,
         depth: u32,
     ) -> Result<()> {
-        let ids: Vec<u32> = self.body.list(list).to_vec();
-        let arg_tys = self.current_expr.and_then(|e| {
-            let need = ids
-                .iter()
-                .any(|&id| self.typed.coercions.contains_key(&ExprId(id)));
-            if !need {
-                return None;
-            }
-            match *self.cx.types.kind(self.expr_ty(e)) {
-                Kind::Tuple(elems) => Some(self.cx.types.substs(elems).to_vec()),
-                Kind::Array(elem, _) => Some(vec![elem; ids.len()]),
-                _ => None,
-            }
-        });
-        self.check_arg_list_with_refs(&ids, None, arg_tys.as_deref(), state, outer_live, depth)
+        self.check_tuple_or_array_list(list, state, outer_live, depth)
     }
 
     fn check_struct_expr(
@@ -736,8 +721,7 @@ impl Checker<'_, '_> {
         depth: u32,
     ) -> Result<()> {
         if let Some(v) = val {
-            let reborrow_mut = self.is_mut_ref_ty(self.expr_ty(v))
-                && self.typed.ret.is_some_and(|r| self.is_mut_ref_ty(r));
+            let reborrow_mut = self.return_allows_reborrow(v);
             self.check_expr(v, state, reborrow_mut, outer_live, true, depth)?;
             if self.returns_borrow || self.returns_invariant {
                 self.check_return_escape(v, state)?;

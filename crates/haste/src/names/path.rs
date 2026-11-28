@@ -252,6 +252,7 @@ impl<'a> Paths<'a> {
                     } else if found.is_none()
                         && let Some(krate) = entry
                         && self.demand_pending_import(krate, at, name)
+                        && krate.settled
                     {
                         asks.names.borrow_mut().push((at, name));
                     }

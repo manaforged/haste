@@ -439,7 +439,12 @@ impl Checker<'_, '_> {
         }
     }
 
-    fn method_self_ty(&self, expr: ExprId, receiver: ExprId, sig: Option<&Signature>) -> Ty {
+    pub(in super::super) fn method_self_ty(
+        &self,
+        expr: ExprId,
+        receiver: ExprId,
+        sig: Option<&Signature>,
+    ) -> Ty {
         let mut cur = self.expr_ty(receiver);
         if cur == Ty::NONE {
             return Ty::NONE;

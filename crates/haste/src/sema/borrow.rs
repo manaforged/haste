@@ -7,6 +7,8 @@ mod flow;
 mod liveness;
 mod places;
 mod propagate;
+#[cfg(test)]
+mod tests;
 
 use anyhow::Result;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -348,8 +350,7 @@ pub(super) fn check(
     let mut state = State::new(init);
     checker.bind_fn_params(sig, &mut state)?;
     let empty_live = HashSet::default();
-    let root_place_ctx = checker.is_mut_ref_ty(checker.expr_ty(root))
-        && typed.ret.is_some_and(|r| checker.is_mut_ref_ty(r));
+    let root_place_ctx = checker.return_allows_reborrow(root);
     checker.check_expr(root, &mut state, root_place_ctx, &empty_live, true, 0)?;
     if (checker.returns_borrow || checker.returns_invariant) && !state.diverged {
         checker.check_return_escape(root, &state)?;

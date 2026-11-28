@@ -61,6 +61,8 @@ pub struct Signature {
     pub is_unsafe: bool,
     /// Whether the function header carries `safe` (e.g. inside an `unsafe extern` block).
     pub is_safe: bool,
+    /// Whether the function carries `#[rustc_deprecated_safe_2024(...)]`, allowing safe calls before Edition 2024.
+    pub deprecated_safe_2024: bool,
     /// The first token of each parameter's pattern.
     pub param_starts: Vec<u32>,
 }
@@ -260,11 +262,35 @@ impl Cursor<'_> {
     }
 }
 
+fn has_outer_attr(src: &Source, from: u32, to: u32, wanted: &str) -> bool {
+    let mut at = from;
+    while at < to {
+        if src.kind(at) == TokenKind::Pound {
+            at += 1;
+            let inner = src.text(at) == "!";
+            if inner {
+                at += 1;
+            }
+            if src.kind(at) == TokenKind::OpenBracket {
+                if !inner && src.kind(at + 1) == TokenKind::Ident && src.text(at + 1) == wanted {
+                    return true;
+                }
+                at = src.pair(at) + 1;
+                continue;
+            }
+        }
+        at += 1;
+    }
+    false
+}
+
 /// Parses the header of the function item whose tokens run from `from` to `to` in `src` with `config`.
 pub fn signature(src: &Source, from: u32, to: u32, config: super::Config<'_>) -> Result<Signature> {
     let mut cursor = Cursor::new(src, from, to);
     cursor.config = config;
-    cursor.skip_attrs()?;
+    let deprecated_safe_2024 = cursor.skip_attrs()?.is_some_and(|(attr_from, attr_to)| {
+        has_outer_attr(src, attr_from, attr_to, "rustc_deprecated_safe_2024")
+    });
     let mut is_async = false;
     let mut is_unsafe = false;
     let mut is_safe = false;
@@ -308,6 +334,7 @@ pub fn signature(src: &Source, from: u32, to: u32, config: super::Config<'_>) ->
     sig.is_async = is_async;
     sig.is_unsafe = is_unsafe;
     sig.is_safe = is_safe;
+    sig.deprecated_safe_2024 = deprecated_safe_2024;
     sig.predicates = cursor.where_clause()?;
     sig.body = cursor.body;
     Ok(sig)

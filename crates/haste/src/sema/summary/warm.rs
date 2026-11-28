@@ -23,7 +23,7 @@ use super::warm_expr::write_slice;
 use count::{count_fixed_entries, raw_entries_at_least};
 
 const WARM_MAGIC: [u8; 8] = *b"HSTWRM01";
-const WARM_VERSION: u32 = 5;
+const WARM_VERSION: u32 = 6;
 pub(crate) const WARM_MIN_LEN: usize = 28;
 pub(super) const WARM_DEF_SHARDS: usize = 4;
 pub(super) const WARM_HDR_SHARDS: usize = 8;

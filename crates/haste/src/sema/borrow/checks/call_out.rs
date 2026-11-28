@@ -86,6 +86,7 @@ impl Checker<'_, '_> {
                     continue;
                 };
                 self.check_call_out_pair(
+                    expr,
                     sig,
                     fn_src,
                     &dst,
@@ -304,6 +305,7 @@ impl Checker<'_, '_> {
 
     fn check_call_out_pair(
         &mut self,
+        call_expr: ExprId,
         sig: &Signature,
         fn_src: &Source,
         dst: &CallOutDst,
@@ -326,36 +328,46 @@ impl Checker<'_, '_> {
                 .zip(self.body.list(aexprs).iter().copied())
                 .collect();
             for (pt, ae) in pairs {
-                self.check_call_out_pair(sig, fn_src, dst, (ExprId(ae), TyId(pt), None), state)?;
+                self.check_call_out_pair(
+                    call_expr,
+                    sig,
+                    fn_src,
+                    dst,
+                    (ExprId(ae), TyId(pt), None),
+                    state,
+                )?;
             }
             return Ok(());
         }
         if !self.sig_params_share_lt_or_ty(sig, fn_src, match_ty, src_ast) {
             return Ok(());
         }
-        let src_expr = match (
-            *sig.body.ty(src_ast),
-            *self.body.expr(self.unwrap_parens(src_id)),
-        ) {
+        let fresh_ref_inner = match *sig.body.ty(src_ast) {
+            AstTy::Ref {
+                lifetime: None,
+                mutable: m,
+                ty: src_inner,
+            } if !matches!(*sig.body.ty(match_ty), AstTy::Ref { .. })
+                && self.sig_params_share_lt_or_ty(sig, fn_src, match_ty, src_inner) =>
+            {
+                Some(m)
+            }
+            _ => None,
+        };
+        let src_expr = match (fresh_ref_inner, *self.body.expr(self.unwrap_parens(src_id))) {
             (
-                AstTy::Ref {
-                    lifetime: None,
-                    mutable: true,
-                    ty: src_inner,
-                },
+                Some(m),
                 Expr::Ref {
-                    mutable: true,
+                    mutable: em,
                     raw: false,
                     expr,
                 },
-            ) if !matches!(*sig.body.ty(match_ty), AstTy::Ref { .. })
-                && self.sig_params_share_lt_or_ty(sig, fn_src, match_ty, src_inner) =>
-            {
-                expr
-            }
+            ) if !m || em => expr,
             _ => src_id,
         };
-        let sources = if src_expr == src_id
+        let sources = if src_expr == src_id && fresh_ref_inner.is_some() {
+            self.copied_arg_borrow_sources(call_expr, src_id, state)
+        } else if src_expr == src_id
             && let Some(pre) = pre_sources
         {
             pre.clone()

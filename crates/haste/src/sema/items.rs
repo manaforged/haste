@@ -318,7 +318,13 @@ impl<'a> Context<'a> {
         if let Some(found) = self.store.signatures.get(&item) {
             return Ok(found);
         }
-        let parsed = Arc::new(self.parse_signature(item)?);
+        let mut parsed = self.parse_signature(item)?;
+        let (src, entry) = self.item(item);
+        let env = &self.outline.crates[item.krate as usize].env;
+        if crate::outline::attr::has_attr(src, &entry.attrs, env, "rustc_deprecated_safe_2024") {
+            parsed.deprecated_safe_2024 = true;
+        }
+        let parsed = Arc::new(parsed);
         self.store.signatures.insert(item, Arc::clone(&parsed));
         Ok(parsed)
     }
@@ -430,5 +436,21 @@ impl<'a> Context<'a> {
     /// The name of `item` as a path or method call names it, without an `r#` prefix.
     pub fn plain_name(&self, item: ItemRef) -> &'a str {
         crate::names::plain(self.name(item))
+    }
+
+    /// The declared edition of crate `krate`, if non-empty.
+    pub fn crate_edition(&self, krate: u32) -> Option<&str> {
+        self.names
+            .crates
+            .get(krate as usize)
+            .map(|c| c.edition.as_str())
+            .filter(|e| !e.is_empty())
+            .or_else(|| {
+                self.outline
+                    .roots
+                    .get(krate as usize)
+                    .map(|r| r.edition.as_str())
+                    .filter(|e| !e.is_empty())
+            })
     }
 }

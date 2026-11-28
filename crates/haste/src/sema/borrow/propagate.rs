@@ -1,3 +1,4 @@
+pub(super) mod closure_peel;
 mod sig;
 mod tuple;
 mod unwrap;
@@ -126,11 +127,14 @@ impl Checker<'_, '_> {
                 self.copy_projected_borrow_sources(expr, base, state)
             }
             Expr::Path(_) => {
-                if let Some(local) = self.expr_plain_local(expr)
-                    && state.moved.get(local as usize).copied().unwrap_or(false)
-                    && let Some(cached) = self.temp_sources.get(&expr)
-                {
-                    return cached.clone();
+                if let Some(local) = self.expr_plain_local(expr) {
+                    if state.moved.get(local as usize).copied().unwrap_or(false)
+                        && let Some(cached) = self.temp_sources.get(&expr)
+                    {
+                        return cached.clone();
+                    }
+                    let sources = self.path_borrow_sources(expr, state, allow_mut_ref_reborrow);
+                    return self.path_deref_coercion_sources(expr, local, sources, state);
                 }
                 self.path_borrow_sources(expr, state, allow_mut_ref_reborrow)
             }
@@ -674,6 +678,9 @@ impl Checker<'_, '_> {
                     out.push(
                         self.combine_closure_loan_source(local, l, steps, tail_steps, mutable),
                     );
+                } else if self
+                    .unwrap_ref_place_container_loan(local, steps, l, mutable, state, &mut out)
+                {
                 } else if steps_conflict(&l.steps, tail_steps)
                     || tail_steps.is_empty()
                     || l.steps.is_empty()
@@ -700,6 +707,13 @@ impl Checker<'_, '_> {
                 });
             }
             return dedup_sources(out);
+        }
+        if p.through_ref
+            && !self.is_ref_ty(self.local_ty(local))
+            && !self.is_param_local(local)
+            && !self.is_closure_param(local)
+        {
+            return Vec::new();
         }
         vec![BorrowSource {
             target: local,

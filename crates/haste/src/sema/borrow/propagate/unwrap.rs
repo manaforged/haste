@@ -11,7 +11,7 @@ use super::super::{Checker, State, is_temp_holder};
 use super::{BorrowSource, dedup_sources, state_holds_other_target};
 
 impl Checker<'_, '_> {
-    fn try_promote_by_val_param(
+    pub(super) fn try_promote_by_val_param(
         &mut self,
         s: &BorrowSource,
         targets: &[u32],
@@ -75,8 +75,17 @@ impl Checker<'_, '_> {
         sources: Vec<BorrowSource>,
         state: &State,
     ) -> Vec<BorrowSource> {
-        let is_deref = matches!(*self.body.expr(expr), Expr::Unary(UnOp::Deref, _));
-        let expr_ty = self.expr_ty(expr);
+        let is_deref = matches!(*self.body.expr(expr), Expr::Unary(UnOp::Deref, _))
+            || self.expr_derefs_ref(expr);
+        let expr_ty = match self
+            .typed
+            .coercions
+            .get(&expr)
+            .map(crate::sema::infer::Coercion::leaf)
+        {
+            Some(crate::sema::infer::Coercion::Deref(_, to)) => *to,
+            _ => self.expr_ty(expr),
+        };
         let base_is_ref = self.is_ref_ty(base_ty);
         let inner_static_res = base_is_ref.then_some((expr_ty, is_deref));
         let no_temps = sources
@@ -191,7 +200,10 @@ impl Checker<'_, '_> {
     pub(in super::super) fn expr_derefs_ref(&self, expr: ExprId) -> bool {
         self.typed.adjusts.get(&expr).is_some_and(|a| a.derefs > 0)
             || matches!(
-                self.typed.coercions.get(&expr),
+                self.typed
+                    .coercions
+                    .get(&expr)
+                    .map(crate::sema::infer::Coercion::leaf),
                 Some(crate::sema::infer::Coercion::Deref(..))
             )
     }
@@ -359,55 +371,6 @@ impl Checker<'_, '_> {
             && !ast_ty_has_type_param(&def.body, adt_src, field.ty, &ty_params)
     }
 
-    pub(super) fn closure_peels_outer_ref(&self, arg: ExprId) -> bool {
-        let cur = self.unwrap_parens(arg);
-        let Expr::Closure { params, .. } = *self.body.expr(cur) else {
-            return false;
-        };
-        let Some(param_local) = self
-            .typed
-            .closures
-            .get(&cur)
-            .filter(|c| c.params.len() == 1)
-            .map(|c| c.params[0])
-        else {
-            return false;
-        };
-        let Kind::Ref(_, inner_ty) = *self.cx.types.kind(self.local_ty(param_local)) else {
-            return false;
-        };
-        if !matches!(
-            *self.cx.types.kind(inner_ty),
-            Kind::Ref(crate::sema::ty::Mut::Not, _)
-        ) {
-            return false;
-        }
-        let param_ids = self.body.list(params);
-        param_ids.len() == 1
-            && matches!(
-                *self.body.pat(self.body.params[param_ids[0] as usize].pat),
-                crate::body::Pat::Ref { .. }
-            )
-    }
-
-    fn expr_projects_local(&self, mut expr: ExprId) -> Option<u32> {
-        loop {
-            expr = self.unwrap_parens(expr);
-            match *self.body.expr(expr) {
-                Expr::Field(base, _)
-                | Expr::TupleField(base, _)
-                | Expr::Index(base, _)
-                | Expr::Unary(UnOp::Deref, base)
-                | Expr::Ref {
-                    raw: false,
-                    expr: base,
-                    ..
-                } => expr = base,
-                _ => return self.expr_plain_local(expr),
-            }
-        }
-    }
-
     pub(super) fn place_steps_ty(&mut self, mut cur: Ty, steps: &[PlaceStep]) -> Ty {
         for step in steps {
             if cur == Ty::NONE {
@@ -478,92 +441,98 @@ impl Checker<'_, '_> {
         false
     }
 
-    pub(super) fn closure_copies_inner_ref(&mut self, arg: ExprId) -> bool {
-        let cur = self.unwrap_parens(arg);
-        let Expr::Closure { params, body, .. } = *self.body.expr(cur) else {
-            return false;
-        };
-        let Some((param_local, ret_ty)) = self
-            .typed
-            .closures
-            .get(&cur)
-            .filter(|c| c.params.len() == 1 && c.captures.is_empty())
-            .map(|c| (c.params[0], c.ret))
-        else {
-            return false;
-        };
-        let param_ty = self.local_ty(param_local);
-        let Kind::Ref(_, inner_ty) = *self.cx.types.kind(param_ty) else {
-            return false;
-        };
-        let body = self.unwrap_parens_and_empty_blocks(body);
-        if matches!(
-            *self.cx.types.kind(inner_ty),
-            Kind::Ref(crate::sema::ty::Mut::Not, _)
-        ) {
-            if let Expr::Unary(crate::body::UnOp::Deref, inner) = *self.body.expr(body)
-                && self.expr_plain_local(inner) == Some(param_local)
-            {
-                return true;
-            }
-            let param_ids = self.body.list(params);
-            if param_ids.len() == 1
-                && let crate::body::Pat::Ref { pat: inner_pat, .. } =
-                    *self.body.pat(self.body.params[param_ids[0] as usize].pat)
-                && let Some(&bound) = self.typed.binds.get(&inner_pat)
-                && self.expr_plain_local(body) == Some(bound)
-            {
-                return true;
+    pub(super) fn unwrap_container_loans_deep(
+        &mut self,
+        sources: Vec<BorrowSource>,
+        state: &State,
+        initial_targets: &[u32],
+    ) -> Vec<BorrowSource> {
+        let mut seen = rustc_hash::FxHashSet::default();
+        let mut cur = super::unwrap_container_loans(sources, state, |s| {
+            initial_targets.contains(&s.target) && seen.insert(s.target)
+        });
+        for _ in 0..8 {
+            let mut grew = false;
+            cur = super::unwrap_container_loans(cur, state, |s| {
+                let s_ty = self.local_ty(s.target);
+                let should = !self.from_caller(s.target, s.through_ref)
+                    && !self.is_param_local(s.target)
+                    && !self.is_closure_param(s.target)
+                    && checks::is_temp_target(s.target).is_none()
+                    && (self.ty_holds_borrow(s_ty) || self.ty_has_non_static_param(s_ty))
+                    && state.loans.iter().any(|l| l.holder == Some(s.target))
+                    && seen.insert(s.target);
+                grew |= should;
+                should
+            });
+            if !grew {
+                break;
             }
         }
-        if matches!(
-            *self.body.expr(body),
-            Expr::Field(..) | Expr::TupleField(..) | Expr::Index(..)
-        ) && self.expr_projects_local(body) == Some(param_local)
-            && self.ty_is_copy(ret_ty)
+        cur
+    }
+
+    pub(super) fn path_deref_coercion_sources(
+        &mut self,
+        expr: ExprId,
+        local: u32,
+        sources: Vec<BorrowSource>,
+        state: &State,
+    ) -> Vec<BorrowSource> {
+        let local_ty = self.local_ty(local);
+        let has_builtin_deref = self.is_ref_ty(local_ty)
+            && matches!(
+                self.typed
+                    .coercions
+                    .get(&expr)
+                    .map(crate::sema::infer::Coercion::leaf),
+                Some(crate::sema::infer::Coercion::Deref(steps, _))
+                    if steps.iter().any(|(_, res)| res.is_none())
+            );
+        if has_builtin_deref {
+            self.finish_projected_borrow_sources(expr, local_ty, true, sources, state)
+        } else {
+            sources
+        }
+    }
+
+    pub(super) fn recv_independent_of_named_ret(
+        &mut self,
+        fn_item: ItemRef,
+        sig: &Signature,
+        sig_src: &crate::outline::source::Source,
+        ret_lts: &Lifetimes<'_>,
+    ) -> bool {
+        if ret_lts.has_elided || ret_lts.named.is_empty() || ret_lts.names.contains(&"Self") {
+            return false;
+        }
+        let owner_hdr = if let Some(blk) = self.cx.owner_impl(fn_item)
+            && let Ok(hdr) = self.cx.impl_header(blk)
         {
+            Some((&self.cx.impl_file(blk).source, hdr.generics.clone()))
+        } else if let Some(tr) = self.cx.owner_trait(fn_item)
+            && let Ok(tg) = self.cx.trait_generics(tr)
+        {
+            Some((&self.cx.file(tr).source, tg.1.params.clone()))
+        } else {
+            None
+        };
+        let Some((h_src, h_generics)) = owner_hdr else {
             return true;
-        }
-        match *self.body.expr(body) {
-            Expr::Method { receiver, .. } => {
-                let Some(Res::Fn(fn_item, _)) = self.typed.res.get(&body).copied() else {
-                    return false;
-                };
-                let (is_clone, is_copy_method) = {
-                    let name = self.cx.name(fn_item);
-                    (name == "clone", matches!(name, "copied" | "cloned"))
-                };
-                if is_clone {
-                    return self.expr_projects_local(receiver) == Some(param_local);
-                }
-                if is_copy_method
-                    && (self.is_iter_mod(fn_item) || self.item_in_std_mod(fn_item, "option"))
-                {
-                    let mut cur = receiver;
-                    for _ in 0..8 {
-                        cur = self.unwrap_parens(cur);
-                        match *self.body.expr(cur) {
-                            Expr::Method { receiver: r, .. } | Expr::Try(r) => cur = r,
-                            _ => break,
-                        }
-                    }
-                    return self.expr_projects_local(cur) == Some(param_local);
-                }
-                false
+        };
+        let owner_has_tied_lt = h_generics.iter().any(|g| match g.kind {
+            GenericKind::Lifetime => {
+                let name = h_src.text(g.name);
+                ret_lts.named.contains(&name)
+                    || ret_lts
+                        .named
+                        .iter()
+                        .any(|&r| super::super::calls::lifetime_outlives(sig, sig_src, name, r))
             }
-            Expr::Call(callee, args) if self.body.list(args).len() == 1 => {
-                let arg = ExprId(self.body.list(args)[0]);
-                matches!(
-                    self.typed
-                        .res
-                        .get(&callee)
-                        .or_else(|| self.typed.res.get(&body))
-                        .copied(),
-                    Some(Res::Fn(fn_item, _)) if self.cx.name(fn_item) == "clone"
-                ) && self.expr_projects_local(arg) == Some(param_local)
-            }
+            GenericKind::Type => ret_lts.names.contains(&h_src.text(g.name)),
             _ => false,
-        }
+        });
+        !owner_has_tied_lt
     }
 
     pub(super) fn expr_is_any_downcast(&mut self, mut expr: ExprId, state: &State) -> bool {
@@ -696,7 +665,7 @@ impl Checker<'_, '_> {
                 return true;
             }
             return pointee.is_some_and(|p| {
-                (!unwrap && self.ty_is_borrow_free(p))
+                (!unwrap && self.ty_is_borrow_free(p) && (call_owned || Some(s.target) == root))
                     || (((unwrap && !self.is_ref_ty(call_ty)) || call_owned)
                         && !self.ty_holds_non_dyn_borrow(p))
             }) || self.can_unwrap_inner_static_param(s, call_ty, false);
@@ -778,11 +747,13 @@ impl Checker<'_, '_> {
             if self.is_param_local(s.target) || self.is_closure_param(s.target) {
                 let target_ty = self.local_ty(s.target);
                 if target_ty != Ty::NONE {
+                    let is_ref = self.is_ref_ty(target_ty);
                     let inner = match *self.cx.types.kind(target_ty) {
                         Kind::Ref(_, pointee) => pointee,
                         _ => target_ty,
                     };
-                    if self.ty_holds_borrow(inner)
+                    if is_ref
+                        && self.ty_holds_borrow(inner)
                         && (call_depth <= self.ty_max_ref_depth(inner)
                             || (Some(s.target) != root && recv_is_mut_ref && clears_mut))
                     {

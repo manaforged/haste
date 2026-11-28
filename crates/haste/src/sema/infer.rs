@@ -618,10 +618,30 @@ impl Infer<'_, '_> {
         match *arena.pat(pat) {
             crate::body::Pat::Bind {
                 name,
+                mutable,
                 sub: None,
                 by_ref: false,
-                ..
             } => {
+                if !mutable {
+                    if let Some((found, res)) = self.named_pat(name)? {
+                        let local = self.new_local(ty);
+                        if let Some(own) = own {
+                            self.bind_pat(own, ty)?;
+                            self.out.unpacks.insert(local, own);
+                        } else {
+                            let mut target = ty;
+                            if !self.is_const(&res) {
+                                while let Kind::Ref(_, inner) =
+                                    *self.cx.types.kind(self.resolve(target))
+                                {
+                                    target = inner;
+                                }
+                            }
+                            self.unify(target, found)?;
+                        }
+                        return Ok(local);
+                    }
+                }
                 let local = self.new_local(ty);
                 self.scope_name(name, local);
                 Ok(local)

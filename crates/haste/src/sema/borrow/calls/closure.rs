@@ -601,6 +601,89 @@ impl Checker<'_, '_> {
         Ok(())
     }
 
+    pub(super) fn infer_method_recv_borrow(
+        &mut self,
+        expr: ExprId,
+        receiver: ExprId,
+        derefs: u32,
+    ) -> Option<crate::sema::ty::Mut> {
+        let sig = self.callee_sig(expr, None);
+        let is_by_val = sig
+            .as_deref()
+            .is_some_and(|s| matches!(s.receiver, Some((crate::body::sig::SelfKind::Value, _))));
+        let recv_mut = sig.as_deref().and_then(super::recv_ref_mut);
+        if !is_by_val
+            && derefs > 0
+            && let Some(m) = recv_mut
+        {
+            return Some(m);
+        }
+        let by_val_reborrow = is_by_val
+            && derefs == 0
+            && self.root_place(receiver).is_some()
+            && self.is_mut_ref_by_val_impl(expr, receiver);
+        ((!is_by_val || by_val_reborrow) && self.is_mut_ref_ty(self.expr_ty(receiver))).then(|| {
+            if recv_mut == Some(crate::sema::ty::Mut::Not) {
+                crate::sema::ty::Mut::Not
+            } else {
+                crate::sema::ty::Mut::Mut
+            }
+        })
+    }
+
+    pub(super) fn needs_instantiated_arg_ref(
+        &self,
+        ctx: &super::ArgListCtx<'_>,
+        arg: ExprId,
+        has_coercion: bool,
+    ) -> bool {
+        has_coercion
+            || ctx.ctor_res.is_some()
+            || ctx.arg_tys.is_some()
+            || (self.is_mut_ref_ty(self.expr_ty(arg))
+                && self.place_behind_ref(arg, false)
+                && !self.place_behind_shared_ref(arg))
+    }
+
+    fn is_mut_ref_by_val_impl(&mut self, expr: ExprId, receiver: ExprId) -> bool {
+        let Some(&crate::sema::infer::Res::Fn(fn_item, substs)) = self.typed.res.get(&expr) else {
+            return false;
+        };
+        let impl_ref = if let Some(blk) = self.cx.owner_impl(fn_item) {
+            Some(blk)
+        } else if let Some(tr) = self.cx.owner_trait(fn_item) {
+            let recv_ty = self.expr_ty(receiver);
+            let trait_arg_len = self.cx.trait_generics(tr).map_or(0, |tg| {
+                tg.1.params
+                    .iter()
+                    .filter(|g| !matches!(g.kind, crate::body::sig::GenericKind::Lifetime))
+                    .count()
+            });
+            let all_substs = self.cx.types.substs(substs).to_vec();
+            let trait_args = all_substs.get(1..1 + trait_arg_len).unwrap_or(&[]);
+            (recv_ty != Ty::NONE)
+                .then(|| {
+                    crate::sema::infer::detached(self.cx, self.item, |infer| {
+                        infer.select(tr, recv_ty, trait_args)
+                    })
+                    .ok()
+                    .flatten()
+                    .map(|(blk, _)| blk)
+                })
+                .flatten()
+        } else {
+            None
+        };
+        impl_ref
+            .and_then(|blk| self.cx.impl_header(blk).ok())
+            .is_some_and(|hdr| {
+                matches!(
+                    *hdr.body.ty(hdr.self_ty),
+                    crate::body::Ty::Ref { mutable: true, .. }
+                )
+            })
+    }
+
     pub(super) fn param_shares_ret_ty(&mut self, local: u32) -> bool {
         self.param_lts
             .only_type_param

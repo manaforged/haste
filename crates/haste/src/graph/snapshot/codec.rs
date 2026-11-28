@@ -248,6 +248,7 @@ pub(super) fn write_package(out: &mut Vec<u8>, pkg: &Package) -> Option<()> {
     let mver = m.version.as_ref().map(ToString::to_string);
     write_opt_str(out, mver.as_deref())?;
     write_str(out, &m.edition)?;
+    out.push(m.resolver.unwrap_or(0));
     for s in [
         &m.meta.authors,
         &m.meta.description,
@@ -312,6 +313,11 @@ pub(super) fn read_package(cur: &mut Cursor<'_>) -> Result<Package> {
         .transpose()
         .context("invalid manifest version")?;
     let edition = read_str(cur)?.to_owned();
+    let resolver = match cur.u8()? {
+        0 => None,
+        v @ 1..=3 => Some(v),
+        other => bail!("invalid resolver tag {other}"),
+    };
     let meta = PackageMeta {
         authors: read_str(cur)?.to_owned(),
         description: read_str(cur)?.to_owned(),
@@ -371,6 +377,7 @@ pub(super) fn read_package(cur: &mut Cursor<'_>) -> Result<Package> {
         name,
         version,
         edition,
+        resolver,
         meta,
         links,
         default_run,

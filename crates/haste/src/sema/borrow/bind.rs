@@ -44,7 +44,7 @@ impl Checker<'_, '_> {
             return;
         }
         let ty = self.local_ty(local);
-        if ty != Ty::NONE && !self.ty_holds_borrow(ty) {
+        if ty != Ty::NONE && !self.ty_holds_borrow(ty) && !self.ty_has_non_static_param(ty) {
             return;
         }
         let is_shared_target = |target: u32| self.is_shared_ref_or_ptr(self.local_ty(target));
@@ -95,6 +95,29 @@ impl Checker<'_, '_> {
         state: &mut State,
         options: (bool, bool, u32),
     ) -> Result<()> {
+        self.bind_pat_with_tuple(
+            pat,
+            init,
+            scrut_place,
+            pat_steps,
+            fallback_sources,
+            None,
+            state,
+            options,
+        )
+    }
+
+    pub(super) fn bind_pat_with_tuple(
+        &mut self,
+        pat: PatId,
+        init: Option<ExprId>,
+        scrut_place: Option<&Place>,
+        pat_steps: &[PlaceStep],
+        fallback_sources: &[BorrowSource],
+        elem_tuple: Option<&super::propagate::TupleSources>,
+        state: &mut State,
+        options: (bool, bool, u32),
+    ) -> Result<()> {
         let ctx = PatCtx {
             init_val: options.0,
             move_on_val: options.1,
@@ -110,7 +133,7 @@ impl Checker<'_, '_> {
             scrut_place,
             pat_steps,
             fallback_sources,
-            elem_tuple: None,
+            elem_tuple,
         };
         self.bind_pat_ctx(pat, target, state, ctx)
     }

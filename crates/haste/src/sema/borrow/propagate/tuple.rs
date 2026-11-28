@@ -1,9 +1,9 @@
-use crate::body::{Args, Body, Expr, ExprId, GenericArg, Ty as AstTy, TyId};
+use crate::body::{Args, Body, Expr, ExprId, GenericArg, List, Ty as AstTy, TyId};
 use crate::lower::is_freeze_ty;
-use crate::names::plain;
+use crate::names::{ItemRef, plain};
 use crate::outline::source::Source;
 use crate::sema::infer::Res;
-use crate::sema::ty::{Kind, Ty};
+use crate::sema::ty::{Kind, Mut, Ty};
 
 use super::super::{Checker, State};
 use super::sig::SigCall;
@@ -247,6 +247,137 @@ impl<'a> Checker<'_, 'a> {
             inner_ref: None,
         }
     }
+
+    pub(in super::super) fn for_iter_item_sources(
+        &mut self,
+        iter: ExprId,
+        iter_sources: &[BorrowSource],
+        state: &State,
+    ) -> (Vec<BorrowSource>, Option<TupleSources>) {
+        let item_sources = if self.for_iter_item_is_static(iter) {
+            Vec::new()
+        } else {
+            let srcs: Vec<BorrowSource> = iter_sources
+                .iter()
+                .filter(|s| !s.env_only)
+                .cloned()
+                .collect();
+            if self.is_iter_copied_call(iter) {
+                let iter_ty = self.expr_ty(iter);
+                self.unwrap_outer_container_loans_with_res(srcs, state, true, iter_ty)
+            } else {
+                srcs
+            }
+        };
+        let item_tuple = self.iter_tuple_sources(iter, state);
+        (item_sources, item_tuple)
+    }
+
+    fn is_iter_copied_call(&mut self, expr: ExprId) -> bool {
+        let cur = self.unwrap_parens(expr);
+        let Expr::Method { params, .. } = *self.body.expr(cur) else {
+            return false;
+        };
+        if !self.body.list(params).is_empty() {
+            return false;
+        }
+        let Some(Res::Fn(fn_item, _)) = self.typed.res.get(&cur).copied() else {
+            return false;
+        };
+        self.is_iter_mod(fn_item) && matches!(self.cx.name(fn_item), "copied" | "cloned")
+    }
+
+    fn unwrap_tuple_sources_containers(&mut self, ts: TupleSources, state: &State) -> TupleSources {
+        match ts {
+            TupleSources::Leaf { sources, inner_ref } => TupleSources::Leaf {
+                sources: self.unwrap_outer_container_loans(sources, state, true),
+                inner_ref,
+            },
+            TupleSources::Tuple(elems) => TupleSources::Tuple(
+                elems
+                    .into_iter()
+                    .map(|e| self.unwrap_tuple_sources_containers(e, state))
+                    .collect(),
+            ),
+        }
+    }
+
+    fn leaf_iter_sources(&mut self, expr: ExprId, state: &State) -> TupleSources {
+        let sources = if self.for_iter_item_is_static(expr) {
+            Vec::new()
+        } else {
+            self.expr_borrow_sources(expr, state)
+                .into_iter()
+                .filter(|s| !s.env_only)
+                .collect()
+        };
+        TupleSources::Leaf {
+            sources,
+            inner_ref: None,
+        }
+    }
+
+    fn iter_tuple_sources(&mut self, expr: ExprId, state: &State) -> Option<TupleSources> {
+        let cur = self.unwrap_parens(expr);
+        let Expr::Method {
+            receiver, params, ..
+        } = *self.body.expr(cur)
+        else {
+            return None;
+        };
+        let Some(Res::Fn(fn_item, _)) = self.typed.res.get(&cur).copied() else {
+            return None;
+        };
+        let name = self.cx.name(fn_item);
+        let in_iter = self.is_iter_mod(fn_item);
+        let param_ids: Vec<u32> = self.body.list(params).to_vec();
+        if in_iter && name == "enumerate" && param_ids.is_empty() {
+            let inner = self
+                .iter_tuple_sources(receiver, state)
+                .unwrap_or_else(|| self.leaf_iter_sources(receiver, state));
+            return Some(TupleSources::Tuple(vec![
+                TupleSources::Leaf {
+                    sources: Vec::new(),
+                    inner_ref: None,
+                },
+                inner,
+            ]));
+        }
+        if ((in_iter && name == "zip") || name == "zip_eq") && param_ids.len() == 1 {
+            let left = self
+                .iter_tuple_sources(receiver, state)
+                .unwrap_or_else(|| self.leaf_iter_sources(receiver, state));
+            let arg = ExprId(param_ids[0]);
+            let right = self
+                .iter_tuple_sources(arg, state)
+                .unwrap_or_else(|| self.leaf_iter_sources(arg, state));
+            return Some(TupleSources::Tuple(vec![left, right]));
+        }
+        if in_iter && matches!(name, "copied" | "cloned") && param_ids.is_empty() {
+            let inner = self
+                .iter_tuple_sources(receiver, state)
+                .unwrap_or_else(|| self.leaf_iter_sources(receiver, state));
+            return Some(self.unwrap_tuple_sources_containers(inner, state));
+        }
+        if in_iter
+            && matches!(
+                name,
+                "skip"
+                    | "take"
+                    | "step_by"
+                    | "rev"
+                    | "peekable"
+                    | "fuse"
+                    | "filter"
+                    | "inspect"
+                    | "take_while"
+                    | "skip_while"
+            )
+        {
+            return self.iter_tuple_sources(receiver, state);
+        }
+        None
+    }
 }
 
 fn unwrap_ast_parens(body: &Body, mut ty: TyId) -> TyId {
@@ -324,4 +455,28 @@ fn peel_try_ret_ast(
         }
     }
     Some(first)
+}
+
+impl Checker<'_, '_> {
+    pub(super) fn ctor_borrow_sources(
+        &mut self,
+        item: ItemRef,
+        variant: u32,
+        args: List,
+        state: &State,
+        extend_depth: Option<u32>,
+    ) -> Vec<BorrowSource> {
+        let arg_ids: Vec<u32> = self.body.list(args).to_vec();
+        let mut out = Vec::new();
+        for (idx, id) in arg_ids.into_iter().enumerate() {
+            let reborrow_mut = self.ctor_field_ref_mut(item, variant, idx) != Some(Mut::Not);
+            out.extend(self.expr_borrow_sources_inner(
+                ExprId(id),
+                state,
+                reborrow_mut,
+                extend_depth,
+            ));
+        }
+        dedup_sources(out)
+    }
 }
