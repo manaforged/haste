@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, bail};
-use rustc_hash::{FxHashMap as HashMap, FxHasher};
+use rustc_hash::FxHasher;
 
 use crate::body::sig::ImplHeader;
 use crate::names::{Def, ItemRef, ModRef, Names};
@@ -15,9 +15,12 @@ use crate::sema::ty::{Kind, Ty, Types};
 
 use super::SummaryKind;
 use super::codec::{Cursor, read_str, read_vec, write_opt, write_str, write_u32, write_u64};
+mod count;
+mod flights;
 use super::warm_decode::decode_payload;
-use super::warm_encode::{count_fixed_entries, encode_payload};
+use super::warm_encode::encode_payload;
 use super::warm_expr::write_slice;
+use count::{count_fixed_entries, raw_entries_at_least};
 
 const WARM_MAGIC: [u8; 8] = *b"HSTWRM01";
 const WARM_VERSION: u32 = 5;
@@ -224,21 +227,27 @@ impl<'a> WarmFilter<'a> {
         }
     }
 
-    pub(super) fn substs(&self, types: &Types, s: Substs, memo: &mut HashMap<Ty, bool>) -> bool {
+    pub(super) fn substs(&self, types: &Types, s: Substs, memo: &mut Vec<u8>) -> bool {
         types.substs(s).iter().all(|&ty| self.ty(types, ty, memo))
     }
 
-    pub(super) fn ty(&self, types: &Types, ty: Ty, memo: &mut HashMap<Ty, bool>) -> bool {
+    pub(super) fn ty(&self, types: &Types, ty: Ty, memo: &mut Vec<u8>) -> bool {
         if ty == Ty::NONE {
             return true;
         }
         if types.has_var_flag(ty) {
             return false;
         }
-        if let Some(&ok) = memo.get(&ty) {
-            return ok;
+        let idx = ty.0 as usize;
+        if let Some(&v) = memo.get(idx)
+            && v != 0
+        {
+            return v == 2;
         }
-        memo.insert(ty, false);
+        if idx >= memo.len() {
+            memo.resize(idx + 1, 0);
+        }
+        memo[idx] = 1;
         let ok = match types.kind(ty) {
             Kind::Prim(_) | Kind::Never | Kind::Value(_) | Kind::Param(_) => true,
             Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => false,
@@ -269,7 +278,7 @@ impl<'a> WarmFilter<'a> {
                     && self.substs(types, d.own, memo)
             }
         };
-        memo.insert(ty, ok);
+        memo[idx] = if ok { 2 } else { 1 };
         ok
     }
 }
@@ -431,16 +440,16 @@ fn encode_warm_blob(
     names: &Names,
     store: &crate::sema::Cache,
     pre: &[PreExtent],
-    raw_count: u32,
+    raw_count: Option<u32>,
 ) -> Option<Vec<u8>> {
     let filter = WarmFilter { outline, pre };
-    let (payload, items) = encode_payload(store, outline, &names.symbols, &filter)?;
+    let (payload, items, encoded_count) = encode_payload(store, outline, &names.symbols, &filter)?;
     if payload.len() > MAX_WARM_PAYLOAD_BYTES {
         return None;
     }
     let mut out = Vec::with_capacity(pre.len() * 48 + payload.len() + 64);
     write_stamps(&mut out, outline, pre, &items, key_hash)?;
-    write_u32(&mut out, raw_count);
+    write_u32(&mut out, raw_count.unwrap_or(encoded_count));
     out.extend_from_slice(&payload);
     Some(out)
 }
@@ -474,7 +483,6 @@ pub(in crate::sema) fn warm_preload(
     Some(flights)
 }
 
-mod flights;
 pub(in crate::sema) use flights::warm_populate_flights;
 
 /// Saves newly populated settled-fixed entries to the one-shot check snapshot when entries grew since load.
@@ -499,19 +507,25 @@ pub(crate) fn save_warm_if_grown(cx: &crate::sema::Context<'_>) {
             .clone();
         (key, pre, guard.loaded_counts)
     };
-    let filter = WarmFilter {
-        outline: cx.outline,
-        pre: &pre,
+    let raw_count = if let Some(prev) = loaded_counts {
+        let threshold = prev
+            .fixed_entries
+            .saturating_add((prev.fixed_entries / 8).max(128));
+        if !raw_entries_at_least(store, threshold) {
+            return;
+        }
+        let filter = WarmFilter {
+            outline: cx.outline,
+            pre: &pre,
+        };
+        let count = count_fixed_entries(store, &filter);
+        if count < threshold {
+            return;
+        }
+        Some(count)
+    } else {
+        None
     };
-    let raw_count = count_fixed_entries(store, &filter);
-    if let Some(prev) = loaded_counts
-        && raw_count
-            < prev
-                .fixed_entries
-                .saturating_add((prev.fixed_entries / 8).max(128))
-    {
-        return;
-    }
     let Some(blob) = encode_warm_blob(
         key.fingerprint(),
         cx.outline,

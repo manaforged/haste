@@ -467,13 +467,16 @@ pub(super) fn decode_payload(
 ) -> Result<WarmFlights> {
     let t_start = std::time::Instant::now();
     let mut cur = Cursor::new(bytes);
-    let items = read_vec(&mut cur, |c| {
-        Ok(ItemRef {
-            krate: c.u32()?,
-            file: c.u32()?,
-            item: c.u32()?,
-        })
-    })?;
+    let item_count = cur.count()?;
+    let item_bytes = cur.take(item_count.checked_mul(12).context("warm items overflow")?)?;
+    let mut items = Vec::with_capacity(item_count);
+    for c in item_bytes.chunks_exact(12) {
+        items.push(ItemRef {
+            krate: crate::substrate::read_u32(c, 0),
+            file: crate::substrate::read_u32(c, 4),
+            item: crate::substrate::read_u32(c, 8),
+        });
+    }
     let ty_count = cur.count()?;
     let mut tys = Vec::with_capacity(ty_count);
     for _ in 0..ty_count {
@@ -486,11 +489,19 @@ pub(super) fn decode_payload(
     }
     let dec = Decoder::new(&store.types, &items, &tys);
 
-    let mut file_map: HashMap<u64, (u32, u32)> = HashMap::default();
     let file_n = cur.count()?;
-    file_map.reserve(file_n);
-    for _ in 0..file_n {
-        file_map.insert(cur.u64()?, (cur.u32()?, cur.u32()?));
+    let file_bytes = cur.take(file_n.checked_mul(16).context("warm file map overflow")?)?;
+    let mut file_map: HashMap<u64, (u32, u32)> =
+        HashMap::with_capacity_and_hasher(file_n, Default::default());
+    for c in file_bytes.chunks_exact(16) {
+        let key = u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]);
+        file_map.insert(
+            key,
+            (
+                crate::substrate::read_u32(c, 8),
+                crate::substrate::read_u32(c, 12),
+            ),
+        );
     }
     for (krate, tree) in outline.crates.iter().enumerate() {
         if tree.env.fixed && !settled_fixed(krate as u32) {
@@ -506,16 +517,18 @@ pub(super) fn decode_payload(
         .file_index
         .set(Arc::new(FileIndex::from_files(file_map)));
 
-    if let Some(pairs) = read_opt(&mut cur, |c| {
-        read_vec(c, |c2| {
-            Ok((
-                dec.read_item_ref(c2)?,
-                read_str(c2)?.to_owned().into_boxed_str(),
-            ))
-        })
+    if let Some(map) = read_opt(&mut cur, |c| {
+        let count = c.count()?;
+        let mut map: HashMap<ItemRef, Box<str>> =
+            HashMap::with_capacity_and_hasher(count, Default::default());
+        for _ in 0..count {
+            let item = dec.read_item_ref(c)?;
+            let name = read_str(c)?.to_owned().into_boxed_str();
+            map.insert(item, name);
+        }
+        Ok(map)
     })? && allow_lang_map
     {
-        let map: HashMap<ItemRef, Box<str>> = pairs.into_iter().collect();
         let _ = store
             .lookups
             .lang_items
@@ -566,6 +579,9 @@ pub(super) fn decode_payload(
             .map(|(i, s)| decode_section(i, s, &dec, &syms, store))
             .collect()
     } else {
+        let mut order: Vec<usize> = (0..WARM_SECTIONS).collect();
+        order.sort_unstable_by(|&a, &b| slices[b].len().cmp(&slices[a].len()));
+        let order_ref = &order;
         let next = AtomicUsize::new(0);
         let shared_store: &crate::sema::Cache = store;
         crate::sync::scope(|scope| {
@@ -574,10 +590,10 @@ pub(super) fn decode_payload(
                     scope.spawn(|| {
                         let mut local = Vec::new();
                         loop {
-                            let i = next.fetch_add(1, Ordering::Relaxed);
-                            if i >= WARM_SECTIONS {
+                            let pos = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(&i) = order_ref.get(pos) else {
                                 break;
-                            }
+                            };
                             local.push(decode_section(i, slices[i], &dec, &syms, shared_store));
                         }
                         local

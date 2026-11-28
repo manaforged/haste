@@ -122,8 +122,15 @@ fn warm_blob_round_trips_and_rejects_mismatch_or_corruption() {
             pre: &pre,
         },
     );
-    let blob = encode_warm_blob(key.fingerprint(), &outline, &names, &store, &pre, raw_count)
-        .expect("warm blob encodes");
+    let blob = encode_warm_blob(
+        key.fingerprint(),
+        &outline,
+        &names,
+        &store,
+        &pre,
+        Some(raw_count),
+    )
+    .expect("warm blob encodes");
 
     let loaded = Cache::default();
     loaded.lookups.warm.set_bytes_for_test(key, blob.clone());

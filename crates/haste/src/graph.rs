@@ -1,7 +1,6 @@
+use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-
-use anyhow::{Context, Result, bail};
 
 mod cache;
 pub mod cfg;
@@ -9,6 +8,7 @@ mod features;
 pub mod lock;
 pub mod manifest;
 pub mod script;
+pub(crate) mod snapshot;
 pub mod store;
 mod sync;
 

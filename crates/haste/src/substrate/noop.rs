@@ -3,13 +3,19 @@
 use std::ffi::OsString;
 use std::hash::{Hash as _, Hasher as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::wire::{read_path, read_u32, read_u64, read_utf8, write_len_bytes, write_path};
+use super::Backing;
+use super::wire::{
+    read_bytes, read_i128, read_path, read_u32, read_u64, read_utf8, write_len_bytes, write_path,
+};
 
+use crate::graph::store::{FileStamp, file_stamp, hash_env_val, write_new_bytes};
 use rustc_hash::FxHasher;
 
-const NOOP_MAGIC: [u8; 8] = *b"HSTNOP02";
-const HEADER_LEN: usize = 36;
+const NOOP_MAGIC: [u8; 8] = *b"HSTNOP03";
+const NOOP_VERSION: u32 = 1;
+const HEADER_LEN: usize = 52;
 const TARGET_DIRS: [&str; 5] = ["src", "src/bin", "tests", "examples", "benches"];
 const ROOT_FILES: [&str; 3] = ["src/lib.rs", "src/main.rs", "build.rs"];
 
@@ -44,7 +50,7 @@ fn stamp_path(root: &Path, out: Option<&Path>) -> PathBuf {
     stamp_path_for(root, out, &crate::config::Config::current())
 }
 
-fn target_dirs(workspace: &crate::graph::Workspace) -> Vec<PathBuf> {
+pub(crate) fn target_dirs(workspace: &crate::graph::Workspace) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     for &member in &workspace.graph.members {
         if let Some(pkg) = workspace.packages.get(member) {
@@ -58,7 +64,7 @@ fn target_dirs(workspace: &crate::graph::Workspace) -> Vec<PathBuf> {
     dirs
 }
 
-fn target_root_files(workspace: &crate::graph::Workspace) -> Vec<PathBuf> {
+pub(crate) fn target_root_files(workspace: &crate::graph::Workspace) -> Vec<PathBuf> {
     let mut files = Vec::new();
     for pkg in workspace.packages.iter().filter(|pkg| pkg.local()) {
         for rel in ROOT_FILES {
@@ -76,20 +82,26 @@ fn target_root_files(workspace: &crate::graph::Workspace) -> Vec<PathBuf> {
     files
 }
 
-fn hash_target_dir(dir: &Path, hasher: &mut FxHasher) {
+pub(crate) fn hash_target_dir(dir: &Path, hasher: &mut FxHasher) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         (dir, false).hash(hasher);
         return;
     };
     let mut found: Vec<OsString> = Vec::new();
     for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
-            found.push(entry.file_name());
-        } else if path.is_dir() && path.join("main.rs").is_file() {
-            let mut name = entry.file_name();
-            name.push("/main.rs");
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        let name = entry.file_name();
+        let is_rs = Path::new(&name).extension().and_then(|ext| ext.to_str()) == Some("rs");
+        if is_rs && (ft.is_file() || (ft.is_symlink() && dir.join(&name).is_file())) {
             found.push(name);
+        } else if (ft.is_dir() || (ft.is_symlink() && dir.join(&name).is_dir()))
+            && dir.join(&name).join("main.rs").is_file()
+        {
+            let mut joined = name;
+            joined.push("/main.rs");
+            found.push(joined);
         }
     }
     found.sort();
@@ -108,17 +120,21 @@ pub(crate) fn target_discovery_stamp(workspace: &crate::graph::Workspace) -> u64
     hasher.finish()
 }
 
-fn compute_stamp(
-    root: &Path,
-    out: Option<&Path>,
-    paths: &[PathBuf],
-    dirs: &[PathBuf],
-    env_names: &[String],
-) -> Option<u64> {
+fn hash_target_dirs(dirs: &[PathBuf]) -> u64 {
+    let mut hasher = FxHasher::default();
+    dirs.len().hash(&mut hasher);
+    for dir in dirs {
+        hash_target_dir(dir, &mut hasher);
+    }
+    hasher.finish()
+}
+
+fn compute_meta_hash(root: &Path, out: Option<&Path>) -> Option<u64> {
     let target = crate::host_target();
     let cfg = crate::config::Config::current();
     let mut hasher = FxHasher::default();
     NOOP_MAGIC.hash(&mut hasher);
+    NOOP_VERSION.hash(&mut hasher);
     super::target_hash(&target).hash(&mut hasher);
     cfg.hash_cache_key(&mut hasher);
     std::env::var_os("CARGO_HOME").hash(&mut hasher);
@@ -132,103 +148,235 @@ fn compute_stamp(
             }
             true.hash(&mut hasher);
             out_path.hash(&mut hasher);
-            crate::graph::store::file_stamp(out_path)?.hash(&mut hasher);
+            file_stamp(out_path)?.hash(&mut hasher);
         }
         None => false.hash(&mut hasher),
-    }
-    paths.len().hash(&mut hasher);
-    for path in paths {
-        (path, crate::graph::store::file_stamp(path)).hash(&mut hasher);
-    }
-    dirs.len().hash(&mut hasher);
-    for dir in dirs {
-        hash_target_dir(dir, &mut hasher);
-    }
-    env_names.len().hash(&mut hasher);
-    for name in env_names {
-        (name, std::env::var_os(name)).hash(&mut hasher);
     }
     Some(hasher.finish())
 }
 
-fn read_paths(data: &[u8], pos: &mut usize, count: usize) -> Option<Vec<PathBuf>> {
-    let mut paths = Vec::with_capacity(count.min(4096));
-    for _ in 0..count {
-        paths.push(read_path(data, pos)?);
+fn file_stamps_ref(paths: &[&Path]) -> Vec<FileStamp> {
+    let workers = crate::jobs().clamp(1, 8);
+    if paths.len() < 64 || workers <= 1 {
+        return paths.iter().map(|p| file_stamp(p)).collect();
     }
-    Some(paths)
+    let chunk = paths.len().div_ceil(workers);
+    crate::sync::scope(|scope| {
+        let handles: Vec<_> = paths
+            .chunks(chunk)
+            .map(|slice| {
+                scope.spawn(move || slice.iter().map(|p| file_stamp(p)).collect::<Vec<_>>())
+            })
+            .collect();
+        let mut out = Vec::with_capacity(paths.len());
+        for handle in handles {
+            match handle.join() {
+                Ok(part) => out.extend(part),
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        }
+        out
+    })
 }
 
-fn write_paths(out: &mut Vec<u8>, paths: &[PathBuf]) -> Option<()> {
-    for path in paths {
-        write_path(out, path)?;
+fn stamp_matches_raw(raw_path: &[u8], expected: FileStamp) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let path = Path::new(std::ffi::OsStr::from_bytes(raw_path));
+        file_stamp(path) == expected
     }
-    Some(())
+    #[cfg(not(unix))]
+    {
+        std::str::from_utf8(raw_path)
+            .ok()
+            .is_some_and(|s| file_stamp(Path::new(s)) == expected)
+    }
 }
 
-type DecodedStamp = (u64, usize, Vec<PathBuf>, Vec<PathBuf>, Vec<String>);
+fn write_path_ref(out: &mut Vec<u8>, path: &Path) -> Option<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        write_len_bytes(out, path.as_os_str().as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        write_len_bytes(out, path.to_str()?.as_bytes())
+    }
+}
 
-fn decode_stamp_file(data: &[u8]) -> Option<DecodedStamp> {
-    if data.len() < HEADER_LEN || data[0..8] != NOOP_MAGIC {
-        return None;
-    }
-    let stamp = read_u64(data, 8);
-    let reached = usize::try_from(read_u64(data, 16)).ok()?;
-    if reached == 0 {
-        return None;
-    }
-    let path_count = read_u32(data, 24) as usize;
-    let dir_count = read_u32(data, 28) as usize;
-    let env_count = read_u32(data, 32) as usize;
-    let mut pos = HEADER_LEN;
-    let paths = read_paths(data, &mut pos, path_count)?;
-    let dirs = read_paths(data, &mut pos, dir_count)?;
-    let mut envs = Vec::with_capacity(env_count.min(1024));
-    for _ in 0..env_count {
-        envs.push(read_utf8(data, &mut pos)?);
-    }
-    (pos == data.len()).then_some((stamp, reached, paths, dirs, envs))
+fn read_raw_entry<'a>(data: &'a [u8], pos: &mut usize) -> Option<(&'a [u8], FileStamp)> {
+    let len = read_u32(read_bytes(data, pos, 4)?, 0) as usize;
+    let raw_path = read_bytes(data, pos, len)?;
+    let present = *read_bytes(data, pos, 1)?.first()?;
+    let stamp = match present {
+        0 => None,
+        1 => {
+            let raw = read_bytes(data, pos, 24)?;
+            Some((read_u64(raw, 0), read_i128(raw, 8)))
+        }
+        _ => return None,
+    };
+    Some((raw_path, stamp))
 }
 
 fn encode_stamp_file(
-    stamp: u64,
+    meta_hash: u64,
     reached: usize,
-    paths: &[PathBuf],
+    dirs_hash: u64,
+    priority_count: usize,
+    entries: &[(&Path, FileStamp)],
     dirs: &[PathBuf],
-    envs: &[String],
+    envs: &[(String, Option<u64>)],
 ) -> Option<Vec<u8>> {
-    let path_count = u32::try_from(paths.len()).ok()?;
+    let p_count = u32::try_from(priority_count).ok()?;
+    let total_count = u32::try_from(entries.len()).ok()?;
     let dir_count = u32::try_from(dirs.len()).ok()?;
     let env_count = u32::try_from(envs.len()).ok()?;
-    let cap = HEADER_LEN + (paths.len() + dirs.len()) * 48 + envs.len() * 16;
+    let cap = HEADER_LEN + entries.len() * 72 + dirs.len() * 48 + envs.len() * 28;
     let mut out = Vec::with_capacity(cap);
     out.extend_from_slice(&NOOP_MAGIC);
-    out.extend_from_slice(&stamp.to_le_bytes());
+    out.extend_from_slice(&NOOP_VERSION.to_le_bytes());
+    out.extend_from_slice(&meta_hash.to_le_bytes());
     out.extend_from_slice(&(reached as u64).to_le_bytes());
-    out.extend_from_slice(&path_count.to_le_bytes());
+    out.extend_from_slice(&dirs_hash.to_le_bytes());
+    out.extend_from_slice(&p_count.to_le_bytes());
+    out.extend_from_slice(&total_count.to_le_bytes());
     out.extend_from_slice(&dir_count.to_le_bytes());
     out.extend_from_slice(&env_count.to_le_bytes());
-    write_paths(&mut out, paths)?;
-    write_paths(&mut out, dirs)?;
-    for env in envs {
-        write_len_bytes(&mut out, env.as_bytes())?;
+    for (name, val) in envs {
+        write_len_bytes(&mut out, name.as_bytes())?;
+        match val {
+            Some(hash) => {
+                out.push(1);
+                out.extend_from_slice(&hash.to_le_bytes());
+            }
+            None => out.push(0),
+        }
+    }
+    for &(path, stamp) in entries {
+        write_path_ref(&mut out, path)?;
+        match stamp {
+            Some((len, nanos)) => {
+                out.push(1);
+                out.extend_from_slice(&len.to_le_bytes());
+                out.extend_from_slice(&nanos.to_le_bytes());
+            }
+            None => out.push(0),
+        }
+    }
+    for dir in dirs {
+        write_path(&mut out, dir)?;
     }
     Some(out)
+}
+
+fn check_rest_entries(entries: &[(&[u8], FileStamp)]) -> bool {
+    let workers = crate::jobs().clamp(1, 8);
+    if entries.len() < 64 || workers <= 1 {
+        return entries
+            .iter()
+            .all(|&(raw, stamp)| stamp_matches_raw(raw, stamp));
+    }
+    let failed = AtomicBool::new(false);
+    let chunk = entries.len().div_ceil(workers);
+    crate::sync::scope(|scope| {
+        let handles: Vec<_> = entries
+            .chunks(chunk)
+            .map(|slice| {
+                let stop = &failed;
+                scope.spawn(move || {
+                    for &(raw, stamp) in slice {
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        if !stamp_matches_raw(raw, stamp) {
+                            stop.store(true, Ordering::Relaxed);
+                            return;
+                        }
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            if let Err(payload) = handle.join() {
+                std::panic::resume_unwind(payload);
+            }
+        }
+    });
+    !failed.load(Ordering::Relaxed)
+}
+
+fn try_hit_at(path: &Path, croot: &Path, aout: Option<&Path>) -> Option<usize> {
+    let meta_hash = compute_meta_hash(croot, aout)?;
+    let backing = Backing::open(path, HEADER_LEN).ok()?;
+    let data = backing.as_slice();
+    if data.len() < HEADER_LEN
+        || data[0..8] != NOOP_MAGIC
+        || read_u32(data, 8) != NOOP_VERSION
+        || read_u64(data, 12) != meta_hash
+    {
+        return None;
+    }
+    let reached = usize::try_from(read_u64(data, 20)).ok()?;
+    if reached == 0 {
+        return None;
+    }
+    let dirs_hash = read_u64(data, 28);
+    let priority_count = read_u32(data, 36) as usize;
+    let total_count = read_u32(data, 40) as usize;
+    let dir_count = read_u32(data, 44) as usize;
+    let env_count = read_u32(data, 48) as usize;
+    if priority_count > total_count {
+        return None;
+    }
+    let mut pos = 52;
+    for _ in 0..env_count {
+        let name = read_utf8(data, &mut pos)?;
+        let present = *read_bytes(data, &mut pos, 1)?.first()?;
+        let expected = match present {
+            0 => None,
+            1 => Some(read_u64(read_bytes(data, &mut pos, 8)?, 0)),
+            _ => return None,
+        };
+        let actual = crate::process_env_var(&name)
+            .as_deref()
+            .map(|v| hash_env_val(&NOOP_MAGIC, &name, v));
+        if actual != expected {
+            return None;
+        }
+    }
+    for _ in 0..priority_count {
+        let (raw, stamp) = read_raw_entry(data, &mut pos)?;
+        if !stamp_matches_raw(raw, stamp) {
+            return None;
+        }
+    }
+    let rest_count = total_count - priority_count;
+    let mut rest = Vec::with_capacity(rest_count.min(4096));
+    for _ in 0..rest_count {
+        rest.push(read_raw_entry(data, &mut pos)?);
+    }
+    if !check_rest_entries(&rest) {
+        return None;
+    }
+    let mut dirs = Vec::with_capacity(dir_count.min(256));
+    for _ in 0..dir_count {
+        dirs.push(read_path(data, &mut pos)?);
+    }
+    (pos == data.len() && hash_target_dirs(&dirs) == dirs_hash).then_some(reached)
 }
 
 /// Returns the cached `reached` count when `root` and all watched inputs match the previous `0 failed` build.
 pub fn try_hit(root: &Path, out: Option<&Path>) -> Option<usize> {
     let croot = canonical_root(root);
     let aout = abs_out(out);
-    if let Some(out_path) = aout.as_deref()
-        && !std::fs::metadata(out_path).is_ok_and(|m| m.is_file())
-    {
-        return None;
-    }
-    let data = std::fs::read(stamp_path(&croot, aout.as_deref())).ok()?;
-    let (stored_stamp, reached, paths, dirs, envs) = decode_stamp_file(&data)?;
-    let current = compute_stamp(&croot, aout.as_deref(), &paths, &dirs, &envs)?;
-    (current == stored_stamp).then_some(reached)
+    try_hit_at(
+        &stamp_path(&croot, aout.as_deref()),
+        &croot,
+        aout.as_deref(),
+    )
 }
 
 /// Records the workspace no-op stamp after a `0 failed` build succeeds.
@@ -245,23 +393,63 @@ pub fn record(
     }
     let croot = canonical_root(root);
     let aout = abs_out(out);
-    let mut paths = crate::graph::manifest_paths(workspace, &croot);
-    paths.extend(build_paths.iter().cloned());
-    paths.extend(target_root_files(workspace));
-    let (watched_files, watched_vars) = crate::graph::store::watched_stamps(workspace);
-    paths.extend(watched_files.into_iter().map(|(path, _, _)| path));
-    paths.sort();
-    paths.dedup();
-    let dirs = target_dirs(workspace);
-    let mut envs: Vec<String> = watched_vars.into_iter().map(|(name, _)| name).collect();
-    envs.extend(env_reads.iter().cloned());
-    envs.sort();
-    envs.dedup();
-    let Some(stamp) = compute_stamp(&croot, aout.as_deref(), &paths, &dirs, &envs) else {
+    let Some(meta_hash) = compute_meta_hash(&croot, aout.as_deref()) else {
         return;
     };
-    if let Some(encoded) = encode_stamp_file(stamp, reached, &paths, &dirs, &envs) {
-        drop(crate::graph::store::write_new_bytes(
+    let manifests = crate::graph::manifest_paths(workspace, &croot);
+    let roots = target_root_files(workspace);
+    let (watched_files, watched_vars) = crate::graph::store::watched_stamps(workspace);
+
+    let mut priority: Vec<&Path> = manifests
+        .iter()
+        .chain(&roots)
+        .map(PathBuf::as_path)
+        .collect();
+    priority.sort_unstable();
+    priority.dedup();
+    let priority_count = priority.len();
+
+    let mut rest: Vec<&Path> = build_paths
+        .iter()
+        .map(PathBuf::as_path)
+        .chain(watched_files.iter().map(|(p, _, _)| p.as_path()))
+        .filter(|p| priority.binary_search(p).is_err())
+        .collect();
+    rest.sort_unstable();
+    rest.dedup();
+
+    let mut all_refs = Vec::with_capacity(priority.len() + rest.len());
+    all_refs.extend(priority);
+    all_refs.extend(rest);
+    let stamps = file_stamps_ref(&all_refs);
+    let entries: Vec<(&Path, FileStamp)> = all_refs.into_iter().zip(stamps).collect();
+
+    let dirs = target_dirs(workspace);
+    let dirs_hash = hash_target_dirs(&dirs);
+    let mut env_names: Vec<String> = watched_vars.into_iter().map(|(name, _)| name).collect();
+    env_names.extend(env_reads.iter().cloned());
+    env_names.sort();
+    env_names.dedup();
+    let envs: Vec<(String, Option<u64>)> = env_names
+        .into_iter()
+        .map(|name| {
+            let hash = crate::process_env_var(&name)
+                .as_deref()
+                .map(|v| hash_env_val(&NOOP_MAGIC, &name, v));
+            (name, hash)
+        })
+        .collect();
+
+    if let Some(encoded) = encode_stamp_file(
+        meta_hash,
+        reached,
+        dirs_hash,
+        priority_count,
+        &entries,
+        &dirs,
+        &envs,
+    ) {
+        drop(write_new_bytes(
             &stamp_path(&croot, aout.as_deref()),
             &encoded,
         ));
@@ -316,16 +504,16 @@ mod tests {
     }
 
     #[test]
-    fn compute_stamp_distinguishes_rustflags_changes() {
+    fn meta_hash_distinguishes_rustflags_changes() {
         let stamp_with = |pairs: &[(&str, &str)]| {
             let map: rustc_hash::FxHashMap<String, String> = pairs
                 .iter()
                 .map(|&(k, v)| (k.to_owned(), v.to_owned()))
                 .collect();
             crate::with_client_env(Some(std::sync::Arc::new(map)), || {
-                compute_stamp(Path::new("/tmp/sample-ws"), None, &[], &[], &[])
+                compute_meta_hash(Path::new("/tmp/sample-ws"), None)
             })
-            .expect("compute_stamp returns Some when out is None")
+            .expect("compute_meta_hash returns Some when out is None")
         };
         let s_unset = stamp_with(&[]);
         let s_empty = stamp_with(&[("RUSTFLAGS", "")]);
@@ -336,5 +524,66 @@ mod tests {
         assert_ne!(s_empty, s_flag);
         assert_ne!(s_unset, s_encoded);
         assert_ne!(s_flag, s_encoded);
+    }
+
+    #[test]
+    fn noop_round_trips_hides_secrets_and_fails_fast_on_root_or_leaf_edits() {
+        let tmp = std::env::temp_dir().join(format!("haste-noop-t-{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&tmp));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let root_rs = tmp.join("main.rs");
+        let leaf_rs = tmp.join("leaf.rs");
+        std::fs::write(&root_rs, "fn main() {}\n").expect("write root");
+        std::fs::write(&leaf_rs, "pub fn x() {}\n").expect("write leaf");
+        let stamp_file = tmp.join("test.stamp");
+        let secret = "noop_secret_value_123";
+        let env_map = std::sync::Arc::new(rustc_hash::FxHashMap::from_iter([(
+            "MY_NOOP_SECRET".to_owned(),
+            secret.to_owned(),
+        )]));
+
+        crate::with_client_env(Some(env_map.clone()), || {
+            let meta_hash = compute_meta_hash(&tmp, None).expect("meta_hash");
+            let entries = vec![
+                (root_rs.as_path(), file_stamp(&root_rs)),
+                (leaf_rs.as_path(), file_stamp(&leaf_rs)),
+            ];
+            let envs = vec![(
+                "MY_NOOP_SECRET".to_owned(),
+                Some(hash_env_val(&NOOP_MAGIC, "MY_NOOP_SECRET", secret)),
+            )];
+            let encoded = encode_stamp_file(
+                meta_hash,
+                42,
+                hash_target_dirs(&[]),
+                1,
+                &entries,
+                &[],
+                &envs,
+            )
+            .expect("encode");
+            assert!(
+                !encoded
+                    .windows(secret.len())
+                    .any(|w| w == secret.as_bytes())
+            );
+            write_new_bytes(&stamp_file, &encoded).expect("write");
+            assert_eq!(try_hit_at(&stamp_file, &tmp, None), Some(42));
+        });
+
+        crate::with_client_env(
+            Some(std::sync::Arc::new(rustc_hash::FxHashMap::default())),
+            || {
+                assert_eq!(try_hit_at(&stamp_file, &tmp, None), None);
+            },
+        );
+        crate::with_client_env(Some(env_map.clone()), || {
+            std::fs::write(&leaf_rs, "pub fn x() { let _ = 1; }\n").expect("edit leaf");
+            assert_eq!(try_hit_at(&stamp_file, &tmp, None), None);
+            std::fs::write(&leaf_rs, "pub fn x() {}\n").expect("restore leaf");
+            std::fs::write(&root_rs, "fn main() { let _ = 1; }\n").expect("edit root");
+            assert_eq!(try_hit_at(&stamp_file, &tmp, None), None);
+        });
+        drop(std::fs::remove_dir_all(&tmp));
     }
 }

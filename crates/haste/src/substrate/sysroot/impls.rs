@@ -10,7 +10,7 @@ use crate::sema::summary::codec::{Cursor, write_u32};
 use crate::sema::ty::Mut;
 use crate::sema::{Cache, Context};
 
-use super::tokens::{read_u32s_map, write_usize};
+use super::tokens::{read_u32s_map, u32_le, write_usize};
 use super::wire::Tables;
 
 pub(super) fn build_module_heads(
@@ -38,11 +38,14 @@ fn write_item_ref(out: &mut Vec<u8>, item: ItemRef, tables: &Tables<'_>) -> Opti
 }
 
 fn read_item_ref(cur: &mut Cursor<'_>, remap: &[u32]) -> Result<ItemRef> {
-    let local = cur.u32()? as usize;
+    let b = cur.take(12)?;
+    let local = u32_le(b, 0) as usize;
     let krate = *remap.get(local).context("impl item crate out of bounds")?;
-    let file = cur.u32()?;
-    let item = cur.u32()?;
-    Ok(ItemRef { krate, file, item })
+    Ok(ItemRef {
+        krate,
+        file: u32_le(b, 4),
+        item: u32_le(b, 8),
+    })
 }
 
 fn write_head(out: &mut Vec<u8>, head: Head, tables: &Tables<'_>) -> Option<()> {

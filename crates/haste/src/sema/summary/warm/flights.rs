@@ -84,23 +84,25 @@ fn expand_body_owners(cx: &mut crate::sema::Context<'_>, todo: Vec<ItemRef>) {
         return;
     }
     let next = std::sync::atomic::AtomicUsize::new(0);
+    let run = |worker: &mut crate::sema::Context<'_>| loop {
+        let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if idx >= todo.len() {
+            break;
+        }
+        let _ = worker.parse_body(todo[idx]);
+    };
     let asks_list = crate::sync::scope(|s| {
-        let handles: Vec<_> = (0..workers)
+        let handles: Vec<_> = (1..workers)
             .map(|_| {
                 let mut worker = cx.fork();
-                s.spawn(|| {
-                    loop {
-                        let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if idx >= todo.len() {
-                            break;
-                        }
-                        let _ = worker.parse_body(todo[idx]);
-                    }
+                s.spawn(move || {
+                    run(&mut worker);
                     worker.asks
                 })
             })
             .collect();
-        let mut out = Vec::with_capacity(workers);
+        run(cx);
+        let mut out = Vec::with_capacity(workers - 1);
         for h in handles {
             match h.join() {
                 Ok(asks) => out.push(asks),
@@ -147,45 +149,45 @@ fn populate_flight_chunks(
     let s_next = std::sync::atomic::AtomicUsize::new(0);
     let (reveals_ref, checked_ref, summaries_ref) = (&reveals_list, &checked_list, &summaries_list);
     let (r_at, c_at, s_at) = (&r_next, &c_next, &s_next);
+    let run = |worker: &mut crate::sema::Context<'_>| {
+        loop {
+            let i = r_at.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if i >= reveals_ref.len() {
+                break;
+            }
+            let (inst, ty) = reveals_ref[i];
+            let _ = reveals.run_cached(worker, inst, |_| Ok(ty), |_| Ok(Ty::NONE));
+        }
+        loop {
+            let i = c_at.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if i >= checked_ref.len() {
+                break;
+            }
+            let (block, val) = checked_ref[i];
+            let _ = checked.run_cached(worker, block, |_| Ok(val), |_| Ok(false));
+        }
+        loop {
+            let i = s_at.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if i >= summaries_ref.len() {
+                break;
+            }
+            let (item, kind) = &summaries_ref[i];
+            let _ = summaries.run_cached(
+                worker,
+                *item,
+                |_| Ok(kind.clone()),
+                |_| Ok(SummaryKind::MonomorphicFallback),
+            );
+        }
+    };
     crate::sync::scope(|s| {
-        let handles: Vec<_> = (0..workers)
+        let handles: Vec<_> = (1..workers)
             .map(|_| {
                 let mut worker = cx.fork();
-                let (reveals, checked, summaries) =
-                    (reveals.clone(), checked.clone(), summaries.clone());
-                s.spawn(move || {
-                    loop {
-                        let i = r_at.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if i >= reveals_ref.len() {
-                            break;
-                        }
-                        let (inst, ty) = reveals_ref[i];
-                        let _ = reveals.run_cached(&mut worker, inst, |_| Ok(ty), |_| Ok(Ty::NONE));
-                    }
-                    loop {
-                        let i = c_at.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if i >= checked_ref.len() {
-                            break;
-                        }
-                        let (block, val) = checked_ref[i];
-                        let _ = checked.run_cached(&mut worker, block, |_| Ok(val), |_| Ok(false));
-                    }
-                    loop {
-                        let i = s_at.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if i >= summaries_ref.len() {
-                            break;
-                        }
-                        let (item, kind) = &summaries_ref[i];
-                        let _ = summaries.run_cached(
-                            &mut worker,
-                            *item,
-                            |_| Ok(kind.clone()),
-                            |_| Ok(SummaryKind::MonomorphicFallback),
-                        );
-                    }
-                })
+                s.spawn(move || run(&mut worker))
             })
             .collect();
+        run(cx);
         for h in handles {
             if let Err(payload) = h.join() {
                 std::panic::resume_unwind(payload);
@@ -223,11 +225,12 @@ pub(in crate::sema) fn warm_populate_flights(
     for &(r, _) in &flights.checked_impls {
         collect_impl_owners(r, &mut owners);
     }
-    let todo: Vec<ItemRef> = owners
+    let mut todo: Vec<ItemRef> = owners
         .into_iter()
         .filter(|&owner| cx.expansion(owner).is_none())
         .collect();
     if !todo.is_empty() {
+        todo.sort_unstable();
         expand_body_owners(cx, todo);
     }
     let t_owners = t0.map(|s| s.elapsed().as_micros() as u64);
