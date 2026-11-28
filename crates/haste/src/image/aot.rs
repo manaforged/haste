@@ -6,12 +6,15 @@ use rustc_hash::{FxHashMap as HashMap, FxHasher};
 
 use crate::host::HostSymbol;
 use crate::lower::{
-    FootprintId, RelocPlan, RodataId, RodataReloc, RodataTarget, SymbolSource, VtableEntry,
+    FootprintId, RelocPlan, RodataId, RodataReloc, RodataTarget, Slots, SymbolSource, VtableEntry,
     VtableId, Word,
 };
 use crate::names::ItemRef;
+use crate::sema::Context;
+use crate::sema::reach::Reached;
 use crate::sync::lock;
 
+pub(super) mod cache;
 mod emit;
 mod icf;
 mod queue;
@@ -138,6 +141,7 @@ pub(crate) struct AotState {
     pub(super) frontier: Option<Arc<AotQueue>>,
     frontier_vtables: Vec<bool>,
     frontier_rodata: Vec<bool>,
+    pub(super) cache: Option<Arc<cache::AotCache>>,
 }
 
 impl AotState {
@@ -156,6 +160,7 @@ impl AotState {
             frontier: None,
             frontier_vtables: Vec::new(),
             frontier_rodata: Vec::new(),
+            cache: None,
         })
     }
 
@@ -314,6 +319,10 @@ impl Image {
             .collect()
     }
 
+    pub(super) fn aot_cache(&self) -> Option<Arc<cache::AotCache>> {
+        self.aot().and_then(|aot| lock(aot).cache.clone())
+    }
+
     pub(super) fn record_aot(&self, index: usize, entry: AotFn, followers: &[usize]) {
         if let Some(aot) = self.aot() {
             let mut state = lock(aot);
@@ -333,6 +342,118 @@ impl Image {
             {
                 q.push_loose(items);
             }
+        }
+    }
+
+    pub(super) fn drain_aot_cache_hits(
+        &self,
+        cx: &mut Context<'_>,
+        reached: &Reached,
+        work: &[usize],
+        pass: &mut super::Pass,
+    ) -> Vec<usize> {
+        let Some(cache) = self.aot_cache() else {
+            return work.to_vec();
+        };
+        if !cache.has_loaded_bundle() {
+            cache.mark_miss();
+            return work.to_vec();
+        }
+        let mut misses = Vec::new();
+        let mut ty_memo = HashMap::default();
+        for &index in work {
+            if let Some(key) = cache.instance_key(cx, reached, index, &mut ty_memo)
+                && let Some((entry, len)) = cache.lookup_instance(index, &key, self, cx, reached)
+            {
+                cache.note_hit();
+                let relocs = match &entry {
+                    AotFn::Direct { relocs, .. } | AotFn::Dict { relocs, .. } => relocs.as_slice(),
+                    AotFn::Alias(_) => &[],
+                };
+                self.register_aot_relocs(relocs);
+                self.record_aot(index, entry, &[]);
+                pass.record_size(index, len, 0);
+            } else {
+                cache.note_miss();
+                misses.push(index);
+            }
+        }
+        if !misses.is_empty() {
+            cache.mark_miss();
+            if self.allow_inline()
+                && let Some(aot) = self.aot()
+                && let Some(queue) = lock(aot).frontier.clone()
+            {
+                queue.push_warm(collect_warm_callees(cx, reached, &queue, &misses));
+            }
+        }
+        misses
+    }
+
+    pub(super) fn record_aot_inlined_evals(
+        &self,
+        cx: &Context<'_>,
+        reached: &Reached,
+        plan: &RelocPlan,
+        evaluated: &[(usize, Vec<SymbolSource>)],
+    ) {
+        let Some(cache) = self.aot_cache() else {
+            return;
+        };
+        for (index, relocs) in evaluated {
+            cache.record_compiled_inlined(cx, reached, plan, *index, relocs);
+        }
+    }
+
+    pub(super) fn record_aot_inlined_groups(
+        &self,
+        cx: &Context<'_>,
+        reached: &Reached,
+        plan: &RelocPlan,
+        evaluated: &[(usize, &Vec<usize>, Vec<SymbolSource>)],
+    ) {
+        let Some(cache) = self.aot_cache() else {
+            return;
+        };
+        for (leader, _, relocs) in evaluated {
+            cache.record_compiled_inlined(cx, reached, plan, *leader, relocs);
+        }
+    }
+
+    pub(super) fn record_aot_inlined_indices(
+        &self,
+        cx: &Context<'_>,
+        reached: &Reached,
+        plan: &RelocPlan,
+        indices: &[usize],
+    ) {
+        let Some(cache) = self.aot_cache() else {
+            return;
+        };
+        let Some(aot) = self.aot() else {
+            return;
+        };
+        let pairs: Vec<(usize, Vec<SymbolSource>)> = {
+            let state = lock(aot);
+            indices
+                .iter()
+                .filter_map(|&idx| {
+                    let mut cur = idx;
+                    for _ in 0..state.functions.len() {
+                        match state.functions.get(cur).and_then(Option::as_ref)? {
+                            AotFn::Alias(next) if *next < state.functions.len() => cur = *next,
+                            AotFn::Direct { relocs, .. } | AotFn::Dict { relocs, .. } => {
+                                return Some((idx, relocs.clone()));
+                            }
+                            AotFn::Alias(_) => return None,
+                        }
+                    }
+                    None
+                })
+                .collect()
+        };
+        for (idx, relocs) in pairs {
+            cache.record_compiled_inlined(cx, reached, plan, idx, &relocs);
         }
     }
 }

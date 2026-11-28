@@ -419,7 +419,7 @@ fn report_cases(
         return crate::build::run(workspace, targets, args);
     }
     let started = Instant::now();
-    let mut build = crate::build::Build::load(workspace, targets)?;
+    let mut build = crate::build::Build::load_oneshot(workspace, targets)?;
     let result = match (request, out) {
         (Request::Build, Some(path)) => build.emit_executable(workspace, path, stats.is_none()),
         (Request::Build, None) if stats.is_none() => build
@@ -442,7 +442,7 @@ fn report_cases(
     if request == Request::Build && crate::substrate::noop::active(stats.map(|(p, _)| p)) {
         match &result {
             Ok(0) => {
-                let watch_paths = build.watch_paths();
+                let watch_paths = build.watch_paths(workspace);
                 let env_reads: Vec<String> = build
                     .env_reads()
                     .into_iter()
@@ -456,6 +456,7 @@ fn report_cases(
                     out,
                     build.reached_count(),
                 );
+                std::mem::forget((watch_paths, env_reads));
             }
             _ => crate::substrate::noop::invalidate(root, out),
         }
@@ -702,6 +703,9 @@ fn report(
             workspace.graph.units.len(),
             loaded.as_secs_f64() * 1e3
         );
+    }
+    if matches!(command, Command::Request(_)) {
+        std::mem::forget(workspace);
     }
     Ok(status)
 }

@@ -333,48 +333,60 @@ fn decode_scope(slice: &[u8], remap: &[u32], sym_remap: &[Sym]) -> Result<Scope>
     })
 }
 
+pub(super) struct SplitScopes<'a> {
+    pub slices: Vec<&'a [u8]>,
+    pub total_bytes: usize,
+}
+
+pub(super) fn split_names_crate_scopes<'a>(cur: &mut Cursor<'a>) -> Result<SplitScopes<'a>> {
+    let scope_len = cur.count()?;
+    let end_bytes = cur.take(scope_len.checked_mul(4).context("scope table overflow")?)?;
+    let scope_byte_len = cur.count()?;
+    let scope_bytes = cur.take(scope_byte_len)?;
+    let mut slices = Vec::with_capacity(scope_len);
+    let mut prev = 0usize;
+    for c in end_bytes.chunks_exact(4) {
+        let end = u32_le(c, 0) as usize;
+        if end < prev || end > scope_byte_len {
+            bail!("non-monotonic sysroot scope offset");
+        }
+        slices.push(&scope_bytes[prev..end]);
+        prev = end;
+    }
+    if prev != scope_byte_len {
+        bail!("sysroot scope table length mismatch");
+    }
+    Ok(SplitScopes {
+        slices,
+        total_bytes: scope_byte_len,
+    })
+}
+
+pub(super) fn decode_scope_slice(
+    slices: &[&[u8]],
+    remap: &[u32],
+    sym_remap: &[Sym],
+) -> Result<Vec<Scope>> {
+    let mut scopes = Vec::with_capacity(slices.len());
+    for &s in slices {
+        scopes.push(decode_scope(s, remap, sym_remap)?);
+    }
+    Ok(scopes)
+}
+
 fn read_scopes(
     cur: &mut Cursor<'_>,
     remap: &[u32],
     sym_remap: &[Sym],
     parallel: bool,
 ) -> Result<Vec<Scope>> {
-    let scope_len = cur.count()?;
-    let end_bytes = cur.take(scope_len.checked_mul(4).context("scope table overflow")?)?;
-    let scope_byte_len = cur.count()?;
-    let scope_bytes = cur.take(scope_byte_len)?;
-    if parallel && scope_len >= 16 && scope_byte_len >= 8 * 1024 && crate::jobs() > 1 {
-        let mut slices = Vec::with_capacity(scope_len);
-        let mut prev = 0usize;
-        for c in end_bytes.chunks_exact(4) {
-            let end = u32_le(c, 0) as usize;
-            if end < prev || end > scope_byte_len {
-                bail!("non-monotonic sysroot scope offset");
-            }
-            slices.push(&scope_bytes[prev..end]);
-            prev = end;
-        }
-        if prev != scope_byte_len {
-            bail!("sysroot scope table length mismatch");
-        }
-        crate::sync::parallel_map(slices, |s| decode_scope(s, remap, sym_remap))
+    let split = split_names_crate_scopes(cur)?;
+    if parallel && split.slices.len() >= 16 && split.total_bytes >= 8 * 1024 && crate::jobs() > 1 {
+        crate::sync::parallel_map(split.slices, |s| decode_scope(s, remap, sym_remap))
             .into_iter()
             .collect::<Result<Vec<_>>>()
     } else {
-        let mut scopes = Vec::with_capacity(scope_len);
-        let mut prev = 0usize;
-        for c in end_bytes.chunks_exact(4) {
-            let end = u32_le(c, 0) as usize;
-            if end < prev || end > scope_byte_len {
-                bail!("non-monotonic sysroot scope offset");
-            }
-            scopes.push(decode_scope(&scope_bytes[prev..end], remap, sym_remap)?);
-            prev = end;
-        }
-        if prev != scope_byte_len {
-            bail!("sysroot scope table length mismatch");
-        }
-        Ok(scopes)
+        decode_scope_slice(&split.slices, remap, sym_remap)
     }
 }
 
@@ -484,13 +496,12 @@ fn read_enums(cur: &mut Cursor<'_>, sym_remap: &[Sym]) -> Result<HashMap<(u32, u
     Ok(enums)
 }
 
-pub(super) fn read_names_crate(
+pub(super) fn read_names_crate_body(
     cur: &mut Cursor<'_>,
+    scopes: Vec<Scope>,
     remap: &[u32],
     sym_remap: &[Sym],
-    parallel_scopes: bool,
 ) -> Result<NamesCrate> {
-    let scopes = read_scopes(cur, remap, sym_remap, parallel_scopes)?;
     let prelude = read_prelude(cur, remap)?;
     let unresolved = read_unresolved(cur)?;
     let externs = read_externs(cur, remap, sym_remap)?;
@@ -516,4 +527,14 @@ pub(super) fn read_names_crate(
     out.settled = true;
     out.rebuild_indices();
     Ok(out)
+}
+
+pub(super) fn read_names_crate(
+    cur: &mut Cursor<'_>,
+    remap: &[u32],
+    sym_remap: &[Sym],
+    parallel_scopes: bool,
+) -> Result<NamesCrate> {
+    let scopes = read_scopes(cur, remap, sym_remap, parallel_scopes)?;
+    read_names_crate_body(cur, scopes, remap, sym_remap)
 }

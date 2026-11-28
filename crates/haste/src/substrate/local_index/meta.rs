@@ -169,6 +169,7 @@ pub(super) fn structural_key(
     refs: &CrateRefs,
     sys_key: u64,
     (host_th, target_th): (u64, u64),
+    pinned_stamps: &mut [Option<FileStamp>],
 ) -> Option<u64> {
     let mut hasher = FxHasher::default();
     (
@@ -207,6 +208,11 @@ pub(super) fn structural_key(
         let root = &outline.roots[dep];
         let pkg = &workspace.packages[workspace.graph.units[root.unit].package];
         let tree = &outline.crates[dep];
+        let root_stamp = if let Some(slot) = pinned_stamps.get_mut(dep) {
+            *slot.get_or_insert_with(|| store::file_stamp(&root.path))
+        } else {
+            store::file_stamp(&root.path)
+        };
         (
             &pkg.locked.source,
             &pkg.locked.checksum,
@@ -214,7 +220,7 @@ pub(super) fn structural_key(
             &root.edition,
             root.proc_macro,
             &root.path,
-            store::file_stamp(&root.path),
+            root_stamp,
         )
             .hash(&mut hasher);
         (

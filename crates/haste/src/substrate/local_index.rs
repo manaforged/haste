@@ -90,6 +90,7 @@ pub(crate) fn prepare(
     let ranks = crate_ranks(workspace, outline);
     let n = outline.crates.len();
     let mut keys: Vec<Option<(u64, u64)>> = vec![None; n];
+    let mut pinned_stamps: Vec<Option<store::FileStamp>> = vec![None; n];
     let mut prepared = Vec::new();
     let mut slot = 0usize;
     for krate in local_lib_topo_order(outline, &ranks) {
@@ -104,8 +105,16 @@ pub(crate) fn prepare(
         else {
             continue;
         };
-        let Some(sk) = structural_key(workspace, targets, outline, krate, &refs, sys_key, th)
-        else {
+        let Some(sk) = structural_key(
+            workspace,
+            targets,
+            outline,
+            krate,
+            &refs,
+            sys_key,
+            th,
+            &mut pinned_stamps,
+        ) else {
             continue;
         };
         let mpath = meta_path(sk);
@@ -313,6 +322,7 @@ pub(crate) fn save(
     let ranks = crate_ranks(workspace, outline);
     let mut keys: Vec<Option<(u64, u64)>> = hit_keys.to_vec();
     keys.resize(outline.crates.len(), None);
+    let mut pinned_stamps: Vec<Option<store::FileStamp>> = vec![None; outline.crates.len()];
     let (mut last_bin, mut last_meta) = (None, None);
 
     for krate in local_lib_topo_order(outline, &ranks) {
@@ -346,8 +356,16 @@ pub(crate) fn save(
         else {
             continue;
         };
-        let Some(sk) = structural_key(workspace, targets, outline, krate, &refs, sys_key, th)
-        else {
+        let Some(sk) = structural_key(
+            workspace,
+            targets,
+            outline,
+            krate,
+            &refs,
+            sys_key,
+            th,
+            &mut pinned_stamps,
+        ) else {
             continue;
         };
         let (watched, included) = collect_watched_files(outline, krate);
