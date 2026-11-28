@@ -9,7 +9,7 @@ use crate::sema::ty::{Kind, Ty};
 use super::super::bind::push_loan;
 use super::super::calls::{
     Lifetimes, ast_ty_may_carry_elided_lt, collect_ty_lifetimes, for_each_param_bound_list,
-    sig_param_idx, sig_returns_only_static, sig_type_params, ty_shares_name,
+    sig_param_idx, sig_returns_only_static, sig_type_params,
 };
 use super::super::places::Place;
 use super::super::propagate::{BorrowSource, TupleSources, dedup_sources};
@@ -61,6 +61,7 @@ struct ParamBounds {
     req_static: bool,
     hrtb_params: Vec<(usize, bool)>,
     hrtb_non_ret: Vec<usize>,
+    hrtb_ret: bool,
     caller_lt_params: Vec<CallerLtParam>,
 }
 
@@ -124,12 +125,14 @@ impl Checker<'_, '_> {
                 self.check_caller_lt_sources(arg, sources, true, &[], false)?;
             } else {
                 self.check_call_static_dyn_arg(sig, sig_src, param_ty, arg, sources)?;
+                self.check_impl_lifetime_arg(arg, sources, sig, fn_item, param_ty)?;
             }
             if bounds.req_fn
                 || bounds.req_fn_mut
                 || bounds.req_static
                 || !bounds.hrtb_params.is_empty()
                 || !bounds.hrtb_non_ret.is_empty()
+                || bounds.hrtb_ret
             {
                 self.check_closure_arg_reqs(arg, &bounds)?;
             }
@@ -164,6 +167,7 @@ impl Checker<'_, '_> {
         arg_sources: &[Vec<BorrowSource>],
         state: &State,
     ) -> Result<()> {
+        self.check_callee_bound_contra(callee, arg_ids)?;
         let Some(bounds) = self.callee_param_bounds(callee) else {
             return Ok(());
         };
@@ -327,7 +331,9 @@ impl Checker<'_, '_> {
                                             .map_or(out_elided, |name| {
                                                 out_lts.named.contains(&name)
                                             });
-                                        if !ret_uses_hrtb && !out.hrtb_non_ret.contains(&p_idx) {
+                                        if ret_uses_hrtb {
+                                            out.hrtb_ret = true;
+                                        } else if !out.hrtb_non_ret.contains(&p_idx) {
                                             out.hrtb_non_ret.push(p_idx);
                                         }
                                     }
@@ -401,6 +407,8 @@ impl Checker<'_, '_> {
             let e_ty = self.expr_ty(expr);
             let peel_by_origin = (outer_hrtb || s.origin_only)
                 && !self.is_dyn_only_borrow(e_ty)
+                && !(matches!(*self.cx.types.kind(e_ty), Kind::Closure(..))
+                    && self.ty_holds_non_dyn_borrow(e_ty))
                 && self.is_ref_ty(target_ty)
                 && matches!(
                     *self.cx.types.kind(target_ty),
@@ -453,7 +461,7 @@ impl Checker<'_, '_> {
         false
     }
 
-    pub(super) fn check_closure_effects(
+    pub(in super::super) fn check_closure_effects(
         &self,
         expr: Option<ExprId>,
         eff: &ClosureEffects,
@@ -509,6 +517,15 @@ impl Checker<'_, '_> {
         }) {
             return Err(self.borrow_err(Some(expr), "borrowed data escapes outside of closure"));
         }
+        if bounds.hrtb_ret
+            && let Some((ret_real, _)) = &eff.ret_targets
+            && let Some(&bad) = ret_real.iter().find(|&&t| {
+                is_temp_target(t).is_some()
+                    || (!self.from_caller(t, false) && !self.is_closure_param(t))
+            })
+        {
+            return Err(self.does_not_live_long_enough(Some(expr), bad));
+        }
         self.check_closure_effects(
             Some(expr),
             eff,
@@ -516,41 +533,6 @@ impl Checker<'_, '_> {
             bounds.req_fn_mut,
             bounds.req_static,
         )
-    }
-
-    fn fn_item_returns_hrtb_param(&mut self, arg: ExprId, hrtb_non_ret: &[usize]) -> bool {
-        let cur = self.unwrap_parens(arg);
-        let Some(crate::sema::infer::Res::Fn(f_item, _)) = self.typed.res.get(&cur).copied() else {
-            return false;
-        };
-        let Ok(sig) = self.cx.signature(f_item) else {
-            return false;
-        };
-        let Some(ret_ast) = sig.ret else {
-            return false;
-        };
-        let sig_src = self.cx.item(f_item).0;
-        let mut ret_lts = Lifetimes::default();
-        collect_ty_lifetimes(&sig.body, sig_src, ret_ast, &mut ret_lts);
-        if sig_returns_only_static(&sig, sig_src, ret_ast, &ret_lts) {
-            return false;
-        }
-        let has_ret_lt = ret_lts.has_elided || !ret_lts.named.is_empty();
-        hrtb_non_ret.iter().any(|&idx| {
-            sig.params.get(idx).is_some_and(|&(_, pt)| {
-                if has_ret_lt {
-                    let mut plts = Lifetimes::default();
-                    collect_ty_lifetimes(&sig.body, sig_src, pt, &mut plts);
-                    if (ret_lts.has_elided && (plts.has_elided || !plts.named.is_empty()))
-                        || ret_lts.named.iter().any(|n| plts.named.contains(n))
-                    {
-                        return true;
-                    }
-                }
-                !matches!(sig.body.ty(pt), AstTy::Ref { .. })
-                    && ty_shares_name(&sig.body, sig_src, pt, &ret_lts.names)
-            })
-        })
     }
 
     fn unwrap_expr(&self, mut expr: ExprId) -> ExprId {

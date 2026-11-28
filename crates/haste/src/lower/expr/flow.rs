@@ -151,7 +151,7 @@ impl Lower<'_, '_> {
         self.loop_body((head, exit, depth), label, body)
     }
 
-    fn cond_has_let(&self, expr: ExprId) -> bool {
+    pub(in crate::lower) fn cond_has_let(&self, expr: ExprId) -> bool {
         match *self.body.expr(expr) {
             Expr::Let(..) => true,
             Expr::Paren(inner) => self.cond_has_let(inner),

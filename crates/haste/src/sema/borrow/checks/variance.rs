@@ -186,6 +186,7 @@ impl Checker<'_, '_> {
         let Some(ty_id) = ann_ty else {
             return Ok(());
         };
+        self.check_static_assoc_ref_ann(ty_id)?;
         if bound.len() != 1 {
             return Ok(());
         }

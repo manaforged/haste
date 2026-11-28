@@ -75,9 +75,10 @@ impl<'a> Infer<'_, 'a> {
     ) -> Result<bool> {
         let src = &self.cx.impl_file(block).source;
         for (generic, &arg) in type_params(&header.generics).zip(impl_args) {
-            if generic.kind != crate::body::sig::GenericKind::Type
-                || !self.cx.types.kind(self.resolve(arg)).is_unsized()
-            {
+            let resolved = self.resolve(arg);
+            let unsized_arg = self.cx.types.kind(resolved).is_unsized()
+                || (self.poly.is_some() && self.has_params(resolved) && !self.poly_sized(resolved));
+            if generic.kind != crate::body::sig::GenericKind::Type || !unsized_arg {
                 continue;
             }
             let bounds =

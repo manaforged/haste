@@ -69,12 +69,24 @@ impl<K, V> Table<K, V> {
         K: Eq + Hash,
         V: Clone,
     {
+        self.get_or_insert_with_flag(key, make).0
+    }
+
+    pub fn get_or_insert_with_flag(&self, key: K, make: impl FnOnce() -> V) -> (V, bool)
+    where
+        K: Eq + Hash,
+        V: Clone,
+    {
         let shard = self.shard(&key);
         if let Some(found) = read_lock(shard).get(&key).cloned() {
-            return found;
+            return (found, false);
         }
         let made = make();
-        write_lock(shard).entry(key).or_insert(made).clone()
+        let mut map = write_lock(shard);
+        match map.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => (e.get().clone(), false),
+            std::collections::hash_map::Entry::Vacant(e) => (e.insert(made).clone(), true),
+        }
     }
 
     /// Removes and returns the value stored under `key`.

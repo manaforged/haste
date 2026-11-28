@@ -11,10 +11,11 @@ use super::super::plan::eval_footprint_with_cycle;
 use super::super::reloc::{RelocPlan, eval_relocs};
 use super::super::{Inline, Slots};
 use super::emit::{run_with_cycle, sym_may_unwind};
+use super::inflight::TemplateClaim;
 use super::persist;
 use super::{
-    Bodies, FootprintId, Form, InlineMeta, InlineTemplate, InlinedCallee, LowerMode, RelocVec,
-    SymbolSource, Tally, TemplateKey, simplify_tallied, tally,
+    Bodies, FootprintId, Form, InlineMeta, InlineTemplate, InlinedCallee, LowerMode, Quiet,
+    RelocVec, SymbolSource, Tally, TemplateKey, simplify_tallied, tally,
 };
 
 const MAX_INLINE_HEIGHT: u8 = 12;
@@ -30,36 +31,6 @@ type Lowered = (
     Arc<RelocPlan>,
     usize,
 );
-
-pub(in crate::lower) struct Quiet {
-    wanted: usize,
-    sema: (usize, usize),
-}
-
-impl Quiet {
-    pub(in crate::lower) fn mark(cx: &Context<'_>, slots: &dyn Slots) -> Self {
-        Self {
-            wanted: slots.wanted_len(),
-            sema: cx.quiet_mark(),
-        }
-    }
-
-    pub(in crate::lower) fn holds(&self, cx: &Context<'_>, slots: &dyn Slots) -> bool {
-        slots.wanted_len() == self.wanted && cx.quiet_mark() == self.sema
-    }
-
-    pub(in crate::lower) fn lowered<T>(
-        &self,
-        slots: &dyn Slots,
-        result: Result<T>,
-    ) -> Result<Option<T>> {
-        match result {
-            Ok(out) => Ok(Some(out)),
-            Err(err) if slots.wanted_len() > self.wanted => Err(err),
-            Err(_) => Ok(None),
-        }
-    }
-}
 
 enum Found {
     Body(Arc<InlineTemplate>, Option<RelocVec>),
@@ -276,10 +247,7 @@ pub(in crate::lower) fn resolve_inline_meta(
     };
     if cycle > depth && quiet.holds(cx, slots) {
         if let Some(Some(cal)) = inlined {
-            bodies.bump_transient();
-            let stored = bodies
-                .inlined
-                .get_or_insert_with((index, limit), || Some(cal));
+            let stored = bodies.cache_inlined((index, limit), Some(cal));
             return Ok((
                 record_meta_height(inline, stored.as_deref().map(InlinedCallee::meta)),
                 cycle,
@@ -356,10 +324,7 @@ pub(in crate::lower) fn resolve_inline(
     if !compact {
         if cycle > depth && quiet.holds(cx, slots) {
             if let Some(cal) = result {
-                bodies.bump_transient();
-                let stored = bodies
-                    .inlined
-                    .get_or_insert_with((index, limit), || Some(cal));
+                let stored = bodies.cache_inlined((index, limit), Some(cal));
                 return finish_inline(cx, (reached, slots), inline, (index, stored, cycle));
             }
             bodies
@@ -430,8 +395,7 @@ fn try_cached_template<'a>(
         if quiet.holds(cx, slots) {
             match found {
                 Some(t) => {
-                    slots.bodies().bump_transient();
-                    found = Some(slots.bodies().templates.get_or_insert_with(*key, || t));
+                    found = Some(slots.bodies().cache_template(*key, t).0);
                 }
                 None => {
                     slots.bodies().rejected.get_or_insert_with(*key, || ());
@@ -455,10 +419,8 @@ fn settle_built_template(
     } else if calm {
         match template {
             Some(t) => {
-                slots.bodies().bump_transient();
-                let built = Arc::as_ptr(&t);
-                let stored = slots.bodies().templates.get_or_insert_with(key, || t);
-                if built != Arc::as_ptr(&stored) {
+                let (stored, inserted) = slots.bodies().cache_template(key, t);
+                if !inserted {
                     tally(Tally::Raced);
                 }
                 template = Some(stored);
@@ -552,10 +514,7 @@ fn apply_inline_cache_hit(
             Some((footprint, Found::Shape(returns, height, size)))
         }
         InlineCacheHit::Body(footprint, template) => {
-            bodies.bump_transient();
-            let stored = bodies
-                .templates
-                .get_or_insert_with(TemplateKey { footprint, ..key }, || template);
+            let (stored, _) = bodies.cache_template(TemplateKey { footprint, ..key }, template);
             Some((footprint, Found::Body(stored, None)))
         }
     }
@@ -592,10 +551,8 @@ fn ensure_inline_template_inner(
             compact: key_compact,
             sole: key_sole,
         };
-        return Ok((
-            apply_inline_cache_hit(slots.bodies(), probe_key, hit),
-            usize::MAX,
-        ));
+        let applied = apply_inline_cache_hit(slots.bodies(), probe_key, hit);
+        return Ok((applied, usize::MAX));
     }
     let fp_res = eval_footprint_with_cycle(cx, (reached, slots), inline, index);
     if inline.aborted {
@@ -648,6 +605,26 @@ fn ensure_inline_template_inner(
         Ok(None) => None,
         Err(disk) => disk,
     };
+    let claim = if fp_cycle > depth && quiet.holds(cx, slots) {
+        let bodies = slots.bodies();
+        match bodies
+            .template_flight
+            .claim(key, inline.warming, |k| bodies.cached_template_state(k))
+        {
+            TemplateClaim::Build(guard) => Some(guard),
+            TemplateClaim::Ready(hit) => {
+                tally(Tally::Hit);
+                return Ok((hit.map(|t| (footprint, Found::Body(t, None))), fp_cycle));
+            }
+            TemplateClaim::Cycle => None,
+            TemplateClaim::Abort => {
+                inline.aborted = true;
+                return Ok((None, usize::MAX));
+            }
+        }
+    } else {
+        None
+    };
     let (lowered, retried) = lower_with_compact(
         cx,
         (reached, slots),
@@ -689,13 +666,17 @@ fn ensure_inline_template_inner(
     if retried && template.is_some() {
         tally(Tally::Compact);
     }
+    let calm = quiet.holds(cx, slots);
     let template = settle_built_template(
         cx,
         (reached, slots),
         key,
         template,
-        (disk, quiet.holds(cx, slots), servable, cycle <= depth),
+        (disk, calm, servable, cycle <= depth),
     );
+    if let Some(guard) = claim {
+        guard.finish((cycle > depth && calm).then(|| template.clone()));
+    }
     if !cyclic
         && cycle > depth
         && quiet.holds(cx, slots)

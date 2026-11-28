@@ -207,9 +207,19 @@ impl Infer<'_, '_> {
         let Some(ty) = self.param_ty(param).filter(|_| param != "Self") else {
             return Ok(None);
         };
-        if let Some((of, args)) = self.bound_trait((param, ty), name, Self::has_member)? {
+        let bounds = self.header_bounds(
+            (param, ty),
+            &mut |infer, of| infer.has_member(of, name),
+            false,
+        )?;
+        if let Some((of, args)) = bounds.first() {
+            let unique = bounds.len() == 1
+                || bounds
+                    .iter()
+                    .all(|(other, other_args)| other == of && other_args == args);
+            let args = unique.then(|| args.clone());
             return self
-                .trait_value(of, (Some(ty), Some(args)), (name, given))
+                .trait_value(*of, (Some(ty), args), (name, given))
                 .map(Some);
         }
         let Some((of, _)) = self.bound_trait((param, ty), name, Self::reaches_member)? else {

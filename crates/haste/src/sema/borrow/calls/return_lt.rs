@@ -171,7 +171,17 @@ impl super::super::Checker<'_, '_> {
         expr: ExprId,
         src: &super::super::propagate::BorrowSource,
     ) -> Result<()> {
-        if self.closure_depth != 0 || self.ret_named_lts.is_empty() {
+        if self.closure_depth != 0 {
+            return Ok(());
+        }
+        if self.ret_named_lts.is_empty() {
+            if !src.env_only
+                && self.is_non_static_param(src.target)
+                && !self.param_shares_ret_ty(src.target)
+                && self.ret_is_elided_impl_self()
+            {
+                return Err(self.borrow_err(Some(expr), "lifetime may not live long enough"));
+            }
             return Ok(());
         }
         let req = self.ret_named_lts.clone();

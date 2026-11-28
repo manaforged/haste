@@ -597,8 +597,7 @@ pub(in crate::lower) fn maybe_partial(
         return Ok(full);
     };
     let built = if quiet.holds(cx, slots) {
-        slots.bodies().bump_transient();
-        slots.bodies().partial.get_or_insert_with(key, || built)
+        slots.bodies().cache_partial(key, built)
     } else {
         built
     };

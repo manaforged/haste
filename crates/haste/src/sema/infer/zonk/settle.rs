@@ -91,7 +91,25 @@ impl Infer<'_, '_> {
 
     fn settle_casts(&mut self, final_pass: bool) -> Result<()> {
         for (inner, found, target) in std::mem::take(&mut self.casts) {
-            let Kind::Ptr(_, open) = *self.cx.types.kind(self.resolve(target)) else {
+            let resolved_target = self.resolve(target);
+            if matches!(*self.cx.types.kind(resolved_target), Kind::Var(_)) {
+                if !final_pass {
+                    self.casts.push((inner, found, target));
+                }
+                continue;
+            }
+            let Kind::Ptr(_, open) = *self.cx.types.kind(resolved_target) else {
+                if !self.out.coercions.contains_key(&inner) {
+                    if matches!(*self.cx.types.kind(self.resolve(found)), Kind::Var(_))
+                        && !final_pass
+                    {
+                        self.casts.push((inner, found, target));
+                    } else if let Some(coercion) = self.coercion(found, target)? {
+                        self.out.coercions.insert(inner, coercion);
+                    } else {
+                        self.finish_identity_cast(found, target)?;
+                    }
+                }
                 continue;
             };
             if !self.has_vars(open) {

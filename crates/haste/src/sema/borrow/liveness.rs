@@ -15,17 +15,6 @@ pub(super) struct LiveTarget<'a> {
 }
 
 impl Checker<'_, '_> {
-    pub(super) fn active_live_targets(&self) -> Vec<LiveTarget<'_>> {
-        self.breaks
-            .iter()
-            .map(|f| LiveTarget {
-                label: f.label,
-                is_block: f.is_block,
-                break_live: &f.break_live,
-                continue_live: f.continue_live.as_ref(),
-            })
-            .collect()
-    }
     pub(super) fn collect_pat_locals(&self, pat: PatId, out: &mut HashSet<u32>) {
         match *self.body.pat(pat) {
             Pat::Bind { sub, .. } => {
@@ -190,9 +179,11 @@ impl Checker<'_, '_> {
             | Expr::Become(e) => self.collect_live_expr_with(e, live, targets),
             Expr::Assign(lhs, rhs) => {
                 if let Some(local) = self.expr_plain_local(lhs) {
-                    if !self.drop_locals.contains(&local) {
-                        live.remove(&local);
-                    }
+                    let _ = if self.drop_locals.contains(&local) {
+                        live.insert(local)
+                    } else {
+                        live.remove(&local)
+                    };
                     self.collect_live_expr_with(rhs, live, targets);
                 } else {
                     self.collect_live_expr_with(rhs, live, targets);

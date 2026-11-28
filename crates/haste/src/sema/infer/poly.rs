@@ -137,7 +137,7 @@ fn build_poly_summary_inner(
         .as_ref()
         .map(|poly| poly.method_traits.clone())
         .unwrap_or_default();
-    let (mut typed, poly, clean) = match infer.finish_poly() {
+    let (mut typed, poly, clean, borrow_clean) = match infer.finish_poly() {
         Ok(ok) => ok,
         Err((err, fell_back)) => {
             if is_user && !fell_back {
@@ -147,20 +147,18 @@ fn build_poly_summary_inner(
         }
     };
     collect_poly_traits(cx, poly.as_deref(), poly_traits);
-    if cx.quiet_mark() != before
-        || (!typed.coercions.is_empty() && super::object::fill_drops(cx, &mut typed).is_err())
-    {
+    if cx.quiet_mark() != before {
         return fallback_kind(poly.map(|poly| poly.method_traits).unwrap_or(pre_hints));
     }
     if is_user
-        && clean
-        && poly
-            .as_ref()
-            .is_some_and(|p| p.phase != PolyPhase::Fallback)
+        && borrow_clean
         && matches!(typed.shape, super::Shape::Body)
         && let Err(err) = super::super::borrow::check(cx, item, (&body, &sig), src, &typed)
     {
         return SummaryKind::Error(crate::diag::format_error(cx.name(item), &err));
+    }
+    if !typed.coercions.is_empty() && super::object::fill_drops(cx, &mut typed).is_err() {
+        return fallback_kind(poly.map(|poly| poly.method_traits).unwrap_or(pre_hints));
     }
     finalize_summary(cx, typed, poly, clean, param_count)
 }

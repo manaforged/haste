@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
@@ -23,7 +23,7 @@ mod tally;
 
 use emit::run_with_cycle;
 pub(crate) use emit::sym_may_unwind;
-pub(super) use inline::{Quiet, resolve_inline, resolve_inline_meta};
+pub(super) use inline::{resolve_inline, resolve_inline_meta};
 use tally::tally;
 pub(super) use tally::{Tally, simplify_tallied};
 
@@ -176,9 +176,11 @@ pub struct Bodies {
     rejected: Table<TemplateKey, ()>,
     cyclic: RwLock<FxHashMap<usize, cycles::CycleState>>,
     inflight: inflight::InFlight,
+    template_flight: inflight::TemplateFlight,
     persist: std::sync::OnceLock<persist::Persist>,
     transient_entries: AtomicUsize,
     evict_cursor: AtomicUsize,
+    trimming: AtomicBool,
 }
 
 impl Bodies {
@@ -202,47 +204,95 @@ impl Bodies {
 
     pub(crate) fn trim_transient(&self) {
         let count = self.transient_entries.load(Ordering::Relaxed);
-        if count < TRANSIENT_CAP / 2 {
+        if count < TRANSIENT_CAP / 2 || self.trimming.swap(true, Ordering::AcqRel) {
             return;
         }
-        let start = self.evict_cursor.fetch_add(TRIM_SHARDS, Ordering::Relaxed);
-        if count >= TRANSIENT_CAP {
-            tally(Tally::Flush);
-            self.clear_transient();
-            for offset in 0..TRIM_SHARDS {
+        let count = self.transient_entries.load(Ordering::Relaxed);
+        if count >= TRANSIENT_CAP / 2 {
+            let start = self.evict_cursor.fetch_add(TRIM_SHARDS, Ordering::Relaxed);
+            if count >= TRANSIENT_CAP {
+                tally(Tally::Flush);
+                self.clear_transient();
+                for offset in 0..TRIM_SHARDS {
+                    self.plans
+                        .clear_shard((start + offset) % crate::sema::table::SHARDS);
+                }
+            } else {
+                tally(Tally::Trim);
+                let mut removed = 0usize;
+                for offset in 0..TRIM_SHARDS {
+                    let shard = (start + offset) % crate::sema::table::SHARDS;
+                    removed += self.inlined.clear_shard(shard);
+                    removed += self.partial.clear_shard(shard);
+                    removed += self.templates.clear_shard(shard);
+                }
                 self.plans
-                    .clear_shard((start + offset) % crate::sema::table::SHARDS);
-            }
-            return;
-        }
-        tally(Tally::Trim);
-        let mut removed = 0usize;
-        for offset in 0..TRIM_SHARDS {
-            let shard = (start + offset) % crate::sema::table::SHARDS;
-            removed += self.inlined.clear_shard(shard);
-            removed += self.partial.clear_shard(shard);
-            removed += self.templates.clear_shard(shard);
-        }
-        self.plans
-            .clear_shard((start / TRIM_SHARDS) % crate::sema::table::SHARDS);
-        if removed > 0 {
-            let mut cur = self.transient_entries.load(Ordering::Relaxed);
-            while cur > 0 {
-                match self.transient_entries.compare_exchange_weak(
-                    cur,
-                    cur.saturating_sub(removed),
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => break,
-                    Err(next) => cur = next,
+                    .clear_shard((start / TRIM_SHARDS) % crate::sema::table::SHARDS);
+                if removed > 0 {
+                    let mut cur = self.transient_entries.load(Ordering::Relaxed);
+                    while cur > 0 {
+                        match self.transient_entries.compare_exchange_weak(
+                            cur,
+                            cur.saturating_sub(removed),
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        ) {
+                            Ok(_) => break,
+                            Err(next) => cur = next,
+                        }
+                    }
                 }
             }
         }
+        self.trimming.store(false, Ordering::Release);
     }
 
     pub(super) fn bump_transient(&self) {
         self.transient_entries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn cache_template(
+        &self,
+        key: TemplateKey,
+        t: Arc<InlineTemplate>,
+    ) -> (Arc<InlineTemplate>, bool) {
+        let (stored, inserted) = self.templates.get_or_insert_with_flag(key, || t);
+        if inserted {
+            self.bump_transient();
+        }
+        (stored, inserted)
+    }
+
+    fn cache_inlined(
+        &self,
+        key: (usize, usize),
+        cal: Option<Arc<InlinedCallee>>,
+    ) -> Option<Arc<InlinedCallee>> {
+        let (stored, inserted) = self.inlined.get_or_insert_with_flag(key, || cal);
+        if inserted {
+            self.bump_transient();
+        }
+        stored
+    }
+
+    pub(super) fn cache_partial(
+        &self,
+        key: (usize, bool),
+        cal: Option<Arc<InlinedCallee>>,
+    ) -> Option<Arc<InlinedCallee>> {
+        let (stored, inserted) = self.partial.get_or_insert_with_flag(key, || cal);
+        if inserted {
+            self.bump_transient();
+        }
+        stored
+    }
+
+    fn cached_template_state(&self, key: &TemplateKey) -> Option<Option<Arc<InlineTemplate>>> {
+        if self.rejected.get(key).is_some() {
+            Some(None)
+        } else {
+            self.templates.get(key).map(Some)
+        }
     }
 
     pub(crate) fn inline_report() -> String {
@@ -302,5 +352,35 @@ pub fn warm_inline(cx: &mut Context<'_>, reached: &Reached, slots: &dyn Slots, i
             ..Inline::default()
         };
         let _ = resolve_inline(cx, (reached, slots), &mut inline, index, (limit, false));
+    }
+}
+
+pub(in crate::lower) struct Quiet {
+    wanted: usize,
+    sema: (usize, usize),
+}
+
+impl Quiet {
+    pub(in crate::lower) fn mark(cx: &Context<'_>, slots: &dyn Slots) -> Self {
+        Self {
+            wanted: slots.wanted_len(),
+            sema: cx.quiet_mark(),
+        }
+    }
+
+    pub(in crate::lower) fn holds(&self, cx: &Context<'_>, slots: &dyn Slots) -> bool {
+        slots.wanted_len() == self.wanted && cx.quiet_mark() == self.sema
+    }
+
+    pub(in crate::lower) fn lowered<T>(
+        &self,
+        slots: &dyn Slots,
+        result: Result<T>,
+    ) -> Result<Option<T>> {
+        match result {
+            Ok(out) => Ok(Some(out)),
+            Err(err) if slots.wanted_len() > self.wanted => Err(err),
+            Err(_) => Ok(None),
+        }
     }
 }

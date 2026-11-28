@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use rustc_lexer::TokenKind;
+use rustc_lexer::{LiteralKind, TokenKind};
 
 use crate::body::{self as syntax, Body, PathId};
 use crate::names::path::Path as NamePath;
@@ -52,7 +52,12 @@ impl<'a> Infer<'_, 'a> {
                 dollar,
             },
             self.home,
-        );
+        )
+        .or_else(|| {
+            (!absolute)
+                .then(|| self.resolve_local_macro(&segments))
+                .flatten()
+        });
         (segments, found)
     }
 
@@ -107,13 +112,20 @@ impl<'a> Infer<'_, 'a> {
         if to == from + 2 && src.text(from) == "!" && src.text(from + 1) == "null" {
             return Ok((1, u64::MAX as u128));
         }
-        let Some((bits, signed)) = (match *self.cx.types.kind(base) {
-            Kind::Prim(primitive) => int_info(primitive),
-            _ => None,
-        }) else {
-            bail!("a pattern type on {}", self.show(base))
+        let bits = match *self.cx.types.kind(base) {
+            Kind::Prim(Primitive::Char) => Bits {
+                mask: 0xffff_ffff,
+                min: 0,
+                max: char::MAX as u128,
+            },
+            Kind::Prim(primitive) => {
+                let Some((bits, signed)) = int_info(primitive) else {
+                    bail!("a pattern type on {}", self.show(base))
+                };
+                Bits::of(bits, signed)
+            }
+            _ => bail!("a pattern type on {}", self.show(base)),
         };
-        let bits = Bits::of(bits, signed);
         let mut ranges = Vec::new();
         let mut start = from;
         for at in from..=to {
@@ -158,6 +170,13 @@ impl<'a> Infer<'_, 'a> {
         let negative = src.text(from) == "-";
         let at = from + u32::from(negative);
         let value = match (to - at, src.kind(at)) {
+            (
+                1,
+                TokenKind::Literal {
+                    kind: LiteralKind::Char { .. },
+                    ..
+                },
+            ) => crate::body::literal::char_value(src.text(at))? as u128,
             (1, TokenKind::Literal { .. }) => parse_int(src.text(at))?.0,
             (4, TokenKind::Ident)
                 if Primitive::named(src.text(at)).is_some()

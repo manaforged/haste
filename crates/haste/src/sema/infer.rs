@@ -561,7 +561,9 @@ impl Infer<'_, '_> {
             };
         };
         if self.sig.is_async {
-            let params = self.out.params.clone();
+            let params: Vec<u32> = (0..self.out.locals.len() as u32)
+                .filter(|local| !self.out.unpacks.contains_key(local))
+                .collect();
             let found = self.coroutine_expr(root, (Some(declared), true), &params)?;
             self.out.exprs[root.0 as usize] = found;
             return self.unify(ret, found);
@@ -715,7 +717,7 @@ pub(super) fn detached_summary<T>(
         path: std::path::PathBuf::new(),
         text: Default::default(),
         tokens: Default::default(),
-        marks: Vec::new(),
+        marks: Default::default(),
         opaque: Vec::new(),
         base: None,
         offset: 0,

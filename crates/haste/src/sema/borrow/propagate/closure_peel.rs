@@ -1,16 +1,40 @@
 use rustc_hash::FxHashSet as HashSet;
 
-use crate::body::{
-    Args, BlockKind, Body, Bound, Expr, ExprId, GenericArg, Pat, PatId, Stmt, Ty as AstTy, TyId,
-    UnOp,
-};
-use crate::outline::source::Source;
+use crate::body::{BlockKind, Expr, ExprId, Pat, PatId, Stmt, UnOp};
 use crate::sema::infer::Res;
 use crate::sema::ty::{Kind, Mut, Ty};
 
 use super::super::Checker;
 
 impl Checker<'_, '_> {
+    pub(super) fn iter_closure_ignores_param(
+        &mut self,
+        arg: ExprId,
+        state: &super::super::State,
+    ) -> bool {
+        if self.fn_arg_returns_static(arg) {
+            return true;
+        }
+        let cur = self.unwrap_parens(arg);
+        let Some(closure) = self.typed.closures.get(&cur).cloned() else {
+            return false;
+        };
+        if self
+            .closure_effects
+            .get(&cur)
+            .is_some_and(|eff| !eff.ret_params.is_empty())
+        {
+            return false;
+        }
+        let Some(targets) = self.closure_ret_targets(cur, closure.ret, state) else {
+            return false;
+        };
+        targets.iter().all(|t| {
+            closure.captures.iter().any(|c| c.local == *t)
+                || state.loans.iter().any(|l| l.target == *t)
+        })
+    }
+
     pub(super) fn closure_peels_outer_ref(&self, arg: ExprId) -> bool {
         let cur = self.unwrap_parens(arg);
         let Expr::Closure { params, .. } = *self.body.expr(cur) else {
@@ -238,10 +262,102 @@ impl Checker<'_, '_> {
                     && matches!(*self.cx.types.kind(ty), Kind::Ref(Mut::Not, _))
                     && self.expr_projects_any(cur, outer_unpeeled)
             }
+            Expr::Lit(..) => true,
             Expr::Path(_) => self
                 .expr_plain_local(cur)
                 .is_none_or(|local| !outer_unpeeled.contains(&local)),
+            Expr::Method {
+                receiver, params, ..
+            } => {
+                self.closure_body_clones_or_copies_local(cur, outer_unpeeled)
+                    || self.method_peels_outer_ref(cur, receiver, params, outer_unpeeled)
+            }
             _ => self.closure_body_clones_or_copies_local(cur, outer_unpeeled),
+        }
+    }
+
+    fn method_peels_outer_ref(
+        &mut self,
+        expr: ExprId,
+        receiver: ExprId,
+        params: crate::body::List,
+        outer_unpeeled: &HashSet<u32>,
+    ) -> bool {
+        if let Some(Res::Fn(fn_item, _)) = self.typed.res.get(&expr).copied() {
+            let name = self.cx.name(fn_item);
+            let is_opt_res =
+                self.item_in_std_mod(fn_item, "option") || self.item_in_std_mod(fn_item, "result");
+            if is_opt_res {
+                let args = self.body.list(params).to_vec();
+                match name {
+                    "unwrap" | "expect" | "unwrap_or_default" => {
+                        return self.expr_peels_outer_ref(receiver, outer_unpeeled);
+                    }
+                    "unwrap_or" if args.len() == 1 => {
+                        return self.expr_peels_outer_ref(receiver, outer_unpeeled)
+                            && self.expr_peels_outer_ref(ExprId(args[0]), outer_unpeeled);
+                    }
+                    "unwrap_or_else" if args.len() == 1 => {
+                        let fallback = self.unwrap_parens(ExprId(args[0]));
+                        let fallback_ok = match *self.body.expr(fallback) {
+                            Expr::Closure { body, .. } => {
+                                self.expr_peels_outer_ref(body, outer_unpeeled)
+                            }
+                            _ => self.expr_peels_outer_ref(fallback, outer_unpeeled),
+                        };
+                        return self.expr_peels_outer_ref(receiver, outer_unpeeled) && fallback_ok;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let args = self.body.list(params).to_vec();
+        !self.expr_mentions_any_local(receiver, outer_unpeeled)
+            && args
+                .into_iter()
+                .all(|id| !self.expr_mentions_any_local(ExprId(id), outer_unpeeled))
+    }
+
+    fn expr_mentions_any_local(&self, expr: ExprId, locals: &HashSet<u32>) -> bool {
+        let cur = self.unwrap_parens(expr);
+        if let Some(local) = self.expr_plain_local(cur) {
+            return locals.contains(&local);
+        }
+        match *self.body.expr(cur) {
+            Expr::Field(b, _)
+            | Expr::TupleField(b, _)
+            | Expr::Unary(_, b)
+            | Expr::Cast(b, _)
+            | Expr::Ref { expr: b, .. }
+            | Expr::Try(b) => self.expr_mentions_any_local(b, locals),
+            Expr::Index(a, b) | Expr::Binary(_, a, b) => {
+                self.expr_mentions_any_local(a, locals) || self.expr_mentions_any_local(b, locals)
+            }
+            Expr::Call(callee, args) => {
+                self.expr_mentions_any_local(callee, locals)
+                    || self
+                        .body
+                        .list(args)
+                        .iter()
+                        .any(|&id| self.expr_mentions_any_local(ExprId(id), locals))
+            }
+            Expr::Method {
+                receiver, params, ..
+            } => {
+                self.expr_mentions_any_local(receiver, locals)
+                    || self
+                        .body
+                        .list(params)
+                        .iter()
+                        .any(|&id| self.expr_mentions_any_local(ExprId(id), locals))
+            }
+            Expr::Tuple(list) | Expr::Array(list) => self
+                .body
+                .list(list)
+                .iter()
+                .any(|&id| self.expr_mentions_any_local(ExprId(id), locals)),
+            Expr::Lit(..) => false,
+            _ => true,
         }
     }
 
@@ -431,210 +547,7 @@ impl Checker<'_, '_> {
     }
 }
 
-fn self_ref_status(
-    body: &Body,
-    src: &Source,
-    ty: TyId,
-    behind_ref: bool,
-    behind_named: bool,
-) -> (bool, bool) {
-    let merge = |(a0, a1): (bool, bool), (b0, b1): (bool, bool)| (a0 || b0, a1 || b1);
-    let check_args = |args: Option<Args>, in_ref: bool, in_named: bool| -> (bool, bool) {
-        match args {
-            Some(Args::Angle(list)) => body.list(list).iter().fold((false, false), |acc, &arg| {
-                let sub = match body.args[arg as usize] {
-                    GenericArg::Ty(t) | GenericArg::Binding { ty: t, .. } => {
-                        self_ref_status(body, src, t, in_ref, in_named)
-                    }
-                    _ => (false, false),
-                };
-                (acc.0 || sub.0, acc.1 || sub.1)
-            }),
-            Some(Args::Paren { inputs, output }) => {
-                let mut acc = body.list(inputs).iter().fold((false, false), |acc, &t| {
-                    let sub = self_ref_status(body, src, TyId(t), false, false);
-                    (acc.0 || sub.0, acc.1 || sub.1)
-                });
-                if let Some(o) = output {
-                    let sub = self_ref_status(body, src, o, false, false);
-                    acc = (acc.0 || sub.0, acc.1 || sub.1);
-                }
-                acc
-            }
-            _ => (false, false),
-        }
-    };
-    match *body.ty(ty) {
-        AstTy::Ref {
-            lifetime,
-            ty: inner,
-            ..
-        } => {
-            let next_named = behind_named
-                || lifetime
-                    .is_some_and(|lt| super::super::calls::lifetimes::is_named_lt(src.text(lt)));
-            self_ref_status(body, src, inner, true, next_named)
-        }
-        AstTy::Path(path) => {
-            let segs = body.list(body.path(path).segments);
-            let mut acc = if segs
-                .first()
-                .is_some_and(|&s| src.text(body.segments[s as usize].name) == "Self")
-            {
-                (behind_ref, !behind_named)
-            } else {
-                (false, false)
-            };
-            for &s in segs {
-                acc = merge(
-                    acc,
-                    check_args(body.segments[s as usize].args, behind_ref, behind_named),
-                );
-            }
-            acc
-        }
-        AstTy::Tuple(list) => body.list(list).iter().fold((false, false), |acc, &t| {
-            let sub = self_ref_status(body, src, TyId(t), behind_ref, behind_named);
-            (acc.0 || sub.0, acc.1 || sub.1)
-        }),
-        AstTy::Slice(t) | AstTy::Array(t, _) | AstTy::Paren(t) | AstTy::Pat(t, _) => {
-            self_ref_status(body, src, t, behind_ref, behind_named)
-        }
-        AstTy::Ptr { ty: t, .. } => self_ref_status(body, src, t, false, false),
-        AstTy::Fn { params, ret, .. } => {
-            let mut acc = body.list(params).iter().fold((false, false), |acc, &t| {
-                let sub = self_ref_status(body, src, TyId(t), false, false);
-                (acc.0 || sub.0, acc.1 || sub.1)
-            });
-            if let Some(r) = ret {
-                acc = merge(acc, self_ref_status(body, src, r, false, false));
-            }
-            acc
-        }
-        AstTy::ImplTrait(_, list) | AstTy::DynTrait(list) => {
-            body.list(list).iter().fold((false, false), |mut acc, &b| {
-                if let Bound::Trait { path, .. } = body.bounds[b as usize] {
-                    for &s in body.list(body.path(path).segments) {
-                        acc = merge(
-                            acc,
-                            check_args(body.segments[s as usize].args, false, false),
-                        );
-                    }
-                }
-                acc
-            })
-        }
-        _ => (false, false),
-    }
-}
-
-pub(in super::super) fn all_self_behind_named_ref(body: &Body, src: &Source, ty: TyId) -> bool {
-    !self_ref_status(body, src, ty, false, false).1
-}
-
-pub(in super::super) fn ast_ty_refs_self(body: &Body, src: &Source, ty: TyId) -> bool {
-    self_ref_status(body, src, ty, false, false).0
-}
-
-pub(in super::super) fn ast_ty_contains_impl_trait(body: &Body, ty: TyId) -> bool {
-    let args_contain = |args: Option<Args>| match args {
-        Some(Args::Angle(list)) => {
-            body.list(list)
-                .iter()
-                .any(|&arg| match body.args[arg as usize] {
-                    GenericArg::Ty(t) | GenericArg::Binding { ty: t, .. } => {
-                        ast_ty_contains_impl_trait(body, t)
-                    }
-                    _ => false,
-                })
-        }
-        Some(Args::Paren { inputs, output }) => {
-            body.list(inputs)
-                .iter()
-                .any(|&t| ast_ty_contains_impl_trait(body, TyId(t)))
-                || output.is_some_and(|o| ast_ty_contains_impl_trait(body, o))
-        }
-        _ => false,
-    };
-    match *body.ty(ty) {
-        AstTy::ImplTrait(..) => true,
-        AstTy::Ref { ty: inner, .. }
-        | AstTy::Ptr { ty: inner, .. }
-        | AstTy::Slice(inner)
-        | AstTy::Array(inner, _)
-        | AstTy::Paren(inner)
-        | AstTy::Pat(inner, _) => ast_ty_contains_impl_trait(body, inner),
-        AstTy::Tuple(list) => body
-            .list(list)
-            .iter()
-            .any(|&t| ast_ty_contains_impl_trait(body, TyId(t))),
-        AstTy::Path(path) => body
-            .list(body.path(path).segments)
-            .iter()
-            .any(|&s| args_contain(body.segments[s as usize].args)),
-        AstTy::Fn { params, ret, .. } => {
-            body.list(params)
-                .iter()
-                .any(|&t| ast_ty_contains_impl_trait(body, TyId(t)))
-                || ret.is_some_and(|r| ast_ty_contains_impl_trait(body, r))
-        }
-        AstTy::DynTrait(list) => body.list(list).iter().any(|&b| {
-            matches!(
-                body.bounds[b as usize],
-                Bound::Trait { path, .. }
-                    if body
-                        .list(body.path(path).segments)
-                        .iter()
-                        .any(|&s| args_contain(body.segments[s as usize].args))
-            )
-        }),
-        _ => false,
-    }
-}
-
-impl Checker<'_, '_> {
-    pub(in super::super) fn sig_captures_edition_2024_rpit(
-        &mut self,
-        fn_item: crate::names::ItemRef,
-        sig: &crate::body::sig::Signature,
-        sig_src: &Source,
-        ret_ast: TyId,
-    ) -> bool {
-        if sig.is_async
-            || !self
-                .cx
-                .crate_edition(fn_item.krate)
-                .is_some_and(|e| e >= "2024")
-            || !ast_ty_contains_impl_trait(&sig.body, ret_ast)
-        {
-            return false;
-        }
-        let mut lts = super::super::calls::Lifetimes::default();
-        super::super::calls::collect_ty_lifetimes(&sig.body, sig_src, ret_ast, &mut lts);
-        !super::super::calls::sig_returns_only_static(sig, sig_src, ret_ast, &lts)
-            && !self.sig_ret_ast_is_provably_static(fn_item, sig, sig_src, ret_ast)
-    }
-
-    pub(in super::super) fn expr_is_capturing_rpit(&mut self, expr: ExprId) -> bool {
-        let cur = self.unwrap_parens_and_empty_blocks(expr);
-        let fn_item = match *self.body.expr(cur) {
-            crate::body::Expr::Method { .. } => match self.typed.res.get(&cur).copied() {
-                Some(crate::sema::infer::Res::Fn(it, _)) => Some(it),
-                _ => None,
-            },
-            crate::body::Expr::Call(callee, _) => self.call_sig_fn_item(cur, callee),
-            _ => None,
-        };
-        let Some(fn_item) = fn_item else {
-            return false;
-        };
-        let Ok(sig) = self.cx.signature(fn_item) else {
-            return false;
-        };
-        let Some(ret_ast) = sig.ret else {
-            return false;
-        };
-        let sig_src = self.cx.item(fn_item).0;
-        self.sig_captures_edition_2024_rpit(fn_item, &sig, sig_src, ret_ast)
-    }
-}
+pub(super) use super::closure_self::extend_ret_lts_from_self_ty;
+pub(in super::super) use super::closure_self::{
+    all_self_behind_named_ref, ast_ty_contains_impl_trait, ast_ty_refs_self,
+};

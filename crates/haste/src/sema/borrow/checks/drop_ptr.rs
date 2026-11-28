@@ -336,6 +336,12 @@ impl Checker<'_, '_> {
             for s in sources {
                 let allowed_ref = self.is_ref_ty(self.local_ty(s.target))
                     && (s.through_ref || self.is_closure_param(s.target));
+                if !allowed_ref
+                    && let Some(origins) = self.closure_param_origins.get(&s.target).cloned()
+                {
+                    self.check_sources_against_targets(true, true, false, &origins)?;
+                    continue;
+                }
                 if is_temp_target(s.target).is_some()
                     || (!self.from_caller(s.target, s.through_ref) && !allowed_ref)
                 {
@@ -351,7 +357,7 @@ impl Checker<'_, '_> {
                     self.is_ref_ty(self.local_ty(s.target)) && (s.through_ref || is_cparam);
                 if is_temp_target(s.target).is_some()
                     || (!s.through_ref
-                        && !self.is_ref_ty(self.local_ty(s.target))
+                        && !s.origin_only
                         && self.closure_by_val_caps.contains(&s.target))
                     || (!self.from_caller(s.target, s.through_ref)
                         && !allowed_ref
@@ -397,5 +403,261 @@ impl Checker<'_, '_> {
             }
         }
         Ok(())
+    }
+
+    pub(in super::super) fn check_tail_drop_temps(
+        &mut self,
+        tail: ExprId,
+        block_depth: u32,
+        state: &State,
+    ) -> Result<()> {
+        let mut subs = Vec::new();
+        self.collect_drop_temp_subexprs(tail, false, &mut subs);
+        for sub in subs {
+            let ty = self.expr_ty(sub);
+            if ty == Ty::NONE || !self.ty_holds_borrow(ty) || !self.ty_has_borrow_drop(ty) {
+                continue;
+            }
+            for src in self.expr_borrow_sources(sub, state) {
+                if self.escapes_depth(src.target, src.through_ref, src.mutable, block_depth) {
+                    return Err(self.does_not_live_long_enough(Some(sub), src.target));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(in super::super) fn collect_drop_temp_sources(
+        &mut self,
+        expr: ExprId,
+        state: &State,
+    ) -> Vec<BorrowSource> {
+        let mut subs = Vec::new();
+        self.collect_drop_temp_subexprs(expr, true, &mut subs);
+        let mut out = Vec::new();
+        for sub in subs {
+            let ty = self.expr_ty(sub);
+            if ty == Ty::NONE || !self.ty_holds_borrow(ty) || !self.ty_has_borrow_drop(ty) {
+                continue;
+            }
+            out.extend(self.expr_borrow_sources(sub, state));
+        }
+        out
+    }
+
+    fn collect_drop_temp_subexprs(
+        &mut self,
+        expr: ExprId,
+        include_self: bool,
+        out: &mut Vec<ExprId>,
+    ) {
+        if include_self && self.root_place(expr).is_none() {
+            out.push(expr);
+        }
+        match *self.body.expr(expr) {
+            Expr::Paren(e)
+            | Expr::Cast(e, _)
+            | Expr::Unary(_, e)
+            | Expr::Ref { expr: e, .. }
+            | Expr::Field(e, _)
+            | Expr::TupleField(e, _)
+            | Expr::Try(e)
+            | Expr::Await(e) => self.collect_drop_temp_subexprs(e, true, out),
+            Expr::Binary(_, a, b) | Expr::Index(a, b) | Expr::Repeat(a, b) => {
+                self.collect_drop_temp_subexprs(a, true, out);
+                self.collect_drop_temp_subexprs(b, true, out);
+            }
+            Expr::Call(callee, args) => {
+                self.collect_drop_temp_subexprs(callee, true, out);
+                for a in self.body.list(args).to_vec() {
+                    self.collect_drop_temp_subexprs(ExprId(a), true, out);
+                }
+            }
+            Expr::Method {
+                receiver, params, ..
+            } => {
+                self.collect_drop_temp_subexprs(receiver, true, out);
+                for a in self.body.list(params).to_vec() {
+                    self.collect_drop_temp_subexprs(ExprId(a), true, out);
+                }
+            }
+            Expr::Tuple(list) | Expr::Array(list) => {
+                for e in self.body.list(list).to_vec() {
+                    self.collect_drop_temp_subexprs(ExprId(e), true, out);
+                }
+            }
+            Expr::Struct { fields, base, .. } => {
+                let vals: Vec<ExprId> = self
+                    .body
+                    .list(fields)
+                    .iter()
+                    .map(|&f| self.body.fields[f as usize].value)
+                    .collect();
+                for v in vals {
+                    self.collect_drop_temp_subexprs(v, true, out);
+                }
+                if let Some(b) = base {
+                    self.collect_drop_temp_subexprs(b, true, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(in super::super) fn lock_slice_index_base(
+        &mut self,
+        expr: ExprId,
+        base: ExprId,
+        state: &mut State,
+    ) -> Option<u32> {
+        if !self.expr_has_slice_index(base) {
+            return None;
+        }
+        let p = self.root_place(base)?;
+        let tid = self.next_temp_holder();
+        super::super::bind::push_loan(
+            &mut state.loans,
+            super::super::Loan::new(p.local, Vec::new(), Some(tid), false, false, Some(expr)),
+        );
+        Some(tid)
+    }
+
+    fn expr_has_slice_index(&self, mut expr: ExprId) -> bool {
+        loop {
+            match *self.body.expr(expr) {
+                Expr::Paren(inner) | Expr::Field(inner, _) | Expr::TupleField(inner, _) => {
+                    expr = inner;
+                }
+                Expr::Index(inner, _) => {
+                    let mut ty = self.expr_ty(inner);
+                    while let Kind::Ref(_, pointee) = *self.cx.types.kind(ty) {
+                        ty = pointee;
+                    }
+                    if matches!(*self.cx.types.kind(ty), Kind::Slice(_)) {
+                        return true;
+                    }
+                    expr = inner;
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    pub(in super::super) fn check_index_mut_impl(&mut self, expr: ExprId) -> Result<()> {
+        let Some(crate::sema::infer::Res::Fn(method, substs)) =
+            self.typed.operators.get(&expr).copied()
+        else {
+            return Ok(());
+        };
+        if self.cx.name(method) != "index_mut" {
+            return Ok(());
+        }
+        let Some(tr) = self.cx.owner_trait(method) else {
+            return Ok(());
+        };
+        let args = self.cx.types.substs(substs).to_vec();
+        let Some((&recv_ty, trait_args)) = args.split_first() else {
+            return Ok(());
+        };
+        if self.cx.types.has_params(recv_ty)
+            || trait_args.iter().any(|&t| self.cx.types.has_params(t))
+        {
+            return Ok(());
+        }
+        let found = crate::sema::infer::detached(self.cx, self.item, |infer| {
+            infer.select(tr, recv_ty, trait_args)
+        })
+        .ok()
+        .flatten()
+        .is_some();
+        if !found {
+            return Err(self.borrow_err(
+                Some(expr),
+                "cannot borrow data in an index as mutable: trait `IndexMut` is not implemented",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(in super::super) fn check_static_assoc_ref_ann(
+        &mut self,
+        ty_id: crate::body::TyId,
+    ) -> Result<()> {
+        let crate::body::Ty::Ref {
+            lifetime: Some(lt),
+            ty: inner,
+            ..
+        } = *self.body.ty(ty_id)
+        else {
+            return Ok(());
+        };
+        if self.src.text(lt) != "'static" {
+            return Ok(());
+        }
+        let crate::body::Ty::Path(path_id) = *self.body.ty(inner) else {
+            return Ok(());
+        };
+        let p = self.body.path(path_id);
+        let segs = self.body.list(p.segments);
+        if segs.len() < 2 {
+            return Ok(());
+        }
+        let last = self.body.segments[segs[segs.len() - 1] as usize];
+        let has_non_static_lt_arg = match last.args {
+            Some(crate::body::Args::Angle(args)) => self.body.list(args).iter().any(|&a| {
+                matches!(
+                    self.body.args[a as usize],
+                    crate::body::GenericArg::Lifetime(arg_lt) if self.src.text(arg_lt) != "'static"
+                )
+            }),
+            _ => false,
+        };
+        if !has_non_static_lt_arg {
+            return Ok(());
+        }
+        let first_name =
+            crate::names::plain(self.src.text(self.body.segments[segs[0] as usize].name));
+        let Ok(sig) = self.cx.signature(self.item) else {
+            return Ok(());
+        };
+        let is_ty_param = sig.generics.iter().any(|g| {
+            g.kind == crate::body::sig::GenericKind::Type && self.src.text(g.name) == first_name
+        });
+        if is_ty_param {
+            return Err(self.borrow_err(
+                None,
+                "the associated type may not live long enough: `'static` required",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(in super::super) fn ret_is_elided_impl_self(&mut self) -> bool {
+        let Ok(sig) = self.cx.signature(self.item) else {
+            return false;
+        };
+        if sig.receiver.is_some() {
+            return false;
+        }
+        let Some(ret_ast) = sig.ret else {
+            return false;
+        };
+        let crate::body::Ty::Path(p) = *sig.body.ty(ret_ast) else {
+            return false;
+        };
+        let segs = sig.body.list(sig.body.path(p).segments);
+        if segs.len() != 1 || self.src.text(sig.body.segments[segs[0] as usize].name) != "Self" {
+            return false;
+        }
+        let Some(impl_ref) = self.cx.owner_impl(self.item) else {
+            return false;
+        };
+        let Ok(hdr) = self.cx.impl_header(impl_ref) else {
+            return false;
+        };
+        let impl_src = &self.cx.impl_file(impl_ref).source;
+        let mut lts = super::super::calls::Lifetimes::default();
+        super::super::calls::collect_ty_lifetimes(&hdr.body, impl_src, hdr.self_ty, &mut lts);
+        lts.has_elided && lts.named.is_empty()
     }
 }

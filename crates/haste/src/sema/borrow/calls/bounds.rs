@@ -1,10 +1,12 @@
 use crate::body::sig::{GenericKind, SelfKind, Signature};
-use crate::body::{Args, Body, Bound, Ty as AstTy, TyId};
+use crate::body::{Args, Body, Bound, ExprId, Ty as AstTy, TyId};
+use crate::names::ItemRef;
 use crate::outline::source::Source;
 use crate::sema::ty::{Kind, Ty};
 
 use super::lifetimes::{
     Lifetimes, collect_ty_lifetimes, lifetime_outlives_in_headers, pred_matches_name,
+    pred_matches_name_in,
 };
 
 #[derive(Clone, Copy)]
@@ -49,6 +51,62 @@ pub(in super::super) fn lifetime_outlives_in_item(
 }
 
 impl super::super::Checker<'_, '_> {
+    pub(in super::super) fn ty_has_non_static_param(&self, ty: Ty) -> bool {
+        if !self.cx.types.has_params(ty) {
+            return false;
+        }
+        match self.cx.types.kind(ty) {
+            Kind::Param(idx) => !self.static_type_params.contains(idx),
+            Kind::Ref(_, inner)
+            | Kind::Ptr(_, inner)
+            | Kind::Slice(inner)
+            | Kind::Array(inner, _)
+            | Kind::Pat(inner, ..) => self.ty_has_non_static_param(*inner),
+            Kind::Adt(_, args)
+            | Kind::Tuple(args)
+            | Kind::FnDef(_, args)
+            | Kind::Dyn(_, args, ..) => self
+                .cx
+                .types
+                .substs(*args)
+                .iter()
+                .any(|&arg| self.ty_has_non_static_param(arg)),
+            Kind::FnPtr(params, ret) | Kind::UnsafeFnPtr(params, ret) => {
+                self.cx
+                    .types
+                    .substs(*params)
+                    .iter()
+                    .any(|&p| self.ty_has_non_static_param(p))
+                    || self.ty_has_non_static_param(*ret)
+            }
+            Kind::Closure(parent, args, at) => {
+                self.closure_has_non_static_param(*parent, *args, *at)
+            }
+            _ => true,
+        }
+    }
+
+    pub(in super::super) fn closure_has_non_static_param(
+        &self,
+        parent: ItemRef,
+        args: crate::sema::substs::Substs,
+        at: u32,
+    ) -> bool {
+        if parent == self.item
+            && let Some(closure) = self.typed.closures.get(&ExprId(at))
+        {
+            return closure
+                .captures
+                .iter()
+                .any(|c| self.ty_has_non_static_param(self.local_ty(c.local)));
+        }
+        self.cx
+            .types
+            .substs(args)
+            .iter()
+            .any(|&arg| self.ty_has_non_static_param(arg))
+    }
+
     fn collect_non_static_params(&self, ty: Ty, out: &mut Vec<u16>, allow_proj: bool) -> bool {
         if ty == Ty::NONE || (!allow_proj && self.cx.types.has_projs(ty)) {
             return false;
@@ -115,6 +173,137 @@ impl super::super::Checker<'_, '_> {
             return false;
         }
         self.ast_unbounded_ty_params_shared_with(local, peel, target)
+    }
+
+    pub(in super::super) fn callee_param_callable_ret_satisfies_fn_ret(
+        &mut self,
+        callee: ExprId,
+    ) -> bool {
+        if self.ret_named_lts.is_empty() {
+            return false;
+        }
+        let mut ty = self.expr_ty(callee);
+        while ty != Ty::NONE
+            && let Kind::Ref(_, inner) = *self.cx.types.kind(ty)
+        {
+            ty = inner;
+        }
+        let Ok(sig) = self.cx.signature(self.item) else {
+            return false;
+        };
+        let param_name = match *self.cx.types.kind(ty) {
+            Kind::Param(param_idx) => {
+                let Some(name) = self.type_param_name_by_index(&sig, param_idx) else {
+                    return false;
+                };
+                Some(name)
+            }
+            Kind::Closure(..) if self.closure_expr_of(callee).is_none() => None,
+            _ => return false,
+        };
+        let mut out_named: Vec<String> = Vec::new();
+        let mut found_output = false;
+        let mut bad = false;
+        let mut inspect_bounds =
+            |body: &Body,
+             src: &Source,
+             generics: &[crate::body::sig::Generic],
+             preds: &[crate::body::sig::Predicate]| {
+                let mut check_bound = |b: &Bound| {
+                    let Bound::Trait { path, .. } = b else { return };
+                    let segs = body.list(body.path(*path).segments);
+                    let Some(&last) = segs.last() else { return };
+                    let Some(Args::Paren {
+                        output: Some(out_ty),
+                        ..
+                    }) = body.segments[last as usize].args
+                    else {
+                        return;
+                    };
+                    let mut lts = Lifetimes::default();
+                    collect_ty_lifetimes(body, src, out_ty, &mut lts);
+                    found_output = true;
+                    if lts.has_elided || lts.named.is_empty() {
+                        bad = true;
+                    } else {
+                        for n in lts.named {
+                            if !out_named.iter().any(|x| x == n) {
+                                out_named.push(n.to_owned());
+                            }
+                        }
+                    }
+                };
+                for g in generics {
+                    if g.kind == GenericKind::Type
+                        && param_name.as_deref().is_none_or(|p| src.text(g.name) == p)
+                    {
+                        for &bid in body.list(g.bounds) {
+                            check_bound(&body.bounds[bid as usize]);
+                        }
+                    }
+                }
+                for pred in preds {
+                    if param_name
+                        .as_deref()
+                        .is_none_or(|p| pred_matches_name_in(body, src, pred, p))
+                    {
+                        for &bid in body.list(pred.bounds) {
+                            check_bound(&body.bounds[bid as usize]);
+                        }
+                    }
+                }
+            };
+        inspect_bounds(&sig.body, self.src, &sig.generics, &sig.predicates);
+        if let Some(block) = self.cx.owner_impl(self.item)
+            && let Ok(hdr) = self.cx.impl_header(block)
+        {
+            let impl_src = &self.cx.impl_file(block).source;
+            inspect_bounds(&hdr.body, impl_src, &hdr.generics, &hdr.predicates);
+        }
+        if !found_output || bad || out_named.is_empty() {
+            return false;
+        }
+        let req = self.ret_named_lts.clone();
+        out_named.iter().all(|lt| {
+            req.iter()
+                .all(|r| lifetime_outlives_in_item(self.cx, self.item, &sig, self.src, lt, r))
+        })
+    }
+
+    fn type_param_name_by_index(&mut self, sig: &Signature, target: u16) -> Option<String> {
+        let mut idx = 0u16;
+        if let Some(impl_ref) = self.cx.owner_impl(self.item) {
+            if let Ok(header) = self.cx.impl_header(impl_ref) {
+                let impl_src = &self.cx.impl_file(impl_ref).source;
+                for g in crate::sema::infer::scope::type_params(&header.generics) {
+                    if idx == target {
+                        return Some(impl_src.text(g.name).to_owned());
+                    }
+                    idx += 1;
+                }
+            }
+        } else if let Some(trait_ref) = self.cx.owner_trait(self.item) {
+            if idx == target {
+                return Some("Self".to_owned());
+            }
+            idx += 1;
+            if let Ok(tg) = self.cx.trait_generics(trait_ref) {
+                let tsrc = &self.cx.file(trait_ref).source;
+                for g in crate::sema::infer::scope::type_params(&tg.1.params) {
+                    if idx == target {
+                        return Some(tsrc.text(g.name).to_owned());
+                    }
+                    idx += 1;
+                }
+            }
+        }
+        for g in crate::sema::infer::scope::type_params(&sig.generics) {
+            if idx == target {
+                return Some(self.src.text(g.name).to_owned());
+            }
+            idx += 1;
+        }
+        None
     }
 
     fn collect_non_static_ty_param_names(&mut self, sig: &Signature) -> Vec<String> {

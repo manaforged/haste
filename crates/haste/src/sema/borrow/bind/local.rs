@@ -151,6 +151,16 @@ impl Checker<'_, '_> {
                     })
                     .collect(),
             };
+            if target.init.is_none() && !ctx.is_param && (!ctx.behind_ref || sources.is_empty()) {
+                sources.push(BorrowSource {
+                    target: super::super::checks::temp_target_for(ctx.scope_depth),
+                    steps: Vec::new(),
+                    mutable: is_mut,
+                    through_ref: false,
+                    env_only: false,
+                    origin_only: false,
+                });
+            }
             if is_mut && !is_ref_init {
                 for s in &mut sources {
                     s.mutable = true;

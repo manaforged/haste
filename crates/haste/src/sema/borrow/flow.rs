@@ -5,6 +5,7 @@ use crate::body::{BinOp, BlockKind, Expr, ExprId, List, Pat, PatId, Stmt};
 
 use super::bind::{push_loan, push_source_loans};
 use super::checks::{is_temp_target, merge_break_states, retain_non_loop_state};
+use super::liveness::LiveTarget;
 use super::propagate::{BorrowSource, TupleSources};
 use super::{
     BreakFrame, Checker, Loan, STMT_TEMP_OFFSET, State, join_moved, merge_branch, merge_states,
@@ -14,6 +15,18 @@ use super::{
 type LoopPat<'a> = (PatId, &'a [BorrowSource], Option<&'a TupleSources>);
 
 impl Checker<'_, '_> {
+    pub(super) fn active_live_targets(&self) -> Vec<LiveTarget<'_>> {
+        self.breaks
+            .iter()
+            .map(|f| LiveTarget {
+                label: f.label,
+                is_block: f.is_block,
+                break_live: &f.break_live,
+                continue_live: f.continue_live.as_ref(),
+            })
+            .collect()
+    }
+
     pub(super) fn check_block(
         &mut self,
         expr_id: ExprId,
@@ -253,6 +266,9 @@ impl Checker<'_, '_> {
         }
         prune_dead_loans(state, tail_live);
         self.check_expr(tail, state, place_ctx, outer_live, value_used, block_depth)?;
+        if !is_const && !state.diverged {
+            self.check_tail_drop_temps(tail, block_depth, state)?;
+        }
         if (value_used || is_const) && !state.diverged {
             let tail_srcs = self.expr_borrow_sources_let(tail, state);
             for src in &tail_srcs {
@@ -610,11 +626,14 @@ impl Checker<'_, '_> {
         let loop_live = self.compute_loop_live(label, None, Some(pat), body, outer_live, &targets);
         self.check_expr(iter, state, false, &loop_live, true, depth)?;
         let iter_sources = self.expr_borrow_sources(iter, state);
-        let iter_temp = if iter_sources.is_empty() {
+        let drop_sources = self.collect_drop_temp_sources(iter, state);
+        let iter_has_drop = !drop_sources.is_empty();
+        let iter_temp = if iter_sources.is_empty() && drop_sources.is_empty() {
             None
         } else {
             let id = self.next_iter_holder();
             push_source_loans(&mut state.loans, Some(id), &iter_sources, Some(iter));
+            push_source_loans(&mut state.loans, Some(id), &drop_sources, Some(iter));
             Some(id)
         };
         let (item_sources, item_tuple) = self.for_iter_item_sources(iter, &iter_sources, state);
@@ -623,7 +642,7 @@ impl Checker<'_, '_> {
             label,
             None,
             Some((pat, &item_sources, item_tuple.as_ref())),
-            iter_temp,
+            iter_temp.map(|h| (h, iter_has_drop)),
             body,
             state,
             outer_live,
@@ -641,7 +660,7 @@ impl Checker<'_, '_> {
         label: Option<u32>,
         cond: Option<ExprId>,
         pat: Option<LoopPat<'_>>,
-        iter_holder: Option<u32>,
+        iter_holder: Option<(u32, bool)>,
         body: ExprId,
         state: &mut State,
         outer_live: &HashSet<u32>,
@@ -669,8 +688,12 @@ impl Checker<'_, '_> {
         for l in &loop_locals {
             loop_live.remove(l);
         }
-        if let Some(h) = iter_holder {
+        let mut break_live = outer_live.clone();
+        if let Some((h, has_drop)) = iter_holder {
             loop_live.insert(h);
+            if has_drop {
+                break_live.insert(h);
+            }
         }
         self.breaks.push(BreakFrame {
             label,
@@ -679,7 +702,7 @@ impl Checker<'_, '_> {
             states: Vec::new(),
             continues: Vec::new(),
             sources: Vec::new(),
-            break_live: outer_live.clone(),
+            break_live,
             continue_live: Some(loop_live.clone()),
         });
         let mut iter_state = state.clone();

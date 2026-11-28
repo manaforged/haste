@@ -1,4 +1,5 @@
 pub(super) mod closure_peel;
+mod closure_self;
 mod sig;
 mod tuple;
 mod unwrap;
@@ -93,25 +94,13 @@ impl Checker<'_, '_> {
                 if self.is_raw_ptr_deref(inner) {
                     return Vec::new();
                 }
-                if allow_mut_ref_reborrow {
-                    self.place_borrow_sources(inner, mutable, state, extend_depth)
-                } else {
-                    self.expr_borrow_sources_inner(inner, state, false, None)
-                }
+                let is_mut = mutable && allow_mut_ref_reborrow;
+                self.place_borrow_sources(inner, is_mut, state, extend_depth)
             }
             Expr::Field(..) | Expr::TupleField(..) | Expr::Unary(UnOp::Deref, _)
                 if allow_mut_ref_reborrow && self.is_mut_ref_ty(ty) =>
             {
-                let mut srcs = self.place_borrow_sources(expr, true, state, None);
-                for s in &mut srcs {
-                    if !s.through_ref
-                        && self.is_param_local(s.target)
-                        && !self.is_ref_ty(self.local_ty(s.target))
-                    {
-                        s.through_ref = true;
-                    }
-                }
-                srcs
+                self.reborrow_mut_ref_place_sources(expr, state)
             }
             Expr::TupleField(base, index)
                 if !self.has_overloaded_deref(expr)

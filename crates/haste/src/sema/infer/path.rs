@@ -449,6 +449,25 @@ impl<'a> Infer<'_, 'a> {
         })
     }
 
+    pub(super) fn resolve_local_macro(&mut self, segments: &[Sym]) -> Option<ItemRef> {
+        let (first, rest) = segments.split_first()?;
+        let binding = self.body_use(*first);
+        let binding = if rest.is_empty() {
+            binding.macros?
+        } else {
+            let mut def = binding.types?.def;
+            let (last, mid) = rest.split_last()?;
+            for segment in mid {
+                def = self.cx.path_member(self.home, def, *segment).types?.def;
+            }
+            self.cx.path_member(self.home, def, *last).macros?
+        };
+        match binding.def {
+            Def::Item(item) => Some(item),
+            _ => None,
+        }
+    }
+
     fn body_use(&mut self, word: Sym) -> PerNs {
         self.body_imports(Some(word))
             .into_iter()

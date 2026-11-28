@@ -11,6 +11,23 @@ use super::super::{Checker, State, is_temp_holder};
 use super::{BorrowSource, dedup_sources, state_holds_other_target};
 
 impl Checker<'_, '_> {
+    pub(super) fn reborrow_mut_ref_place_sources(
+        &mut self,
+        expr: ExprId,
+        state: &State,
+    ) -> Vec<BorrowSource> {
+        let mut srcs = self.place_borrow_sources(expr, true, state, None);
+        for s in &mut srcs {
+            if !s.through_ref
+                && (self.is_param_local(s.target) || self.is_closure_param(s.target))
+                && !self.is_ref_ty(self.local_ty(s.target))
+            {
+                s.through_ref = true;
+            }
+        }
+        srcs
+    }
+
     pub(super) fn try_promote_by_val_param(
         &mut self,
         s: &BorrowSource,
@@ -724,7 +741,7 @@ impl Checker<'_, '_> {
     pub(super) fn finish_unwrapped_copied_sources(
         &mut self,
         call_ty: Ty,
-        recv_is_mut_ref: bool,
+        (recv_is_mut_ref, recv_depth): (bool, u32),
         root: Option<u32>,
         out: Vec<BorrowSource>,
         state: &State,
@@ -758,6 +775,15 @@ impl Checker<'_, '_> {
                         && (call_depth <= self.ty_max_ref_depth(inner)
                             || (Some(s.target) != root && recv_is_mut_ref && clears_mut))
                     {
+                        s.origin_only = true;
+                        s.mutable = false;
+                    } else if !is_ref
+                        && !s.through_ref
+                        && s.steps.is_empty()
+                        && call_depth < recv_depth
+                        && self.ty_holds_borrow(target_ty)
+                    {
+                        s.through_ref = true;
                         s.origin_only = true;
                         s.mutable = false;
                     }

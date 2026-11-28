@@ -18,6 +18,21 @@ pub(in super::super) struct ActiveClosure {
 }
 
 impl Checker<'_, '_> {
+    pub(super) fn recv_reborrows_mut_ref(
+        &self,
+        expr: ExprId,
+        receiver: ExprId,
+        derefs: u32,
+    ) -> bool {
+        let direct_mut_autoref = derefs == 0
+            && self
+                .typed
+                .adjusts
+                .get(&expr)
+                .is_some_and(|a| a.autoref == Some(crate::sema::ty::Mut::Mut));
+        !direct_mut_autoref && self.is_mut_ref_ty(self.expr_ty(receiver))
+    }
+
     pub(super) fn is_by_val_map_fn(&self, fn_item: Option<crate::names::ItemRef>) -> bool {
         fn_item.is_some_and(|it| {
             matches!(
@@ -162,7 +177,7 @@ impl Checker<'_, '_> {
         let next_by_val = closure
             .captures
             .iter()
-            .filter(|c| c.by == By::Value && !self.is_ref_ty(self.local_ty(c.local)))
+            .filter(|c| c.by == By::Value)
             .map(|c| c.local)
             .collect();
         let saved_by_val = std::mem::replace(&mut self.closure_by_val_caps, next_by_val);
@@ -348,7 +363,9 @@ impl Checker<'_, '_> {
                     }
                 }
                 By::Value => {
-                    if self.is_mut_ref_ty(cap_ty) {
+                    if self.is_mut_ref_ty(cap_ty)
+                        && !matches!(*self.body.expr(expr), Expr::Closure { capture: true, .. })
+                    {
                         self.check_borrow(local, false, true, &cap_steps, true, state)?;
                     } else if cap_copy {
                         self.check_can_read(local, &cap_steps, state)?;

@@ -41,7 +41,9 @@ impl Lower<'_, '_> {
                 let outer_pending = std::mem::take(&mut self.pending);
                 let guard_mark = self.owned.len();
                 let ok = self.expr(guard)?;
-                self.end_scope(guard_mark)?;
+                if !self.cond_has_let(guard) {
+                    self.end_scope(guard_mark)?;
+                }
                 if !self.open {
                     self.owned.truncate(mark);
                     self.enter(next);
@@ -51,7 +53,7 @@ impl Lower<'_, '_> {
                 let Some(ok) = ok else {
                     bail!("guard with no value");
                 };
-                self.guard_pass(ok, mark, next);
+                self.guard_pass(ok, mark, guard_mark, next)?;
             }
             self.commit_moves()?;
             let value = self.expr(arm.body)?;
@@ -107,13 +109,15 @@ impl Lower<'_, '_> {
         self.commit_moves()
     }
 
-    fn guard_pass(&mut self, ok: Value, mark: usize, next: Block) {
+    fn guard_pass(&mut self, ok: Value, mark: usize, guard_mark: usize, next: Block) -> Result<()> {
         let (pass, fail) = (self.b.create_block(), self.b.create_block());
         self.brif(ok, (pass, &[]), (fail, &[]));
         self.enter(fail);
+        self.drop_to(guard_mark)?;
         self.forget_from(mark);
         self.jump(next, &[]);
         self.enter(pass);
+        Ok(())
     }
 
     pub(super) fn pass(&mut self, ok: Value, fail: Block) {

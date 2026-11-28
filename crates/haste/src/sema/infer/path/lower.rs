@@ -445,7 +445,7 @@ impl<'a> Infer<'_, 'a> {
         };
         let name = self.segments(arena, path).0;
         if let ([owner], [name]) = (&owner[..], &name[..])
-            && let Some(ty) = self.scoped_ty(&[*owner, *name])?
+            && let Some(ty) = self.scoped_ty(arena, path, 1, &[*owner, *name])?
         {
             return Ok(ty);
         }
@@ -465,7 +465,7 @@ impl<'a> Infer<'_, 'a> {
     ) -> Result<Ty> {
         let (mut segments, absolute, dollar) = self.segments(arena, path);
         segments.truncate(count);
-        if let Some(ty) = self.scoped_ty(&segments)? {
+        if let Some(ty) = self.scoped_ty(arena, path, count, &segments)? {
             return Ok(ty);
         }
         let first_tok = Self::path_first_tok(arena, path);
@@ -513,7 +513,13 @@ impl<'a> Infer<'_, 'a> {
         Ok(self.cx.types.adt(item, &args))
     }
 
-    fn scoped_ty(&mut self, segments: &[Sym]) -> Result<Option<Ty>> {
+    fn scoped_ty(
+        &mut self,
+        arena: &Body,
+        path: PathId,
+        count: usize,
+        segments: &[Sym],
+    ) -> Result<Option<Ty>> {
         if self.self_ty.is_none() && self.generics.is_empty() {
             return Ok(None);
         }
@@ -539,7 +545,8 @@ impl<'a> Infer<'_, 'a> {
                         .any(|(generic, _)| *generic == param_text)
                 {
                     let (param, name) = (param_text.to_string(), symbols.text(name).to_string());
-                    self.param_projection(&param, &name)
+                    let own = self.segment_args(arena, path, count)?;
+                    self.param_projection(&param, (&name, &own))
                 } else {
                     Ok(None)
                 }

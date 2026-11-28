@@ -589,3 +589,197 @@ fn main() {
 "#,
     );
 }
+
+#[test]
+fn cmark_and_ruff_borrowck_patterns() {
+    check_passes(
+        "tuple_closure_param_mut_ref_reborrow",
+        r#"
+fn bump<'a>(opt: Option<(usize, &'a mut i32)>) -> Option<(usize, &'a mut i32)> {
+    opt.and_then(|item| Some((item.0 + 1, item.1)))
+}
+fn main() {
+    let mut x = 1;
+    if let Some((_, r)) = bump(Some((0, &mut x))) {
+        *r += 1;
+    }
+    assert_eq!(x, 2);
+}
+"#,
+    );
+
+    check_passes(
+        "option_map_store_by_val_borrow_into_self",
+        r#"
+struct Attrs<'a>(&'a str);
+struct Store<'a>(Vec<Attrs<'a>>);
+impl<'a> Store<'a> {
+    fn push_opt(&mut self, attrs: Option<Attrs<'a>>) -> Option<usize> {
+        attrs.map(|a| {
+            self.0.push(a);
+            self.0.len()
+        })
+    }
+}
+fn main() {
+    let mut s = Store(Vec::new());
+    assert_eq!(s.push_opt(Some(Attrs("hi"))), Some(1));
+}
+"#,
+    );
+
+    check_passes(
+        "option_map_unwrap_or_else_peels_outer_ref",
+        r#"
+use std::borrow::Cow;
+struct Entry<'a> {
+    dest: Cow<'a, str>,
+    title: Option<Cow<'a, str>>,
+}
+struct Map<'a>(Entry<'a>);
+impl<'a, 'b, 's> Map<'a>
+where
+    's: 'b,
+{
+    fn get(&'s self, _key: &'b str) -> Option<&'b Entry<'a>> {
+        Some(&self.0)
+    }
+}
+fn lookup<'a>(map: &Map<'a>, label: Cow<'a, str>) -> Option<(Cow<'a, str>, Cow<'a, str>)> {
+    map.get(label.as_ref()).map(|e| {
+        let title = e.title.as_ref().cloned().unwrap_or_else(|| "".into());
+        let url = e.dest.clone();
+        (url, title)
+    })
+}
+fn main() {
+    let m = Map(Entry {
+        dest: Cow::Borrowed("u"),
+        title: None,
+    });
+    assert!(lookup(&m, Cow::Borrowed("k")).is_some());
+}
+"#,
+    );
+
+    check_passes(
+        "generic_fnmut_callback_named_output_lt",
+        r#"
+use std::borrow::Cow;
+trait Cb<'a> {
+    fn call(&mut self, input: Cow<'a, str>) -> Option<Cow<'a, str>>;
+}
+struct Wrap<F>(Option<F>);
+impl<'a, F> Cb<'a> for Wrap<F>
+where
+    F: FnMut(Cow<'a, str>) -> Option<Cow<'a, str>>,
+{
+    fn call(&mut self, input: Cow<'a, str>) -> Option<Cow<'a, str>> {
+        self.0.as_mut().and_then(|cb| cb(input))
+    }
+}
+fn main() {
+    let mut w = Wrap(Some(|s: Cow<'_, str>| Some(s)));
+    assert_eq!(w.call(Cow::Borrowed("ok")).as_deref(), Some("ok"));
+}
+"#,
+    );
+
+    check_passes(
+        "double_ended_iter_elided_impl_self_next_back",
+        r#"
+struct SliceIter<'a>(std::slice::Iter<'a, i32>);
+impl<'a> Iterator for SliceIter<'a> {
+    type Item = &'a i32;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next()
+    }
+    fn last(mut self) -> Option<Self::Item> {
+        self.next_back()
+    }
+}
+impl DoubleEndedIterator for SliceIter<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.0.next_back()
+    }
+}
+fn main() {
+    let data = [1, 2, 3];
+    assert_eq!(SliceIter(data.iter()).last(), Some(&3));
+}
+"#,
+    );
+
+    check_passes(
+        "match_mut_iter_next_unwraps_container_loans",
+        r#"
+enum Parts<'a> {
+    Slice(std::slice::Iter<'a, &'a str>),
+}
+fn make_iter<'a>(xs: &'a [&'a str]) -> impl Iterator<Item = &'a str> {
+    let mut parts = Parts::Slice(xs.iter());
+    std::iter::from_fn(move || match &mut parts {
+        Parts::Slice(it) => it.next().copied(),
+    })
+}
+fn main() {
+    let xs = ["a", "b"];
+    let out: Vec<&str> = make_iter(&xs).collect();
+    assert_eq!(out, vec!["a", "b"]);
+}
+"#,
+    );
+
+    check_fails_borrow(
+        "option_map_store_local_borrow_into_self_rejected",
+        r#"
+struct Attrs<'a>(&'a str);
+struct Store<'a>(Vec<Attrs<'a>>);
+impl<'a> Store<'a> {
+    fn bad(&mut self) {
+        let local = String::from("dangling");
+        let opt = Some(Attrs(local.as_str()));
+        opt.map(|a| self.0.push(a));
+    }
+}
+fn main() {
+    let mut s = Store(Vec::new());
+    s.bad();
+}
+"#,
+    );
+
+    check_fails_borrow(
+        "generic_fnmut_callback_short_output_lt_rejected",
+        r#"
+fn bad<'a, 'b, F: FnMut() -> &'b str>(cb: &mut Option<F>) -> Option<&'a str> {
+    cb.as_mut().and_then(|f| Some(f()))
+}
+fn main() {
+    let local = String::from("short");
+    let mut cb = Some(|| local.as_str());
+    let _ = bad(&mut cb);
+}
+"#,
+    );
+
+    check_fails_borrow(
+        "match_mut_iter_next_local_borrow_still_rejected",
+        r#"
+enum Parts<'a> {
+    Slice(std::slice::Iter<'a, &'a str>),
+}
+fn bad<'a>() -> Option<&'a str> {
+    let local = String::from("dangling");
+    let arr = [local.as_str()];
+    let mut parts = Parts::Slice(arr.iter());
+    match &mut parts {
+        Parts::Slice(it) => it.next().copied(),
+    }
+}
+fn main() {
+    let _ = bad();
+}
+"#,
+    );
+}

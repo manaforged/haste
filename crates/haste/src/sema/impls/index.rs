@@ -177,7 +177,13 @@ impl<'a> Context<'a> {
         let head = if generic_self(src, &header) {
             None
         } else {
-            let found = self.syntax_head(src, &header.body, header.self_ty, (home, block.item()));
+            let found = self.syntax_head(
+                src,
+                &header.body,
+                header.self_ty,
+                (home, block.item()),
+                &mut Vec::new(),
+            );
             if found.is_none() && self.asks.count() > asks_before {
                 index.incomplete = true;
             }
@@ -222,16 +228,17 @@ impl<'a> Context<'a> {
         arena: &Body,
         ty: syntax::TyId,
         home: (ModRef, Option<ItemRef>),
+        seen: &mut Vec<ItemRef>,
     ) -> Option<Head> {
         Some(match *arena.ty(ty) {
-            syntax::Ty::Paren(inner) => return self.syntax_head(src, arena, inner, home),
+            syntax::Ty::Paren(inner) => return self.syntax_head(src, arena, inner, home, seen),
             syntax::Ty::Ref { mutable, .. } => Head::Ref(if mutable { Mut::Mut } else { Mut::Not }),
             syntax::Ty::Ptr { mutable, .. } => Head::Ptr(if mutable { Mut::Mut } else { Mut::Not }),
             syntax::Ty::Slice(_) => Head::Slice,
             syntax::Ty::Array(..) => Head::Array,
             syntax::Ty::Tuple(_) => Head::Tuple,
             syntax::Ty::Never => Head::Never,
-            syntax::Ty::Path(path) => return self.path_head(src, arena, path, home),
+            syntax::Ty::Path(path) => return self.path_head(src, arena, path, home, seen),
             syntax::Ty::DynTrait(bounds) => return self.dyn_head(src, arena, bounds, home),
             _ => return None,
         })
@@ -274,6 +281,7 @@ impl<'a> Context<'a> {
         arena: &Body,
         path: syntax::PathId,
         (home, root): (ModRef, Option<ItemRef>),
+        seen: &mut Vec<ItemRef>,
     ) -> Option<Head> {
         let (segments, absolute, dollar) = segments(&self.names.symbols, src, arena, path);
         match self.resolve_in(
@@ -295,15 +303,42 @@ impl<'a> Context<'a> {
                 Some(Head::Adt(item))
             }
             Def::Item(item) if self.item(item).1.kind == ItemKind::Type => {
-                let alias = self.alias_def(item).ok()?;
-                let home = self.module_of(item).ok()?;
-                self.syntax_head(
-                    self.item(item).0,
-                    &alias.arena,
-                    alias.ty,
-                    (home, Some(item)),
-                )
+                if seen.contains(&item) || seen.len() >= 32 {
+                    return None;
+                }
+                seen.push(item);
+                let found = self.alias_def(item).ok().and_then(|alias| {
+                    let home = self.module_of(item).ok()?;
+                    self.syntax_head(
+                        self.item(item).0,
+                        &alias.arena,
+                        alias.ty,
+                        (home, Some(item)),
+                        seen,
+                    )
+                });
+                seen.pop();
+                found
             }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn impl_self_adt(&mut self, block: ImplRef) -> Option<ItemRef> {
+        let header = self.impl_header(block).ok()?;
+        let src = &impl_file_entry(self.outline, block).0.source;
+        if generic_self(src, &header) {
+            return None;
+        }
+        let home = self.impl_module(block).ok()?;
+        match self.syntax_head(
+            src,
+            &header.body,
+            header.self_ty,
+            (home, block.item()),
+            &mut Vec::new(),
+        ) {
+            Some(Head::Adt(item)) => Some(item),
             _ => None,
         }
     }

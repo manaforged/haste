@@ -129,7 +129,9 @@ impl<'a> Infer<'_, 'a> {
             let arena = self.body;
             locals.push(self.param_pat(arena, pat, ty, Some(pat))?);
         }
-        let param_locals: Vec<u32> = (param_first..self.out.locals.len() as u32).collect();
+        let param_locals: Vec<u32> = (param_first..self.out.locals.len() as u32)
+            .filter(|local| !self.out.unpacks.contains_key(local))
+            .collect();
         let async_body = matches!(
             *self.body.expr(body),
             Expr::Block {

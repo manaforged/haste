@@ -1,5 +1,6 @@
 mod arg_refs;
 pub(super) mod bounds;
+mod bounds_static;
 mod closure;
 pub(super) mod lifetimes;
 pub(super) mod return_lt;
@@ -15,11 +16,10 @@ use crate::body::{ExprId, List, TyId};
 use crate::sema::infer::{By, Res};
 use crate::sema::ty::{Kind, Mut, Ty};
 
-use super::bind::push_loan;
-use super::checks::is_temp_target;
-use super::places::PlaceStep;
-use super::propagate::BorrowSource;
-use super::{Checker, Loan, State, prune_moved_loans};
+use super::{
+    Checker, Loan, State, bind::push_loan, checks::is_temp_target, places::PlaceStep,
+    propagate::BorrowSource, prune_moved_loans,
+};
 
 pub(super) use arg_refs::{recv_is_by_ref, recv_ref_mut, sig_param_idx};
 pub(super) use closure::ActiveClosure;
@@ -131,6 +131,7 @@ impl Checker<'_, '_> {
                 outer_live,
                 depth,
             )?;
+            this.check_call_static_type_args(expr, call_res, sig.as_deref(), fn_item)?;
             this.check_call_bounds(
                 &arg_ids,
                 &arg_sources,
@@ -267,7 +268,7 @@ impl Checker<'_, '_> {
             self.check_expr(receiver, state, true, outer_live, true, depth)?;
             return Ok(None);
         }
-        let recv_is_mut_ref = self.is_mut_ref_ty(self.expr_ty(receiver));
+        let recv_is_mut_ref = self.recv_reborrows_mut_ref(expr, receiver, derefs);
         if mutability == Mut::Mut {
             state.set_tuple_sources(p.local, None);
         }
@@ -328,10 +329,15 @@ impl Checker<'_, '_> {
                 "cannot borrow data in a `&` reference as mutable",
             ));
         }
+        let param_ids: Vec<u32> = self.body.list(params).to_vec();
+        let mut arg_live = outer_live.clone();
+        for &id in &param_ids {
+            self.collect_live_expr(ExprId(id), &mut arg_live);
+        }
         let temp_id = self.next_temp_holder();
         let deferred_recv = if let Some(mutability) = recv_borrow {
             self.check_borrowed_receiver(
-                expr, receiver, mutability, temp_id, state, outer_live, depth,
+                expr, receiver, mutability, temp_id, state, &arg_live, depth,
             )?
         } else {
             let derefs = self.typed.adjusts.get(&expr).map_or(0, |a| a.derefs);
@@ -340,9 +346,9 @@ impl Checker<'_, '_> {
                     .callee_sig(expr, None)
                     .is_some_and(|s| matches!(s.receiver, Some((SelfKind::Value, _))));
             if by_val_deref {
-                self.check_method_by_val_derefs(expr, receiver, derefs, state, outer_live, depth)?;
+                self.check_method_by_val_derefs(expr, receiver, derefs, state, &arg_live, depth)?;
             } else {
-                self.check_by_val_receiver(receiver, state, outer_live, depth)?;
+                self.check_by_val_receiver(receiver, state, &arg_live, depth)?;
             }
             None
         };
@@ -350,19 +356,14 @@ impl Checker<'_, '_> {
             self.release_temp_holder(state, temp_id);
             return Ok(());
         }
-        let param_ids: Vec<u32> = self.body.list(params).to_vec();
         let recv_closure_sources =
             if !param_ids.is_empty() && self.ty_holds_borrow(self.expr_ty(receiver)) {
                 self.expr_borrow_sources(receiver, state)
             } else {
                 Vec::new()
             };
-        let mut arg_live = outer_live.clone();
         if self.ty_holds_borrow(self.expr_ty(expr)) {
             self.collect_live_expr(receiver, &mut arg_live);
-        }
-        for &id in &param_ids {
-            self.collect_live_expr(ExprId(id), &mut arg_live);
         }
         super::prune_dead_loans(state, &arg_live);
         let call_res = self.typed.res.get(&expr).copied();
@@ -396,6 +397,8 @@ impl Checker<'_, '_> {
             self.check_borrow(local, through_ref, mut_ref_root, &steps, true, &check_state)?;
         }
         if !state.diverged {
+            self.check_method_impl_static_self(receiver, call_res, fn_item, state)?;
+            self.check_call_static_type_args(expr, call_res, sig.as_deref(), fn_item)?;
             self.check_call_bounds(&param_ids, &arg_sources, sig.as_deref(), fn_item, false)?;
             self.attach_method_arg_sources(
                 expr,
@@ -700,7 +703,11 @@ impl Checker<'_, '_> {
                 if plain_local.is_some() {
                     self.temp_sources.remove(&cache_expr);
                 }
-                let effective_ref = self.resolve_call_arg_ref(ctx, idx, arg);
+                let mut effective_ref = self.resolve_call_arg_ref(ctx, idx, arg);
+                effective_ref = effective_ref.filter(|&m| {
+                    m != Mut::Mut
+                        || !self.fn_ptr_field_named_mut_lt(ctx.callee_expr, idx, plain_local)
+                });
                 let expected_ty = self.resolve_call_arg_ty(ctx, idx, arg);
                 let shared_reborrow = effective_ref == Some(Mut::Not);
                 let added_origins =

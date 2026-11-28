@@ -48,10 +48,15 @@ const SOLE_INLINE_INSTS: usize = 1600;
 const SOLE_LEAF_INSTS: usize = 4096;
 const SOLE_OUTLINE: usize = 64;
 const FMT_FANOUT_LIMIT: usize = 12;
-const COLD_FANOUT_LIMIT: usize = 48;
+const COLD_FANOUT_LIMIT: usize = 32;
 const LOOP_FANOUT_LIMIT: usize = 144;
 const HOT_FANOUT_LIMIT: usize = 144;
-const SHARED_LOOP_LIMIT: usize = 160;
+const FLAT_DEFAULT_FANOUT: usize = 56;
+const SHARED_LOOP_LIMIT: usize = 72;
+const FLAT_DEFAULT_LIMIT: usize = 96;
+const FLAT_DEFAULT_COLD_LIMIT: usize = 40;
+const FLAT_INLINE_FANOUT_LIMIT: usize = 320;
+const FLAT_INLINE_COLD_LIMIT: usize = 128;
 const LARGE_CALLER_EXPRS: usize = 120;
 const HUGE_CALLER_EXPRS: usize = 850;
 
@@ -297,29 +302,31 @@ fn callee_cold(cx: &mut Context<'_>, reached: &Reached, callee: usize) -> usize 
 }
 
 fn is_fmt_caller(cx: &Context<'_>, reached: &Reached, caller: usize, fanout: usize) -> bool {
-    let Some(((item, _), Ok(typed))) = reached.list.get(caller) else {
+    let Some((_, Ok(typed))) = reached.list.get(caller) else {
         return false;
     };
-    if fanout < 4 || cx.plain_name(*item) != "fmt" || typed.params.len() != 2 {
+    if fanout < 4 {
         return false;
     }
-    let fmt_param = typed.locals[typed.params[1] as usize].ty;
-    let Kind::Ref(_, inner) = *cx.types.kind(fmt_param) else {
-        return false;
-    };
-    let Kind::Adt(adt, _) = *cx.types.kind(inner) else {
-        return false;
-    };
-    cx.plain_name(adt) == "Formatter" && cx.outline.roots[adt.krate as usize].name == "core"
+    typed.params.iter().any(|&param| {
+        let ty = typed.locals[param as usize].ty;
+        let Kind::Ref(_, inner) = *cx.types.kind(ty) else {
+            return false;
+        };
+        let Kind::Adt(adt, _) = *cx.types.kind(inner) else {
+            return false;
+        };
+        cx.plain_name(adt) == "Formatter" && cx.outline.roots[adt.krate as usize].name == "core"
+    })
 }
 
 fn dampen_cold_flat(limit: usize, (same, total): (usize, usize)) -> usize {
     let mut cap = limit;
     if same >= 2 {
-        cap = cap.min((limit / same).max(64));
+        cap = cap.min((limit / same).max(COLD_FANOUT_LIMIT));
     }
     if total >= 14 {
-        cap = cap.min((limit * 8 / total).max(64));
+        cap = cap.min((limit * 8 / total).max(COLD_FANOUT_LIMIT));
     }
     cap
 }
@@ -329,19 +336,22 @@ fn dampen_default_flat(
     (same, total, cold): (usize, usize, usize),
     (caller_gen, both_gen, large_caller): (bool, bool, bool),
 ) -> usize {
+    let limit = limit.min(if cold >= 1 {
+        FLAT_DEFAULT_COLD_LIMIT
+    } else {
+        FLAT_DEFAULT_LIMIT
+    });
     let min_cold_total = if caller_gen { 16 } else { 24 };
     if large_caller {
-        limit.min(if cold >= 1 && same >= 2 {
+        limit.min(if cold >= 1 {
             COLD_FANOUT_LIMIT
         } else {
-            HOT_FANOUT_LIMIT
+            FLAT_DEFAULT_FANOUT
         })
     } else if cold >= 1 && (same >= 4 || (both_gen && same >= 2) || total >= min_cold_total) {
         dampen_cold_flat(limit, (same, total))
-    } else if same >= 6 || (caller_gen && total >= 28) {
-        limit.min(HOT_FANOUT_LIMIT)
-    } else if total >= 36 {
-        limit.min(184)
+    } else if same >= 4 || (caller_gen && total >= 24) || total >= 32 {
+        limit.min(FLAT_DEFAULT_FANOUT)
     } else {
         limit
     }
@@ -352,9 +362,16 @@ fn dampen_inline_flat(
     (same, total, cold): (usize, usize, usize),
     caller_gen: bool,
 ) -> usize {
+    let limit = if cold >= 1 {
+        limit.min(FLAT_INLINE_COLD_LIMIT)
+    } else if same >= 2 || total >= 12 {
+        limit.min(FLAT_INLINE_FANOUT_LIMIT)
+    } else {
+        limit
+    };
     if cold >= 1 && ((caller_gen && total >= 16) || same >= 4) {
         limit.min(64)
-    } else if same >= 10 || total >= 45 {
+    } else if (cold >= 1 && caller_gen && total >= 16) || same >= 10 || total >= 45 {
         limit.min(HOT_FANOUT_LIMIT)
     } else {
         limit
@@ -477,7 +494,7 @@ pub(super) fn caller_inline_limit(
     let Some(calls) = calls_opt else {
         return Some(limit);
     };
-    let large_flat = !in_loop && c_hint == Hint::Default && caller_gen && caller_exprs > 560;
+    let large_flat = !in_loop && c_hint == Hint::Default && (caller_exprs > 180 || fanout >= 18);
     let huge_caller = c_hint == Hint::Default && caller_exprs > HUGE_CALLER_EXPRS;
     let cold = if c_hint == Hint::Always {
         0
@@ -637,9 +654,19 @@ impl Copies {
         self.bulky.iter().filter(|&&at| at == index).count() >= budget().copies
     }
 
-    fn compact_drop(&self, index: usize, hint: Option<Hint>) -> bool {
+    fn compact_drop(
+        &self,
+        cx: &Context<'_>,
+        reached: &Reached,
+        index: usize,
+        size: usize,
+        hint: Option<Hint>,
+    ) -> bool {
         if !self.sole {
             return true;
+        }
+        if stable_sole(cx, reached, index) && size <= budget().outline * 3 {
+            return false;
         }
         hint == Some(Hint::Default) || (!self.bulky.is_empty() && self.repeated(index))
     }
@@ -653,7 +680,9 @@ impl Copies {
         callee: &InlinedCallee,
     ) -> bool {
         let (bulky, hint) = callee_bulky(cx, reached, index, callee, self.sole);
-        bulky && self.compact && self.compact_drop(index, hint)
+        bulky
+            && self.compact
+            && self.compact_drop(cx, reached, index, usize::from(callee.size), hint)
     }
 
     /// Records the copy `callee` of reached function `index` and returns whether the body takes it: a compact body leaves bulky callees out of line.
@@ -665,7 +694,10 @@ impl Copies {
         callee: &InlinedCallee,
     ) -> bool {
         let (bulky, hint) = callee_bulky(cx, reached, index, callee, self.sole);
-        if bulky && self.compact && self.compact_drop(index, hint) {
+        if bulky
+            && self.compact
+            && self.compact_drop(cx, reached, index, usize::from(callee.size), hint)
+        {
             return false;
         }
         if bulky && !self.compact {

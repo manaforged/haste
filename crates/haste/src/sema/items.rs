@@ -378,8 +378,8 @@ impl<'a> Context<'a> {
         }
         let (src, entry) = self.item(item);
         let (at, eq) = self.alias_eq(item)?;
-        let generics: traits::TraitGenerics = match src.text(at + 1) {
-            "<" => sig::generics(src, at + 1, eq)?,
+        let mut generics: traits::TraitGenerics = match src.text(at + 1) {
+            "<" | "where" => sig::generics(src, at + 1, eq)?,
             _ => Default::default(),
         };
         let params = generics
@@ -389,7 +389,11 @@ impl<'a> Context<'a> {
             .filter(|generic| generic.kind != sig::GenericKind::Lifetime)
             .cloned()
             .collect();
-        let (arena, ty) = crate::body::parse_ty(src, eq + 1, entry.end - 1)?;
+        let (arena, ty, trailing_where) = sig::alias_ty(src, eq + 1, entry.end - 1)?;
+        if let Some(where_at) = trailing_where {
+            let extra = sig::parse_where_into(src, where_at, entry.end - 1, &mut generics.0)?;
+            generics.1.predicates.extend(extra);
+        }
         let alias = Arc::new(Alias {
             params,
             generics: Arc::new(generics),

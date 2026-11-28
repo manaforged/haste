@@ -100,7 +100,11 @@ impl<'a> Checker<'_, 'a> {
         {
             return Vec::new();
         }
-        let mut out = self.expr_borrow_sources_inner(callee, state, true, None);
+        let mut out = if self.callee_param_callable_ret_satisfies_fn_ret(callee) {
+            Vec::new()
+        } else {
+            self.expr_borrow_sources_inner(callee, state, true, None)
+        };
         out.retain(|s| !s.env_only);
         let ret_has_borrow = self.ty_holds_borrow(self.expr_ty(expr));
         let hrtb_non_ret = self.callee_hrtb_non_ret_params(callee, ret_has_borrow);
@@ -235,14 +239,15 @@ impl<'a> Checker<'_, 'a> {
         ret_ty: Ty,
         state: &State,
     ) -> Vec<BorrowSource> {
+        let ret_lts = self.collect_ret_lifetimes(call.fn_item, call.sig, call.sig_src, ret_ast);
         if ret_ty != Ty::NONE
             && !self.ty_holds_borrow(ret_ty)
+            && ret_lts.named.is_empty()
             && !self.sig_captures_edition_2024_rpit(call.fn_item, call.sig, call.sig_src, ret_ast)
         {
             return Vec::new();
         }
-        let ret_lts = self.collect_ret_lifetimes(call.fn_item, call.sig, call.sig_src, ret_ast);
-        let flags = self.sig_fn_flags(call.fn_item, call.sig);
+        let flags = self.sig_fn_flags(call.fn_item, call.sig, ret_ty);
         let ctx = SigCallCtx {
             expr: call.expr,
             fn_item: call.fn_item,
@@ -263,10 +268,13 @@ impl<'a> Checker<'_, 'a> {
             );
         }
         let mut srcs = self.sig_arg_sources_with_lifetimes(&ctx, call.arg_ids, state);
+        let mut keep_env_only = ctx.flags.is_by_ref;
         if let Some(recv) = call.receiver {
-            srcs.extend(self.sig_recv_sources_with_lifetimes(&ctx, recv, state));
+            let (recv_srcs, iter_env) = self.sig_recv_sources_with_lifetimes(&ctx, recv, state);
+            srcs.extend(recv_srcs);
+            keep_env_only |= iter_env;
         }
-        self.finish_sources_for_ty(ret_ty, srcs, ctx.flags.is_by_ref)
+        self.finish_sources_for_ty(ret_ty, srcs, keep_env_only)
     }
 
     fn collect_ret_lifetimes(
@@ -283,7 +291,12 @@ impl<'a> Checker<'_, 'a> {
                 && let Ok(hdr) = self.cx.impl_header(block)
             {
                 let impl_src = &self.cx.impl_file(block).source;
-                collect_ty_lifetimes(&hdr.body, impl_src, hdr.self_ty, &mut ret_lts);
+                super::closure_peel::extend_ret_lts_from_self_ty(
+                    &hdr.body,
+                    impl_src,
+                    hdr.self_ty,
+                    &mut ret_lts,
+                );
             } else if let Some(tr) = self.cx.owner_trait(fn_item)
                 && let Ok(tg) = self.cx.trait_generics(tr)
             {
@@ -301,12 +314,12 @@ impl<'a> Checker<'_, 'a> {
         ret_lts
     }
 
-    fn sig_fn_flags(&mut self, fn_item: ItemRef, sig: &Signature) -> SigFnFlags<'a> {
+    fn sig_fn_flags(&mut self, fn_item: ItemRef, sig: &Signature, ret_ty: Ty) -> SigFnFlags<'a> {
         let fn_name = self.cx.name(fn_item);
         let is_iter_fn = self.is_iter_mod(fn_item);
-        let is_opt_fn = self.item_in_std_mod(fn_item, "option");
         let is_owned_copy_fn = recv_is_by_ref(sig)
             && ((fn_name == "clone"
+                && !self.is_ref_ty(ret_ty)
                 && self
                     .cx
                     .owner_trait(fn_item)
@@ -320,13 +333,12 @@ impl<'a> Checker<'_, 'a> {
                 || sig
                     .ret
                     .is_some_and(|ret| self.sig_returns_type_param(fn_item, sig, ret)));
-        let is_by_ref = is_iter_fn && fn_name == "by_ref";
         SigFnFlags {
             fn_name,
             is_iter_fn,
-            is_opt_fn,
+            is_opt_fn: self.item_in_std_mod(fn_item, "option"),
             is_owned_copy_fn,
-            is_by_ref,
+            is_by_ref: is_iter_fn && fn_name == "by_ref",
         }
     }
 
@@ -410,11 +422,8 @@ impl<'a> Checker<'_, 'a> {
         flags: &SigFnFlags<'a>,
         state: &State,
     ) -> Vec<BorrowSource> {
-        let mut recv_sources =
-            self.expr_borrow_sources_inner(recv, state, !recv_is_by_ref(sig), None);
-        if recv_is_by_ref(sig) {
-            self.filter_owned_closure_param_sources(ret_ty, &mut recv_sources);
-        }
+        let recv = self.peel_ufcs_ref_recv(call_expr, recv, sig);
+        let mut recv_sources = self.sig_no_lt_raw_recv_sources(recv, ret_ty, sig, state);
         let maps_inner_copy = (flags.is_iter_fn || flags.is_opt_fn)
             && matches!(
                 flags.fn_name,
@@ -549,7 +558,7 @@ impl<'a> Checker<'_, 'a> {
         ctx: &SigCallCtx<'a, '_>,
         recv: ExprId,
         state: &State,
-    ) -> Vec<BorrowSource> {
+    ) -> (Vec<BorrowSource>, bool) {
         let (sig, sig_src, ret_lts) = (ctx.sig, ctx.sig_src, ctx.ret_lts);
         let recv_creates_borrow = match sig.receiver {
             Some((SelfKind::Ref | SelfKind::RefMut, _)) => {
@@ -568,7 +577,7 @@ impl<'a> Checker<'_, 'a> {
                 if self.ty_is_borrow_free(self_ty)
                     || self.recv_independent_of_named_ret(ctx.fn_item, sig, sig_src, ret_lts)
                 {
-                    return Vec::new();
+                    return (Vec::new(), false);
                 }
                 true
             }
@@ -576,7 +585,7 @@ impl<'a> Checker<'_, 'a> {
         };
         let recv_is_mut = recv_ref_mut(sig) == Some(Mut::Mut);
         if ctx.flags.is_by_ref {
-            self.by_ref_recv_sources(ctx.expr, recv, state)
+            (self.by_ref_recv_sources(ctx.expr, recv, state), false)
         } else if recv_creates_borrow
             && !recv_is_mut
             && self.is_mut_ref_to_shared_ref(self.expr_ty(recv))
@@ -587,9 +596,12 @@ impl<'a> Checker<'_, 'a> {
             } else {
                 self.expr_borrow_sources_inner(recv, state, false, None)
             };
-            unwrap_container_loans(inner_srcs, state, |s| {
-                self.is_ref_ty(self.local_ty(s.target))
-            })
+            (
+                unwrap_container_loans(inner_srcs, state, |s| {
+                    self.is_ref_ty(self.local_ty(s.target))
+                }),
+                false,
+            )
         } else if recv_creates_borrow {
             let srcs = if let Some(mutability) =
                 self.typed.adjusts.get(&ctx.expr).and_then(|a| a.autoref)
@@ -602,16 +614,19 @@ impl<'a> Checker<'_, 'a> {
                 && matches!(sig.receiver, Some((SelfKind::Ref | SelfKind::RefMut, _)))
                 && sig.receiver_lifetime.is_none();
             if inner_only {
-                self.copied_recv_sources(ctx.expr, recv, srcs, state, true)
+                (
+                    self.copied_recv_sources(ctx.expr, recv, srcs, state, true),
+                    false,
+                )
             } else {
-                srcs
+                self.mark_iter_env_only_recv(ctx.expr, recv, (sig, sig_src), srcs)
             }
         } else {
             if recv_is_by_ref(sig)
                 && (self.recv_independent_of_named_ret(ctx.fn_item, sig, sig_src, ret_lts)
                     || self.ty_is_borrow_free(self.method_self_ty(ctx.expr, recv, Some(sig))))
             {
-                return Vec::new();
+                return (Vec::new(), false);
             }
             let mut srcs = self.expr_borrow_sources_inner(recv, state, !recv_is_by_ref(sig), None);
             if recv_is_by_ref(sig) {
@@ -619,11 +634,12 @@ impl<'a> Checker<'_, 'a> {
                     !(s.env_only && super::super::checks::is_temp_target(s.target).is_some())
                 });
             }
-            if ctx.flags.is_owned_copy_fn {
+            let out = if ctx.flags.is_owned_copy_fn || recv_is_by_ref(sig) {
                 self.copied_recv_sources(ctx.expr, recv, srcs, state, true)
             } else {
                 srcs
-            }
+            };
+            (out, false)
         }
     }
 
@@ -661,8 +677,9 @@ impl<'a> Checker<'_, 'a> {
         }
         if unwrap {
             let out = self.unwrap_container_loans_deep(recv_sources, state, &container_targets);
-            let recv_is_mut_ref = self.is_mut_ref_ty(self.expr_ty(recv));
-            self.finish_unwrapped_copied_sources(call_ty, recv_is_mut_ref, root, out, state)
+            let recv_ty = self.expr_ty(recv);
+            let recv_info = (self.is_mut_ref_ty(recv_ty), self.ty_max_ref_depth(recv_ty));
+            self.finish_unwrapped_copied_sources(call_ty, recv_info, root, out, state)
         } else {
             let call_depth = self.ty_max_ref_depth(call_ty);
             let mut out = Vec::with_capacity(recv_sources.len());
@@ -745,30 +762,6 @@ impl<'a> Checker<'_, 'a> {
         }
         let arg_sources = self.expr_borrow_sources_inner(arg, state, false, None);
         self.copied_recv_sources(call_expr, arg, arg_sources, state, true)
-    }
-
-    fn iter_closure_ignores_param(&mut self, arg: ExprId, state: &State) -> bool {
-        if self.fn_arg_returns_static(arg) {
-            return true;
-        }
-        let cur = self.unwrap_parens(arg);
-        let Some(closure) = self.typed.closures.get(&cur).cloned() else {
-            return false;
-        };
-        if self
-            .closure_effects
-            .get(&cur)
-            .is_some_and(|eff| !eff.ret_params.is_empty())
-        {
-            return false;
-        }
-        let Some(targets) = self.closure_ret_targets(cur, closure.ret, state) else {
-            return false;
-        };
-        targets.iter().all(|t| {
-            closure.captures.iter().any(|c| c.local == *t)
-                || state.loans.iter().any(|l| l.target == *t)
-        })
     }
 
     fn finish_sig_sources(

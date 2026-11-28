@@ -259,16 +259,19 @@ impl<'a> Context<'a> {
         let held = |import: &&u32| {
             file.items.items[file.items.imports[**import as usize].item as usize].parent == Some(at)
         };
-        let imports = self.body_index(file).imports.get(*first)?;
-        let (_, entry) = imports.iter().filter(held).find_map(|&import| {
-            self.import_entry((root, home), &paths, (file, import), Some(word), &[], 0)
-        })?;
-        let binding = if more.is_empty() {
-            entry.get(ns)
-        } else {
-            entry.types
-        };
-        self.def_descend(home, binding?.def, more, ns)
+        let index = self.body_index(file);
+        let named = index.imports.get(*first).map_or(&[][..], Vec::as_slice);
+        let wanted = if more.is_empty() { ns } else { Ns::Types };
+        let binding = named
+            .iter()
+            .chain(&index.globs)
+            .filter(held)
+            .find_map(|&import| {
+                let (_, entry) =
+                    self.import_entry((root, home), &paths, (file, import), Some(word), &[], 0)?;
+                entry.get(wanted)
+            })?;
+        self.def_descend(home, binding.def, more, ns)
     }
 
     fn def_descend(&self, home: ModRef, mut def: Def, rest: &[&str], ns: Ns) -> Option<BodyPath> {
@@ -446,7 +449,8 @@ impl<'a> Context<'a> {
                 found
             }
         };
-        (entry.types.is_some() || entry.values.is_some()).then_some((name.is_some(), entry))
+        (entry.types.is_some() || entry.values.is_some() || entry.macros.is_some())
+            .then_some((name.is_some(), entry))
     }
 
     fn body_import(

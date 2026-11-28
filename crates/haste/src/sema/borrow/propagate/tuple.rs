@@ -569,4 +569,58 @@ impl Checker<'_, '_> {
         }
         dedup_sources(out)
     }
+
+    pub(super) fn peel_ufcs_ref_recv(
+        &self,
+        call_expr: ExprId,
+        recv: ExprId,
+        sig: &crate::body::sig::Signature,
+    ) -> ExprId {
+        let by_ref = matches!(
+            sig.receiver,
+            Some((
+                crate::body::sig::SelfKind::Ref | crate::body::sig::SelfKind::RefMut,
+                _
+            ))
+        );
+        if !by_ref
+            || self
+                .typed
+                .adjusts
+                .get(&call_expr)
+                .and_then(|a| a.autoref)
+                .is_some()
+        {
+            return recv;
+        }
+        match *self.body.expr(self.unwrap_parens(recv)) {
+            Expr::Ref {
+                raw: false,
+                expr: inner,
+                ..
+            } => inner,
+            _ => recv,
+        }
+    }
+
+    pub(super) fn sig_no_lt_raw_recv_sources(
+        &mut self,
+        recv: ExprId,
+        ret_ty: Ty,
+        sig: &crate::body::sig::Signature,
+        state: &State,
+    ) -> Vec<BorrowSource> {
+        let by_ref = matches!(
+            sig.receiver,
+            Some((
+                crate::body::sig::SelfKind::Ref | crate::body::sig::SelfKind::RefMut,
+                _
+            ))
+        );
+        let mut recv_sources = self.expr_borrow_sources_inner(recv, state, !by_ref, None);
+        if by_ref {
+            self.filter_owned_closure_param_sources(ret_ty, &mut recv_sources);
+        }
+        recv_sources
+    }
 }

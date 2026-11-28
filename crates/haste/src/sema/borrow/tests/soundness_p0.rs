@@ -11,7 +11,7 @@ use crate::sema::{Cache, Context};
 
 use super::{find_item_in, test_outline};
 
-const MIN_CORE_TRAITS: &str = concat!(
+pub(super) const MIN_CORE_TRAITS: &str = concat!(
     "#![no_core]\n",
     "#[lang = \"sized\"]\n",
     "pub trait Sized {}\n",
@@ -26,7 +26,7 @@ const MIN_CORE_TRAITS: &str = concat!(
     "}\n",
 );
 
-fn load_borrow_fixture(
+pub(super) fn load_borrow_fixture(
     tag: &str,
     edition: &str,
     core_src: &str,
@@ -90,7 +90,7 @@ fn load_borrow_fixture(
     (dir, outline, names)
 }
 
-fn find_app_item(outline: &Outline, name: &str) -> ItemRef {
+pub(super) fn find_app_item(outline: &Outline, name: &str) -> ItemRef {
     outline.crates[1].files[0]
         .items
         .items
@@ -108,7 +108,11 @@ fn find_app_item(outline: &Outline, name: &str) -> ItemRef {
         .expect("find item")
 }
 
-fn run_borrow_on_item(cx: &mut Context<'_>, item: ItemRef, substs: Substs) -> anyhow::Result<()> {
+pub(super) fn run_borrow_on_item(
+    cx: &mut Context<'_>,
+    item: ItemRef,
+    substs: Substs,
+) -> anyhow::Result<()> {
     let typed = crate::sema::infer::infer(cx, item, substs)?;
     let sig = cx.signature(item).expect("sig");
     let body = cx.body(item).expect("body");

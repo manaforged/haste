@@ -83,7 +83,14 @@ impl Lower<'_, '_> {
                 tail: Some(tail),
                 label: None,
                 kind: BlockKind::Plain | BlockKind::Unsafe | BlockKind::Const,
-            } => self.body.list(stmts).is_empty() && self.promotable_in(tail, true)?,
+            } => {
+                self.body.list(stmts).iter().all(|&stmt| {
+                    matches!(
+                        self.body.stmts[stmt as usize],
+                        crate::body::Stmt::Item(..) | crate::body::Stmt::Empty
+                    )
+                }) && self.promotable_in(tail, true)?
+            }
             Expr::If(cond, then, alt) => {
                 self.promotable_in(cond, true)?
                     && self.promotable_in(then, true)?
@@ -200,9 +207,13 @@ impl Lower<'_, '_> {
         let ((source, _), Ok(typed)) = &self.reached.list[index] else {
             return Ok(None);
         };
+        let owner = self.reached.list[self.index].0.0;
         let env = &self.cx.outline.crates[source.krate as usize].env;
         let readable = matches!(typed.shape, Shape::Body)
-            && (env.release || env.fixed)
+            && (env.release
+                || env.fixed
+                || source.krate == owner.krate
+                || crate::profile() == crate::outline::tree::Profile::Release)
             && self.cx.types.substs(substs).is_empty();
         Ok(readable.then(|| (*source, typed.clone())))
     }

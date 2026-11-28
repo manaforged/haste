@@ -365,3 +365,212 @@ fn mut_ref_deref_behind_mut_ref_reborrows_and_behind_shared_ref_rejects() {
     run_case(&mut cx, ok_fn, mut_proj).expect("mut_ref behind mut_ref should reborrow");
     assert!(run_case(&mut cx, bad_fn, ref_proj).is_err());
 }
+
+#[test]
+fn iter_env_only_recv_lifetime_collect_ok_and_item_lt_rejected() {
+    use super::soundness_p0::{
+        MIN_CORE_TRAITS, find_app_item, load_borrow_fixture, run_borrow_on_item,
+    };
+    let core_src = format!(
+        "{MIN_CORE_TRAITS}{}",
+        concat!(
+            "#[lang = \"copy\"]\n",
+            "pub trait Copy {}\n",
+            "impl Copy for u8 {}\n",
+            "impl<T: ?Sized> Copy for &T {}\n",
+            "pub mod iter {\n",
+            "    pub trait FromIterator<A> { fn from_iter<T: Iterator<Item = A>>(iter: T) -> Self; }\n",
+            "    pub trait Iterator {\n",
+            "        type Item;\n",
+            "        fn next(&mut self) -> crate::Option<Self::Item>;\n",
+            "        fn collect<B: FromIterator<Self::Item>>(self) -> B where Self: crate::Sized { loop {} }\n",
+            "    }\n",
+            "}\n",
+            "pub enum Option<T> { None, Some(T) }\n",
+            "pub struct Vec<T>(T);\n",
+            "impl<T> iter::FromIterator<T> for Vec<T> {\n",
+            "    fn from_iter<I: iter::Iterator<Item = T>>(_: I) -> Self { loop {} }\n",
+            "}\n",
+        )
+    );
+    let app_src = concat!(
+        "use core::iter::Iterator;\n",
+        "use core::Vec;\n",
+        "pub struct Captures<'h>(&'h [u8]);\n",
+        "pub struct SubMatches<'c, 'h>(&'c Captures<'h>, &'h [u8]);\n",
+        "impl<'h> Captures<'h> {\n",
+        "    pub fn new(h: &'h [u8]) -> Self { Captures(h) }\n",
+        "    pub fn iter<'c>(&'c self) -> SubMatches<'c, 'h> { SubMatches(self, self.0) }\n",
+        "}\n",
+        "impl<'c, 'h> Iterator for SubMatches<'c, 'h> {\n",
+        "    type Item = &'h [u8];\n",
+        "    fn next(&mut self) -> core::Option<Self::Item> { core::Option::None }\n",
+        "}\n",
+        "pub struct OwnedBuf(u8);\n",
+        "pub struct BufIter<'a>(&'a OwnedBuf);\n",
+        "impl OwnedBuf {\n",
+        "    pub fn new() -> Self { OwnedBuf(0) }\n",
+        "    pub fn iter<'a>(&'a self) -> BufIter<'a> { BufIter(self) }\n",
+        "}\n",
+        "impl<'a> Iterator for BufIter<'a> {\n",
+        "    type Item = &'a u8;\n",
+        "    fn next(&mut self) -> core::Option<Self::Item> { core::Option::None }\n",
+        "}\n",
+        "pub fn ok_collect_env_only<'h>(h: &'h [u8]) -> Vec<&'h [u8]> {\n",
+        "    let v: Vec<&'h [u8]> = Captures::new(h).iter().collect();\n",
+        "    v\n",
+        "}\n",
+        "pub fn bad_collect_item_borrows_temp() {\n",
+        "    let v: Vec<&u8> = OwnedBuf::new().iter().collect();\n",
+        "    let _ = v;\n",
+        "}\n",
+        "pub fn bad_iter_escapes_local<'h>(h: &'h [u8]) {\n",
+        "    let it = { let c = Captures::new(h); c.iter() };\n",
+        "    let _ = it;\n",
+        "}\n",
+        "pub fn bad_iter_escapes_temp<'h>(h: &'h [u8]) {\n",
+        "    let it = Captures::new(h).iter();\n",
+        "    let _ = it;\n",
+        "}\n",
+    );
+    let (dir, outline, names) = load_borrow_fixture("iter_env_only", "2021", &core_src, app_src);
+    let mut cx = Context::new(&outline, &names, Cache::default());
+    run_borrow_on_item(
+        &mut cx,
+        find_app_item(&outline, "ok_collect_env_only"),
+        Substs::EMPTY,
+    )
+    .expect("iterator whose Item does not mention receiver lifetime should collect cleanly");
+    let bad = run_borrow_on_item(
+        &mut cx,
+        find_app_item(&outline, "bad_collect_item_borrows_temp"),
+        Substs::EMPTY,
+    )
+    .expect_err("iterator whose Item borrows temporary receiver must be rejected");
+    assert!(
+        format!("{bad:#}").contains("temporary value dropped while borrowed"),
+        "unexpected error: {bad:#}"
+    );
+    run_borrow_on_item(
+        &mut cx,
+        find_app_item(&outline, "bad_iter_escapes_local"),
+        Substs::EMPTY,
+    )
+    .expect_err("iterator borrowing dropped local Captures must be rejected");
+    run_borrow_on_item(
+        &mut cx,
+        find_app_item(&outline, "bad_iter_escapes_temp"),
+        Substs::EMPTY,
+    )
+    .expect_err("iterator borrowing dropped temporary Captures must be rejected");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn iter_env_only_matches_exact_adt_item_not_plain_name() {
+    use super::soundness_p0::{
+        MIN_CORE_TRAITS, find_app_item, load_borrow_fixture, run_borrow_on_item,
+    };
+    let core_src = format!(
+        "{MIN_CORE_TRAITS}{}",
+        concat!(
+            "#[lang = \"copy\"]\n",
+            "pub trait Copy {}\n",
+            "impl Copy for u8 {}\n",
+            "impl<T: ?Sized> Copy for &T {}\n",
+            "pub mod iter {\n",
+            "    pub trait FromIterator<A> { fn from_iter<T: Iterator<Item = A>>(iter: T) -> Self; }\n",
+            "    pub trait Iterator {\n",
+            "        type Item;\n",
+            "        fn next(&mut self) -> crate::Option<Self::Item>;\n",
+            "        fn collect<B: FromIterator<Self::Item>>(self) -> B where Self: crate::Sized { loop {} }\n",
+            "    }\n",
+            "}\n",
+            "pub enum Option<T> { None, Some(T) }\n",
+            "pub struct Vec<T>(T);\n",
+            "impl<T> iter::FromIterator<T> for Vec<T> {\n",
+            "    fn from_iter<I: iter::Iterator<Item = T>>(_: I) -> Self { loop {} }\n",
+            "}\n",
+        )
+    );
+    let app_src = concat!(
+        "use core::iter::Iterator;\n",
+        "use core::Vec;\n",
+        "pub mod a {\n",
+        "    use core::iter::Iterator;\n",
+        "    pub struct Iter<'a>(pub &'a u8);\n",
+        "    impl<'a> Iterator for Iter<'a> {\n",
+        "        type Item = u8;\n",
+        "        fn next(&mut self) -> core::Option<Self::Item> { core::Option::None }\n",
+        "    }\n",
+        "}\n",
+        "pub mod b {\n",
+        "    use core::iter::Iterator;\n",
+        "    pub struct Buf(pub u8);\n",
+        "    pub struct Iter<'a>(pub &'a Buf);\n",
+        "    impl Buf {\n",
+        "        pub fn iter<'a>(&'a self) -> Iter<'a> { Iter(self) }\n",
+        "    }\n",
+        "    impl<'a> Iterator for Iter<'a> {\n",
+        "        type Item = &'a u8;\n",
+        "        fn next(&mut self) -> core::Option<Self::Item> { core::Option::None }\n",
+        "    }\n",
+        "}\n",
+        "pub fn bad_same_name_iter() -> Vec<&'static u8> {\n",
+        "    let buf = b::Buf(0);\n",
+        "    buf.iter().collect()\n",
+        "}\n",
+    );
+    let (dir, outline, names) =
+        load_borrow_fixture("iter_env_only_same_name", "2021", &core_src, app_src);
+    let mut cx = Context::new(&outline, &names, Cache::default());
+    run_borrow_on_item(
+        &mut cx,
+        find_app_item(&outline, "bad_same_name_iter"),
+        Substs::EMPTY,
+    )
+    .expect_err("b::Iter with Item = &'a u8 must not inherit a::Iter's Item = u8");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn type_macro_via_body_local_use_and_body_mod_glob_reexport() {
+    use super::soundness_p0::{
+        MIN_CORE_TRAITS, find_app_item, load_borrow_fixture, run_borrow_on_item,
+    };
+    let app_src = concat!(
+        "pub mod plumbing {\n",
+        "    #[macro_export]\n",
+        "    macro_rules! ret_mode_ty {\n",
+        "        ($t:ty) => { $t };\n",
+        "    }\n",
+        "    pub use crate::ret_mode_ty;\n",
+        "}\n",
+        "pub struct Handle;\n",
+        "const _: () = {\n",
+        "    use crate::plumbing as zalsa_;\n",
+        "    impl Handle {\n",
+        "        pub fn get(&self) -> zalsa_::ret_mode_ty!(u32) { 7 }\n",
+        "    }\n",
+        "};\n",
+        "pub fn check_all() -> u32 {\n",
+        "    mod rules {\n",
+        "        pub mod visible {\n",
+        "            pub fn r#grammar_rules() -> u32 { 35 }\n",
+        "        }\n",
+        "        pub use self::visible::*;\n",
+        "    }\n",
+        "    Handle.get() + rules::r#grammar_rules()\n",
+        "}\n",
+    );
+    let (dir, outline, names) = load_borrow_fixture(
+        "body_local_macro_and_glob",
+        "2021",
+        MIN_CORE_TRAITS,
+        app_src,
+    );
+    let mut cx = Context::new(&outline, &names, Cache::default());
+    run_borrow_on_item(&mut cx, find_app_item(&outline, "check_all"), Substs::EMPTY)
+        .expect("body-local type macro and body-local mod glob re-export must type-check");
+    let _ = std::fs::remove_dir_all(&dir);
+}

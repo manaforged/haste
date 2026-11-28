@@ -72,35 +72,6 @@ impl Checker<'_, '_> {
             && !self.ty_holds_borrow(ty)
     }
 
-    pub(in super::super) fn ty_has_non_static_param(&self, ty: Ty) -> bool {
-        if !self.cx.types.has_params(ty) {
-            return false;
-        }
-        match self.cx.types.kind(ty) {
-            Kind::Param(idx) => !self.static_type_params.contains(idx),
-            Kind::Ref(_, inner)
-            | Kind::Ptr(_, inner)
-            | Kind::Slice(inner)
-            | Kind::Array(inner, _)
-            | Kind::Pat(inner, ..) => self.ty_has_non_static_param(*inner),
-            Kind::Adt(_, args) | Kind::Tuple(args) | Kind::FnDef(_, args) => self
-                .cx
-                .types
-                .substs(*args)
-                .iter()
-                .any(|&arg| self.ty_has_non_static_param(arg)),
-            Kind::FnPtr(params, ret) => {
-                self.cx
-                    .types
-                    .substs(*params)
-                    .iter()
-                    .any(|&p| self.ty_has_non_static_param(p))
-                    || self.ty_has_non_static_param(*ret)
-            }
-            _ => true,
-        }
-    }
-
     fn ty_holds_borrow_inner(&mut self, ty: Ty, seen: &mut HashSet<Ty>, include_dyn: bool) -> bool {
         if ty == Ty::NONE || !seen.insert(ty) {
             return false;
@@ -116,6 +87,32 @@ impl Checker<'_, '_> {
                 items
                     .into_iter()
                     .any(|item| self.ty_holds_borrow_inner(item, seen, include_dyn))
+            }
+            Kind::FnPtr(params, ret) | Kind::UnsafeFnPtr(params, ret) => {
+                let params = self.cx.types.substs(params).to_vec();
+                self.ty_holds_borrow_inner(ret, seen, include_dyn)
+                    || params
+                        .into_iter()
+                        .any(|p| self.ty_holds_borrow_inner(p, seen, include_dyn))
+            }
+            Kind::Proj(id) => {
+                let proj = self.cx.types.proj(id);
+                let args = self.cx.types.substs(proj.args).to_vec();
+                let own = self.cx.types.substs(proj.own).to_vec();
+                self.ty_holds_borrow_inner(proj.self_ty, seen, include_dyn)
+                    || args
+                        .into_iter()
+                        .chain(own)
+                        .any(|arg| self.ty_holds_borrow_inner(arg, seen, include_dyn))
+                    || {
+                        let (src, entry) = self.cx.item(proj.assoc);
+                        entry.name.is_some_and(|at| {
+                            src.text(at + 1) == "<"
+                                && crate::body::sig::generics(src, at + 1, entry.end).is_ok_and(
+                                    |g| g.1.params.iter().any(|p| p.kind == GenericKind::Lifetime),
+                                )
+                        })
+                    }
             }
             Kind::Closure(..) => self.closure_ty_holds_borrow(ty, seen, include_dyn),
             Kind::Adt(item, args) => {

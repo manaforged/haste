@@ -13,18 +13,21 @@ use super::scope::type_params;
 use super::unify::{CacheState, replay_obligations};
 use super::{Infer, LocalProjectionKey};
 
-/// An associated type whose `Self` is not known yet: trait, `Self`, trait arguments, name, and the variable that stands for it.
-pub(super) type Projection = (ItemRef, Ty, Vec<Ty>, String, Ty);
+pub(super) type Projection = (ItemRef, Ty, Vec<Ty>, String, Vec<Ty>, Ty);
 type ProjectionKey = (ItemRef, Ty, Substs, crate::names::Sym, Substs);
 
 const SUPER_DEPTH: u32 = 8;
 
 impl Infer<'_, '_> {
     /// The type that `param::name` names, when `param` is `Self` or a type parameter of the frame and a trait that bounds it has the associated type `name`.
-    pub(super) fn param_projection(&mut self, param: &str, name: &str) -> Result<Option<Ty>> {
+    pub(super) fn param_projection(
+        &mut self,
+        param: &str,
+        (name, own): (&str, &[Ty]),
+    ) -> Result<Option<Ty>> {
         if param == "Self"
             && let Some(block) = self.block
-            && let Some(ty) = self.impl_self_alias(block, name)?
+            && let Some(ty) = self.impl_self_alias(block, (name, own))?
         {
             return Ok(Some(ty));
         }
@@ -48,20 +51,24 @@ impl Infer<'_, '_> {
                 .map(|&(_, ty)| ty)
                 .collect();
             if let Some((owner, args)) = self.assoc_owner((of, args), ty, name, 0)? {
-                return self.project(owner, ty, args, name).map(Some);
+                return self.project_own(owner, ty, args, (name, own)).map(Some);
             }
         }
         let Some(bound) = self.bound_trait((param, ty), name, Self::reaches_assoc_ty)? else {
             return Ok(None);
         };
         match self.assoc_owner(bound, ty, name, 0)? {
-            Some((of, args)) => self.project(of, ty, args, name).map(Some),
+            Some((of, args)) => self.project_own(of, ty, args, (name, own)).map(Some),
             None => Ok(None),
         }
     }
 
-    fn impl_self_alias(&mut self, block: ImplRef, name: &str) -> Result<Option<Ty>> {
-        if let Some(ty) = self.impl_alias(block, (name, &[]))? {
+    fn impl_self_alias(
+        &mut self,
+        block: ImplRef,
+        (name, own): (&str, &[Ty]),
+    ) -> Result<Option<Ty>> {
+        if let Some(ty) = self.impl_alias(block, (name, own))? {
             return Ok(Some(ty));
         }
         let (Some(of), Some(self_ty)) = (self.cx.impl_trait(block), self.self_ty) else {
@@ -78,7 +85,9 @@ impl Infer<'_, '_> {
             self.fresh_trait_args(of)?
         };
         match self.assoc_owner((of, args), self_ty, name, 0)? {
-            Some((owner, args)) => self.project(owner, self_ty, args, name).map(Some),
+            Some((owner, args)) => self
+                .project_own(owner, self_ty, args, (name, own))
+                .map(Some),
             None => Ok(None),
         }
     }
@@ -144,7 +153,7 @@ impl Infer<'_, '_> {
         }
         let result = self.fresh(Kind::Var);
         self.projections
-            .push((of, ty, args, name.to_string(), result));
+            .push((of, ty, args, name.to_string(), own.to_vec(), result));
         Ok(result)
     }
 
@@ -416,8 +425,8 @@ impl Infer<'_, '_> {
     pub(in crate::sema) fn settle_projections(&mut self) -> Result<()> {
         let mut at = 0;
         while at < self.projections.len() {
-            let (of, ty, args, name, result) = self.projections[at].clone();
-            match self.picked_alias(of, ty, &args, (&name, &[]))? {
+            let (of, ty, args, name, own, result) = self.projections[at].clone();
+            match self.picked_alias(of, ty, &args, (&name, &own))? {
                 Some(found) => {
                     self.projections.swap_remove(at);
                     self.unify(found, result)?;

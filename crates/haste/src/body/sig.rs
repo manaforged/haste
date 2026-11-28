@@ -463,3 +463,21 @@ pub fn initializer(src: &Source, name: u32, to: u32) -> Option<u32> {
     }
     None
 }
+
+pub fn alias_ty(src: &Source, from: u32, to: u32) -> Result<(Body, TyId, Option<u32>)> {
+    let mut cursor = Cursor::new(src, from, to);
+    let ty = cursor.ty()?;
+    let trailing = cursor.is_word("where").then_some(cursor.at);
+    let _ = cursor.where_clause()?;
+    cursor.finish()?;
+    Ok((cursor.body, ty, trailing))
+}
+
+pub fn parse_where_into(src: &Source, at: u32, to: u32, body: &mut Body) -> Result<Vec<Predicate>> {
+    let mut cursor = Cursor::new(src, at, to);
+    std::mem::swap(&mut cursor.body, body);
+    let predicates = cursor.where_clause()?;
+    cursor.finish()?;
+    std::mem::swap(&mut cursor.body, body);
+    Ok(predicates)
+}

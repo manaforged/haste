@@ -30,8 +30,8 @@ impl Checker<'_, '_> {
         (sig, fn_item): (Option<&Signature>, Option<ItemRef>),
         state: &mut State,
     ) -> Result<()> {
-        let Some((p, recv_ty, recv_interior_mut)) =
-            self.method_recv_target(expr, receiver, recv_mut, sig)
+        let Some((targets, recv_ty, recv_interior_mut)) =
+            self.method_recv_targets(expr, receiver, recv_mut, sig, state)
         else {
             return Ok(());
         };
@@ -60,7 +60,9 @@ impl Checker<'_, '_> {
                     && let Some(item) = fn_item
                     && self.interior_arg_shares_self(s, item, param_ty, &self_lts)
                 {
-                    self.check_local_place_fits_target(arg, &p, src_local, state)?;
+                    for p in &targets {
+                        self.check_local_place_fits_target(arg, p, src_local, state)?;
+                    }
                 }
                 continue;
             }
@@ -68,7 +70,9 @@ impl Checker<'_, '_> {
                 let ae_ty = self.expr_ty(ae);
                 if ae_ty != Ty::NONE && !self.ty_holds_borrow(ae_ty) {
                     if recv_interior_mut && let Some(src_local) = self.expr_plain_local(ae) {
-                        self.check_local_place_fits_target(ae, &p, src_local, state)?;
+                        for p in &targets {
+                            self.check_local_place_fits_target(ae, p, src_local, state)?;
+                        }
                     }
                     continue;
                 }
@@ -89,7 +93,9 @@ impl Checker<'_, '_> {
                         continue;
                     }
                     if recv_interior_mut && let Some(src_local) = self.expr_plain_local(ae) {
-                        self.check_local_place_fits_target(ae, &p, src_local, state)?;
+                        for p in &targets {
+                            self.check_local_place_fits_target(ae, p, src_local, state)?;
+                        }
                     }
                     param_ty_info = Some((item, param_ty));
                 }
@@ -111,45 +117,78 @@ impl Checker<'_, '_> {
                 }
             }
         }
-        if !all_sources.is_empty() {
-            state.set_tuple_sources(p.local, None);
+        for p in &targets {
+            if !all_sources.is_empty() {
+                state.set_tuple_sources(p.local, None);
+            }
+            self.propagate_assign_sources(p, &all_sources, state)?;
         }
-        self.propagate_assign_sources(&p, &all_sources, state)
+        Ok(())
     }
 
-    fn method_recv_target(
+    fn method_recv_targets(
         &mut self,
         expr: ExprId,
         receiver: ExprId,
         recv_mut: bool,
         sig: Option<&Signature>,
-    ) -> Option<(Place, Ty, bool)> {
-        let mut p = self.root_place(receiver)?;
+        state: &State,
+    ) -> Option<(Vec<Place>, Ty, bool)> {
         let self_ty = self.method_self_ty(expr, receiver, sig);
-        let recv_ty = if self_ty != Ty::NONE {
-            self_ty
-        } else {
-            self.local_ty(p.local)
-        };
-        let recv_interior_mut = self.ty_has_borrow_interior_mut(recv_ty);
-        let adjust = self.typed.adjusts.get(&expr).copied();
-        let derefs = adjust.map_or(0, |a| a.derefs);
-        let recv_expr_ty = self.expr_ty(receiver);
-        if derefs > 0 {
-            self.apply_deref_steps(expr, recv_expr_ty, derefs, &mut p);
-        } else if adjust.and_then(|a| a.autoref).is_none()
-            && (self.is_mut_ref_ty(recv_expr_ty)
-                || (self.is_ref_ty(recv_expr_ty) && recv_interior_mut))
-            && sig.is_some_and(recv_is_by_ref)
-        {
-            self.apply_deref_steps(expr, recv_expr_ty, 1, &mut p);
+        if let Some(mut p) = self.root_place(receiver) {
+            let recv_ty = if self_ty != Ty::NONE {
+                self_ty
+            } else {
+                self.local_ty(p.local)
+            };
+            let recv_interior_mut = self.ty_has_borrow_interior_mut(recv_ty);
+            let adjust = self.typed.adjusts.get(&expr).copied();
+            let derefs = adjust.map_or(0, |a| a.derefs);
+            let recv_expr_ty = self.expr_ty(receiver);
+            if derefs > 0 {
+                self.apply_deref_steps(expr, recv_expr_ty, derefs, &mut p);
+            } else if adjust.and_then(|a| a.autoref).is_none()
+                && (self.is_mut_ref_ty(recv_expr_ty)
+                    || (self.is_ref_ty(recv_expr_ty) && recv_interior_mut))
+                && sig.is_some_and(recv_is_by_ref)
+            {
+                self.apply_deref_steps(expr, recv_expr_ty, 1, &mut p);
+            }
+            if (!recv_mut && !self.ty_holds_closure(recv_ty) && !recv_interior_mut)
+                || (!self.ty_holds_borrow(recv_ty) && !recv_interior_mut)
+            {
+                return None;
+            }
+            return Some((vec![p], recv_ty, recv_interior_mut));
         }
-        if (!recv_mut && !self.ty_holds_closure(recv_ty) && !recv_interior_mut)
-            || (!self.ty_holds_borrow(recv_ty) && !recv_interior_mut)
+        if self_ty == Ty::NONE {
+            return None;
+        }
+        let recv_interior_mut = self.ty_has_borrow_interior_mut(self_ty);
+        if (!recv_mut && !recv_interior_mut)
+            || (!self.ty_holds_borrow(self_ty) && !recv_interior_mut)
         {
             return None;
         }
-        Some((p, recv_ty, recv_interior_mut))
+        let mut places = Vec::new();
+        for s in self.expr_borrow_sources(receiver, state) {
+            if (s.mutable || recv_interior_mut)
+                && super::is_temp_target(s.target).is_none()
+                && !places.iter().any(|p: &Place| p.local == s.target)
+            {
+                places.push(Place {
+                    local: s.target,
+                    through_ref: s.through_ref,
+                    through_deref: false,
+                    mut_ref_root: false,
+                    behind_shared: false,
+                    reborrows_shared_field: false,
+                    raw_ptr_prefix: None,
+                    steps: Vec::new(),
+                });
+            }
+        }
+        (!places.is_empty()).then_some((places, self_ty, recv_interior_mut))
     }
 
     fn interior_arg_shares_self(

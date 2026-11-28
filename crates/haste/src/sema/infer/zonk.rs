@@ -173,13 +173,14 @@ impl Infer<'_, '_> {
     pub(super) fn finish_poly(
         mut self,
     ) -> std::result::Result<
-        (Typed, Option<Box<super::poly::PolyState>>, bool),
+        (Typed, Option<Box<super::poly::PolyState>>, bool, bool),
         (anyhow::Error, bool),
     > {
         if let Err(err) = self.settle_all() {
             return Err((err, self.poly_fell_back()));
         }
-        let clean = self.shared_here(None) && self.backlog() == 0 && !self.has_unbound_out_vars();
+        let borrow_clean = self.backlog() == 0 && !self.has_unbound_out_vars();
+        let clean = self.shared_here(None) && borrow_clean;
         let typed = match self.pack_typed() {
             Ok(typed) => typed,
             Err(err) => return Err((err, self.poly_fell_back())),
@@ -188,7 +189,7 @@ impl Infer<'_, '_> {
         if let Some(state) = &mut poly {
             super::poly::zonk_poly_state(&mut self, state);
         }
-        Ok((typed, poly, clean))
+        Ok((typed, poly, clean, borrow_clean))
     }
 
     fn has_unbound_out_vars(&self) -> bool {

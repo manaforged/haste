@@ -157,7 +157,10 @@ impl Infer<'_, '_> {
                 continue;
             }
             let bounds = self.cx.trait_generics(member)?;
-            if bounds.1.supers.len == 0 || substs.len() != params.len() + 1 {
+            if bounds.1.supers.len == 0
+                || substs.len() != params.len() + 1
+                || type_params(&bounds.1.params).next().is_some()
+            {
                 continue;
             }
             let Some(value) =
@@ -541,7 +544,9 @@ impl Infer<'_, '_> {
     }
 
     fn bind_callable(&mut self, arena: &Body, (of, path): (ItemRef, PathId), ty: Ty) -> Result<()> {
-        if angle_args(arena, path).is_some() {
+        if angle_args(arena, path).is_some()
+            || matches!(self.cx.types.kind(self.resolve(ty)), Kind::Var(_))
+        {
             let args = self.bound_args(of, arena, path, ty)?;
             self.bindings_hold(arena, path, (of, ty, &args))?;
         }

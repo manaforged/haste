@@ -408,11 +408,17 @@ impl Checker<'_, '_> {
         outer_live: &HashSet<u32>,
         depth: u32,
     ) -> Result<()> {
+        self.check_index_mut_impl(expr)?;
         if !place_ctx && !self.ty_is_copy(self.expr_ty(expr)) {
             return Err(self.borrow_err(Some(expr), "cannot move out of index"));
         }
         self.check_expr(a, state, true, outer_live, true, depth)?;
-        self.check_expr(b, state, false, outer_live, true, depth)
+        let slice_lock = self.lock_slice_index_base(expr, a, state);
+        let res = self.check_expr(b, state, false, outer_live, true, depth);
+        if let Some(tid) = slice_lock {
+            self.release_temp_holder(state, tid);
+        }
+        res
     }
 
     fn check_binary_expr(

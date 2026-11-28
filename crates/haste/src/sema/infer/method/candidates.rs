@@ -267,12 +267,14 @@ impl Infer<'_, '_> {
         }
         let args = self.fresh_trait_args(candidate.of)?;
         if use_bounds && (candidate.bound.is_some() || !args.is_empty()) {
-            self.assume(
-                candidate.of,
-                &std::iter::once(self_ty)
-                    .chain(args.iter().copied())
-                    .collect::<Vec<_>>(),
-            )?;
+            let substs: Vec<Ty> = std::iter::once(self_ty)
+                .chain(args.iter().copied())
+                .collect();
+            if !self.assume(candidate.of, &substs)? && !args.is_empty() {
+                for (super_of, super_substs) in self.super_bounds(candidate.of, &substs)? {
+                    self.assume(super_of, &super_substs)?;
+                }
+            }
         }
         if self.compiler_impl(candidate.of, self_ty)
             || self.object_holds(candidate.of, self_ty, &args) == Some(true)

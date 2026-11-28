@@ -142,10 +142,12 @@ impl Infer<'_, '_> {
     }
 
     fn note_cast_pointee(&mut self, inner: ExprId, found: Ty, target: Ty) {
-        let Kind::Ptr(_, open) = *self.cx.types.kind(self.resolve(target)) else {
-            return;
+        let defer = match *self.cx.types.kind(self.resolve(target)) {
+            Kind::Var(_) => true,
+            Kind::Ptr(_, open) => self.has_vars(open),
+            _ => false,
         };
-        if self.has_vars(open) {
+        if defer {
             self.casts.push((inner, found, target));
         }
     }

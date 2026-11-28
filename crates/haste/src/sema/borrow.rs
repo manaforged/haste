@@ -554,7 +554,7 @@ impl Checker<'_, '_> {
         }
         if self.closure_depth > 0
             && !src.through_ref
-            && !self.is_ref_ty(self.local_ty(src.target))
+            && !src.origin_only
             && self.closure_by_val_caps.contains(&src.target)
         {
             return true;
