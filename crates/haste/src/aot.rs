@@ -83,6 +83,7 @@ pub(crate) struct Executable {
     pub(super) lines: Vec<(u32, u64)>,
     pub(super) sources: Vec<std::path::PathBuf>,
     pub(crate) extra_libs: Vec<String>,
+    pub panic_abort: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -121,6 +122,7 @@ impl Executable {
             lines: Vec::new(),
             sources: Vec::new(),
             extra_libs: Vec::new(),
+            panic_abort: false,
         }
     }
 

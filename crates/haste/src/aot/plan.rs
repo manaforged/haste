@@ -199,6 +199,7 @@ pub(crate) struct Plan<'a> {
     pub(crate) imports: Vec<PlanImport<'a>>,
     import_index: FxHashMap<&'a str, usize>,
     pub(crate) libs: BTreeSet<&'a str>,
+    panic_abort: bool,
 }
 
 fn collect_dynamic_chunk<'a>(syms: impl Iterator<Item = &'a Symbol>) -> Result<Vec<Binding<'a>>> {
@@ -223,6 +224,7 @@ impl<'a> Plan<'a> {
             imports: Vec::new(),
             import_index: FxHashMap::default(),
             libs: BTreeSet::new(),
+            panic_abort: exe.panic_abort,
         };
         extra_imports
             .iter()
@@ -345,14 +347,25 @@ impl<'a> Plan<'a> {
         (table, walk)
     }
 
+    fn resolve_shim(&self, shim: Shim) -> Shim {
+        if shim == Shim::StartPanic && self.panic_abort {
+            Shim::StartPanicAbort
+        } else {
+            shim
+        }
+    }
+
     fn visit(&mut self, binding: Binding<'a>) {
         match binding {
-            Binding::Shim(shim) if !self.shim_index.contains_key(&shim) => {
-                self.shim_index.insert(shim, self.shims.len());
-                self.shims.push(shim);
-                shims::deps(shim)
-                    .iter()
-                    .for_each(|&dep| self.add_import(dep, None, None));
+            Binding::Shim(shim) => {
+                let shim = self.resolve_shim(shim);
+                if !self.shim_index.contains_key(&shim) {
+                    self.shim_index.insert(shim, self.shims.len());
+                    self.shims.push(shim);
+                    shims::deps(shim)
+                        .iter()
+                        .for_each(|&dep| self.add_import(dep, None, None));
+                }
             }
             Binding::Import {
                 name,
@@ -390,6 +403,7 @@ impl<'a> Plan<'a> {
     }
 
     pub(in crate::aot) fn shim_idx(&self, shim: Shim) -> Result<usize> {
+        let shim = self.resolve_shim(shim);
         self.shim_index
             .get(&shim)
             .copied()

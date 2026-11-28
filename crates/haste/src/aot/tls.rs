@@ -194,7 +194,7 @@ fn arm64_tlv_word(sym: &Symbol, addrs: SectionAddrs, existing: u32) -> Result<u3
     let rn = (existing >> 5) & 0x1F;
     match *sym {
         Symbol::Runtime(_) => {
-            ensure!(addrs.frame_tls != 0, "Arm64TlvCell without frame cache");
+            ensure!(addrs.tlv_desc != 0, "Arm64TlvCell without frame cache");
             let bytes = (existing >> 10) & 0xFFF;
             let total = addrs.frame_tls as u32 + bytes;
             ensure!(
@@ -205,7 +205,7 @@ fn arm64_tlv_word(sym: &Symbol, addrs: SectionAddrs, existing: u32) -> Result<u3
         }
         Symbol::Word(s) => {
             ensure!(
-                addrs.thread_tls != 0,
+                addrs.tlv_desc != 0,
                 "Arm64TlvCell without thread cell table"
             );
             let byte_off = addrs.thread_tls + s * 8;
@@ -217,7 +217,7 @@ fn arm64_tlv_word(sym: &Symbol, addrs: SectionAddrs, existing: u32) -> Result<u3
         }
         Symbol::Host(HostSymbol::ThreadCell) => {
             ensure!(
-                addrs.thread_tls != 0,
+                addrs.tlv_desc != 0,
                 "Arm64TlvCell without thread cell table"
             );
             ensure!(

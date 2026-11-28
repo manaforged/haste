@@ -300,6 +300,7 @@ impl Image {
             (live, fns, counts)
         });
         let mut exe = Executable::new(target);
+        exe.panic_abort = user_panic_abort(cx, reached, user_main);
         if target.format == haste_codegen::Format::MachO {
             collect_macho_frameworks(cx, reached, &live, &mut exe);
         }
@@ -472,6 +473,73 @@ fn collect_exe_symbols(
         }
     }
     out
+}
+
+fn rustflags_panic_abort() -> Option<bool> {
+    let flags: Vec<String> = if let Some(raw) = crate::process_env_var("CARGO_ENCODED_RUSTFLAGS") {
+        if raw.is_empty() {
+            Vec::new()
+        } else {
+            raw.split('\x1f').map(str::to_owned).collect()
+        }
+    } else if let Some(raw) = crate::process_env_var("RUSTFLAGS") {
+        raw.split_whitespace().map(str::to_owned).collect()
+    } else {
+        Vec::new()
+    };
+    let mut abort = None;
+    let mut expect_c_arg = false;
+    for flag in &flags {
+        let opt = if expect_c_arg {
+            expect_c_arg = false;
+            Some(flag.as_str())
+        } else if flag == "-C" || flag == "--codegen" {
+            expect_c_arg = true;
+            None
+        } else {
+            flag.strip_prefix("-C")
+                .or_else(|| flag.strip_prefix("--codegen="))
+        };
+        if let Some(opt) = opt {
+            match opt {
+                "panic=abort" => abort = Some(true),
+                "panic=unwind" => abort = Some(false),
+                _ => {}
+            }
+        }
+    }
+    abort
+}
+
+fn user_panic_abort(
+    cx: &crate::sema::Context<'_>,
+    reached: &crate::sema::reach::Reached,
+    user_main: usize,
+) -> bool {
+    if let Some(abort) = rustflags_panic_abort() {
+        return abort;
+    }
+    let release =
+        crate::config::Config::current().profile == crate::outline::tree::Profile::Release;
+    let main_krate = reached
+        .list
+        .get(user_main)
+        .map(|((item, _), _)| item.krate as usize);
+    let manifest_dir = main_krate
+        .into_iter()
+        .chain(0..cx.outline.crates.len())
+        .filter(|&k| !cx.outline.crates[k].env.fixed)
+        .find_map(|k| {
+            cx.outline.crates[k]
+                .env
+                .vars
+                .iter()
+                .find(|(key, _)| key == "CARGO_MANIFEST_DIR")
+                .map(|(_, val)| std::path::Path::new(val.as_str()))
+        });
+    manifest_dir.is_some_and(|dir| {
+        crate::graph::manifest::profile_panic_for(dir, release).as_deref() == Some("abort")
+    })
 }
 
 fn collect_macho_frameworks(

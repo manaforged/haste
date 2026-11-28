@@ -479,6 +479,7 @@ pub(super) fn emit_shim_arm64(
         Shim::ThreadCell => emit_arm64_thread_cell(&c, addrs.thread_key, out)?,
         Shim::CatchUnwind => unwind::emit_arm64_catch_unwind(&c, addrs, out)?,
         Shim::StartPanic => unwind::emit_arm64_start_panic(&c, addrs, out)?,
+        Shim::StartPanicAbort => c.tail("abort", out)?,
         Shim::PanicCleanup => out.words(&[0xA940_0400, 0xD65F_03C0]),
         Shim::DropPush | Shim::DropPop => {
             emit_arm64_drop_op(&c, shim == Shim::DropPush, addrs, out)?

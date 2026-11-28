@@ -26,7 +26,7 @@ use super::store::{self, FileStamp};
 use super::{Graph, LOCK_FILE, MANIFEST_FILE, Targets, Workspace};
 
 const WS_MAGIC: [u8; 8] = *b"HSTWKS01";
-const WS_VERSION: u32 = 6;
+const WS_VERSION: u32 = 7;
 const HEADER_LEN: usize = 28;
 const MAX_KEPT_SNAPSHOTS: usize = 128;
 

@@ -647,6 +647,7 @@ pub(super) fn emit_shim_x64(
         )?,
         Shim::CatchUnwind => unwind::emit_x64_catch_unwind(&c, addrs, out)?,
         Shim::StartPanic => unwind::emit_x64_start_panic(&c, addrs, out)?,
+        Shim::StartPanicAbort => c.tail("abort", out)?,
         Shim::PanicCleanup => out.bytes(if c.win {
             &[0x48, 0x8B, 0x01, 0x48, 0x8B, 0x51, 0x08, 0xC3]
         } else {

@@ -477,11 +477,15 @@ impl Emit<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::compile;
+    use super::super::super::asm::Asm;
     use super::super::super::features::Features;
+    use super::super::super::frame::classify;
+    use super::super::super::{Emit, REGS, REGS_RBP, keeps_frame_pointer, location};
     use crate::Effort;
+    use crate::emit::Tails;
+    use crate::frame::{Prepared, drive, prepare_split, repack_after_elide};
     use crate::ir::{AbiParam, CallConv, Function, IntCC, Signature, Type};
-    use crate::{FunctionBuilder, Target};
+    use crate::{Code, ConfigScope, FunctionBuilder, Target};
 
     fn x64_full() -> Target {
         let mut target = *Target::find("x86_64-unknown-linux-gnu").expect("x64 linux target");
@@ -489,60 +493,111 @@ mod tests {
         target
     }
 
-    #[test]
-    fn float_select_is_branchless_for_f64_and_f32() {
-        let target = x64_full();
-        let features = Features::for_target(&target);
-        for (ty, avx_opc, sse41_opc) in [(Type::F64, 0x4B_u8, 0x15_u8), (Type::F32, 0x4A, 0x14)] {
-            let mut sig = Signature::new(CallConv::Internal);
-            sig.params = vec![
-                AbiParam::new(Type::I64),
-                AbiParam::new(ty),
-                AbiParam::new(ty),
-            ];
-            sig.returns = vec![AbiParam::new(ty)];
-            let mut func = Function::new(sig);
-            {
-                let mut b = FunctionBuilder::new(&mut func);
-                let entry = b.create_block();
-                b.append_block_params_for_function_params(entry);
-                let p = b.block_params(entry).to_vec();
-                b.switch_to_block(entry);
-                let cmp = b.ins().icmp_imm(IntCC::Equal, p[0], 0);
-                let sel = b.ins().select(cmp, p[1], p[2]);
-                b.ins().return_(&[sel]);
-            }
-            let code = compile(&func, &target).expect("x64 float select compiles");
-            let bytes = code.bytes();
-            assert!(
-                bytes.windows(4).any(|w| w == [0x48, 0x8D, 0x40, 0xFF]),
-                "expected lea rax, [rax - 1] mask build in {bytes:02x?}"
-            );
-            if features.avx {
-                assert!(
-                    bytes.contains(&0xC4) && bytes.contains(&avx_opc),
-                    "expected vblendv opcode {avx_opc:#x} in {bytes:02x?}"
-                );
-            } else if features.sse41 {
-                assert!(
-                    bytes.windows(4).any(|w| w == [0x66, 0x0F, 0x38, sse41_opc]),
-                    "expected blendv opcode {sse41_opc:#x} in {bytes:02x?}"
-                );
-            } else {
-                assert!(
-                    bytes.windows(3).any(|w| w == [0x66, 0x0F, 0x54])
-                        && bytes.windows(3).any(|w| w == [0x66, 0x0F, 0x55])
-                        && bytes.windows(3).any(|w| w == [0x66, 0x0F, 0x56]),
-                    "expected SSE2 andpd/andnpd/orpd in {bytes:02x?}"
-                );
-            }
+    fn compile_with_features(
+        func: &Function,
+        target: &Target,
+        features: Features,
+    ) -> Result<Code, String> {
+        let abi_kind = target.abi;
+        let keeps = keeps_frame_pointer(func);
+        let regs = if keeps { &REGS } else { &REGS_RBP };
+        let (
+            split,
+            Prepared {
+                order,
+                copied,
+                abi,
+                mut plan,
+                mut frame,
+                mut framed,
+            },
+        ) = prepare_split(func, regs, (true, false), |sig| classify(sig, abi_kind))?;
+        let func = split.as_ref().unwrap_or(func);
+        let dropped_before = plan.dropped_count();
+        let (roots, pure_test) = location::fuse(func, &mut plan, &features);
+        if plan.dropped_count() != dropped_before {
+            repack_after_elide(func, &plan, &abi, &mut frame, &mut framed, |sig| {
+                classify(sig, abi_kind)
+            })?;
         }
+        let (base, bias) = if framed && !keeps {
+            (super::Reg::Rsp, frame.size as i32)
+        } else {
+            (super::Reg::Rbp, 0)
+        };
+        let mut asm = Asm::default();
+        asm.avx = features.avx;
+        let blocks = func.blocks.iter().map(|_| asm.label()).collect();
+        let defs = crate::fold::defs(func);
+        let n = func.types.len();
+        let last_block = order.last().copied();
+        let emit = Emit {
+            func,
+            frame,
+            framed,
+            base,
+            bias,
+            abi,
+            abi_kind,
+            asm,
+            blocks,
+            sites: Vec::new(),
+            relocs: Vec::new(),
+            plan,
+            defs,
+            roots,
+            pure_test,
+            flags: None,
+            spills: crate::spills::SpillState::new(crate::spills::pred_totals(
+                func, &order, &copied,
+            )),
+            next: None,
+            last_block,
+            at_end: false,
+            trap_label: None,
+            lines: Vec::new(),
+            features,
+            copied,
+            direct_calls: target.direct_calls,
+            frame_cache: false,
+            cold_calls: Vec::new(),
+            shrink: None,
+            in_fast: false,
+            low_product: None,
+            overflow_read: vec![false; n],
+            adc_sum: vec![false; n],
+            flag_carry: vec![false; n],
+            carry_flags: None,
+            tails: Tails::new(),
+            tail_calls: Vec::new(),
+        };
+        drive(emit, &order)
     }
 
-    #[test]
-    fn float_select_preserves_flags_for_second_consumer() {
-        let target = x64_full();
-        let mut sig = Signature::new(CallConv::Internal);
+    fn build_float_select_fn(call_conv: CallConv, ty: Type) -> Function {
+        let mut sig = Signature::new(call_conv);
+        sig.params = vec![
+            AbiParam::new(Type::I64),
+            AbiParam::new(ty),
+            AbiParam::new(ty),
+        ];
+        sig.returns = vec![AbiParam::new(ty)];
+        let mut func = Function::new(sig);
+        {
+            let mut b = FunctionBuilder::new(&mut func);
+            let entry = b.create_block();
+            b.append_block_params_for_function_params(entry);
+            let p = b.block_params(entry).to_vec();
+            b.switch_to_block(entry);
+            let cmp = b.ins().icmp_imm(IntCC::Equal, p[0], 0);
+            let sel = b.ins().select(cmp, p[1], p[2]);
+            b.ins().return_(&[sel]);
+        }
+        func
+    }
+
+    fn build_shared_flag_select_fn(call_conv: CallConv) -> Function {
+        let mut sig = Signature::new(call_conv);
         sig.params = vec![
             AbiParam::new(Type::I64),
             AbiParam::new(Type::F64),
@@ -563,11 +618,136 @@ mod tests {
             let isel = b.ins().select(cmp, p[3], p[4]);
             b.ins().return_(&[fsel, isel]);
         }
-        let code = compile(&func, &target).expect("x64 shared-flag float select compiles");
+        func
+    }
+
+    #[test]
+    fn float_select_is_branchless_for_f64_and_f32() {
+        let target = x64_full();
+        let sets = [
+            Features::default(),
+            Features {
+                sse41: true,
+                ..Features::default()
+            },
+            Features {
+                sse41: true,
+                avx: true,
+                ..Features::default()
+            },
+        ];
+        for features in sets {
+            for (ty, avx_opc, sse41_opc) in [(Type::F64, 0x4B_u8, 0x15_u8), (Type::F32, 0x4A, 0x14)]
+            {
+                let func = build_float_select_fn(CallConv::Internal, ty);
+                let code = compile_with_features(&func, &target, features)
+                    .expect("x64 float select compiles");
+                let bytes = code.bytes();
+                assert!(
+                    bytes.windows(4).any(|w| w == [0x48, 0x8D, 0x40, 0xFF]),
+                    "expected lea rax, [rax - 1] mask build in {bytes:02x?}"
+                );
+                if features.avx {
+                    assert!(
+                        bytes.contains(&0xC4) && bytes.contains(&avx_opc),
+                        "expected vblendv opcode {avx_opc:#x} in {bytes:02x?}"
+                    );
+                } else if features.sse41 {
+                    assert!(
+                        bytes.windows(4).any(|w| w == [0x66, 0x0F, 0x38, sse41_opc]),
+                        "expected blendv opcode {sse41_opc:#x} in {bytes:02x?}"
+                    );
+                } else {
+                    assert!(
+                        bytes.windows(3).any(|w| w == [0x66, 0x0F, 0x54])
+                            && bytes.windows(3).any(|w| w == [0x66, 0x0F, 0x55])
+                            && bytes.windows(3).any(|w| w == [0x66, 0x0F, 0x56]),
+                        "expected SSE2 andpd/andnpd/orpd in {bytes:02x?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn float_select_preserves_flags_for_second_consumer() {
+        let target = x64_full();
+        let _baseline = ConfigScope::enter(true, false);
+        let func = build_shared_flag_select_fn(CallConv::Internal);
+        let code =
+            super::super::super::compile(&func, &target).expect("x64 shared-flag select compiles");
         assert!(
             code.bytes()
                 .windows(4)
                 .any(|w| w == [0x48, 0x8D, 0x40, 0xFF])
         );
+    }
+
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[test]
+    fn float_select_executes_correctly_across_feature_sets() {
+        #[repr(C)]
+        struct SharedOut {
+            f: f64,
+            i: i64,
+        }
+
+        let target = x64_full();
+        let f64_fn = build_float_select_fn(CallConv::Native, Type::F64);
+        let f32_fn = build_float_select_fn(CallConv::Native, Type::F32);
+        let shared_fn = build_shared_flag_select_fn(CallConv::Native);
+        let mut feature_sets = vec![Features::default()];
+        if std::arch::is_x86_feature_detected!("sse4.1") {
+            feature_sets.push(Features {
+                sse41: true,
+                ..Features::default()
+            });
+        }
+        if std::arch::is_x86_feature_detected!("avx") {
+            feature_sets.push(Features {
+                sse41: true,
+                avx: true,
+                ..Features::default()
+            });
+        }
+
+        let mut mem = crate::Memory::default();
+        for features in feature_sets {
+            let f64_code = compile_with_features(&f64_fn, &target, features)
+                .expect("f64 float select compiles");
+            let f64_addr = mem.write_patched(&f64_code, &[]).expect("map f64 code");
+            // SAFETY: `f64_code` was compiled for SysV x86-64 `CallConv::Native` with `(i64, f64, f64) -> f64`.
+            let run_f64: extern "C" fn(i64, f64, f64) -> f64 =
+                unsafe { std::mem::transmute(f64_addr) };
+            assert_eq!(run_f64(0, 1.5, -0.75).to_bits(), 1.5_f64.to_bits());
+            assert_eq!(run_f64(1, 1.5, -0.75).to_bits(), (-0.75_f64).to_bits());
+            assert_eq!(run_f64(0, -0.0, 3.25).to_bits(), (-0.0_f64).to_bits());
+            assert_eq!(run_f64(-9, -0.0, 3.25).to_bits(), 3.25_f64.to_bits());
+
+            let f32_code = compile_with_features(&f32_fn, &target, features)
+                .expect("f32 float select compiles");
+            let f32_addr = mem.write_patched(&f32_code, &[]).expect("map f32 code");
+            // SAFETY: `f32_code` was compiled for SysV x86-64 `CallConv::Native` with `(i64, f32, f32) -> f32`.
+            let run_f32: extern "C" fn(i64, f32, f32) -> f32 =
+                unsafe { std::mem::transmute(f32_addr) };
+            assert_eq!(run_f32(0, 2.25, -3.5).to_bits(), 2.25_f32.to_bits());
+            assert_eq!(run_f32(42, 2.25, -3.5).to_bits(), (-3.5_f32).to_bits());
+            assert_eq!(run_f32(0, -0.0, 7.5).to_bits(), (-0.0_f32).to_bits());
+
+            let shared_code = compile_with_features(&shared_fn, &target, features)
+                .expect("shared-flag float select compiles");
+            let shared_addr = mem
+                .write_patched(&shared_code, &[])
+                .expect("map shared-flag code");
+            // SAFETY: `shared_code` was compiled for SysV x86-64 `CallConv::Native` returning `(F64, I64)` in `(xmm0, rax)`.
+            let run_shared: extern "C" fn(i64, f64, f64, i64, i64) -> SharedOut =
+                unsafe { std::mem::transmute(shared_addr) };
+            let t = run_shared(0, 12.5, -4.25, 111, 222);
+            assert_eq!(t.f.to_bits(), 12.5_f64.to_bits());
+            assert_eq!(t.i, 111);
+            let f = run_shared(1, 12.5, -4.25, 111, 222);
+            assert_eq!(f.f.to_bits(), (-4.25_f64).to_bits());
+            assert_eq!(f.i, 222);
+        }
     }
 }

@@ -14,7 +14,7 @@ use crate::graph::store::{FileStamp, file_stamp, hash_env_val, write_new_bytes};
 use rustc_hash::FxHasher;
 
 const NOOP_MAGIC: [u8; 8] = *b"HSTNOP03";
-const NOOP_VERSION: u32 = 4;
+const NOOP_VERSION: u32 = 5;
 const HEADER_LEN: usize = 52;
 const TARGET_DIRS: [&str; 5] = ["src", "src/bin", "tests", "examples", "benches"];
 const ROOT_FILES: [&str; 3] = ["src/lib.rs", "src/main.rs", "build.rs"];
