@@ -33,6 +33,16 @@ impl FileIndex {
         Self { files }
     }
 
+    /// Builds a `FileIndex` directly from pre-validated `(file_key -> (krate, file))` pairs.
+    pub(crate) fn from_files(files: HashMap<u64, (u32, u32)>) -> Self {
+        Self { files }
+    }
+
+    /// Iterates every `(file_key, (krate, file))` entry in this index.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&u64, &(u32, u32))> {
+        self.files.iter()
+    }
+
     /// Resolves `record` to its `ItemRef` in this workspace, or `None` when it is body-local, its file is absent or `key_of` disagrees with its key.
     pub(crate) fn resolve(
         &self,

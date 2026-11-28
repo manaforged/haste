@@ -65,6 +65,21 @@ fn cache_from_slot(
     if let Some(sub) = slot.as_ref().and_then(SubstrateSlot::top) {
         cache.set_substrate(Some(sub));
     }
+    if !warm_sysroot_bodies
+        && crate::substrate::enabled()
+        && let Some(ref s) = slot
+    {
+        let key = sema::summary::WarmKey {
+            toolchain_key: s.toolchain_key,
+            deps_key: s.deps_key,
+            target_key: s.target_key,
+            workspace_key: s.workspace_key,
+            release: crate::profile() == crate::outline::tree::Profile::Release,
+        };
+        let backing =
+            crate::substrate::Backing::open(&key.path(), sema::summary::WARM_MIN_LEN).ok();
+        cache.warm_state().set(key, backing);
+    }
     (slot, cache)
 }
 
@@ -169,6 +184,9 @@ pub(super) fn export_pre_summaries(
     drop_finals: bool,
     slot: Option<&SubstrateSlot>,
 ) -> Option<PreBuilders> {
+    if drop_finals {
+        sema::summary::save_warm_if_grown(cx);
+    }
     if !drop_finals || !cx.store().has_new_sysroot_summaries() {
         return None;
     }

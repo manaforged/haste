@@ -43,10 +43,11 @@ impl<'a> Context<'a> {
 
     /// A pass over an outline and its resolved names that reuses `store`.
     pub fn new(outline: &'a Outline, names: &'a Names, mut store: Cache) -> Context<'a> {
+        let flights = super::summary::warm_preload(outline, names, &mut store);
         let types = store.types.clone();
         store.lookups.check(outline);
         let (kids, trait_members, impl_members, aliases, asks) = Default::default();
-        Context {
+        let mut cx = Context {
             outline,
             names,
             types,
@@ -85,7 +86,11 @@ impl<'a> Context<'a> {
             drops_local: HashMap::default(),
             reveals_local: HashMap::default(),
             ty_facts: HashMap::default(),
+        };
+        if let Some(flights) = flights {
+            super::summary::warm_populate_flights(&mut cx, flights);
         }
+        cx
     }
 
     /// A sibling context over the same outline, names, types and caches, with its own empty request list so a worker thread can run without contending on asks.

@@ -1,8 +1,3 @@
-#![expect(
-    dead_code,
-    reason = "the syntax tree records every part of the syntax it parses; sema reads the parts it supports and prints the rest in errors"
-)]
-
 /// An expression in a body's arena.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ExprId(pub u32);
@@ -388,5 +383,5 @@ pub struct Body {
     /// The function's parameter patterns, parsed into this arena when one of them is more than a name.
     pub fn_params: Vec<PatId>,
     /// The interned name of each segment, filled on the first call to `Body::syms`.
-    pub(super) syms: std::sync::OnceLock<Box<[crate::names::Sym]>>,
+    pub(crate) syms: std::sync::OnceLock<Box<[crate::names::Sym]>>,
 }

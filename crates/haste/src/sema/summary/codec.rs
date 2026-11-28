@@ -23,8 +23,8 @@ pub use mono::{decode_typed, decode_verdict, encode_typed, encode_verdict};
 pub use summary::{decode_instance, decode_summary, encode_instance, encode_summary};
 use tables::{read_syntax, write_syntax};
 pub(crate) use wire::{
-    Cursor, TyTable, read_mut, read_site_key, read_str, read_substs, read_ty, write_site_key,
-    write_str, write_u16, write_u32, write_u32s, write_u64,
+    Cursor, TyTable, decode_prim, encode_prim, read_mut, read_site_key, read_str, read_substs,
+    read_ty, write_site_key, write_str, write_u16, write_u32, write_u32s, write_u64, write_u128,
 };
 
 fn framed<F: FnMut(&Outline, ItemRef) -> Option<u64>>(
@@ -38,6 +38,7 @@ fn framed<F: FnMut(&Outline, ItemRef) -> Option<u64>>(
         key_of,
         item_map: HashMap::default(),
         items: Vec::new(),
+        raw_items: None,
         tys: TyTable::default(),
     };
     let mut body = Vec::new();
@@ -81,13 +82,14 @@ fn unframed<T>(
     )
 }
 
-struct Encoder<'a, F> {
-    outline: &'a Outline,
-    types: &'a Types,
+pub(super) struct Encoder<'a, F> {
+    pub(super) outline: &'a Outline,
+    pub(super) types: &'a Types,
     key_of: &'a mut F,
     item_map: HashMap<ItemRef, u32>,
     items: Vec<ItemRecord>,
-    tys: TyTable,
+    raw_items: Option<Vec<ItemRef>>,
+    pub(super) tys: TyTable,
 }
 
 fn intern_item<F: FnMut(&Outline, ItemRef) -> Option<u64>>(
@@ -95,60 +97,88 @@ fn intern_item<F: FnMut(&Outline, ItemRef) -> Option<u64>>(
     key_of: &mut F,
     item_map: &mut HashMap<ItemRef, u32>,
     items: &mut Vec<ItemRecord>,
+    raw_items: &mut Option<Vec<ItemRef>>,
     item: ItemRef,
 ) -> Option<u32> {
     if let Some(&idx) = item_map.get(&item) {
         return Some(idx);
     }
-    let record = ItemRecord::of(outline, item, key_of)?;
-    let idx = items.len() as u32;
-    items.push(record);
+    let idx = if let Some(raw) = raw_items.as_mut() {
+        key_of(outline, item)?;
+        let idx = raw.len() as u32;
+        raw.push(item);
+        idx
+    } else {
+        let record = ItemRecord::of(outline, item, key_of)?;
+        let idx = items.len() as u32;
+        items.push(record);
+        idx
+    };
     item_map.insert(item, idx);
     Some(idx)
 }
 
-impl<F: FnMut(&Outline, ItemRef) -> Option<u64>> Encoder<'_, F> {
-    fn item_id(&mut self, item: ItemRef) -> Option<u32> {
+impl<'a, F: FnMut(&Outline, ItemRef) -> Option<u64>> Encoder<'a, F> {
+    pub(super) fn new_raw(outline: &'a Outline, types: &'a Types, key_of: &'a mut F) -> Self {
+        Self {
+            outline,
+            types,
+            key_of,
+            item_map: HashMap::default(),
+            items: Vec::new(),
+            raw_items: Some(Vec::new()),
+            tys: TyTable::default(),
+        }
+    }
+
+    pub(super) fn finish_raw(self) -> (Vec<ItemRef>, TyTable) {
+        (self.raw_items.unwrap_or_default(), self.tys)
+    }
+
+    pub(super) fn item_id(&mut self, item: ItemRef) -> Option<u32> {
         intern_item(
             self.outline,
             self.key_of,
             &mut self.item_map,
             &mut self.items,
+            &mut self.raw_items,
             item,
         )
     }
 
-    fn substs_ids(&mut self, substs: Substs) -> Option<Vec<u32>> {
-        let (outline, key_of, item_map, items) = (
+    pub(super) fn substs_ids(&mut self, substs: Substs) -> Option<Vec<u32>> {
+        let (outline, key_of, item_map, items, raw_items) = (
             self.outline,
             &mut *self.key_of,
             &mut self.item_map,
             &mut self.items,
+            &mut self.raw_items,
         );
         self.tys.substs_ids(self.types, substs, &mut |i| {
-            intern_item(outline, key_of, item_map, items, i)
+            intern_item(outline, key_of, item_map, items, raw_items, i)
         })
     }
 
-    fn ty_id(&mut self, ty: Ty) -> Option<u32> {
-        let (outline, key_of, item_map, items) = (
+    pub(super) fn ty_id(&mut self, ty: Ty) -> Option<u32> {
+        let (outline, key_of, item_map, items, raw_items) = (
             self.outline,
             &mut *self.key_of,
             &mut self.item_map,
             &mut self.items,
+            &mut self.raw_items,
         );
         self.tys.ty_id(self.types, ty, &mut |i| {
-            intern_item(outline, key_of, item_map, items, i)
+            intern_item(outline, key_of, item_map, items, raw_items, i)
         })
     }
 
-    fn write_substs(&mut self, out: &mut Vec<u8>, s: Substs) -> Option<()> {
+    pub(super) fn write_substs(&mut self, out: &mut Vec<u8>, s: Substs) -> Option<()> {
         let ids = self.substs_ids(s)?;
         write_u32s(out, &ids);
         Some(())
     }
 
-    fn write_tys(&mut self, out: &mut Vec<u8>, tys: &[Ty]) -> Option<()> {
+    pub(super) fn write_tys(&mut self, out: &mut Vec<u8>, tys: &[Ty]) -> Option<()> {
         write_u32(out, tys.len() as u32);
         for &t in tys {
             write_u32(out, self.ty_id(t)?);
@@ -156,7 +186,7 @@ impl<F: FnMut(&Outline, ItemRef) -> Option<u64>> Encoder<'_, F> {
         Some(())
     }
 
-    fn write_proj_def(&mut self, out: &mut Vec<u8>, pid: ProjId) -> Option<()> {
+    pub(super) fn write_proj_def(&mut self, out: &mut Vec<u8>, pid: ProjId) -> Option<()> {
         let d = self.types.proj(pid);
         write_u32(out, self.item_id(d.of)?);
         write_u32(out, self.ty_id(d.self_ty)?);
@@ -179,7 +209,7 @@ impl<F: FnMut(&Outline, ItemRef) -> Option<u64>> Encoder<'_, F> {
         Some(())
     }
 
-    fn write_res(&mut self, out: &mut Vec<u8>, r: &Res) -> Option<()> {
+    pub(super) fn write_res(&mut self, out: &mut Vec<u8>, r: &Res) -> Option<()> {
         match *r {
             Res::Local(id) => {
                 out.push(0);
@@ -220,14 +250,18 @@ impl<F: FnMut(&Outline, ItemRef) -> Option<u64>> Encoder<'_, F> {
     }
 }
 
-struct Decoder<'a> {
-    types: &'a Types,
+pub(super) struct Decoder<'a> {
+    pub(super) types: &'a Types,
     items: &'a [ItemRef],
     tys: &'a [Ty],
 }
 
-impl Decoder<'_> {
-    fn ty(&self, idx: u32) -> Result<Ty> {
+impl<'a> Decoder<'a> {
+    pub(super) fn new(types: &'a Types, items: &'a [ItemRef], tys: &'a [Ty]) -> Self {
+        Self { types, items, tys }
+    }
+
+    pub(super) fn ty(&self, idx: u32) -> Result<Ty> {
         if idx == u32::MAX {
             return Ok(Ty::NONE);
         }
@@ -237,22 +271,22 @@ impl Decoder<'_> {
             .context("type index out of bounds")
     }
 
-    fn read_ty_ref(&self, cur: &mut Cursor<'_>) -> Result<Ty> {
+    pub(super) fn read_ty_ref(&self, cur: &mut Cursor<'_>) -> Result<Ty> {
         self.ty(cur.u32()?)
     }
 
-    fn item(&self, idx: u32) -> Result<ItemRef> {
+    pub(super) fn item(&self, idx: u32) -> Result<ItemRef> {
         self.items
             .get(idx as usize)
             .copied()
             .context("item index out of bounds")
     }
 
-    fn read_item_ref(&self, cur: &mut Cursor<'_>) -> Result<ItemRef> {
+    pub(super) fn read_item_ref(&self, cur: &mut Cursor<'_>) -> Result<ItemRef> {
         self.item(cur.u32()?)
     }
 
-    fn substs(&self, cur: &mut Cursor<'_>) -> Result<Substs> {
+    pub(super) fn substs(&self, cur: &mut Cursor<'_>) -> Result<Substs> {
         let ids = cur
             .u32s()?
             .into_iter()
@@ -261,11 +295,11 @@ impl Decoder<'_> {
         Ok(self.types.intern_substs(&ids))
     }
 
-    fn read_tys(&self, cur: &mut Cursor<'_>) -> Result<Vec<Ty>> {
+    pub(super) fn read_tys(&self, cur: &mut Cursor<'_>) -> Result<Vec<Ty>> {
         read_vec(cur, |c| self.read_ty_ref(c))
     }
 
-    fn read_proj_def(&self, cur: &mut Cursor<'_>) -> Result<ProjId> {
+    pub(super) fn read_proj_def(&self, cur: &mut Cursor<'_>) -> Result<ProjId> {
         Ok(self.types.intern_proj(ProjDef {
             of: self.read_item_ref(cur)?,
             self_ty: self.read_ty_ref(cur)?,
@@ -282,7 +316,7 @@ impl Decoder<'_> {
         .into_boxed_slice())
     }
 
-    fn res(&self, cur: &mut Cursor<'_>) -> Result<Res> {
+    pub(super) fn res(&self, cur: &mut Cursor<'_>) -> Result<Res> {
         Ok(match cur.u8()? {
             0 => Res::Local(cur.u32()?),
             1 => Res::Fn(self.read_item_ref(cur)?, self.substs(cur)?),
@@ -308,7 +342,7 @@ impl Decoder<'_> {
     }
 }
 
-fn write_opt<T>(
+pub(super) fn write_opt<T>(
     out: &mut Vec<u8>,
     opt: Option<&T>,
     mut f: impl FnMut(&mut Vec<u8>, &T) -> Option<()>,
@@ -325,18 +359,18 @@ fn write_opt<T>(
     }
 }
 
-fn read_opt<T>(
+pub(super) fn read_opt<T>(
     cur: &mut Cursor<'_>,
     f: impl FnOnce(&mut Cursor<'_>) -> Result<T>,
 ) -> Result<Option<T>> {
     Ok(if cur.u8()? != 0 { Some(f(cur)?) } else { None })
 }
 
-fn read_vec<T>(
+pub(super) fn read_vec<T>(
     cur: &mut Cursor<'_>,
     mut f: impl FnMut(&mut Cursor<'_>) -> Result<T>,
 ) -> Result<Vec<T>> {
-    (0..cur.u32()?).map(|_| f(cur)).collect()
+    (0..cur.count()?).map(|_| f(cur)).collect()
 }
 
 fn read_expr_ids(cur: &mut Cursor<'_>) -> Result<Vec<ExprId>> {

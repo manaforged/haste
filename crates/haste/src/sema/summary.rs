@@ -4,8 +4,17 @@ pub(super) mod frozen;
 mod inst;
 mod prepare;
 pub(super) mod thaw;
+mod warm;
+mod warm_abi;
+mod warm_body;
+mod warm_decode;
+mod warm_encode;
+mod warm_expr;
+mod warm_sig;
 
 pub use inst::{PolyCheck, PolyInst};
+pub(crate) use warm::{WARM_MIN_LEN, WarmKey, WarmState, save_warm_if_grown};
+pub(super) use warm::{warm_populate_flights, warm_preload};
 
 use std::sync::{Arc, OnceLock};
 

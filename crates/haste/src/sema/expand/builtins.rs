@@ -309,3 +309,102 @@ fn position(run: Run<'_>, site: Site, input: (u32, u32), out: &mut Tokens) {
         )),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use rustc_hash::FxHashMap as HashMap;
+
+    use crate::body::literal::string_bytes;
+    use crate::names::{ModRef, Names};
+    use crate::outline::source::{Source, Tokens};
+    use crate::outline::tree::{Crate, File};
+    use crate::outline::{Outline, Role, Root};
+    use crate::sema::builtin::Builtin;
+    use crate::sema::expand::writer::{Run, Writer};
+    use crate::sema::{Cache, Context};
+
+    use super::Site;
+
+    #[test]
+    fn include_bytes_preserves_detect_compiler_family_c_bytes() {
+        let dir = std::env::temp_dir().join(format!("haste_include_bytes_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let c_file = dir.join("detect_compiler_family.c");
+        let payload = concat!(
+            "#ifdef __clang__\n",
+            "clang\n",
+            "#else\n",
+            "#ifdef __GNUC__\n",
+            "gcc\n",
+            "#endif\n",
+            "#endif\n",
+        );
+        std::fs::write(&c_file, payload).expect("write c probe");
+
+        let rs_path = dir.join("tool.rs");
+        let call_src = Source::parse(rs_path.clone(), "(\"detect_compiler_family.c\")".to_owned())
+            .expect("parse call args");
+        let mut krate = Crate::default();
+        krate.files.push(Arc::new(File::new(
+            Source::parse(PathBuf::from(&rs_path), "fn main() {}".to_owned()).expect("parse dummy"),
+            Default::default(),
+            false,
+        )));
+        let outline = Outline {
+            roots: vec![Root {
+                unit: 0,
+                name: "cc".to_owned(),
+                path: rs_path.clone(),
+                edition: "2021".to_owned(),
+                role: Role::Lib,
+                proc_macro: false,
+            }],
+            crates: vec![krate],
+            deps: vec![Vec::new()],
+            cache: Default::default(),
+            procs: HashMap::default(),
+            pins: vec![None],
+        };
+        let names = Names::default();
+        let mut cx = Context::new(&outline, &names, Cache::default());
+        let writer = Writer {
+            out: Tokens::default(),
+            calls: HashMap::default(),
+            offset: 0,
+            home: ModRef {
+                krate: 0,
+                module: 0,
+            },
+            locals: Vec::new(),
+            uses: Vec::new(),
+            globs: Vec::new(),
+            externs: Vec::new(),
+        };
+        let run = Run {
+            src: &call_src,
+            from: 0,
+            shift: 0,
+            depth: 0,
+            call: (&call_src, 0),
+        };
+        let site = Site {
+            builtin: Builtin::IncludeBytes,
+            krate: 0,
+            start: 0,
+            open: 0,
+        };
+        let mut out = Tokens::default();
+        let expanded = writer
+            .builtin(&mut cx, run, site, &mut out)
+            .expect("include_bytes expands");
+        assert!(expanded);
+        let tokens = out.finish(rs_path).expect("finish tokens");
+        let decoded = string_bytes(tokens.text(0)).expect("decode byte string");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(decoded.len(), payload.len());
+        assert_eq!(decoded.as_slice(), payload.as_bytes());
+    }
+}

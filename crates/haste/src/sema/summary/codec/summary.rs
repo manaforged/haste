@@ -84,7 +84,11 @@ pub fn decode_instance(
 }
 
 impl<F: FnMut(&Outline, ItemRef) -> Option<u64>> Encoder<'_, F> {
-    fn write_summary(&mut self, out: &mut Vec<u8>, s: &PolySummary) -> Option<()> {
+    pub(in crate::sema::summary) fn write_summary(
+        &mut self,
+        out: &mut Vec<u8>,
+        s: &PolySummary,
+    ) -> Option<()> {
         write_u16(out, s.param_count);
         write_opt(out, s.ret.as_ref(), |out, t| {
             write_u32(out, self.ty_id(*t)?);
@@ -251,7 +255,10 @@ impl<F: FnMut(&Outline, ItemRef) -> Option<u64>> Encoder<'_, F> {
 }
 
 impl Decoder<'_> {
-    fn read_summary(&self, cur: &mut Cursor<'_>) -> Result<PolySummary> {
+    pub(in crate::sema::summary) fn read_summary(
+        &self,
+        cur: &mut Cursor<'_>,
+    ) -> Result<PolySummary> {
         let param_count = cur.u16()?;
         let ret = read_opt(cur, |c| self.read_ty_ref(c))?;
         let locals = read_vec(cur, |c| {
