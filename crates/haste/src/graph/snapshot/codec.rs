@@ -298,27 +298,26 @@ pub(super) fn write_package(out: &mut Vec<u8>, pkg: &Package) -> Option<()> {
     Some(())
 }
 
-pub(super) fn read_package(cur: &mut Cursor<'_>) -> Result<Package> {
-    let locked = Locked {
+fn read_locked(cur: &mut Cursor<'_>) -> Result<Locked> {
+    Ok(Locked {
         name: read_str(cur)?.to_owned(),
         version: semver::Version::parse(read_str(cur)?).context("invalid locked version")?,
         source: read_opt_str(cur)?,
         checksum: read_opt_str(cur)?,
         dependencies: read_strs(cur)?,
-    };
-    let dir = read_path(cur)?;
-    let name = read_str(cur)?.to_owned();
-    let version = read_opt_str(cur)?
-        .map(|s| semver::Version::parse(&s))
-        .transpose()
-        .context("invalid manifest version")?;
-    let edition = read_str(cur)?.to_owned();
-    let resolver = match cur.u8()? {
+    })
+}
+
+fn read_resolver(cur: &mut Cursor<'_>) -> Result<Option<u8>> {
+    Ok(match cur.u8()? {
         0 => None,
         v @ 1..=3 => Some(v),
         other => bail!("invalid resolver tag {other}"),
-    };
-    let meta = PackageMeta {
+    })
+}
+
+fn read_package_meta(cur: &mut Cursor<'_>) -> Result<PackageMeta> {
+    Ok(PackageMeta {
         authors: read_str(cur)?.to_owned(),
         description: read_str(cur)?.to_owned(),
         homepage: read_str(cur)?.to_owned(),
@@ -327,7 +326,65 @@ pub(super) fn read_package(cur: &mut Cursor<'_>) -> Result<Package> {
         license_file: read_str(cur)?.to_owned(),
         readme: read_str(cur)?.to_owned(),
         rust_version: read_str(cur)?.to_owned(),
-    };
+    })
+}
+
+fn read_features(cur: &mut Cursor<'_>) -> Result<BTreeMap<String, Vec<String>>> {
+    let feat_len = cur.count()?;
+    let mut features = BTreeMap::new();
+    for _ in 0..feat_len {
+        let k = read_str(cur)?.to_owned();
+        let v = read_strs(cur)?;
+        features.insert(k, v);
+    }
+    Ok(features)
+}
+
+fn read_dep(cur: &mut Cursor<'_>) -> Result<Dep> {
+    let key = read_str(cur)?.to_owned();
+    let package = read_str(cur)?.to_owned();
+    let req = read_opt_str(cur)?
+        .map(|s| semver::VersionReq::parse(&s))
+        .transpose()
+        .context("invalid dep req")?;
+    let path = read_opt_path(cur)?;
+    let optional = cur.u8()? != 0;
+    let default_features = cur.u8()? != 0;
+    let dfeatures = read_strs(cur)?;
+    let kind = kind_from_tag(cur.u8()?)?;
+    let platform = read_opt_str(cur)?;
+    Ok(Dep {
+        key,
+        package,
+        req,
+        path,
+        optional,
+        default_features,
+        features: dfeatures,
+        kind,
+        platform,
+    })
+}
+
+fn read_deps(cur: &mut Cursor<'_>) -> Result<Vec<Dep>> {
+    let dep_len = cur.count()?;
+    let mut deps = Vec::with_capacity(dep_len);
+    for _ in 0..dep_len {
+        deps.push(read_dep(cur)?);
+    }
+    Ok(deps)
+}
+
+fn read_manifest(cur: &mut Cursor<'_>) -> Result<Manifest> {
+    let dir = read_path(cur)?;
+    let name = read_str(cur)?.to_owned();
+    let version = read_opt_str(cur)?
+        .map(|s| semver::Version::parse(&s))
+        .transpose()
+        .context("invalid manifest version")?;
+    let edition = read_str(cur)?.to_owned();
+    let resolver = read_resolver(cur)?;
+    let meta = read_package_meta(cur)?;
     let links = read_opt_str(cur)?;
     let default_run = read_opt_str(cur)?;
     let build = read_opt_path(cur)?;
@@ -338,41 +395,9 @@ pub(super) fn read_package(cur: &mut Cursor<'_>) -> Result<Package> {
     let examples = read_targets(cur)?;
     let tests = read_targets(cur)?;
     let benches = read_targets(cur)?;
-    let feat_len = cur.count()?;
-    let mut features = BTreeMap::new();
-    for _ in 0..feat_len {
-        let k = read_str(cur)?.to_owned();
-        let v = read_strs(cur)?;
-        features.insert(k, v);
-    }
-    let dep_len = cur.count()?;
-    let mut deps = Vec::with_capacity(dep_len);
-    for _ in 0..dep_len {
-        let key = read_str(cur)?.to_owned();
-        let package = read_str(cur)?.to_owned();
-        let req = read_opt_str(cur)?
-            .map(|s| semver::VersionReq::parse(&s))
-            .transpose()
-            .context("invalid dep req")?;
-        let path = read_opt_path(cur)?;
-        let optional = cur.u8()? != 0;
-        let default_features = cur.u8()? != 0;
-        let dfeatures = read_strs(cur)?;
-        let kind = kind_from_tag(cur.u8()?)?;
-        let platform = read_opt_str(cur)?;
-        deps.push(Dep {
-            key,
-            package,
-            req,
-            path,
-            optional,
-            default_features,
-            features: dfeatures,
-            kind,
-            platform,
-        });
-    }
-    let manifest = Manifest {
+    let features = read_features(cur)?;
+    let deps = read_deps(cur)?;
+    Ok(Manifest {
         dir,
         name,
         version,
@@ -391,7 +416,12 @@ pub(super) fn read_package(cur: &mut Cursor<'_>) -> Result<Package> {
         benches,
         features,
         deps,
-    };
+    })
+}
+
+pub(super) fn read_package(cur: &mut Cursor<'_>) -> Result<Package> {
+    let locked = read_locked(cur)?;
+    let manifest = read_manifest(cur)?;
     let res_len = cur.count()?;
     let mut resolved = BTreeMap::new();
     for _ in 0..res_len {

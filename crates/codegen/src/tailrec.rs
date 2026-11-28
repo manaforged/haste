@@ -196,6 +196,56 @@ fn kill_dead_value(func: &mut Function, def_inst: &[Option<Inst>], val: Value) -
     next
 }
 
+fn stack_addr_reaches_tail(func: &Function, cases: &[(usize, TailCase)]) -> bool {
+    let mut is_stack_addr = vec![false; func.types.len()];
+    let mut any_stack_addr = false;
+    for data in &func.insts {
+        if matches!(data.op, Op::StackAddr(..))
+            && let Some(res) = data.result
+        {
+            is_stack_addr[res.index()] = true;
+            any_stack_addr = true;
+        }
+    }
+    if !any_stack_addr {
+        return false;
+    }
+    let cfg = func.cfg();
+    let mut can_reach_tail = vec![false; func.blocks.len()];
+    let mut work = Vec::with_capacity(cases.len());
+    for &(b_idx, _) in cases {
+        if !can_reach_tail[b_idx] {
+            can_reach_tail[b_idx] = true;
+            work.push(b_idx);
+        }
+    }
+    while let Some(b_idx) = work.pop() {
+        for &pred in cfg.preds_of(Block(b_idx as u32)) {
+            if !can_reach_tail[pred.index()] {
+                can_reach_tail[pred.index()] = true;
+                work.push(pred.index());
+            }
+        }
+    }
+    for (b_idx, block) in func.blocks.iter().enumerate() {
+        if !can_reach_tail[b_idx] {
+            continue;
+        }
+        for &inst in &block.insts {
+            let mut hits = false;
+            func.insts[inst.index()].op.for_operands(|v| {
+                if is_stack_addr[v.index()] {
+                    hits = true;
+                }
+            });
+            if hits {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Turns self-recursive tail calls into loops and splits call-crossing invariants into call-free innermost loops.
 pub(crate) fn run(func: &mut Function, target: &crate::Target) -> Domain {
     let mut changed = elim_tail_rec(func);
@@ -232,10 +282,7 @@ fn elim_tail_rec(func: &mut Function) -> Domain {
             return Domain::NONE;
         }
         for &inst in &block.insts {
-            if matches!(
-                func.insts[inst.index()].op,
-                Op::StackAddr(..) | Op::TryCall { .. }
-            ) {
+            if matches!(func.insts[inst.index()].op, Op::TryCall { .. }) {
                 return Domain::NONE;
             }
         }
@@ -272,7 +319,7 @@ fn elim_tail_rec(func: &mut Function) -> Domain {
         }
         cases.push((block, case));
     }
-    if cases.is_empty() {
+    if cases.is_empty() || stack_addr_reaches_tail(func, &cases) {
         return Domain::NONE;
     }
     let accum_ret_ty = accum_op.and_then(|_| {

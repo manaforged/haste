@@ -14,6 +14,7 @@ use super::super::calls::lifetimes::collect_ty_lifetimes;
 use super::super::calls::{
     Lifetimes, lifetime_outlives, pred_matches_name, recv_is_by_ref, ty_shares_name,
 };
+use super::super::places::Place;
 use super::super::propagate::{BorrowSource, unwrap_container_loans};
 use super::super::{Checker, State};
 use super::is_temp_target;
@@ -29,33 +30,11 @@ impl Checker<'_, '_> {
         (sig, fn_item): (Option<&Signature>, Option<ItemRef>),
         state: &mut State,
     ) -> Result<()> {
-        let Some(mut p) = self.root_place(receiver) else {
+        let Some((p, recv_ty, recv_interior_mut)) =
+            self.method_recv_target(expr, receiver, recv_mut, sig)
+        else {
             return Ok(());
         };
-        let self_ty = self.method_self_ty(expr, receiver, sig);
-        let recv_ty = if self_ty != Ty::NONE {
-            self_ty
-        } else {
-            self.local_ty(p.local)
-        };
-        let recv_interior_mut = self.ty_has_borrow_interior_mut(recv_ty);
-        let adjust = self.typed.adjusts.get(&expr).copied();
-        let derefs = adjust.map_or(0, |a| a.derefs);
-        let recv_expr_ty = self.expr_ty(receiver);
-        if derefs > 0 {
-            self.apply_deref_steps(expr, recv_expr_ty, derefs, &mut p);
-        } else if adjust.and_then(|a| a.autoref).is_none()
-            && (self.is_mut_ref_ty(recv_expr_ty)
-                || (self.is_ref_ty(recv_expr_ty) && recv_interior_mut))
-            && sig.is_some_and(recv_is_by_ref)
-        {
-            self.apply_deref_steps(expr, recv_expr_ty, 1, &mut p);
-        }
-        if (!recv_mut && !self.ty_holds_closure(recv_ty) && !recv_interior_mut)
-            || (!self.ty_holds_borrow(recv_ty) && !recv_interior_mut)
-        {
-            return Ok(());
-        }
         let fn_item = fn_item.or_else(|| match self.typed.res.get(&expr).copied() {
             Some(Res::Fn(item, _)) => Some(item),
             _ => None,
@@ -79,36 +58,13 @@ impl Checker<'_, '_> {
                     && let Some(s) = sig
                     && let Some(&(_, param_ty)) = s.params.get(idx)
                     && let Some(item) = fn_item
+                    && self.interior_arg_shares_self(s, item, param_ty, &self_lts)
                 {
-                    let sig_src = self.cx.item(item).0;
-                    let mut p_lts = Lifetimes::default();
-                    collect_ty_lifetimes(&s.body, sig_src, param_ty, &mut p_lts);
-                    let shares = p_lts.named.iter().any(|n| self_lts.named.contains(n))
-                        || ty_shares_name(&s.body, sig_src, param_ty, &self_lts.names)
-                        || self.generic_param_ties_to_self(s, sig_src, &p_lts, &self_lts);
-                    if shares {
-                        self.check_local_place_fits_target(arg, &p, src_local, state)?;
-                    }
+                    self.check_local_place_fits_target(arg, &p, src_local, state)?;
                 }
                 continue;
             }
-            let pairs: Vec<(Option<TyId>, ExprId, bool)> = if let Some(s) = sig
-                && let Some(&(_, param_ty)) = s.params.get(idx)
-            {
-                match (s.body.ty(param_ty), *self.body.expr(arg)) {
-                    (AstTy::Tuple(ptys), Expr::Tuple(aexprs)) if ptys.len == aexprs.len => s
-                        .body
-                        .list(*ptys)
-                        .iter()
-                        .zip(self.body.list(aexprs))
-                        .map(|(&pt, &ae)| (Some(TyId(pt)), ExprId(ae), false))
-                        .collect(),
-                    _ => vec![(Some(param_ty), arg, true)],
-                }
-            } else {
-                vec![(None, arg, true)]
-            };
-            for (param_ty_opt, ae, use_pre) in pairs {
+            for (param_ty_opt, ae, use_pre) in self.method_arg_pairs(sig, idx, arg) {
                 let ae_ty = self.expr_ty(ae);
                 if ae_ty != Ty::NONE && !self.ty_holds_borrow(ae_ty) {
                     if recv_interior_mut && let Some(src_local) = self.expr_plain_local(ae) {
@@ -123,24 +79,12 @@ impl Checker<'_, '_> {
                     && let Some(item) = fn_item
                     && let Some(param_ty) = param_ty_opt
                 {
-                    let (sig_src, _) = self.cx.item(item);
-                    let mut p_lts = Lifetimes::default();
-                    collect_ty_lifetimes(&s.body, sig_src, param_ty, &mut p_lts);
-                    is_fresh_ref = matches!(s.body.ty(param_ty), AstTy::Ref { lifetime: None, .. });
-                    if let AstTy::ImplTrait(_, bounds) = *s.body.ty(param_ty) {
-                        let has_lt = s.body.list(bounds).iter().any(|&b| {
-                            matches!(s.body.bounds[b as usize], Bound::Lifetime(lt)
-                                if self_lts.named.contains(&sig_src.text(lt))
-                                    || sig_src.text(lt) == "'static")
-                        });
-                        if !has_lt {
-                            arg_keep_env = false;
-                        }
+                    let (fresh_ref, bounds_keep_env, shares_self) =
+                        self.param_ties_to_self(s, item, param_ty, &self_lts);
+                    is_fresh_ref = fresh_ref;
+                    if !bounds_keep_env {
+                        arg_keep_env = false;
                     }
-                    let shares_self = p_lts.named.iter().any(|n| self_lts.named.contains(n))
-                        || (!is_fresh_ref
-                            && ty_shares_name(&s.body, sig_src, param_ty, &self_lts.names))
-                        || self.generic_param_ties_to_self(s, sig_src, &p_lts, &self_lts);
                     if !shares_self {
                         continue;
                     }
@@ -155,12 +99,9 @@ impl Checker<'_, '_> {
                         self.matching_adt_arg_sources(expr, ae, s, item, param_ty, &self_lts, state)
                 {
                     filtered
-                } else if is_fresh_ref {
-                    self.copied_arg_borrow_sources(expr, ae, state)
-                } else if use_pre && let Some(pre) = pre_arg_sources.get(idx) {
-                    pre.clone()
                 } else {
-                    self.expr_borrow_sources(ae, state)
+                    let pre = pre_arg_sources.get(idx).filter(|_| use_pre);
+                    self.fallback_arg_sources(expr, ae, is_fresh_ref, pre, state)
                 };
                 for s in self.unwrap_collection_arg_sources(ae, ae_ty, recv_ty, arg_sources, state)
                 {
@@ -174,6 +115,122 @@ impl Checker<'_, '_> {
             state.set_tuple_sources(p.local, None);
         }
         self.propagate_assign_sources(&p, &all_sources, state)
+    }
+
+    fn method_recv_target(
+        &mut self,
+        expr: ExprId,
+        receiver: ExprId,
+        recv_mut: bool,
+        sig: Option<&Signature>,
+    ) -> Option<(Place, Ty, bool)> {
+        let mut p = self.root_place(receiver)?;
+        let self_ty = self.method_self_ty(expr, receiver, sig);
+        let recv_ty = if self_ty != Ty::NONE {
+            self_ty
+        } else {
+            self.local_ty(p.local)
+        };
+        let recv_interior_mut = self.ty_has_borrow_interior_mut(recv_ty);
+        let adjust = self.typed.adjusts.get(&expr).copied();
+        let derefs = adjust.map_or(0, |a| a.derefs);
+        let recv_expr_ty = self.expr_ty(receiver);
+        if derefs > 0 {
+            self.apply_deref_steps(expr, recv_expr_ty, derefs, &mut p);
+        } else if adjust.and_then(|a| a.autoref).is_none()
+            && (self.is_mut_ref_ty(recv_expr_ty)
+                || (self.is_ref_ty(recv_expr_ty) && recv_interior_mut))
+            && sig.is_some_and(recv_is_by_ref)
+        {
+            self.apply_deref_steps(expr, recv_expr_ty, 1, &mut p);
+        }
+        if (!recv_mut && !self.ty_holds_closure(recv_ty) && !recv_interior_mut)
+            || (!self.ty_holds_borrow(recv_ty) && !recv_interior_mut)
+        {
+            return None;
+        }
+        Some((p, recv_ty, recv_interior_mut))
+    }
+
+    fn interior_arg_shares_self(
+        &self,
+        s: &Signature,
+        item: ItemRef,
+        param_ty: TyId,
+        self_lts: &Lifetimes<'_>,
+    ) -> bool {
+        let sig_src = self.cx.item(item).0;
+        let mut p_lts = Lifetimes::default();
+        collect_ty_lifetimes(&s.body, sig_src, param_ty, &mut p_lts);
+        p_lts.named.iter().any(|n| self_lts.named.contains(n))
+            || ty_shares_name(&s.body, sig_src, param_ty, &self_lts.names)
+            || self.generic_param_ties_to_self(s, sig_src, &p_lts, self_lts)
+    }
+
+    fn method_arg_pairs(
+        &self,
+        sig: Option<&Signature>,
+        idx: usize,
+        arg: ExprId,
+    ) -> Vec<(Option<TyId>, ExprId, bool)> {
+        let Some(s) = sig else {
+            return vec![(None, arg, true)];
+        };
+        let Some(&(_, param_ty)) = s.params.get(idx) else {
+            return vec![(None, arg, true)];
+        };
+        match (s.body.ty(param_ty), *self.body.expr(arg)) {
+            (AstTy::Tuple(ptys), Expr::Tuple(aexprs)) if ptys.len == aexprs.len => s
+                .body
+                .list(*ptys)
+                .iter()
+                .zip(self.body.list(aexprs))
+                .map(|(&pt, &ae)| (Some(TyId(pt)), ExprId(ae), false))
+                .collect(),
+            _ => vec![(Some(param_ty), arg, true)],
+        }
+    }
+
+    fn param_ties_to_self(
+        &self,
+        s: &Signature,
+        item: ItemRef,
+        param_ty: TyId,
+        self_lts: &Lifetimes<'_>,
+    ) -> (bool, bool, bool) {
+        let (sig_src, _) = self.cx.item(item);
+        let mut p_lts = Lifetimes::default();
+        collect_ty_lifetimes(&s.body, sig_src, param_ty, &mut p_lts);
+        let fresh_ref = matches!(s.body.ty(param_ty), AstTy::Ref { lifetime: None, .. });
+        let mut bounds_keep_env = true;
+        if let AstTy::ImplTrait(_, bounds) = *s.body.ty(param_ty) {
+            bounds_keep_env = s.body.list(bounds).iter().any(|&b| {
+                matches!(s.body.bounds[b as usize], Bound::Lifetime(lt)
+                    if self_lts.named.contains(&sig_src.text(lt))
+                        || sig_src.text(lt) == "'static")
+            });
+        }
+        let shares_self = p_lts.named.iter().any(|n| self_lts.named.contains(n))
+            || (!fresh_ref && ty_shares_name(&s.body, sig_src, param_ty, &self_lts.names))
+            || self.generic_param_ties_to_self(s, sig_src, &p_lts, self_lts);
+        (fresh_ref, bounds_keep_env, shares_self)
+    }
+
+    fn fallback_arg_sources(
+        &mut self,
+        expr: ExprId,
+        ae: ExprId,
+        is_fresh_ref: bool,
+        pre: Option<&Vec<BorrowSource>>,
+        state: &State,
+    ) -> Vec<BorrowSource> {
+        if is_fresh_ref {
+            self.copied_arg_borrow_sources(expr, ae, state)
+        } else if let Some(pre) = pre {
+            pre.clone()
+        } else {
+            self.expr_borrow_sources(ae, state)
+        }
     }
 
     fn matching_adt_arg_sources(

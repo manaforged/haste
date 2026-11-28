@@ -11,11 +11,13 @@ use crate::outline::Outline;
 use crate::outline::edit::hash_outside_bodies;
 use crate::outline::tree::File;
 
+use super::enabled;
 use super::keys::{CrateHashes, hash_crate_env};
+use super::local_index::file_stamp_matches;
+use super::sysroot::prune_cache_pair;
 use super::wire::{
     read_bytes, read_i128, read_path, read_u32, read_u64, read_utf8, write_len_bytes, write_path,
 };
-use super::{enabled, prune_stale};
 
 const LOCAL_MAGIC: [u8; 8] = *b"HSTLCHK2";
 const FILES_MAGIC: [u8; 8] = *b"HSTLFIL2";
@@ -283,9 +285,10 @@ fn read_watch_data(
 }
 
 fn validate_watch(included: &[(PathBuf, FileStamp)], envs: &[(String, Option<u64>)]) -> bool {
+    let mut buf = Vec::new();
     included
         .iter()
-        .all(|(inc, expected)| file_stamp(inc) == *expected)
+        .all(|(inc, expected)| file_stamp_matches(inc, *expected, &mut buf))
         && envs.iter().all(|(name, expected)| {
             crate::process_env_var(name)
                 .as_deref()
@@ -427,18 +430,14 @@ pub fn partition(
     let mut is_dirty = vec![false; outline.crates.len()];
     let mut watches_by_crate: HashMap<usize, WatchData> = HashMap::default();
     let mut pending_dirty = Vec::new();
-    for &krate in crates {
+    let probe = |&krate: &usize| {
         let key = crate_key(&hashes, krate, global_key);
         let closure = local_closure(outline, krate);
         if has_partial_local(outline, &closure) {
-            is_dirty[krate] = true;
-            pending_dirty.push((krate, key, None, None));
-            continue;
+            return (krate, key, closure, None, None, None);
         }
         if let Some(watch) = try_hit(key) {
-            hits.push(krate);
-            watches_by_crate.insert(krate, watch);
-            continue;
+            return (krate, key, closure, None, None, Some(watch));
         }
         let iface_key = can_file_cache(workspace, outline, krate).then(|| {
             crate_iface_key(
@@ -453,23 +452,48 @@ pub fn partition(
             && let Some((dirty_files, watch)) =
                 try_hit_files_at(&files_path(ik), ik, outline, krate)
         {
-            watches_by_crate.insert(krate, watch);
-            if dirty_files.is_empty() {
-                hits.push(krate);
-            } else {
-                is_dirty[krate] = true;
-                pending_dirty.push((krate, key, Some(ik), Some(dirty_files)));
-            }
-            continue;
+            return (
+                krate,
+                key,
+                closure,
+                Some(ik),
+                Some(dirty_files),
+                Some(watch),
+            );
         }
-        is_dirty[krate] = true;
-        pending_dirty.push((krate, key, iface_key, None));
+        (krate, key, closure, iface_key, None, None)
+    };
+    let probed: Vec<_> = if crates.len() >= 4 && crate::jobs() > 1 {
+        crate::sync::parallel_map(crates.to_vec(), |k| probe(&k))
+    } else {
+        crates.iter().map(probe).collect()
+    };
+    for (krate, key, closure, iface_key, dirty_files, watch) in probed {
+        match (dirty_files, watch) {
+            (None, Some(watch)) => {
+                hits.push(krate);
+                watches_by_crate.insert(krate, watch);
+            }
+            (Some(dirty_files), Some(watch)) => {
+                watches_by_crate.insert(krate, watch);
+                if dirty_files.is_empty() {
+                    hits.push(krate);
+                } else {
+                    is_dirty[krate] = true;
+                    pending_dirty.push((krate, key, iface_key, Some(dirty_files), closure));
+                }
+            }
+            _ => {
+                is_dirty[krate] = true;
+                pending_dirty.push((krate, key, iface_key, None, closure));
+            }
+        }
     }
     let mut unhit_deps = HashSet::default();
     let mut dirty = Vec::with_capacity(pending_dirty.len());
-    for (krate, key, iface_key, dirty_files) in pending_dirty {
+    for (krate, key, iface_key, dirty_files, closure) in pending_dirty {
         let mut carried = (Vec::new(), Vec::new());
-        for dep in local_closure(outline, krate) {
+        for dep in closure {
             if let Some(watch) = watches_by_crate.get(&dep) {
                 merge_watch_into(&mut carried, watch);
             } else if !is_dirty[dep] && !unhit_deps.contains(&dep) {
@@ -552,17 +576,14 @@ pub fn record(outline: &Outline, dirty: &[DirtyCrate], failed_crates: &HashSet<u
             }
         }
     }
-    let dir = cache_dir();
-    if let Some(keep) = last_check {
-        prune_stale(&dir, &keep, MAX_KEPT_ENTRIES - 1, |p: &Path| {
-            p.extension().and_then(|e| e.to_str()) == Some("check")
-        });
-    }
-    if let Some(keep) = last_files {
-        prune_stale(&dir, &keep, MAX_KEPT_ENTRIES - 1, |p: &Path| {
-            p.extension().and_then(|e| e.to_str()) == Some("files")
-        });
-    }
+    prune_cache_pair(
+        &cache_dir(),
+        last_check.as_deref(),
+        "check",
+        last_files.as_deref(),
+        "files",
+        MAX_KEPT_ENTRIES - 1,
+    );
 }
 
 fn watch_matches_workspace(

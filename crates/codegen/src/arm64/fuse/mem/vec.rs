@@ -337,6 +337,130 @@ fn try_fuse_vec_insert(
     }
 }
 
+fn is_even_odd_pair(count: u8, even: &[u8; 16], odd: &[u8; 16]) -> bool {
+    (0..usize::from(count))
+        .all(|i| usize::from(even[i]) == 2 * i && usize::from(odd[i]) == 2 * i + 1)
+}
+
+fn pairwise_base(op: Binary, lane: Lane, q: u32, size: u32, fsz: u32) -> Option<u32> {
+    Some(match op {
+        Binary::Iadd if lane.is_int() => 0x0E20_BC00 | (q << 30) | (size << 22),
+        Binary::Smax if matches!(lane, Lane::I8 | Lane::I16 | Lane::I32) => {
+            0x0E20_A400 | (q << 30) | (size << 22)
+        }
+        Binary::Smin if matches!(lane, Lane::I8 | Lane::I16 | Lane::I32) => {
+            0x0E20_AC00 | (q << 30) | (size << 22)
+        }
+        Binary::Umax if matches!(lane, Lane::I8 | Lane::I16 | Lane::I32) => {
+            0x2E20_A400 | (q << 30) | (size << 22)
+        }
+        Binary::Umin if matches!(lane, Lane::I8 | Lane::I16 | Lane::I32) => {
+            0x2E20_AC00 | (q << 30) | (size << 22)
+        }
+        Binary::Fadd if lane.is_float() => 0x2E20_D400 | (q << 30) | (fsz << 22),
+        Binary::Fmax if lane.is_float() => 0x2E20_F400 | (q << 30) | (fsz << 22),
+        Binary::Fmin if lane.is_float() => 0x2EA0_F400 | (q << 30) | (fsz << 22),
+        _ => return None,
+    })
+}
+
+fn match_pairwise_shuffles(
+    _func: &Function,
+    (op, ty): (Binary, Type),
+    (x_op, y_op): (&Op, &Op),
+) -> Option<(Value, Value, u32)> {
+    let Type::Vec { lane, count } = ty else {
+        return None;
+    };
+    let bytes = lane.bytes() * u32::from(count);
+    if count < 2 || !matches!(bytes, 8 | 16) {
+        return None;
+    }
+    let size = match lane {
+        Lane::I8 => 0,
+        Lane::I16 => 1,
+        Lane::I32 | Lane::F32 => 2,
+        Lane::I64 | Lane::F64 => 3,
+    };
+    let word = pairwise_base(
+        op,
+        lane,
+        u32::from(bytes == 16),
+        size,
+        u32::from(lane == Lane::F64),
+    )?;
+    let (Op::Shuffle(xa, xb, ShuffleMask::Const(xm)), Op::Shuffle(ya, yb, ShuffleMask::Const(ym))) =
+        (x_op, y_op)
+    else {
+        return None;
+    };
+    if (xa, xb) != (ya, yb) {
+        return None;
+    }
+    let matched =
+        is_even_odd_pair(count, xm, ym) || (lane.is_int() && is_even_odd_pair(count, ym, xm));
+    matched.then_some((*xa, *xb, word))
+}
+
+/// Returns `(word, a, b)` when `Binary(op, x, y)` lowers to a single ARM64 NEON pairwise instruction over elided even/odd shuffles.
+pub(in crate::arm64) fn pairwise_binary_parts(
+    func: &Function,
+    plan: &Plan<Reg>,
+    (op, ty, x, y): (Binary, Type, Value, Value),
+    def: impl Fn(Value) -> Option<Inst>,
+) -> Option<(u32, Value, Value)> {
+    if !plan.elided[x.index()] || !plan.elided[y.index()] {
+        return None;
+    }
+    let (xinst, yinst) = (def(x)?, def(y)?);
+    let (a, b, word) = match_pairwise_shuffles(
+        func,
+        (op, ty),
+        (&func.insts[xinst.index()].op, &func.insts[yinst.index()].op),
+    )?;
+    (!plan.elided[a.index()] && !plan.elided[b.index()]).then_some((word, a, b))
+}
+
+fn try_fuse_vec_binary(
+    func: &Function,
+    plan: &mut Plan<Reg>,
+    ctx: (&[u32], &[Option<(usize, usize, Inst)>]),
+    (b_idx, pos, res): (usize, usize, Value),
+    (op, x, y): (Binary, Value, Value),
+) -> bool {
+    let ty = func.ty(res);
+    if !ty.is_vector() || x == y {
+        return false;
+    }
+    let Some((xpos, xinst)) = local_single(plan, ctx, b_idx, pos, x) else {
+        return false;
+    };
+    let Some((ypos, yinst)) = local_single(plan, ctx, b_idx, pos, y) else {
+        return false;
+    };
+    let Some((a, b, _)) = match_pairwise_shuffles(
+        func,
+        (op, ty),
+        (&func.insts[xinst.index()].op, &func.insts[yinst.index()].op),
+    ) else {
+        return false;
+    };
+    if plan.elided[a.index()] || plan.elided[b.index()] {
+        return false;
+    }
+    plan.elided[x.index()] = true;
+    plan.elided[y.index()] = true;
+    let min_pos = xpos.min(ypos);
+    if preserved(func, plan, b_idx, min_pos, pos, None, a)
+        && preserved(func, plan, b_idx, min_pos, pos, None, b)
+    {
+        return true;
+    }
+    plan.elided[x.index()] = false;
+    plan.elided[y.index()] = false;
+    false
+}
+
 pub(in crate::arm64::fuse) fn try_fuse_vec_op(
     func: &Function,
     plan: &mut Plan<Reg>,
@@ -346,12 +470,16 @@ pub(in crate::arm64::fuse) fn try_fuse_vec_op(
 ) -> bool {
     match *op {
         Op::Shuffle(a, b, ShuffleMask::Const(_)) => {
-            try_fuse_splat_shuffle(func, plan, ctx, (b_idx, pos, res), (a, b))
+            try_fuse_splat_shuffle(func, plan, ctx, (b_idx, pos, res), (a, b));
+            true
         }
         Op::Insert(vec, val, idx) => {
-            try_fuse_vec_insert(func, plan, ctx, (b_idx, pos, res), (vec, val, idx))
+            try_fuse_vec_insert(func, plan, ctx, (b_idx, pos, res), (vec, val, idx));
+            true
         }
-        _ => return false,
+        Op::Binary(bin, x, y) => {
+            try_fuse_vec_binary(func, plan, ctx, (b_idx, pos, res), (bin, x, y))
+        }
+        _ => false,
     }
-    true
 }

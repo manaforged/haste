@@ -259,20 +259,22 @@ pub(super) fn write_names_crate(
         };
         write_opt_u32(out, dollar);
         write_opt_u32(out, p.name.map(|s| tables.sym(s)));
-        write_usize(out, p.segments.len())?;
-        for &seg in &p.segments {
-            write_u32(out, tables.sym(seg));
-        }
-        out.push(u8::from(p.absolute));
-        write_vis(out, p.vis);
         match p.stamp {
             Some((def, ver)) => {
                 out.push(1);
                 write_def(out, def, tables)?;
                 write_u32(out, ver);
             }
-            None => out.push(0),
+            None => {
+                out.push(0);
+                write_usize(out, p.segments.len())?;
+                for &seg in &p.segments {
+                    write_u32(out, tables.sym(seg));
+                }
+            }
         }
+        out.push(u8::from(p.absolute));
+        write_vis(out, p.vis);
         out.push(u8::from(p.active));
     }
     write_usize(out, krate.enums.len())?;
@@ -517,14 +519,15 @@ fn read_pending(
         let name = opt_u32_le(&b, 16)
             .map(|id| map_sym(id, sym_remap))
             .transpose()?;
-        let segments = read_syms(reader, sym_remap)?;
+        let (stamp, segments) = if reader.u8()? != 0 {
+            let def = read_def(reader, remap)?;
+            let ver = reader.u32()?;
+            (Some((def, ver)), Box::default())
+        } else {
+            (None, read_syms(reader, sym_remap)?)
+        };
         let absolute = reader.u8()? != 0;
         let vis = read_vis(reader)?;
-        let stamp = if reader.u8()? != 0 {
-            Some((read_def(reader, remap)?, reader.u32()?))
-        } else {
-            None
-        };
         let active = reader.u8()? != 0;
         match name {
             Some(sym) => named.entry((module, sym)).or_default().push(index),

@@ -179,6 +179,24 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
             )
         })
         .flatten();
+    let mut align_loops = vec![false; func.blocks.len()];
+    if full {
+        let cfg = func.cfg();
+        let loops = cfg.loops();
+        if !loops.list.is_empty() {
+            let cold = crate::live::cold(func);
+            for each in &loops.list {
+                let inner = each
+                    .body
+                    .iter()
+                    .zip(&loops.depths)
+                    .all(|(inside, &depth)| !inside || depth <= each.depth);
+                if inner && !cold[each.head.index()] {
+                    align_loops[each.head.index()] = true;
+                }
+            }
+        }
+    }
     let mut asm = Asm::default();
     let tlv_cache = (full && tlv_cells && framed)
         .then(|| frames::plan_tlv_cache(func, &plan, &defs, &mut frame, &mut asm))
@@ -206,6 +224,7 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         }),
         next: None,
         copied,
+        align_loops,
         direct_calls: target.direct_calls,
         tlv_cells,
         tlv_cache,
@@ -260,6 +279,53 @@ pub(crate) fn dict_stub(
     asm.finish()
 }
 
+#[cfg(test)]
+mod tests {
+    use crate::{
+        AbiParam, CallConv, Effort, Function, FunctionBuilder, IntCC, Signature, Target, compile,
+    };
+
+    #[test]
+    fn inner_loop_header_is_16_byte_aligned() {
+        let mut target = *Target::find("aarch64-apple-darwin").expect("arm64 target");
+        target.effort = Effort::Full;
+        let mut sig = Signature::new(CallConv::Internal);
+        sig.params.push(AbiParam::new(crate::Type::I64));
+        sig.returns.push(AbiParam::new(crate::Type::I64));
+        let mut func = Function::new(sig);
+        {
+            let mut b = FunctionBuilder::new(&mut func);
+            let entry = b.create_block();
+            b.append_block_params_for_function_params(entry);
+            let n = b.block_params(entry)[0];
+            let head = b.create_block();
+            let i = b.append_block_param(head, crate::Type::I64);
+            let acc = b.append_block_param(head, crate::Type::I64);
+            let body = b.create_block();
+            let exit = b.create_block();
+
+            b.switch_to_block(entry);
+            let z = b.ins().iconst(crate::Type::I64, 0);
+            b.ins().jump(head, &[z, z]);
+
+            b.switch_to_block(head);
+            let cond = b.ins().icmp(IntCC::SignedLessThan, i, n);
+            b.ins().brif(cond, body, &[], exit, &[]);
+
+            b.switch_to_block(body);
+            let next_i = b.ins().iadd_imm(i, 1);
+            let next_acc = b.ins().iadd(acc, i);
+            b.ins().jump(head, &[next_i, next_acc]);
+
+            b.switch_to_block(exit);
+            b.ins().return_(&[acc]);
+        }
+        let code = compile(func, &target).expect("arm64 loop compiles");
+        assert!(!code.loops.is_empty());
+        assert_eq!(code.loops[0].start % 16, 0, "loops: {:?}", code.loops);
+    }
+}
+
 pub(super) struct Emit<'a> {
     func: &'a Function,
     frame: Frame<Reg>,
@@ -278,6 +344,7 @@ pub(super) struct Emit<'a> {
     spills: crate::spills::SpillState<Reg, Vreg>,
     next: Option<Block>,
     copied: Vec<bool>,
+    align_loops: Vec<bool>,
     direct_calls: bool,
     tlv_cells: bool,
     tlv_cache: Option<frames::TlvCache>,
@@ -376,8 +443,18 @@ impl<'a> Emitter<'a> for Emit<'a> {
     fn deferred_prologue(&self) -> bool {
         self.shrink.is_some()
     }
-    fn before_block_bind(&mut self, _block: Block) -> Result<(), String> {
+    fn before_block_bind(&mut self, block: Block) -> Result<(), String> {
         self.asm.maybe_island()?;
+        if self
+            .align_loops
+            .get(block.index())
+            .copied()
+            .unwrap_or(false)
+        {
+            while (self.asm.pos() & 15) != 0 {
+                self.asm.word(frames::ARM64_NOP);
+            }
+        }
         Ok(())
     }
     fn on_block_bound(&mut self, block: Block) -> Result<(), String> {

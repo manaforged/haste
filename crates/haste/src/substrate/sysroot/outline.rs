@@ -158,7 +158,6 @@ fn write_module<'a>(out: &mut Vec<u8>, module: &'a Module, tables: &mut Tables<'
     write_opt_u32(out, module.item);
     write_opt_u32(out, module.parent.map(|p| p as u32));
     write_str(out, &module.name)?;
-    write_path(out, &module.dir)?;
     write_usize(out, module.parts.len())?;
     for &part in &module.parts {
         write_usize(out, part)?;
@@ -168,6 +167,7 @@ fn write_module<'a>(out: &mut Vec<u8>, module: &'a Module, tables: &mut Tables<'
     match &module.state {
         State::Declared(Decl::Inline { file, at }) => {
             out.push(0);
+            write_path(out, &module.dir)?;
             write_usize(out, *file)?;
             write_u32(out, *at);
         }
@@ -176,6 +176,7 @@ fn write_module<'a>(out: &mut Vec<u8>, module: &'a Module, tables: &mut Tables<'
             by_attr,
         }) => {
             out.push(1);
+            write_path(out, &module.dir)?;
             write_paths(out, candidates)?;
             out.push(u8::from(*by_attr));
         }
@@ -331,19 +332,25 @@ fn read_module(reader: &mut Reader<'_>, textuals: &[Arc<Textual>]) -> Result<Mod
     let item = opt_u32_le(&b, 4);
     let parent = opt_u32_le(&b, 8).map(|v| v as usize);
     let name = reader.str()?.to_owned();
-    let dir = reader.path()?;
     let parts = reader.u32s_map(|v| v as usize)?;
     let vis = read_vis(reader)?;
     let macro_use = reader.u8()? != 0;
+    let mut dir = std::path::PathBuf::new();
     let state = match reader.u8()? {
-        0 => State::Declared(Decl::Inline {
-            file: reader.u32()? as usize,
-            at: reader.u32()?,
-        }),
-        1 => State::Declared(Decl::File {
-            candidates: reader.paths()?,
-            by_attr: reader.u8()? != 0,
-        }),
+        0 => {
+            dir = reader.path()?;
+            State::Declared(Decl::Inline {
+                file: reader.u32()? as usize,
+                at: reader.u32()?,
+            })
+        }
+        1 => {
+            dir = reader.path()?;
+            State::Declared(Decl::File {
+                candidates: reader.paths()?,
+                by_attr: reader.u8()? != 0,
+            })
+        }
         2 => State::Loaded,
         3 => State::Missing,
         4 => State::Gated,

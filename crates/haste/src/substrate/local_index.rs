@@ -4,9 +4,10 @@ mod meta;
 
 #[cfg(test)]
 pub(crate) use meta::encode_test_meta;
+pub(super) use meta::file_stamp_matches;
 pub(crate) use meta::matches_workspace;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap as HashMap;
@@ -14,25 +15,29 @@ use rustc_hash::FxHashMap as HashMap;
 use crate::graph::store;
 use crate::graph::{Targets, Workspace};
 use crate::macros::Compilation;
+#[cfg(test)]
 use crate::names::{Crate as NamesCrate, Symbols};
 use crate::outline::Outline;
 use crate::sema::impls::Index as ImplIndex;
 
 use meta::{
-    LOCAL_INDEX_MAGIC, LOCAL_INDEX_VERSION, LocalMeta, collect_watched_files, compute_content_key,
-    crate_ranks, crate_refs, decode_meta, encode_meta, hash_env_reads, local_lib_topo_order,
-    structural_key, target_fingerprint, validate_env_reads, validate_watched,
+    CrateRefs, LOCAL_INDEX_MAGIC, LOCAL_INDEX_VERSION, LocalMeta, MetaCheck, PrepCache, check_meta,
+    collect_watched_files, compute_content_key, hash_env_reads, local_lib_topo_order,
+    target_fingerprint,
 };
 
 use super::sysroot::{
-    DecodeSpec, HEADER_LEN, PreparedWire, SnapshotSpec, apply_decoded_crates, collect_env_reads,
-    decode_prepared_batch, decode_snapshot, encode_snapshot, prepare_wire,
+    DecodeSpec, HEADER_LEN, PreparedWire, SnapshotSpec, collect_env_reads, encode_local_snapshot,
+    prepare_wire, prune_cache_pair,
 };
+#[cfg(test)]
+use super::sysroot::{apply_decoded_crates, decode_prepared_batch, decode_snapshot};
 
 const KEPT_LOCAL_INDEX: usize = 64;
 pub(crate) const LOCAL_SCOPE_BIT: u32 = 1 << 29;
 
 /// Cached local library symbols, resolved crate scopes, module impl indices, and hit tracking.
+#[cfg(test)]
 pub(crate) struct LoadedLocal {
     pub symbols: Option<Symbols>,
     pub names: Vec<(usize, NamesCrate)>,
@@ -71,12 +76,82 @@ fn meta_path(structural_key: u64) -> PathBuf {
     cache_dir().join(format!("{structural_key:016x}.meta"))
 }
 
-fn is_ext(path: &Path, ext: &str) -> bool {
-    path.extension().and_then(|e| e.to_str()) == Some(ext)
-}
-
 fn local_scope_bit(slot: usize) -> u32 {
     LOCAL_SCOPE_BIT | (((slot as u32) & 0xff) << 21)
+}
+
+struct PreparedCandidate {
+    krate: usize,
+    sk: u64,
+    refs: CrateRefs,
+    expected_deps: Vec<(u64, u64)>,
+}
+
+enum PrepareOutcome {
+    Miss,
+    CorruptMeta(PathBuf),
+    CorruptBin(PathBuf, PathBuf),
+    Hit {
+        krate: usize,
+        sk: u64,
+        content_key: u64,
+        needs_sysroot: bool,
+        needs_deps: bool,
+        meta_path: PathBuf,
+        bin_path: PathBuf,
+        included: Vec<(PathBuf, PathBuf)>,
+        wire: PreparedWire,
+    },
+}
+
+fn prepare_one(
+    candidate: PreparedCandidate,
+    workspace: &Workspace,
+    outline: &Outline,
+    parallel_stat: bool,
+) -> PrepareOutcome {
+    let PreparedCandidate {
+        krate,
+        sk,
+        refs,
+        expected_deps,
+    } = candidate;
+    let mpath = meta_path(sk);
+    let Ok(meta_bytes) = std::fs::read(&mpath) else {
+        return PrepareOutcome::Miss;
+    };
+    let meta = match check_meta(&meta_bytes, sk, &expected_deps, parallel_stat) {
+        MetaCheck::Valid(meta) => meta,
+        MetaCheck::Corrupt => return PrepareOutcome::CorruptMeta(mpath),
+        MetaCheck::Stale => return PrepareOutcome::Miss,
+    };
+    let bpath = bin_path(meta.content_key);
+    let Ok(backing) = super::Backing::open(&bpath, HEADER_LEN).map(Arc::new) else {
+        return PrepareOutcome::CorruptMeta(mpath);
+    };
+    let cached = [krate];
+    let spec = DecodeSpec {
+        magic: LOCAL_INDEX_MAGIC,
+        version: LOCAL_INDEX_VERSION,
+        key: meta.content_key,
+        cached_crates: &cached,
+        ref_crates: &refs.ref_crates,
+        scope_bit: 0,
+    };
+    match prepare_wire(backing, &spec, workspace, outline) {
+        Ok(Some(wire)) => PrepareOutcome::Hit {
+            krate,
+            sk,
+            content_key: meta.content_key,
+            needs_sysroot: !refs.sysroot_deps.is_empty(),
+            needs_deps: !refs.pinned_deps.is_empty(),
+            meta_path: mpath,
+            bin_path: bpath,
+            included: meta.included,
+            wire,
+        },
+        Ok(None) | Err(_) => PrepareOutcome::CorruptBin(mpath, bpath),
+    }
 }
 
 /// Validates file stamps and memory-maps settled local library snapshots without requiring `Symbols`.
@@ -90,91 +165,104 @@ pub(crate) fn prepare(
     if !enabled() {
         return Vec::new();
     }
+    let mut prep = PrepCache::new(workspace, outline);
+    let topo = local_lib_topo_order(outline, &prep.ranks);
+    if topo.is_empty() {
+        return Vec::new();
+    }
     let th = target_fingerprint(targets);
-    let ranks = crate_ranks(workspace, outline);
     let n = outline.crates.len();
-    let mut keys: Vec<Option<(u64, u64)>> = vec![None; n];
-    let mut pinned_stamps: Vec<Option<store::FileStamp>> = vec![None; n];
-    let mut prepared = Vec::new();
-    let mut slot = 0usize;
-    for krate in local_lib_topo_order(outline, &ranks) {
-        let Some(refs) = crate_refs(outline, &ranks, krate) else {
+    let mut depths = vec![0usize; n];
+    let mut waves: Vec<Vec<(usize, CrateRefs)>> = Vec::new();
+    for krate in topo {
+        let Some(refs) = prep.crate_refs(outline, krate) else {
             continue;
         };
-        let Some(expected_deps) = refs
+        let depth = refs
             .local_deps
             .iter()
-            .map(|&d| keys[d])
-            .collect::<Option<Vec<_>>>()
-        else {
-            continue;
-        };
-        let Some(sk) = structural_key(
-            workspace,
-            targets,
-            outline,
-            krate,
-            &refs,
-            sys_key,
-            th,
-            &mut pinned_stamps,
-        ) else {
-            continue;
-        };
-        let mpath = meta_path(sk);
-        let Ok(meta_bytes) = std::fs::read(&mpath) else {
-            continue;
-        };
-        let Some(meta) = decode_meta(&meta_bytes, sk) else {
-            drop(std::fs::remove_file(&mpath));
-            continue;
-        };
-        if meta.dep_keys != expected_deps
-            || !validate_env_reads(&meta.env_reads)
-            || !validate_watched(&meta.watched, parallel_stat)
-            || compute_content_key(
+            .map(|&d| depths[d] + 1)
+            .max()
+            .unwrap_or(0);
+        depths[krate] = depth;
+        if waves.len() <= depth {
+            waves.resize_with(depth + 1, Vec::new);
+        }
+        waves[depth].push((krate, refs));
+    }
+    let mut keys: Vec<Option<(u64, u64)>> = vec![None; n];
+    let mut prepared = Vec::new();
+    let mut slot = 0usize;
+    for wave in waves {
+        let mut candidates = Vec::with_capacity(wave.len());
+        for (krate, refs) in wave {
+            let Some(expected_deps) = refs
+                .local_deps
+                .iter()
+                .map(|&d| keys[d])
+                .collect::<Option<Vec<_>>>()
+            else {
+                continue;
+            };
+            let Some(sk) =
+                prep.structural_key(workspace, targets, outline, krate, &refs, sys_key, th)
+            else {
+                continue;
+            };
+            candidates.push(PreparedCandidate {
+                krate,
                 sk,
-                &meta.watched,
-                &meta.included,
-                &meta.env_reads,
-                &meta.dep_keys,
-            ) != meta.content_key
-        {
+                refs,
+                expected_deps,
+            });
+        }
+        if candidates.is_empty() {
             continue;
         }
-        let bpath = bin_path(meta.content_key);
-        let Ok(backing) = super::Backing::open(&bpath, HEADER_LEN).map(Arc::new) else {
-            drop(std::fs::remove_file(&mpath));
-            continue;
+        let outcomes = if candidates.len() >= 2 && crate::jobs() > 1 {
+            crate::sync::parallel_map(candidates, |c| prepare_one(c, workspace, outline, false))
+        } else {
+            candidates
+                .into_iter()
+                .map(|c| prepare_one(c, workspace, outline, parallel_stat))
+                .collect()
         };
-        let cached = [krate];
-        let spec = DecodeSpec {
-            magic: LOCAL_INDEX_MAGIC,
-            version: LOCAL_INDEX_VERSION,
-            key: meta.content_key,
-            cached_crates: &cached,
-            ref_crates: &refs.ref_crates,
-            scope_bit: local_scope_bit(slot),
-        };
-        match prepare_wire(backing, &spec, workspace, outline) {
-            Ok(Some(wire)) => {
-                keys[krate] = Some((sk, meta.content_key));
-                prepared.push(PreparedLocal {
+        for outcome in outcomes {
+            match outcome {
+                PrepareOutcome::Miss => {}
+                PrepareOutcome::CorruptMeta(mpath) => {
+                    drop(std::fs::remove_file(&mpath));
+                }
+                PrepareOutcome::CorruptBin(mpath, bpath) => {
+                    drop(std::fs::remove_file(&mpath));
+                    drop(std::fs::remove_file(&bpath));
+                }
+                PrepareOutcome::Hit {
                     krate,
-                    structural_key: sk,
-                    content_key: meta.content_key,
-                    needs_sysroot: !refs.sysroot_deps.is_empty(),
-                    needs_deps: !refs.pinned_deps.is_empty(),
-                    meta_path: mpath,
-                    bin_path: bpath,
-                    included: meta.included,
-                    wire,
-                });
-                slot += 1;
-            }
-            Ok(None) | Err(_) => {
-                drop(std::fs::remove_file(&mpath));
-                drop(std::fs::remove_file(&bpath));
+                    sk,
+                    content_key,
+                    needs_sysroot,
+                    needs_deps,
+                    meta_path,
+                    bin_path,
+                    included,
+                    mut wire,
+                } => {
+                    wire.scope_bit = local_scope_bit(slot);
+                    keys[krate] = Some((sk, content_key));
+                    prepared.push(PreparedLocal {
+                        krate,
+                        structural_key: sk,
+                        content_key,
+                        needs_sysroot,
+                        needs_deps,
+                        meta_path,
+                        bin_path,
+                        included,
+                        wire,
+                    });
+                    slot += 1;
+                }
             }
         }
     }
@@ -206,6 +294,7 @@ pub(crate) fn filter_prepared(
 }
 
 /// Attempts to load cached settled local library crates into `outline`, interning symbols into `existing_symbols` if present.
+#[cfg(test)]
 pub(crate) fn try_load(
     workspace: &Workspace,
     targets: &Targets,
@@ -235,33 +324,31 @@ pub(crate) fn try_load(
     let mut iter = prepared.into_iter();
     if existing_symbols.is_none()
         && let Some(first) = iter.next()
+        && let Some(refs) = PrepCache::new(workspace, outline).crate_refs(outline, first.krate)
     {
-        let ranks = crate_ranks(workspace, outline);
-        if let Some(refs) = crate_refs(outline, &ranks, first.krate) {
-            let cached = [first.krate];
-            let spec = DecodeSpec {
-                magic: LOCAL_INDEX_MAGIC,
-                version: LOCAL_INDEX_VERSION,
-                key: first.content_key,
-                cached_crates: &cached,
-                ref_crates: &refs.ref_crates,
-                scope_bit: first.wire.scope_bit,
-            };
-            match decode_snapshot(&first.wire.backing, &spec, None, workspace, outline) {
-                Ok(Some((crates, owned_syms, names, heads, env_reads))) => {
-                    loaded.symbols = owned_syms;
-                    apply_decoded_crates(outline, crates, env_reads);
-                    outline.crates[first.krate].cached_included = Some(first.included);
-                    loaded.names.extend(names);
-                    loaded.heads.extend(heads);
-                    loaded.hits[first.krate] = true;
-                    loaded.keys[first.krate] = Some((first.structural_key, first.content_key));
-                }
-                Ok(None) | Err(_) => {
-                    drop(std::fs::remove_file(&first.meta_path));
-                    drop(std::fs::remove_file(&first.bin_path));
-                    return loaded;
-                }
+        let cached = [first.krate];
+        let spec = DecodeSpec {
+            magic: LOCAL_INDEX_MAGIC,
+            version: LOCAL_INDEX_VERSION,
+            key: first.content_key,
+            cached_crates: &cached,
+            ref_crates: &refs.ref_crates,
+            scope_bit: first.wire.scope_bit,
+        };
+        match decode_snapshot(&first.wire.backing, &spec, None, workspace, outline) {
+            Ok(Some((crates, owned_syms, names, heads, env_reads))) => {
+                loaded.symbols = owned_syms;
+                apply_decoded_crates(outline, crates, env_reads);
+                outline.crates[first.krate].cached_included = Some(first.included);
+                loaded.names.extend(names);
+                loaded.heads.extend(heads);
+                loaded.hits[first.krate] = true;
+                loaded.keys[first.krate] = Some((first.structural_key, first.content_key));
+            }
+            Ok(None) | Err(_) => {
+                drop(std::fs::remove_file(&first.meta_path));
+                drop(std::fs::remove_file(&first.bin_path));
+                return loaded;
             }
         }
     }
@@ -323,13 +410,12 @@ pub(crate) fn save(
     }
     let outline = &compilation.outline;
     let th = target_fingerprint(targets);
-    let ranks = crate_ranks(workspace, outline);
+    let mut prep = PrepCache::new(workspace, outline);
     let mut keys: Vec<Option<(u64, u64)>> = hit_keys.to_vec();
     keys.resize(outline.crates.len(), None);
-    let mut pinned_stamps: Vec<Option<store::FileStamp>> = vec![None; outline.crates.len()];
     let (mut last_bin, mut last_meta) = (None, None);
 
-    for krate in local_lib_topo_order(outline, &ranks) {
+    for krate in local_lib_topo_order(outline, &prep.ranks) {
         if hits.get(krate).copied().unwrap_or(false) {
             continue;
         }
@@ -341,7 +427,7 @@ pub(crate) fn save(
         {
             continue;
         }
-        let Some(refs) = crate_refs(outline, &ranks, krate) else {
+        let Some(refs) = prep.crate_refs(outline, krate) else {
             continue;
         };
         let deps_settled = refs
@@ -360,16 +446,8 @@ pub(crate) fn save(
         else {
             continue;
         };
-        let Some(sk) = structural_key(
-            workspace,
-            targets,
-            outline,
-            krate,
-            &refs,
-            sys_key,
-            th,
-            &mut pinned_stamps,
-        ) else {
+        let Some(sk) = prep.structural_key(workspace, targets, outline, krate, &refs, sys_key, th)
+        else {
             continue;
         };
         let (watched, included) = collect_watched_files(outline, krate);
@@ -385,7 +463,7 @@ pub(crate) fn save(
             ref_crates: &refs.ref_crates,
             env_reads: &env_reads_vec,
         };
-        let Some((bytes, heads)) = encode_snapshot(&spec, workspace, compilation) else {
+        let Some((bytes, heads)) = encode_local_snapshot(&spec, workspace, compilation) else {
             continue;
         };
         all_heads.extend(heads);
@@ -401,7 +479,7 @@ pub(crate) fn save(
             included,
             env_reads: env_hashes,
         };
-        let Some(meta_bytes) = encode_meta(sk, &meta) else {
+        let Some(meta_bytes) = meta::encode_meta(sk, &meta) else {
             continue;
         };
         let mpath = meta_path(sk);
@@ -414,371 +492,16 @@ pub(crate) fn save(
         last_meta = Some(mpath);
     }
 
-    let dir = cache_dir();
-    if let Some(keep) = last_bin {
-        super::prune_stale(&dir, &keep, KEPT_LOCAL_INDEX, |p| is_ext(p, "bin"));
-    }
-    if let Some(keep) = last_meta {
-        super::prune_stale(&dir, &keep, KEPT_LOCAL_INDEX, |p| is_ext(p, "meta"));
-    }
+    prune_cache_pair(
+        &cache_dir(),
+        last_bin.as_deref(),
+        "bin",
+        last_meta.as_deref(),
+        "meta",
+        KEPT_LOCAL_INDEX,
+    );
     all_heads
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::outline::Role;
-
-    fn temp_dir(tag: &str) -> PathBuf {
-        let seq = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        let dir = std::env::temp_dir().join(format!(
-            "haste-local-idx-{tag}-{}-{seq}",
-            std::process::id()
-        ));
-        drop(std::fs::remove_dir_all(&dir));
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        dir.canonicalize().unwrap_or(dir)
-    }
-
-    fn with_local_env<R>(home: &Path, disable_local: bool, f: impl FnOnce() -> R) -> R {
-        let _guard = crate::sync::lock(&crate::substrate::TEST_HOME_LOCK);
-        let prev_home = std::env::var_os("HASTE_HOME");
-        let prev_no_local = std::env::var_os("HASTE_NO_LOCAL_INDEX");
-        // SAFETY: serialized by `TEST_HOME_LOCK` within unit tests.
-        unsafe {
-            std::env::set_var("HASTE_HOME", home);
-            if disable_local {
-                std::env::set_var("HASTE_NO_LOCAL_INDEX", "1");
-            } else {
-                std::env::remove_var("HASTE_NO_LOCAL_INDEX");
-            }
-        }
-        let out = f();
-        // SAFETY: serialized by `TEST_HOME_LOCK` within unit tests.
-        unsafe {
-            match prev_home {
-                Some(v) => std::env::set_var("HASTE_HOME", v),
-                None => std::env::remove_var("HASTE_HOME"),
-            }
-            match prev_no_local {
-                Some(v) => std::env::set_var("HASTE_NO_LOCAL_INDEX", v),
-                None => std::env::remove_var("HASTE_NO_LOCAL_INDEX"),
-            }
-        }
-        out
-    }
-
-    fn test_targets() -> Targets {
-        let host = crate::graph::cfg::Target::of(&crate::host_target());
-        Targets {
-            target: host.clone(),
-            host,
-        }
-    }
-
-    fn write_test_workspace(root: &Path) {
-        std::fs::create_dir_all(root.join("crates/lib_a/src")).expect("mkdir lib_a");
-        std::fs::create_dir_all(root.join("crates/app/src")).expect("mkdir app");
-        std::fs::write(
-            root.join("Cargo.toml"),
-            "[workspace]\nmembers = [\"crates/lib_a\", \"crates/app\"]\nresolver = \"2\"\n",
-        )
-        .expect("write Cargo.toml");
-        std::fs::write(
-            root.join("Cargo.lock"),
-            "version = 4\n\n[[package]]\nname = \"lib_a\"\nversion = \"0.1.0\"\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"lib_a\"]\n",
-        )
-        .expect("write Cargo.lock");
-        std::fs::write(
-            root.join("crates/lib_a/Cargo.toml"),
-            "[package]\nname = \"lib_a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-        )
-        .expect("write lib_a Cargo.toml");
-        std::fs::write(
-            root.join("crates/lib_a/src/lib.rs"),
-            "pub mod extra;\npub const MSG: &str = include_str!(\"msg.txt\");\n#[macro_export]\nmacro_rules! make_val {\n    () => { { let local_var = 41usize; local_var + 1 } };\n}\nmacro_rules! def_helper {\n    () => { pub fn helper() -> usize { let v = 41usize; v + 1 } };\n}\ndef_helper!();\npub fn base_val() -> usize { make_val!() + helper() + extra::ext() }\n",
-        )
-        .expect("write lib.rs");
-        std::fs::write(
-            root.join("crates/lib_a/src/extra.rs"),
-            "pub fn ext() -> usize { 7 }\n",
-        )
-        .expect("write extra.rs");
-        std::fs::write(root.join("crates/lib_a/src/msg.txt"), "hello").expect("write msg.txt");
-        std::fs::write(
-            root.join("crates/app/Cargo.toml"),
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nlib_a = { path = \"../lib_a\" }\n",
-        )
-        .expect("write app Cargo.toml");
-        std::fs::write(
-            root.join("crates/app/src/main.rs"),
-            "fn main() { let _ = lib_a::base_val(); }\n",
-        )
-        .expect("write main.rs");
-    }
-
-    fn build_comp(ws: &Workspace, targets: &Targets) -> Compilation {
-        let mut outline = crate::outline::new(ws, targets, &[]);
-        let selected = vec![true; outline.crates.len()];
-        outline.load_selected(&selected).expect("load_selected");
-        let mut names = crate::names::Names::new_with(ws, &outline, None);
-        for k in 0..selected.len() {
-            names.crates[k].set_eager();
-        }
-        names.resolve(&mut outline).expect("resolve");
-        Compilation::for_test(outline, names)
-    }
-
-    #[test]
-    fn meta_round_trip_and_key_mismatch() {
-        let meta = LocalMeta {
-            content_key: 0x1234_5678_9abc_def0,
-            dep_keys: vec![(11, 22)],
-            watched: vec![
-                (PathBuf::from("/tmp/a.rs"), Some((10, 20))),
-                (PathBuf::from("/tmp/missing.rs"), None),
-            ],
-            included: vec![(PathBuf::from("/tmp/msg.txt"), PathBuf::from("/tmp/a.rs"))],
-            env_reads: hash_env_reads(&[("K".to_owned(), Some("V".to_owned()))]),
-        };
-        let bytes = encode_meta(0xdead_beef, &meta).expect("encode meta");
-        assert!(decode_meta(&bytes, 0xcafe_babe).is_none());
-        let decoded = decode_meta(&bytes, 0xdead_beef).expect("decode meta");
-        assert_eq!(decoded.content_key, meta.content_key);
-        assert_eq!(decoded.dep_keys, meta.dep_keys);
-        assert_eq!(decoded.watched, meta.watched);
-        assert_eq!(decoded.included, meta.included);
-        assert_eq!(decoded.env_reads, meta.env_reads);
-    }
-
-    #[test]
-    fn scope_bit_isolation_preserves_sysroot_and_deps_and_tags_local() {
-        use crate::outline::source::Mark;
-        let mut out = Vec::new();
-        let marks = vec![
-            (0, Mark::Scope { id: 1, parent: 0 }),
-            (
-                1,
-                Mark::Scope {
-                    id: 2,
-                    parent: (1 << 31) | 7,
-                },
-            ),
-            (
-                2,
-                Mark::Scope {
-                    id: 3,
-                    parent: (1 << 30) | 9,
-                },
-            ),
-            (
-                3,
-                Mark::Scope {
-                    id: 4,
-                    parent: LOCAL_SCOPE_BIT | 11,
-                },
-            ),
-        ];
-        super::super::sysroot::tokens::write_marks(&mut out, &marks, &[Some(0)]).expect("write");
-        let decoded =
-            super::super::sysroot::tokens::read_marks(&out, &[0], LOCAL_SCOPE_BIT).expect("read");
-        assert_eq!(
-            decoded[0].1,
-            Mark::Scope {
-                id: LOCAL_SCOPE_BIT | 1,
-                parent: 0,
-            }
-        );
-        assert_eq!(
-            decoded[1].1,
-            Mark::Scope {
-                id: LOCAL_SCOPE_BIT | 2,
-                parent: (1 << 31) | 7,
-            }
-        );
-        assert_eq!(
-            decoded[2].1,
-            Mark::Scope {
-                id: LOCAL_SCOPE_BIT | 3,
-                parent: (1 << 30) | 9,
-            }
-        );
-        assert_eq!(
-            decoded[3].1,
-            Mark::Scope {
-                id: LOCAL_SCOPE_BIT | 4,
-                parent: LOCAL_SCOPE_BIT | 11,
-            }
-        );
-        assert_eq!(LOCAL_SCOPE_BIT & ((1 << 31) | (1 << 30)), 0);
-    }
-
-    #[test]
-    fn file_stamp_invalidation_and_main_edit_cache_hit() {
-        let root = temp_dir("ws");
-        let home = temp_dir("home");
-        write_test_workspace(&root);
-
-        with_local_env(&home, false, || {
-            let targets = test_targets();
-            let ws = crate::graph::load(&root, &targets, &Default::default()).expect("load ws");
-            let sys_key = super::super::sysroot_key(&ws, &targets);
-            let comp1 = build_comp(&ws, &targets);
-            let lib_krate = comp1
-                .outline
-                .roots
-                .iter()
-                .position(|r| r.name == "lib_a" && r.role == Role::Lib)
-                .expect("lib_a");
-            let empty_hits = vec![false; comp1.outline.crates.len()];
-            let empty_keys = vec![None; comp1.outline.crates.len()];
-            let heads = save(&ws, &targets, &comp1, sys_key, &empty_hits, &empty_keys);
-            assert!(heads.contains_key(&(lib_krate as u32)));
-
-            std::fs::write(
-                root.join("crates/app/src/main.rs"),
-                "fn main() { let x = lib_a::base_val(); let _ = x + 1; }\n",
-            )
-            .expect("edit main.rs");
-
-            let mut outline2 = crate::outline::new(&ws, &targets, &[]);
-            let loaded2 = try_load(&ws, &targets, &mut outline2, None, sys_key, true, true);
-            assert!(loaded2.hits[lib_krate]);
-            assert!(!outline2.crates[lib_krate].partial());
-            let expected_included = vec![(
-                root.join("crates/lib_a/src/msg.txt"),
-                root.join("crates/lib_a/src/lib.rs"),
-            )];
-            assert_eq!(
-                outline2.crates[lib_krate].cached_included.as_deref(),
-                Some(expected_included.as_slice())
-            );
-            assert_eq!(outline2.included(lib_krate), expected_included);
-            let has_local_scope = outline2.crates[lib_krate].files.iter().any(|f| {
-                f.source.marks.iter().any(|&(_, m)| {
-                    matches!(
-                        m,
-                        crate::outline::source::Mark::Scope { id, .. }
-                        if (id & LOCAL_SCOPE_BIT) != 0 && (id & ((1 << 31) | (1 << 30))) == 0
-                    )
-                })
-            });
-            assert!(has_local_scope);
-
-            std::fs::write(
-                root.join("crates/lib_a/src/extra.rs"),
-                "pub fn ext() -> usize { 99 }\n",
-            )
-            .expect("edit extra.rs");
-            let mut outline3 = crate::outline::new(&ws, &targets, &[]);
-            assert!(
-                !try_load(&ws, &targets, &mut outline3, None, sys_key, true, true).hits[lib_krate]
-            );
-
-            std::fs::write(
-                root.join("crates/lib_a/src/extra.rs"),
-                "pub fn ext() -> usize { 7 }\n",
-            )
-            .expect("restore extra.rs");
-            let comp4 = build_comp(&ws, &targets);
-            save(&ws, &targets, &comp4, sys_key, &empty_hits, &empty_keys);
-
-            std::fs::write(root.join("crates/lib_a/src/msg.txt"), "changed include")
-                .expect("edit msg.txt");
-            let mut outline5 = crate::outline::new(&ws, &targets, &[]);
-            assert!(
-                !try_load(&ws, &targets, &mut outline5, None, sys_key, true, true).hits[lib_krate]
-            );
-        });
-
-        with_local_env(&home, true, || {
-            assert!(!enabled());
-        });
-
-        drop(std::fs::remove_dir_all(&root));
-        drop(std::fs::remove_dir_all(&home));
-    }
-
-    #[test]
-    fn env_reads_never_leak_secrets_on_disk_and_invalidate_on_change() {
-        let root = temp_dir("env-secret-ws");
-        let home = temp_dir("env-secret-home");
-        write_test_workspace(&root);
-
-        let key_name = "HASTE_TEST_SECRET_22B";
-        let secret_v1 = "SECRET_TOKEN_DO_NOT_LEAK_9911";
-        let secret_v2 = "SECRET_TOKEN_ROTATED_2222";
-
-        with_local_env(&home, false, || {
-            let prev = std::env::var_os(key_name);
-            // SAFETY: serialized by `TEST_HOME_LOCK` via `with_local_env`.
-            unsafe { std::env::set_var(key_name, secret_v1) };
-
-            let targets = test_targets();
-            let ws = crate::graph::load(&root, &targets, &Default::default()).expect("load ws");
-            let sys_key = super::super::sysroot_key(&ws, &targets);
-            let comp = build_comp(&ws, &targets);
-            let lib_krate = comp
-                .outline
-                .roots
-                .iter()
-                .position(|r| r.name == "lib_a" && r.role == Role::Lib)
-                .expect("lib_a");
-            crate::sync::lock(&comp.outline.crates[lib_krate].env.env_reads)
-                .insert(key_name.to_owned(), Some(secret_v1.to_owned()));
-
-            let empty_hits = vec![false; comp.outline.crates.len()];
-            let empty_keys = vec![None; comp.outline.crates.len()];
-            save(&ws, &targets, &comp, sys_key, &empty_hits, &empty_keys);
-
-            let mut stack = vec![home.clone()];
-            let mut file_count = 0usize;
-            while let Some(dir) = stack.pop() {
-                for entry in std::fs::read_dir(&dir).expect("read cache dir").flatten() {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        stack.push(path);
-                    } else if path.is_file() {
-                        file_count += 1;
-                        let bytes = std::fs::read(&path).expect("read cached file");
-                        assert!(
-                            !bytes
-                                .windows(secret_v1.len())
-                                .any(|w| w == secret_v1.as_bytes()),
-                            "plaintext env secret leaked in {}",
-                            path.display()
-                        );
-                    }
-                }
-            }
-            assert!(file_count >= 2, "expected .meta and .bin cache files");
-
-            let mut outline_hit = crate::outline::new(&ws, &targets, &[]);
-            let loaded_hit = try_load(&ws, &targets, &mut outline_hit, None, sys_key, true, true);
-            assert!(loaded_hit.hits[lib_krate]);
-            let restored = crate::sync::lock(&outline_hit.crates[lib_krate].env.env_reads)
-                .get(key_name)
-                .cloned();
-            assert_eq!(restored, Some(Some(secret_v1.to_owned())));
-
-            // SAFETY: serialized by `TEST_HOME_LOCK` via `with_local_env`.
-            unsafe { std::env::set_var(key_name, secret_v2) };
-            let mut outline_miss = crate::outline::new(&ws, &targets, &[]);
-            let loaded_miss = try_load(&ws, &targets, &mut outline_miss, None, sys_key, true, true);
-            assert!(!loaded_miss.hits[lib_krate]);
-
-            // SAFETY: serialized by `TEST_HOME_LOCK` via `with_local_env`.
-            unsafe {
-                match prev {
-                    Some(v) => std::env::set_var(key_name, v),
-                    None => std::env::remove_var(key_name),
-                }
-            }
-        });
-
-        drop(std::fs::remove_dir_all(&root));
-        drop(std::fs::remove_dir_all(&home));
-    }
-}
+mod tests;

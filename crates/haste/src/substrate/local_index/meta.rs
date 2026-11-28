@@ -1,5 +1,5 @@
 use std::hash::{Hash as _, Hasher as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rustc_hash::FxHasher;
 
@@ -15,7 +15,7 @@ use super::super::sysroot::{SYSROOT_VERSION, crate_order, hash_identity};
 
 pub(super) const LOCAL_INDEX_MAGIC: [u8; 8] = *b"HSTLOC01";
 const LOCAL_META_MAGIC: [u8; 8] = *b"HSTLMT01";
-pub(super) const LOCAL_INDEX_VERSION: u32 = 3;
+pub(super) const LOCAL_INDEX_VERSION: u32 = 4;
 
 pub(super) type EnvHashes = Vec<(String, Option<u64>)>;
 
@@ -42,7 +42,7 @@ fn is_local_lib(outline: &Outline, krate: usize) -> bool {
             .is_some_and(|root| root.role == Role::Lib)
 }
 
-pub(super) fn crate_ranks(workspace: &Workspace, outline: &Outline) -> Vec<usize> {
+fn crate_ranks(workspace: &Workspace, outline: &Outline) -> Vec<usize> {
     let ordered = crate_order(workspace, outline, |_| true);
     let mut ranks = vec![0usize; outline.crates.len()];
     for (rank, &krate) in ordered.iter().enumerate() {
@@ -51,47 +51,158 @@ pub(super) fn crate_ranks(workspace: &Workspace, outline: &Outline) -> Vec<usize
     ranks
 }
 
-pub(super) fn crate_refs(outline: &Outline, ranks: &[usize], krate: usize) -> Option<CrateRefs> {
-    let mut seen = vec![false; outline.crates.len()];
-    let mut stack: Vec<usize> = outline.deps[krate].iter().map(|&(_, d)| d).collect();
-    let mut closure = Vec::new();
-    while let Some(dep) = stack.pop() {
-        if dep >= outline.crates.len() || std::mem::replace(&mut seen[dep], true) {
-            continue;
-        }
-        closure.push(dep);
-        for &(_, next) in &outline.deps[dep] {
-            stack.push(next);
+pub(super) struct PrepCache {
+    pub ranks: Vec<usize>,
+    seen: Vec<u32>,
+    epoch: u32,
+    to_local: Vec<Option<u32>>,
+    pinned_stamps: Vec<Option<FileStamp>>,
+}
+
+impl PrepCache {
+    pub(super) fn new(workspace: &Workspace, outline: &Outline) -> Self {
+        let n = outline.crates.len();
+        Self {
+            ranks: crate_ranks(workspace, outline),
+            seen: vec![0; n],
+            epoch: 0,
+            to_local: vec![None; n],
+            pinned_stamps: vec![None; n],
         }
     }
-    let (mut local_deps, mut pinned_deps, mut sysroot_deps) = (Vec::new(), Vec::new(), Vec::new());
-    for &dep in &closure {
-        if outline.is_sysroot(dep as u32) {
-            sysroot_deps.push(dep);
-        } else if outline.is_fixed(dep as u32) {
-            pinned_deps.push(dep);
-        } else {
-            if !is_local_lib(outline, dep) {
-                return None;
+
+    pub(super) fn crate_refs(&mut self, outline: &Outline, krate: usize) -> Option<CrateRefs> {
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.seen.fill(0);
+            self.epoch = 1;
+        }
+        let mark = self.epoch;
+        let mut stack: Vec<usize> = outline.deps[krate].iter().map(|&(_, d)| d).collect();
+        let (mut local_deps, mut pinned_deps, mut sysroot_deps) =
+            (Vec::new(), Vec::new(), Vec::new());
+        while let Some(dep) = stack.pop() {
+            if dep >= outline.crates.len() || self.seen[dep] == mark {
+                continue;
             }
-            local_deps.push(dep);
+            self.seen[dep] = mark;
+            if outline.is_sysroot(dep as u32) {
+                sysroot_deps.push(dep);
+            } else if outline.is_fixed(dep as u32) {
+                pinned_deps.push(dep);
+            } else {
+                if !is_local_lib(outline, dep) {
+                    return None;
+                }
+                local_deps.push(dep);
+            }
+            for &(_, next) in &outline.deps[dep] {
+                stack.push(next);
+            }
         }
+        local_deps.sort_unstable_by_key(|&k| self.ranks[k]);
+        pinned_deps.sort_unstable_by_key(|&k| self.ranks[k]);
+        sysroot_deps.sort_unstable_by_key(|&k| self.ranks[k]);
+        let mut ref_crates =
+            Vec::with_capacity(1 + local_deps.len() + pinned_deps.len() + sysroot_deps.len());
+        ref_crates.push(krate);
+        ref_crates.extend_from_slice(&local_deps);
+        ref_crates.extend_from_slice(&pinned_deps);
+        ref_crates.extend_from_slice(&sysroot_deps);
+        Some(CrateRefs {
+            local_deps,
+            pinned_deps,
+            sysroot_deps,
+            ref_crates,
+        })
     }
-    local_deps.sort_unstable_by_key(|&k| ranks[k]);
-    pinned_deps.sort_unstable_by_key(|&k| ranks[k]);
-    sysroot_deps.sort_unstable_by_key(|&k| ranks[k]);
-    let mut ref_crates =
-        Vec::with_capacity(1 + local_deps.len() + pinned_deps.len() + sysroot_deps.len());
-    ref_crates.push(krate);
-    ref_crates.extend_from_slice(&local_deps);
-    ref_crates.extend_from_slice(&pinned_deps);
-    ref_crates.extend_from_slice(&sysroot_deps);
-    Some(CrateRefs {
-        local_deps,
-        pinned_deps,
-        sysroot_deps,
-        ref_crates,
-    })
+
+    pub(super) fn structural_key(
+        &mut self,
+        workspace: &Workspace,
+        targets: &Targets,
+        outline: &Outline,
+        krate: usize,
+        refs: &CrateRefs,
+        sys_key: u64,
+        (host_th, target_th): (u64, u64),
+    ) -> Option<u64> {
+        let mut hasher = FxHasher::default();
+        (
+            LOCAL_INDEX_MAGIC,
+            LOCAL_INDEX_VERSION,
+            SYSROOT_VERSION,
+            super::super::MAGIC,
+            super::super::VERSION,
+            crate::profile() == Profile::Release,
+            sys_key,
+            host_th,
+            target_th,
+        )
+            .hash(&mut hasher);
+        (
+            &targets.target.triple,
+            &workspace.rustflags,
+            &workspace.config_env,
+            workspace.profile_dev,
+            workspace.profile_release,
+            refs.ref_crates.len(),
+        )
+            .hash(&mut hasher);
+        for (pos, &c) in refs.ref_crates.iter().enumerate() {
+            self.to_local[c] = Some(pos as u32);
+        }
+        let res = (|| {
+            for &c in &refs.ref_crates {
+                hash_identity(workspace, outline, c, &self.to_local, &mut hasher)?;
+            }
+            Some(())
+        })();
+        for &c in &refs.ref_crates {
+            self.to_local[c] = None;
+        }
+        res?;
+        hash_local_env(workspace, outline, krate, &mut hasher);
+        for &dep in &refs.local_deps {
+            hash_local_env(workspace, outline, dep, &mut hasher);
+        }
+        for &dep in &refs.pinned_deps {
+            let root = &outline.roots[dep];
+            let pkg = &workspace.packages[workspace.graph.units[root.unit].package];
+            let tree = &outline.crates[dep];
+            let root_stamp = if let Some(slot) = self.pinned_stamps.get_mut(dep) {
+                *slot.get_or_insert_with(|| {
+                    std::fs::metadata(&root.path)
+                        .ok()
+                        .map(|m| store::meta_stamp(&m))
+                })
+            } else {
+                std::fs::metadata(&root.path)
+                    .ok()
+                    .map(|m| store::meta_stamp(&m))
+            };
+            (
+                &pkg.locked.source,
+                &pkg.locked.checksum,
+                &pkg.manifest.dir,
+                &root.edition,
+                root.proc_macro,
+                &root.path,
+                root_stamp,
+            )
+                .hash(&mut hasher);
+            (
+                outline.pins.get(dep).copied().flatten(),
+                tree.env.script.as_ref().map(|s| s.key_parts()),
+                &tree.env.vars,
+                tree.env.profile_override,
+                tree.env.test,
+                tree.env.known,
+            )
+                .hash(&mut hasher);
+        }
+        Some(hasher.finish())
+    }
 }
 
 pub(super) fn local_lib_topo_order(outline: &Outline, ranks: &[usize]) -> Vec<usize> {
@@ -161,81 +272,6 @@ fn hash_local_env(workspace: &Workspace, outline: &Outline, krate: usize, hasher
         &tree.env.target.internal,
     )
         .hash(hasher);
-}
-
-pub(super) fn structural_key(
-    workspace: &Workspace,
-    targets: &Targets,
-    outline: &Outline,
-    krate: usize,
-    refs: &CrateRefs,
-    sys_key: u64,
-    (host_th, target_th): (u64, u64),
-    pinned_stamps: &mut [Option<FileStamp>],
-) -> Option<u64> {
-    let mut hasher = FxHasher::default();
-    (
-        LOCAL_INDEX_MAGIC,
-        LOCAL_INDEX_VERSION,
-        SYSROOT_VERSION,
-        super::super::MAGIC,
-        super::super::VERSION,
-        crate::profile() == Profile::Release,
-        sys_key,
-        host_th,
-        target_th,
-    )
-        .hash(&mut hasher);
-    (
-        &targets.target.triple,
-        &workspace.rustflags,
-        &workspace.config_env,
-        workspace.profile_dev,
-        workspace.profile_release,
-        refs.ref_crates.len(),
-    )
-        .hash(&mut hasher);
-    let mut to_local = vec![None; outline.crates.len()];
-    for (pos, &c) in refs.ref_crates.iter().enumerate() {
-        to_local[c] = Some(pos as u32);
-    }
-    for &c in &refs.ref_crates {
-        hash_identity(workspace, outline, c, &to_local, &mut hasher)?;
-    }
-    hash_local_env(workspace, outline, krate, &mut hasher);
-    for &dep in &refs.local_deps {
-        hash_local_env(workspace, outline, dep, &mut hasher);
-    }
-    for &dep in &refs.pinned_deps {
-        let root = &outline.roots[dep];
-        let pkg = &workspace.packages[workspace.graph.units[root.unit].package];
-        let tree = &outline.crates[dep];
-        let root_stamp = if let Some(slot) = pinned_stamps.get_mut(dep) {
-            *slot.get_or_insert_with(|| store::file_stamp(&root.path))
-        } else {
-            store::file_stamp(&root.path)
-        };
-        (
-            &pkg.locked.source,
-            &pkg.locked.checksum,
-            &pkg.manifest.dir,
-            &root.edition,
-            root.proc_macro,
-            &root.path,
-            root_stamp,
-        )
-            .hash(&mut hasher);
-        (
-            outline.pins.get(dep).copied().flatten(),
-            tree.env.script.as_ref().map(|s| s.key_parts()),
-            &tree.env.vars,
-            tree.env.profile_override,
-            tree.env.test,
-            tree.env.known,
-        )
-            .hash(&mut hasher);
-    }
-    Some(hasher.finish())
 }
 
 pub(super) fn collect_watched_files(
@@ -402,13 +438,17 @@ fn decode_meta_prefix<'a>(
     Some((content_key, dep_keys, watched, cur))
 }
 
-pub(super) fn decode_meta(data: &[u8], expected_structural: u64) -> Option<LocalMeta> {
-    let (content_key, dep_keys, watched, mut cur) =
-        decode_meta_prefix(data, Some(expected_structural))?;
+pub(super) enum MetaCheck {
+    Corrupt,
+    Stale,
+    Valid(LocalMeta),
+}
+
+fn read_meta_envs(cur: &mut Cursor<'_>) -> Option<EnvHashes> {
     let env_count = cur.count().ok()?;
     let mut env_reads = Vec::with_capacity(env_count.min(256));
     for _ in 0..env_count {
-        let name = read_str(&mut cur).ok()?.to_owned();
+        let name = read_str(cur).ok()?.to_owned();
         let hash = match cur.u8().ok()? {
             0 => None,
             1 => Some(cur.u64().ok()?),
@@ -416,13 +456,26 @@ pub(super) fn decode_meta(data: &[u8], expected_structural: u64) -> Option<Local
         };
         env_reads.push((name, hash));
     }
+    Some(env_reads)
+}
+
+fn read_meta_included(cur: &mut Cursor<'_>) -> Option<Vec<(PathBuf, PathBuf)>> {
     let included_count = cur.count().ok()?;
     let mut included = Vec::with_capacity(included_count.min(1024));
     for _ in 0..included_count {
-        let path = read_path_bytes(&mut cur)?;
-        let by = read_path_bytes(&mut cur)?;
+        let path = read_path_bytes(cur)?;
+        let by = read_path_bytes(cur)?;
         included.push((path, by));
     }
+    Some(included)
+}
+
+#[cfg(test)]
+pub(super) fn decode_meta(data: &[u8], expected_structural: u64) -> Option<LocalMeta> {
+    let (content_key, dep_keys, watched, mut cur) =
+        decode_meta_prefix(data, Some(expected_structural))?;
+    let env_reads = read_meta_envs(&mut cur)?;
+    let included = read_meta_included(&mut cur)?;
     (cur.pos == data.len() - 8).then_some(LocalMeta {
         content_key,
         dep_keys,
@@ -432,13 +485,105 @@ pub(super) fn decode_meta(data: &[u8], expected_structural: u64) -> Option<Local
     })
 }
 
+pub(super) fn check_meta(
+    data: &[u8],
+    expected_structural: u64,
+    expected_deps: &[(u64, u64)],
+    parallel_stat: bool,
+) -> MetaCheck {
+    let Some((content_key, dep_keys, watched, mut cur)) =
+        decode_meta_prefix(data, Some(expected_structural))
+    else {
+        return MetaCheck::Corrupt;
+    };
+    if dep_keys != expected_deps {
+        if read_meta_envs(&mut cur).is_none()
+            || read_meta_included(&mut cur).is_none()
+            || cur.pos != data.len() - 8
+        {
+            return MetaCheck::Corrupt;
+        }
+        return MetaCheck::Stale;
+    }
+    let Some(env_reads) = read_meta_envs(&mut cur) else {
+        return MetaCheck::Corrupt;
+    };
+    if !validate_env_reads(&env_reads) {
+        if read_meta_included(&mut cur).is_none() || cur.pos != data.len() - 8 {
+            return MetaCheck::Corrupt;
+        }
+        return MetaCheck::Stale;
+    }
+    if !validate_watched(&watched, parallel_stat) {
+        if read_meta_included(&mut cur).is_none() || cur.pos != data.len() - 8 {
+            return MetaCheck::Corrupt;
+        }
+        return MetaCheck::Stale;
+    }
+    let Some(included) = read_meta_included(&mut cur) else {
+        return MetaCheck::Corrupt;
+    };
+    if cur.pos != data.len() - 8 {
+        return MetaCheck::Corrupt;
+    }
+    if compute_content_key(
+        expected_structural,
+        &watched,
+        &included,
+        &env_reads,
+        &dep_keys,
+    ) != content_key
+    {
+        return MetaCheck::Stale;
+    }
+    MetaCheck::Valid(LocalMeta {
+        content_key,
+        dep_keys,
+        watched,
+        included,
+        env_reads,
+    })
+}
+
+pub(in crate::substrate) fn file_stamp_matches(
+    path: &Path,
+    expected: FileStamp,
+    buf: &mut Vec<u8>,
+) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return expected.is_none();
+    };
+    let Some((exp_len, exp_packed)) = expected else {
+        return false;
+    };
+    let (len, nanos) = store::meta_stamp(&meta);
+    if len != exp_len || (nanos as u64) != (exp_packed as u64) {
+        return false;
+    }
+    buf.clear();
+    let actual = match std::fs::File::open(path).and_then(|mut f| {
+        if let Ok(cap) = usize::try_from(len) {
+            buf.reserve(cap);
+        }
+        std::io::Read::read_to_end(&mut f, buf)
+    }) {
+        Ok(_) => {
+            let hash = store::hash_bytes(buf);
+            (len, ((hash as i128) << 64) | i128::from(nanos as u64))
+        }
+        Err(_) => (len, nanos),
+    };
+    actual == (exp_len, exp_packed)
+}
+
 pub(super) fn validate_watched(watched: &[(PathBuf, FileStamp)], parallel: bool) -> bool {
     let check = |slice: &[(PathBuf, FileStamp)]| {
+        let mut buf = Vec::new();
         slice
             .iter()
-            .all(|(path, expected)| store::file_stamp(path) == *expected)
+            .all(|(path, expected)| file_stamp_matches(path, *expected, &mut buf))
     };
-    if !parallel || watched.len() < 64 || crate::jobs() <= 1 {
+    if !parallel || watched.len() < 32 || crate::jobs() <= 1 {
         return check(watched);
     }
     let chunk = watched.len().div_ceil(crate::jobs().clamp(1, 8));
