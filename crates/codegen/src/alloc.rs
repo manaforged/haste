@@ -355,7 +355,7 @@ pub(crate) fn plan<R: Copy + PartialEq + std::fmt::Debug>(
         })
         .unwrap_or_default();
     let promoted_syms = (weighed && regs.absolute_calls)
-        .then(|| consts::promote_loop_syms(func, &census, loop_depths, &elided, &mut locations))
+        .then(|| consts::promote_loop_syms(func, &census, loop_depths, eff, &mut locations))
         .unwrap_or_default();
     let wanted: Vec<bool> = (0..count)
         .map(|value| {

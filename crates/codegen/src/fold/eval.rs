@@ -208,6 +208,91 @@ fn known_shift_bits(op: Binary, ty: Type, (za, oa): (u64, u64), count: i64) -> (
     }
 }
 
+fn param_low_zeros(
+    func: &Function,
+    def_of: &dyn Fn(Value) -> Option<Inst>,
+    known: &dyn Fn(Value) -> Option<i64>,
+    v: Value,
+    ty: Type,
+) -> u64 {
+    let Some((blk_idx, param_idx)) = func
+        .blocks
+        .iter()
+        .enumerate()
+        .find_map(|(b, data)| data.params.iter().position(|&p| p == v).map(|idx| (b, idx)))
+    else {
+        return 0;
+    };
+    let target = Block(blk_idx as u32);
+    if func.entry == Some(target) {
+        return 0;
+    }
+    let mut seen = false;
+    let mut shared_tz = ty.bits();
+    for pred in 0..func.blocks.len() {
+        let mut check_args = |args: &[Value]| {
+            let Some(&arg) = args.get(param_idx) else {
+                shared_tz = 0;
+                return;
+            };
+            seen = true;
+            if arg == v {
+                return;
+            }
+            if let Some(imm) = known(arg) {
+                let tz = (extend(imm, ty, false) as u64)
+                    .trailing_zeros()
+                    .min(ty.bits());
+                shared_tz = shared_tz.min(tz);
+                return;
+            }
+            if let Some(inst) = def_of(arg)
+                && let Op::Binary(Binary::Iadd, p, q) = func.insts[inst.index()].op
+            {
+                let step = if p == v {
+                    known(q)
+                } else if q == v {
+                    known(p)
+                } else {
+                    None
+                };
+                if let Some(imm) = step {
+                    let tz = (extend(imm, ty, false) as u64)
+                        .trailing_zeros()
+                        .min(ty.bits());
+                    shared_tz = shared_tz.min(tz);
+                    return;
+                }
+            }
+            shared_tz = 0;
+        };
+        if let Some(last) = func.blocks[pred].insts.last() {
+            match &func.insts[last.index()].op {
+                Op::Jump(t, args) if *t == target => check_args(args),
+                Op::Brif(_, t, ta, f, fa) => {
+                    if *t == target {
+                        check_args(ta);
+                    }
+                    if *f == target {
+                        check_args(fa);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if shared_tz == 0 {
+            return 0;
+        }
+    }
+    if !seen || shared_tz == 0 {
+        0
+    } else if shared_tz >= 64 {
+        u64::MAX
+    } else {
+        (1_u64 << shared_tz) - 1
+    }
+}
+
 /// Returns `(known_zero_bits, known_one_bits)` within `v`'s integer type width.
 pub(crate) fn known_bits(
     func: &Function,
@@ -215,6 +300,27 @@ pub(crate) fn known_bits(
     known: &dyn Fn(Value) -> Option<i64>,
     v: Value,
     depth: u8,
+) -> (u64, u64) {
+    known_bits_inner(func, def_of, known, v, depth, false)
+}
+
+pub(crate) fn known_bits_with_params(
+    func: &Function,
+    def_of: &dyn Fn(Value) -> Option<Inst>,
+    known: &dyn Fn(Value) -> Option<i64>,
+    v: Value,
+    depth: u8,
+) -> (u64, u64) {
+    known_bits_inner(func, def_of, known, v, depth, true)
+}
+
+fn known_bits_inner(
+    func: &Function,
+    def_of: &dyn Fn(Value) -> Option<Inst>,
+    known: &dyn Fn(Value) -> Option<i64>,
+    v: Value,
+    depth: u8,
+    check_params: bool,
 ) -> (u64, u64) {
     let ty = func.ty(v);
     if !ty.is_small_int() {
@@ -229,9 +335,14 @@ pub(crate) fn known_bits(
         return (0, 0);
     }
     let Some(inst) = def_of(v) else {
-        return (0, 0);
+        let kz = if check_params {
+            param_low_zeros(func, def_of, known, v, ty) & w
+        } else {
+            0
+        };
+        return (kz, 0);
     };
-    let rec = |u: Value| known_bits(func, def_of, known, u, depth + 1);
+    let rec = |u: Value| known_bits_inner(func, def_of, known, u, depth + 1, check_params);
     match func.insts[inst.index()].op {
         Op::Unary(Unary::Bnot, a) => {
             let (z, o) = rec(a);
@@ -251,6 +362,18 @@ pub(crate) fn known_bits(
         }
         Op::Binary(op @ (Binary::Ushr | Binary::Ishl), a, sh) => {
             known(sh).map_or((0, 0), |c| known_shift_bits(op, ty, rec(a), c))
+        }
+        Op::Binary(Binary::Iadd, a, b) => {
+            let ((za, oa), (zb, ob)) = (rec(a), rec(b));
+            let mask = |tz: u32| {
+                if tz >= 64 {
+                    u64::MAX
+                } else {
+                    (1_u64 << tz) - 1
+                }
+            };
+            let (ma, mb) = (mask(za.trailing_ones()), mask(zb.trailing_ones()));
+            (((zb & ma) | (za & mb)) & w, ((ob & ma) | (oa & mb)) & w)
         }
         Op::Binary(Binary::Imul, a, b) => {
             let tz = (rec(a).0.trailing_ones() + rec(b).0.trailing_ones()).min(ty.bits());

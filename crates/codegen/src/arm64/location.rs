@@ -180,11 +180,25 @@ impl Emit<'_> {
         Mem::new(scratch, offset)
     }
 
+    fn cached_loop_const(&self, imm: i64) -> Option<Reg> {
+        self.loop_consts
+            .block_consts
+            .get(self.cur_block.index())
+            .and_then(|list| list.iter().find(|&&(k, _)| k == imm).map(|&(_, r)| r))
+    }
+
     pub(super) fn raw(&mut self, reg: Reg, value: Value) {
         match self.plan.location(value) {
             Location::Imm(imm) => {
-                self.asm.mov_imm(reg, imm);
-                self.spills.clobber_reg(reg);
+                if let Some(cached) = self.cached_loop_const(imm) {
+                    if reg != cached {
+                        self.asm.mov(reg, cached);
+                        self.clobber_reg(reg);
+                    }
+                } else {
+                    self.asm.mov_imm(reg, imm);
+                    self.spills.clobber_reg(reg);
+                }
             }
             Location::SlotAddr(sym) | Location::Symbol(sym) if self.direct_calls => {
                 let at = self.asm.adrp_add_reloc(reg);
@@ -269,8 +283,16 @@ impl Emit<'_> {
         let full = bytes >= 8 || (!signed && self.plan.zero_ext[value.index()]);
         match self.plan.location(value) {
             Location::Imm(imm) => {
-                self.asm.mov_imm(reg, crate::fold::extend(imm, ty, signed));
-                self.spills.clobber_reg(reg);
+                let ext_imm = crate::fold::extend(imm, ty, signed);
+                if let Some(cached) = self.cached_loop_const(ext_imm) {
+                    if reg != cached {
+                        self.asm.mov(reg, cached);
+                        self.clobber_reg(reg);
+                    }
+                } else {
+                    self.asm.mov_imm(reg, ext_imm);
+                    self.spills.clobber_reg(reg);
+                }
             }
             Location::Frame(..)
             | Location::SlotAddr(_)
@@ -391,6 +413,12 @@ impl Emit<'_> {
         {
             return reg;
         }
+        if let Location::Imm(imm) = self.plan.location(value) {
+            let ext_imm = crate::fold::extend(imm, self.ty(value), matches!(ext, Ext::Sign));
+            if let Some(reg) = self.cached_loop_const(ext_imm) {
+                return reg;
+            }
+        }
         self.get(scratch, value, ext);
         scratch
     }
@@ -400,6 +428,11 @@ impl Emit<'_> {
             return reg;
         }
         if let Some(reg) = self.spill_borrow(value, scratch) {
+            return reg;
+        }
+        if let Location::Imm(imm) = self.plan.location(value)
+            && let Some(reg) = self.cached_loop_const(imm)
+        {
             return reg;
         }
         self.raw(scratch, value);

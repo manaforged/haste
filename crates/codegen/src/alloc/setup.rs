@@ -122,11 +122,44 @@ fn slow_blocks(func: &Function, cfg: &Cfg, loops: &Loops) -> (Vec<bool>, Vec<boo
                 }
             }
         }
+        let has_call_free_latch = !calls[each.head.index()]
+            && each.latches.iter().any(|&latch| {
+                let mut block = latch;
+                loop {
+                    if calls[block.index()] {
+                        return false;
+                    }
+                    match cfg.idom[block.index()] {
+                        Some(parent) if block != each.head && parent != block => block = parent,
+                        _ => return true,
+                    }
+                }
+            });
+        let mut dom_calls = vec![false; count];
+        if has_call_free_latch {
+            for &block in cfg.rpo.iter().rev() {
+                let at = block.index();
+                if !each.body[at] {
+                    continue;
+                }
+                if calls[at] {
+                    dom_calls[at] = true;
+                }
+                if dom_calls[at]
+                    && block != each.head
+                    && let Some(parent) = cfg.idom[at]
+                    && each.body[parent.index()]
+                {
+                    dom_calls[parent.index()] = true;
+                }
+            }
+        }
         let mut guarded = vec![false; count];
         for &block in &cfg.rpo {
             let at = block.index();
             let under = cfg.idom[at].is_some_and(|parent| guarded[parent.index()]);
-            if each.body[at] && (under || (calls[at] && spine[at] != each.latches.len())) {
+            let side_call = spine[at] != each.latches.len() && (calls[at] || dom_calls[at]);
+            if each.body[at] && (under || side_call) {
                 guarded[at] = true;
                 slow[at] = true;
             }
@@ -224,4 +257,75 @@ pub(super) fn parked<R: Copy + PartialEq>(
         .collect();
     out.sort_unstable_by_key(|(inst, _)| inst.index());
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BASE_WEIGHT, LOOP_WEIGHT, SLOW_SHARE, block_weights};
+    use crate::FunctionBuilder;
+    use crate::ir::{AbiParam, CallConv, Function, IntCC, Signature, Type};
+
+    #[test]
+    fn call_bearing_side_branch_is_marked_slow_when_loop_has_call_free_latch() {
+        let mut sig = Signature::new(CallConv::Native);
+        sig.params = vec![AbiParam::new(Type::I64), AbiParam::new(Type::I64)];
+        let mut callee_sig = Signature::new(CallConv::Native);
+        callee_sig.params = vec![AbiParam::new(Type::I64)];
+        let mut func = Function::new(sig);
+        let (head, fast_latch, side_entry, side_call, side_join) = {
+            let mut b = FunctionBuilder::new(&mut func);
+            let sig_ref = b.import_signature(callee_sig);
+            let entry = b.create_block();
+            b.append_block_params_for_function_params(entry);
+            let head = b.create_block();
+            let fast_latch = b.create_block();
+            let side_entry = b.create_block();
+            let side_call = b.create_block();
+            let side_join = b.create_block();
+            let exit = b.create_block();
+            b.switch_to_block(entry);
+            let n = b.block_params(entry)[0];
+            let callee = b.block_params(entry)[1];
+            let zero = b.ins().iconst(Type::I64, 0);
+            b.ins().jump(head, &[zero]);
+
+            b.switch_to_block(head);
+            let i = b.append_block_param(head, Type::I64);
+            let flag = b.ins().icmp(IntCC::Equal, i, zero);
+            b.ins().brif(flag, side_entry, &[], fast_latch, &[]);
+
+            b.switch_to_block(fast_latch);
+            let one = b.ins().iconst(Type::I64, 1);
+            let next_fast = b.ins().iadd(i, one);
+            let cont_fast = b.ins().icmp(IntCC::UnsignedLessThan, next_fast, n);
+            b.ins().brif(cont_fast, head, &[next_fast], exit, &[]);
+
+            b.switch_to_block(side_entry);
+            let need_grow = b.ins().icmp(IntCC::UnsignedGreaterThan, n, one);
+            b.ins().brif(need_grow, side_call, &[], side_join, &[]);
+
+            b.switch_to_block(side_call);
+            b.ins().call_indirect(sig_ref, callee, &[i]);
+            b.ins().jump(side_join, &[]);
+
+            b.switch_to_block(side_join);
+            let next_side = b.ins().iadd(i, one);
+            let cont_side = b.ins().icmp(IntCC::UnsignedLessThan, next_side, n);
+            b.ins().brif(cont_side, head, &[next_side], exit, &[]);
+
+            b.switch_to_block(exit);
+            b.ins().return_(&[]);
+            (head, fast_latch, side_entry, side_call, side_join)
+        };
+        let cfg = func.cfg();
+        let loops = cfg.loops();
+        let weights = block_weights(&func, &cfg, loops);
+        let hot = BASE_WEIGHT * LOOP_WEIGHT;
+        let slow = hot / SLOW_SHARE;
+        assert_eq!(weights[head.index()], hot);
+        assert_eq!(weights[fast_latch.index()], hot);
+        assert_eq!(weights[side_entry.index()], slow);
+        assert_eq!(weights[side_call.index()], slow);
+        assert_eq!(weights[side_join.index()], slow);
+    }
 }

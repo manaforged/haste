@@ -1,6 +1,26 @@
 use super::{Asm, Label};
 use crate::{Site, StencilReloc};
 
+const NOPS: [&[u8]; 9] = [
+    &[0x90],
+    &[0x66, 0x90],
+    &[0x0F, 0x1F, 0x00],
+    &[0x0F, 0x1F, 0x40, 0x00],
+    &[0x0F, 0x1F, 0x44, 0x00, 0x00],
+    &[0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00],
+    &[0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00],
+    &[0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+    &[0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+];
+
+fn emit_nops(out: &mut Vec<u8>, mut n: u32) {
+    while n > 0 {
+        let step = n.min(9) as usize;
+        out.extend_from_slice(NOPS[step - 1]);
+        n -= step as u32;
+    }
+}
+
 /// How the displacement at a fixup is encoded.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Disp {
@@ -32,34 +52,92 @@ pub(crate) struct Fixup {
     pub(super) disp: Disp,
 }
 
-/// Where offsets taken before `relax` land after it: the end of each shortened branch and the bytes removed up to it.
-pub(crate) struct Moves(Vec<(u32, u32)>);
+#[derive(Clone, Copy)]
+struct Event {
+    at: u32,
+    delta: i32,
+    is_align: bool,
+}
+
+pub(crate) struct Moves(Vec<Event>);
 
 impl Moves {
-    fn of(fixups: &[Fixup], short: &[bool]) -> Self {
-        let mut removed = 0;
-        let ends = fixups
-            .iter()
-            .zip(short)
-            .filter(|(_, short)| **short)
-            .map(|(fixup, _)| {
-                removed += fixup.disp.opcode_len() + 2;
-                (fixup.at + 4, removed)
-            });
-        Self(ends.collect())
+    fn of(fixups: &[Fixup], short: &[bool], aligns: &[(u32, u8)]) -> (Self, Vec<(u32, u32)>) {
+        let mut events = Vec::with_capacity(fixups.len() + aligns.len());
+        let mut pads = Vec::with_capacity(aligns.len());
+        let mut delta = 0_i32;
+        let (mut fi, mut ai) = (0, 0);
+        loop {
+            while fi < fixups.len() && !short[fi] {
+                fi += 1;
+            }
+            let next_f = fixups.get(fi).map(|f| f.at + 4);
+            let next_a = aligns.get(ai).map(|&(at, _)| at);
+            match (next_f, next_a) {
+                (Some(f_at), Some(a_at)) if a_at < f_at => {
+                    let max_pad = u32::from(aligns[ai].1);
+                    let cur = (i64::from(a_at) + i64::from(delta)) as u32;
+                    let need = (16 - (cur & 15)) & 15;
+                    if need > 0 && need <= max_pad {
+                        delta += need as i32;
+                        pads.push((a_at, need));
+                        events.push(Event {
+                            at: a_at,
+                            delta,
+                            is_align: true,
+                        });
+                    }
+                    ai += 1;
+                }
+                (Some(f_at), _) => {
+                    delta -= (fixups[fi].disp.opcode_len() + 2) as i32;
+                    events.push(Event {
+                        at: f_at,
+                        delta,
+                        is_align: false,
+                    });
+                    fi += 1;
+                }
+                (None, Some(a_at)) => {
+                    let max_pad = u32::from(aligns[ai].1);
+                    let cur = (i64::from(a_at) + i64::from(delta)) as u32;
+                    let need = (16 - (cur & 15)) & 15;
+                    if need > 0 && need <= max_pad {
+                        delta += need as i32;
+                        pads.push((a_at, need));
+                        events.push(Event {
+                            at: a_at,
+                            delta,
+                            is_align: true,
+                        });
+                    }
+                    ai += 1;
+                }
+                (None, None) => break,
+            }
+        }
+        (Self(events), pads)
     }
 
-    /// The offset in the relaxed code of `at`, an instruction boundary taken before relaxing.
     pub fn map(&self, at: u32) -> u32 {
-        let index = self.0.partition_point(|&(end, _)| end <= at);
-        at - index.checked_sub(1).map_or(0, |last| self.0[last].1)
+        let index = self.0.partition_point(|e| e.at <= at);
+        let delta = index.checked_sub(1).map_or(0, |last| self.0[last].delta);
+        (i64::from(at) + i64::from(delta)) as u32
+    }
+
+    fn map_end(&self, at: u32) -> u32 {
+        let index = self
+            .0
+            .partition_point(|e| e.at < at || (e.at == at && !e.is_align));
+        let delta = index.checked_sub(1).map_or(0, |last| self.0[last].delta);
+        (i64::from(at) + i64::from(delta)) as u32
     }
 
     /// Moves block starts, exception sites and relocations to their offsets in the relaxed code.
     pub fn apply(&self, starts: &mut [u32], sites: &mut [Site], relocs: &mut [StencilReloc]) {
         starts.iter_mut().for_each(|at| *at = self.map(*at));
         for site in sites {
-            site.ret = self.map(site.ret);
+            site.ret = self.map_end(site.ret);
             site.handler = self.map(site.handler);
         }
         relocs
@@ -78,18 +156,17 @@ impl Asm {
         let Ok(target) = self.place(fixup.label) else {
             return false;
         };
-        i8::try_from(i64::from(moves.map(target)) - i64::from(moves.map(fixup.at + 4))).is_ok()
+        i8::try_from(i64::from(moves.map(target)) - i64::from(moves.map_end(fixup.at + 4))).is_ok()
     }
 
-    /// Rewrites each `jmp` and `jcc` whose target lies within a signed byte in its two-byte form, and returns where earlier offsets moved.
     pub fn relax(&mut self) -> Moves {
         let mut short: Vec<bool> = self
             .fixups
             .iter()
             .map(|fixup| matches!(fixup.disp, Disp::Jmp | Disp::Jcc))
             .collect();
-        let moves = loop {
-            let moves = Moves::of(&self.fixups, &short);
+        let (moves, pads) = loop {
+            let (moves, pads) = Moves::of(&self.fixups, &short, &self.aligns);
             let mut grew = false;
             for (fixup, short) in self.fixups.iter().zip(&mut short) {
                 if *short && !self.reaches(fixup, &moves) {
@@ -98,29 +175,55 @@ impl Asm {
                 }
             }
             if !grew {
-                break moves;
+                break (moves, pads);
             }
         };
-        let mut code = Vec::with_capacity(self.code.len());
-        let mut from = 0;
-        for (fixup, _) in self.fixups.iter().zip(&short).filter(|(_, short)| **short) {
-            let start = (fixup.at - fixup.disp.opcode_len()) as usize;
-            code.extend_from_slice(&self.code[from..start]);
-            code.extend([
-                if fixup.disp == Disp::Jmp {
-                    0xEB
-                } else {
-                    self.code[start + 1] - 0x10
-                },
-                0,
-            ]);
-            from = fixup.at as usize + 4;
+        let mut code = Vec::with_capacity(self.code.len() + pads.len() * 8);
+        let (mut from, mut fi, mut pi) = (0usize, 0, 0);
+        loop {
+            while fi < self.fixups.len() && !short[fi] {
+                fi += 1;
+            }
+            let next_f = self.fixups.get(fi).map(|f| f.at + 4);
+            let next_p = pads.get(pi).map(|&(at, _)| at);
+            match (next_f, next_p) {
+                (Some(f_end), Some(p_at)) if p_at < f_end => {
+                    let end = p_at as usize;
+                    code.extend_from_slice(&self.code[from..end]);
+                    emit_nops(&mut code, pads[pi].1);
+                    from = end;
+                    pi += 1;
+                }
+                (Some(f_end), _) => {
+                    let fixup = self.fixups[fi];
+                    let start = (fixup.at - fixup.disp.opcode_len()) as usize;
+                    code.extend_from_slice(&self.code[from..start]);
+                    code.extend([
+                        if fixup.disp == Disp::Jmp {
+                            0xEB
+                        } else {
+                            self.code[start + 1] - 0x10
+                        },
+                        0,
+                    ]);
+                    from = f_end as usize;
+                    fi += 1;
+                }
+                (None, Some(p_at)) => {
+                    let end = p_at as usize;
+                    code.extend_from_slice(&self.code[from..end]);
+                    emit_nops(&mut code, pads[pi].1);
+                    from = end;
+                    pi += 1;
+                }
+                (None, None) => break,
+            }
         }
         code.extend_from_slice(&self.code[from..]);
         self.code = code;
         for (fixup, &short) in self.fixups.iter_mut().zip(&short) {
             (fixup.at, fixup.disp) = if short {
-                (moves.map(fixup.at + 4) - 1, Disp::Short)
+                (moves.map_end(fixup.at + 4) - 1, Disp::Short)
             } else {
                 (moves.map(fixup.at), fixup.disp)
             };
@@ -132,6 +235,7 @@ impl Asm {
         self.table_fixups
             .iter_mut()
             .for_each(|(at, _, _)| *at = moves.map(*at));
+        self.aligns.clear();
         self.tail = None;
         moves
     }

@@ -3,7 +3,7 @@ mod shrink;
 mod steps;
 mod tail;
 use emit::mark_line;
-pub(crate) use emit::{emit_body, stack_zero_store};
+pub(crate) use emit::{emit_body, stack_byte_store, stack_zero_store};
 pub(crate) use shrink::{ShrinkWrap, shrink_wrap};
 pub(crate) use steps::{
     ArgStep, EdgeScratch, Step, arg_steps, edge_steps, loc_targets, reg_steps, same_home,
@@ -261,46 +261,58 @@ pub(crate) fn terminator_edges<'a>(op: &'a Op, mut f: impl FnMut(Block, &'a [Val
 enum HomeTarget {
     Value(usize),
     Shared(usize),
+    Slot(usize),
 }
 
-fn place_slots(
-    func: &Function,
-    addressed: &[bool],
-    descending: bool,
-    cursor: &mut u32,
-) -> Vec<i32> {
-    let mut slots = vec![0; func.slots.len()];
-    let mut order: Vec<usize> = (0..func.slots.len())
-        .filter(|&slot| addressed[slot])
-        .collect();
-    if descending {
-        order.sort_by_key(|&slot| (std::cmp::Reverse(func.slots[slot].size), slot));
+fn access_counts(func: &Function) -> (Vec<u32>, Vec<u32>) {
+    let mut val_uses = vec![0u32; func.types.len()];
+    let mut slot_uses = vec![0u32; func.slots.len()];
+    for block in &func.blocks {
+        for inst in &block.insts {
+            let data = &func.insts[inst.index()];
+            data.op
+                .for_operands(|v| val_uses[v.index()] = val_uses[v.index()].saturating_add(1));
+            crate::live::results(data)
+                .for_each(|v| val_uses[v.index()] = val_uses[v.index()].saturating_add(1));
+            if let Op::StackAddr(slot, _) | Op::StackLoad(slot, _) | Op::StackStore(_, slot, _) =
+                data.op
+            {
+                slot_uses[slot.index()] = slot_uses[slot.index()].saturating_add(1);
+            }
+        }
+    }
+    (val_uses, slot_uses)
+}
+
+fn cmp_density(a: (u32, u32), b: (u32, u32), ascending: bool) -> std::cmp::Ordering {
+    let lhs = u64::from(a.0) * u64::from(b.1.max(1));
+    let rhs = u64::from(b.0) * u64::from(a.1.max(1));
+    if ascending {
+        lhs.cmp(&rhs).then_with(|| b.1.cmp(&a.1))
     } else {
-        order.sort_by_key(|&slot| (func.slots[slot].size, slot));
+        rhs.cmp(&lhs).then_with(|| a.1.cmp(&b.1))
     }
-    for slot in order {
-        let data = &func.slots[slot];
-        let min_align = if data.size >= 8 {
-            8
-        } else if data.size >= 4 {
-            4
-        } else if data.size >= 2 {
-            2
-        } else {
-            1
-        };
-        let align = (1 << data.align_shift.min(MAX_ALIGN_SHIFT)).max(min_align);
-        *cursor = round(*cursor + data.size, align);
-        slots[slot] = -(*cursor as i32);
-    }
-    slots
+}
+
+fn slot_align(data: &crate::ir::SlotData) -> u32 {
+    let min_align = if data.size >= 8 {
+        8
+    } else if data.size >= 4 {
+        4
+    } else if data.size >= 2 {
+        2
+    } else {
+        1
+    };
+    (1 << data.align_shift.min(MAX_ALIGN_SHIFT)).max(min_align)
 }
 
 fn collect_value_homes<R: Copy + PartialEq>(
     func: &Function,
     present: &[bool],
+    val_uses: &[u32],
     (locations, shared, homed, elided): (&[Location<R>], &[Option<u32>], &[bool], &[bool]),
-) -> (Vec<(HomeTarget, u32, u32)>, usize, Vec<(usize, usize)>) {
+) -> (Vec<(HomeTarget, u32, u32, u32)>, usize, Vec<(usize, usize)>) {
     let mut order: Vec<usize> = (0..func.types.len()).collect();
     order.sort_by_key(|&v| {
         (
@@ -315,7 +327,7 @@ fn collect_value_homes<R: Copy + PartialEq>(
             v,
         )
     });
-    let mut items: Vec<(HomeTarget, u32, u32)> = Vec::new();
+    let mut items: Vec<(HomeTarget, u32, u32, u32)> = Vec::new();
     let mut home_pos: Vec<Option<usize>> = Vec::new();
     let mut shared_vals: Vec<(usize, usize)> = Vec::new();
     for v in order {
@@ -331,50 +343,76 @@ fn collect_value_homes<R: Copy + PartialEq>(
         }
         let bytes = func.types[v].bytes();
         let align = if bytes >= 16 { 16 } else { WORD };
+        let uses = val_uses[v];
         let Some(home) = shared.get(v).copied().flatten().map(|h| h as usize) else {
-            items.push((HomeTarget::Value(v), bytes, align));
+            items.push((HomeTarget::Value(v), bytes, align, uses));
             continue;
         };
         if home_pos.len() <= home {
             home_pos.resize(home + 1, None);
         }
         if let Some(at) = home_pos[home] {
-            items[at] = (items[at].0, items[at].1.max(bytes), items[at].2.max(align));
+            items[at] = (
+                items[at].0,
+                items[at].1.max(bytes),
+                items[at].2.max(align),
+                items[at].3.saturating_add(uses),
+            );
         } else {
             home_pos[home] = Some(items.len());
-            items.push((HomeTarget::Shared(home), bytes, align));
+            items.push((HomeTarget::Shared(home), bytes, align, uses));
         }
         shared_vals.push((v, home));
     }
     (items, home_pos.len(), shared_vals)
 }
 
-fn place_values<R: Copy + PartialEq>(
+fn place_locals<R: Copy + PartialEq>(
     func: &Function,
-    present: &[bool],
+    (present, addressed): (&[bool], &[bool]),
+    (val_uses, slot_uses): (&[u32], &[u32]),
     (locations, shared, homed, elided): (&[Location<R>], &[Option<u32>], &[bool], &[bool]),
     sp_near: bool,
     cursor: &mut u32,
-) -> Vec<i32> {
+) -> (Vec<i32>, Vec<i32>) {
     let (mut items, home_len, shared_vals) =
-        collect_value_homes(func, present, (locations, shared, homed, elided));
-    if sp_near {
-        items.reverse();
+        collect_value_homes(func, present, val_uses, (locations, shared, homed, elided));
+    for slot in 0..func.slots.len() {
+        if addressed[slot] {
+            let data = &func.slots[slot];
+            items.push((
+                HomeTarget::Slot(slot),
+                data.size,
+                slot_align(data),
+                slot_uses[slot],
+            ));
+        }
     }
+    items.sort_by(|a, b| cmp_density((a.3, a.1), (b.3, b.1), sp_near));
     let mut values = vec![0; func.types.len()];
+    let mut slots = vec![0; func.slots.len()];
     let mut homes = vec![0; home_len];
-    for (target, bytes, align) in items {
-        *cursor = round(*cursor, align) + round(bytes, align);
-        let disp = -(*cursor as i32);
+    for (target, bytes, align, _) in items {
+        let disp = match target {
+            HomeTarget::Slot(_) => {
+                *cursor = round(*cursor + bytes, align);
+                -(*cursor as i32)
+            }
+            HomeTarget::Value(_) | HomeTarget::Shared(_) => {
+                *cursor = round(*cursor, align) + round(bytes, align);
+                -(*cursor as i32)
+            }
+        };
         match target {
             HomeTarget::Value(v) => values[v] = disp,
             HomeTarget::Shared(h) => homes[h] = disp,
+            HomeTarget::Slot(s) => slots[s] = disp,
         }
     }
     for (v, h) in shared_vals {
         values[v] = homes[h];
     }
-    values
+    (slots, values)
 }
 
 pub(crate) fn layout<R: Copy + PartialEq>(
@@ -391,29 +429,19 @@ pub(crate) fn layout<R: Copy + PartialEq>(
 ) -> Result<Frame<R>, String> {
     let outgoing = needs(func, classify)?;
     let (present, addressed) = present(func, fused);
-    let sp_near = !live_ops(func).any(|op| matches!(op, Op::TryCall { .. } | Op::FramePointer));
+    let (val_uses, slot_uses) = access_counts(func);
+    let sp_near = !func.keep_fp
+        && !func.needs_unwind_frame()
+        && !live_ops(func).any(|op| matches!(op, Op::TryCall { .. } | Op::FramePointer));
     let mut cursor = (saves.len() + float_saves.len()) as u32 * WORD;
-    let (slots, values) = if sp_near {
-        let s = place_slots(func, &addressed, true, &mut cursor);
-        let v = place_values(
-            func,
-            &present,
-            (locations, shared, homed, elided),
-            true,
-            &mut cursor,
-        );
-        (s, v)
-    } else {
-        let v = place_values(
-            func,
-            &present,
-            (locations, shared, homed, elided),
-            false,
-            &mut cursor,
-        );
-        let s = place_slots(func, &addressed, false, &mut cursor);
-        (s, v)
-    };
+    let (slots, values) = place_locals(
+        func,
+        (&present, &addressed),
+        (&val_uses, &slot_uses),
+        (locations, shared, homed, elided),
+        sp_near,
+        &mut cursor,
+    );
     let mut max_saved = 0_usize;
     let mut check_edge = |block: Block, args: &[Value]| {
         for step in edge_steps(
@@ -666,6 +694,12 @@ pub(crate) trait Emitter<'a>: Sized {
     }
 
     fn emit_zero_frame(&mut self, _offset: i32, _bytes: u32) {}
+
+    fn const_byte_stack_store(&self, _inst: Inst) -> Option<(i32, u8)> {
+        None
+    }
+
+    fn emit_fill_frame(&mut self, _offset: i32, _bytes: u32, _byte: u8) {}
 
     fn try_tail_call(&mut self, _inst: Inst) -> Result<bool, String> {
         Ok(false)

@@ -2,7 +2,7 @@ use std::cell::RefCell;
 
 use crate::ir::{Binary, Convert, Function, Op, Type, Value};
 
-use super::rel::{Path, Reached, Rel, RelKind, UNSIGNED, kind_bit};
+use super::rel::{Path, Reached, Rel, RelKind, RevReach, UNSIGNED, kind_bit};
 use super::transfer::{transfer, unwrapped, valid};
 use super::{Fact, Ranges};
 
@@ -492,6 +492,7 @@ impl Path {
         q: AddQuery,
         (a_base, c): (Value, u64),
         (s, s_base, k): (Value, Value, u64),
+        s_to_b: RevReach,
         from_a: &mut Option<Reached>,
     ) -> bool {
         let require_strict = if c <= k {
@@ -505,8 +506,14 @@ impl Path {
             && self.reaches_or_eq(q.ty, a_base, s_base, from_a)
             && if s == q.b {
                 !require_strict
+            } else if !require_strict {
+                true
             } else {
-                self.reaches(q.ty, s, q.b, UNSIGNED, require_strict)
+                match s_to_b {
+                    RevReach::Strict => true,
+                    RevReach::Weak | RevReach::No => false,
+                    RevReach::Unknown => self.reaches(q.ty, s, q.b, UNSIGNED, true),
+                }
             }
     }
 
@@ -521,7 +528,7 @@ impl Path {
         for &a_form in a_forms {
             let mut from_a = None;
             if b_steps.iter().any(|&(b_base, k)| {
-                self.matches_upper_term(q, a_form, (q.b, b_base, k), &mut from_a)
+                self.matches_upper_term(q, a_form, (q.b, b_base, k), RevReach::Weak, &mut from_a)
             }) {
                 return true;
             }
@@ -535,15 +542,26 @@ impl Path {
         if !multi && !any_add {
             return false;
         }
+        let rev = self.reached_into(q.ty, q.b, UNSIGNED);
+        if rev.is_empty() && !multi {
+            return false;
+        }
         for (s, s_is_add, steps) in values.iter_mut() {
             let s = *s;
             let s_is_add = *s_is_add;
             if !multi && (!s_is_add || s == q.b) {
                 continue;
             }
-            if s != q.b && !self.reaches(q.ty, s, q.b, UNSIGNED, false) {
-                continue;
-            }
+            let s_to_b = if s == q.b {
+                RevReach::Weak
+            } else {
+                let r = rev.get(s);
+                match r {
+                    RevReach::No => continue,
+                    RevReach::Unknown if !self.reaches(q.ty, s, q.b, UNSIGNED, false) => continue,
+                    _ => r,
+                }
+            };
             if s_is_add && s != q.b {
                 steps.get_or_insert_with(|| self.non_wrap_iadd_chain(func, ranges, s, q.ty));
             }
@@ -553,9 +571,9 @@ impl Path {
             };
             let matches_s = a_forms.iter().any(|&a_form| {
                 let mut from_a = None;
-                (multi && self.matches_upper_term(q, a_form, (s, s, 0), &mut from_a))
+                (multi && self.matches_upper_term(q, a_form, (s, s, 0), s_to_b, &mut from_a))
                     || st_slice.iter().any(|&(s_base, k)| {
-                        self.matches_upper_term(q, a_form, (s, s_base, k), &mut from_a)
+                        self.matches_upper_term(q, a_form, (s, s_base, k), s_to_b, &mut from_a)
                     })
             });
             if matches_s {

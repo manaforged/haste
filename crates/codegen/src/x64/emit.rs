@@ -41,6 +41,21 @@ impl<'a> Emitter<'a> for Emit<'a> {
         }
     }
 
+    fn const_byte_stack_store(&self, inst: Inst) -> Option<(i32, u8)> {
+        crate::frame::stack_byte_store(self.func, &self.frame.slots, inst, |v| self.const_of(v))
+    }
+
+    fn emit_fill_frame(&mut self, offset: i32, bytes: u32, byte: u8) {
+        let to = self.frame_mem(offset);
+        let imm = match bytes {
+            1 => i32::from(byte),
+            2 => i32::from(u16::from_ne_bytes([byte; 2])),
+            4 => u32::from_ne_bytes([byte; 4]) as i32,
+            _ => unreachable!("fill width {bytes}"),
+        };
+        self.asm.store_imm_sized(Size::of(bytes), to, imm);
+    }
+
     fn try_tail_call(&mut self, inst: Inst) -> Result<bool, String> {
         self.emit_tail_call(inst)
     }
@@ -49,21 +64,39 @@ impl<'a> Emitter<'a> for Emit<'a> {
         if !self.framed {
             return;
         }
+        let push_saves = self.frame.float_saves.is_empty();
+        let saved_bytes = if push_saves {
+            self.frame.saves.len() as u32 * 8
+        } else {
+            0
+        };
         let size = if self.base == Reg::Rsp {
-            self.frame.size + 8
+            if push_saves {
+                for &reg in &self.frame.saves {
+                    self.asm.push(reg);
+                }
+            }
+            self.frame.size + 8 - saved_bytes
         } else {
             self.asm.push(Reg::Rbp);
             self.asm.mov(Reg::Rbp, Reg::Rsp);
-            self.frame.size
+            if push_saves {
+                for &reg in &self.frame.saves {
+                    self.asm.push(reg);
+                }
+            }
+            self.frame.size - saved_bytes
         };
         if size > PAGE {
             self.probe(size);
         } else if size > 0 {
             self.asm.alu_imm(Alu::Sub, Reg::Rsp, size as i32);
         }
-        for (index, &reg) in self.frame.saves.iter().enumerate() {
-            self.asm
-                .store(Size::Q, self.frame_mem(save_offset(index)), reg);
+        if !push_saves {
+            for (index, &reg) in self.frame.saves.iter().enumerate() {
+                self.asm
+                    .store(Size::Q, self.frame_mem(save_offset(index)), reg);
+            }
         }
     }
 
@@ -90,6 +123,16 @@ impl<'a> Emitter<'a> for Emit<'a> {
 
     fn deferred_prologue(&self) -> bool {
         self.shrink.is_some()
+    }
+
+    fn before_block_bind(&mut self, block: Block) -> Result<(), String> {
+        if let Some(&max_pad) = self.align_loops.get(block.index())
+            && max_pad > 0
+        {
+            self.asm.flags_overwritten();
+            self.asm.align(max_pad);
+        }
+        Ok(())
     }
 
     fn on_block_bound(&mut self, block: Block) -> Result<(), String> {
@@ -293,6 +336,35 @@ impl Emit<'_> {
     }
 
     pub(super) fn epilogue_body(&mut self) {
+        let pop_saves = self.framed && self.frame.float_saves.is_empty();
+        if pop_saves && self.base == Reg::Rsp {
+            let size = self.bias + 8 - (self.frame.saves.len() as i32 * 8);
+            if size > 0 {
+                self.asm.alu_imm(Alu::Add, Reg::Rsp, size);
+            }
+            for &reg in self.frame.saves.iter().rev() {
+                self.asm.pop(reg);
+            }
+            self.asm.flags_overwritten();
+            return;
+        }
+        if pop_saves
+            && self.base == Reg::Rbp
+            && (self.frame.saves.len() >= 3
+                || (!self.frame.saves.is_empty()
+                    && self.frame.size == self.frame.saves.len() as u32 * 8))
+        {
+            let saved_bytes = self.frame.saves.len() as i32 * 8;
+            if self.frame.size as i32 > saved_bytes {
+                self.asm.lea(Reg::Rsp, Mem::new(Reg::Rbp, -saved_bytes));
+            }
+            for &reg in self.frame.saves.iter().rev() {
+                self.asm.pop(reg);
+            }
+            self.asm.pop(Reg::Rbp);
+            self.asm.flags_overwritten();
+            return;
+        }
         for (index, &reg) in self.frame.saves.iter().enumerate() {
             self.asm
                 .load(Size::Q, reg, self.frame_mem(save_offset(index)));
@@ -307,6 +379,20 @@ impl Emit<'_> {
     }
 
     fn epilogue(&mut self) {
+        let share = self.framed
+            && (self.frame.saves.len() >= 2
+                || !self.frame.float_saves.is_empty()
+                || (self.base == Reg::Rsp
+                    && (!self.frame.saves.is_empty() || self.bias + 8 > 127)));
+        if share {
+            if let Some(label) = self.epilogue_label {
+                self.asm.jmp(label);
+                return;
+            }
+            let label = self.asm.label();
+            self.asm.bind(label);
+            self.epilogue_label = Some(label);
+        }
         self.epilogue_body();
         self.asm.bytes(&[0xC3]);
     }

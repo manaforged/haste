@@ -10,7 +10,7 @@ mod vector;
 pub(crate) use crate::ir::compact;
 pub(crate) use eval::{
     Before, binary, const_offset, constant, evaluate_wrapped, extend, fits_imm32, holds,
-    is_unit_bool, known_bits, non_null_at,
+    is_unit_bool, known_bits, known_bits_with_params, non_null_at,
 };
 pub(crate) use unused::prune;
 
@@ -45,9 +45,25 @@ impl Fold {
 
     fn evaluate(&self, func: &Function, at: Before, op: &Op, ty: Type) -> Option<i64> {
         evaluate_wrapped(func, op, ty, &|value| self.known(value)).or_else(|| match *op {
-            Op::Binary(op, x, y) if ty.is_small_int() => {
-                self.absorbed(op, ty, x, y).map(|v| extend(v, ty, true))
-            }
+            Op::Binary(op, x, y) if ty.is_small_int() => self
+                .absorbed(op, ty, x, y)
+                .map(|v| extend(v, ty, true))
+                .or_else(|| {
+                    (op == Binary::Band).then(|| {
+                        [(x, y), (y, x)].into_iter().find_map(|(val, other)| {
+                            let mask = extend(self.known(other)?, ty, false) as u64;
+                            let (kz, ko) = known_bits_with_params(
+                                func,
+                                &|v| self.def_inst(v),
+                                &|v| self.known(v),
+                                val,
+                                0,
+                            );
+                            (((kz | ko) & mask) == mask)
+                                .then(|| extend((ko & mask) as i64, ty, true))
+                        })
+                    })?
+                }),
             Op::Icmp(cc, x, y) => crate::algebra::non_null_cmp(
                 func,
                 &|v| self.def_inst(v),

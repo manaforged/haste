@@ -147,6 +147,108 @@ impl Emit<'_> {
         self.emit_cbz(condition, !invert, label);
     }
 
+    fn exact_branch_read(&self, condition: Value) -> Option<Option<Location<Reg>>> {
+        if self.flags.is_some_and(|(v, _)| v == condition) {
+            return Some(None);
+        }
+        if !self.plan.elided[condition.index()] {
+            return Some(Some(self.plan.location(condition)));
+        }
+        let inst = self.defs[condition.index()]?;
+        let Op::Icmp(cc, lhs, rhs) = self.func.insts[inst.index()].op else {
+            return None;
+        };
+        if let Some((val, _, _)) =
+            fuse::sign_bit_test(self.func, &self.plan, (cc, lhs, rhs), &|v: Value| {
+                self.defs[v.index()]
+            })
+        {
+            return Some(Some(self.plan.location(val)));
+        }
+        if matches!(cc, IntCC::Equal | IntCC::NotEqual)
+            && let Some((val, _)) = fuse::zero_cmp_operand(&self.plan, self.ty(lhs), lhs, rhs)
+        {
+            return Some(Some(self.plan.location(val)));
+        }
+        None
+    }
+
+    pub(super) fn try_hoist_loop_branch(
+        &mut self,
+        condition: Value,
+        then: (Block, &[Value]),
+        otherwise: (Block, &[Value]),
+    ) -> Result<bool, String> {
+        if self.in_fast || self.live_in_regs.is_empty() || self.plan.const_of(condition).is_some() {
+            return Ok(false);
+        }
+        let (func, plan, frame) = (self.func, &self.plan, &self.frame);
+        let then_moves = plan.moves(func, frame, then.0, then.1);
+        let else_moves = plan.moves(func, frame, otherwise.0, otherwise.1);
+        let (moved, to_then, plain) = match (then_moves, else_moves) {
+            (true, false) => (then, true, otherwise.0),
+            (false, true) => (otherwise, false, then.0),
+            _ => return Ok(false),
+        };
+        let falls = self
+            .next
+            .is_some_and(|n| n == moved.0 || n == func.jump_target(moved.0));
+        if falls
+            || !self
+                .loop_heads
+                .get(moved.0.index())
+                .copied()
+                .unwrap_or(false)
+        {
+            return Ok(false);
+        }
+        let closes = func.cfg().loops().list.iter().any(|each| {
+            each.head == moved.0 && !each.body.get(plain.index()).copied().unwrap_or(true)
+        });
+        if !closes {
+            return Ok(false);
+        }
+        let Some(cond_read) = self.exact_branch_read(condition) else {
+            return Ok(false);
+        };
+        let cond_mask = cond_read.map_or(0, super::frames::loc_mask);
+        let plain_mask = self.live_in_regs[plain.index()];
+        let simple = |v: Value| {
+            !plan.elided[v.index()]
+                && !plan.deferred[v.index()]
+                && !plan.fused[v.index()]
+                && plan.pairs[v.index()].is_none()
+                && (func.ty(v).is_small_int() || func.ty(v).is_float())
+        };
+        let params = &func.blocks[moved.0.index()].params;
+        let ok = moved.1.iter().zip(params).all(|(&arg, &param)| {
+            if plan.same_home(frame, arg, param) {
+                return true;
+            }
+            let dst = plan.locations[param.index()];
+            let dst_mask = super::frames::loc_mask(dst);
+            simple(arg)
+                && simple(param)
+                && matches!(
+                    plan.locations[arg.index()],
+                    Location::Reg(_) | Location::Float(_) | Location::Slot
+                )
+                && matches!(dst, Location::Reg(_) | Location::Float(_))
+                && (dst_mask & (cond_mask | plain_mask)) == 0
+        });
+        if !ok {
+            return Ok(false);
+        }
+        self.edge(moved.0, moved.1)?;
+        let target = self.blocks[self.func.jump_target(moved.0).index()];
+        self.branch_cond(condition, !to_then, target);
+        let cache = self.spills.cache;
+        self.record_edge_spill(moved.0, cache);
+        self.record_edge_spill(plain, cache);
+        emit_goto(self, plain, true);
+        Ok(true)
+    }
+
     pub(super) fn br_table(&mut self, index: Value, default: Block, targets: &[Block]) {
         if targets.is_empty() {
             emit_goto(self, default, true);

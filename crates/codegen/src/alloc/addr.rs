@@ -62,7 +62,7 @@ struct SibCtx<'a, R> {
     zero_ext: &'a [bool],
 }
 
-type SibOperands = (SibBase, i32, Value, u8, Option<Value>, Option<Value>);
+type SibOperands = (SibBase, i32, Value, u8, Option<Value>, Option<Value>, i64);
 
 impl<R> SibCtx<'_, R> {
     fn slot_i64(&self, v: Value) -> bool {
@@ -103,7 +103,24 @@ impl<R> SibCtx<'_, R> {
         }
     }
 
-    fn parse_scaled(&self, v: Value, block: usize) -> Option<(Value, u8, Value, Option<Value>)> {
+    fn offset_idx(&self, v: Value, block: usize) -> Option<(Value, i64, Value)> {
+        let def = self
+            .single_i64(v, block)
+            .then(|| self.census.def_inst[v.index()])??;
+        let (inner, c) = iadd_sub_const(&self.func.insts[def.index()].op, |x| {
+            match self.locations[x.index()] {
+                Location::Imm(c) => Some(c),
+                _ => None,
+            }
+        })?;
+        (inner != v && self.slot_i64(inner)).then_some((inner, c, v))
+    }
+
+    fn parse_scaled(
+        &self,
+        v: Value,
+        block: usize,
+    ) -> Option<(Value, u8, Value, Option<Value>, i64)> {
         let def = self
             .single_i64(v, block)
             .then(|| self.census.def_inst[v.index()])??;
@@ -112,14 +129,21 @@ impl<R> SibCtx<'_, R> {
                 let Location::Imm(s @ 1..=3) = self.locations[sh.index()] else {
                     return None;
                 };
-                self.unwrap_idx(idx, block).map(|(b, e)| (b, s as u8, v, e))
+                if let Some((inner, c, folded)) = self.offset_idx(idx, block)
+                    && let Some(disp) = c.checked_mul(1 << s)
+                    && (-FOLD_LIMIT..=FOLD_LIMIT).contains(&disp)
+                {
+                    return Some((inner, s as u8, v, Some(folded), disp));
+                }
+                self.unwrap_idx(idx, block)
+                    .map(|(b, e)| (b, s as u8, v, e, 0))
             }
             Op::Binary(Binary::Imul, a, b) => [(a, b), (b, a)].into_iter().find_map(|(idx, sc)| {
                 let Location::Imm(m @ (2 | 4 | 8)) = self.locations[sc.index()] else {
                     return None;
                 };
                 self.unwrap_idx(idx, block)
-                    .map(|(b, e)| (b, m.trailing_zeros() as u8, v, e))
+                    .map(|(b, e)| (b, m.trailing_zeros() as u8, v, e, 0))
             }),
             _ => None,
         }
@@ -148,9 +172,9 @@ impl<R> SibCtx<'_, R> {
         [(left, right), (right, left)]
             .into_iter()
             .find_map(|(b, i)| {
-                self.parse_base(b)
-                    .zip(self.parse_scaled(i, block))
-                    .map(|((base, bd), (idx, sh, sv, ev))| (base, bd, idx, sh, Some(sv), ev))
+                self.parse_base(b).zip(self.parse_scaled(i, block)).map(
+                    |((base, bd), (idx, sh, sv, ev, id))| (base, bd, idx, sh, Some(sv), ev, id),
+                )
             })
             .or_else(|| {
                 [(left, right), (right, left)]
@@ -158,7 +182,7 @@ impl<R> SibCtx<'_, R> {
                     .find_map(|(b, i)| {
                         self.parse_base(b)
                             .zip(self.unwrap_idx(i, block))
-                            .map(|((base, bd), (idx, ev))| (base, bd, idx, 0, None, ev))
+                            .map(|((base, bd), (idx, ev))| (base, bd, idx, 0, None, ev, 0))
                     })
             })
     }
@@ -217,12 +241,12 @@ pub(super) fn sib_addrs<R>(
                 continue;
             };
             let (outer_disp, peeled_add, left, right) = ctx.peel_outer_disp(block, left, right);
-            let Some((base, base_disp, index, shift, scaled_val, ext_val)) =
+            let Some((base, base_disp, index, shift, scaled_val, ext_val, index_disp)) =
                 ctx.match_operands(block, left, right)
             else {
                 continue;
             };
-            let total = outer_disp + i64::from(base_disp);
+            let total = outer_disp + i64::from(base_disp) + index_disp;
             if !(-FOLD_LIMIT..=FOLD_LIMIT).contains(&total) {
                 continue;
             }

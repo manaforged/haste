@@ -292,6 +292,9 @@ fn same(
     args: &[Value],
     sides: [Value; 2],
 ) -> bool {
+    if sides[0] == sides[1] {
+        return true;
+    }
     let params = &func.blocks[block.index()].params;
     let local = |v: Value| {
         defs[v.index()].is_some_and(|inst| func.blocks[block.index()].insts.contains(&inst))
@@ -303,16 +306,25 @@ fn same(
     };
     let leaf = |u: Value, v: Value| u == v || constant(u).is_some_and(|c| constant(v) == Some(c));
     let shape = |v: Value| {
-        let mapped = subst(v);
-        let op = match defs[mapped.index()].map(|inst| &func.insts[inst.index()].op) {
-            Some(&Op::Binary(bin, x, y)) if local(mapped) => Some((bin, subst(x), subst(y))),
-            Some(&Op::Binary(bin, x, y)) => Some((bin, x, y)),
-            _ => None,
-        };
-        (mapped, op)
+        if local(v) {
+            let op = match defs[v.index()].map(|inst| &func.insts[inst.index()].op) {
+                Some(&Op::Binary(bin, x, y)) if !local(x) && !local(y) => {
+                    Some((bin, subst(x), subst(y)))
+                }
+                _ => None,
+            };
+            (None, op)
+        } else {
+            let mapped = subst(v);
+            let op = match defs[mapped.index()].map(|inst| &func.insts[inst.index()].op) {
+                Some(&Op::Binary(bin, x, y)) if !local(mapped) => Some((bin, x, y)),
+                _ => None,
+            };
+            (Some(mapped), op)
+        }
     };
     let ((a, a_op), (b, b_op)) = (shape(sides[0]), shape(sides[1]));
-    a == b
+    (a.is_some() && a == b)
         || matches!(
             (a_op, b_op),
             (Some((p, x1, y1)), Some((q, x2, y2))) if p == q && leaf(x1, x2) && leaf(y1, y2)

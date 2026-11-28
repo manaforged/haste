@@ -8,26 +8,22 @@ pub(crate) fn may_alias(a: MemLoc, b: MemLoc, prov: &Provenance) -> bool {
     may_alias_at(a, b, prov, None)
 }
 
-/// Whether `a` and `b` may alias at instruction `at`, using slot escape frontiers when `at` is known.
-pub(crate) fn may_alias_at(a: MemLoc, b: MemLoc, prov: &Provenance, at: Option<Inst>) -> bool {
-    if a.size == 0 || b.size == 0 {
-        return false;
+fn span_base(prov: &Provenance, base: MemBase) -> MemBase {
+    if let MemBase::Addr(v) = base
+        && let Some((b, _, _)) = prov.spans.get(v.index()).copied().flatten()
+    {
+        return b;
     }
-    if a.base == b.base {
-        return a.overlaps(b);
-    }
-    if let Some(alias) = prov.frame_alias(a, b) {
-        return alias;
-    }
-    if a.size != u32::MAX && b.size != u32::MAX {
-        let (ba, alo, ahi) = prov.loc_span(a);
-        let (bb, blo, bhi) = prov.loc_span(b);
-        if ba == bb {
-            return alo < bhi && blo < ahi;
-        }
-    }
-    match (a.root, b.root) {
-        (MemRoot::CallerLoc, MemRoot::CallerLoc) => a.overlaps(b),
+    base
+}
+
+fn roots_may_alias_at(
+    (a_root, a_base): (MemRoot, MemBase),
+    (b_root, b_base): (MemRoot, MemBase),
+    prov: &Provenance,
+    at: Option<Inst>,
+) -> bool {
+    match (a_root, b_root) {
         (MemRoot::CallerLoc, _) | (_, MemRoot::CallerLoc) => false,
         (MemRoot::ThreadCell(ta), MemRoot::ThreadCell(tb)) => ta == tb,
         (
@@ -63,17 +59,70 @@ pub(crate) fn may_alias_at(a: MemLoc, b: MemLoc, prov: &Provenance, at: Option<I
             | MemRoot::ReadonlyParam(_),
             MemRoot::UniqueHeap(_),
         ) => false,
-        (MemRoot::UniqueHeap(Some(owner)), _) if b.base == MemBase::Addr(owner) => false,
-        (_, MemRoot::UniqueHeap(Some(owner))) if a.base == MemBase::Addr(owner) => false,
+        (MemRoot::UniqueHeap(Some(owner)), _) if b_base == MemBase::Addr(owner) => false,
+        (_, MemRoot::UniqueHeap(Some(owner))) if a_base == MemBase::Addr(owner) => false,
         (MemRoot::NoAliasParam(p), MemRoot::Unknown)
         | (MemRoot::Unknown, MemRoot::NoAliasParam(p)) => !prov.noalias_unescaped(p),
-        (MemRoot::Slot(_), _) if prov.is_incoming(b.base) => false,
-        (_, MemRoot::Slot(_)) if prov.is_incoming(a.base) => false,
+        (MemRoot::Slot(_), _) if prov.is_incoming(b_base) => false,
+        (_, MemRoot::Slot(_)) if prov.is_incoming(a_base) => false,
         (MemRoot::Slot(s), _) | (_, MemRoot::Slot(s)) => {
             !prov.slot_addr_unescaped(s) && !prov.slot_return_only(s) && prov.slot_escaped_at(s, at)
         }
         _ => true,
     }
+}
+
+fn base_may_alias_at(
+    a: MemLoc,
+    b_root: MemRoot,
+    b_base: MemBase,
+    prov: &Provenance,
+    at: Option<Inst>,
+) -> Option<bool> {
+    if a.size == 0 {
+        return Some(false);
+    }
+    if a.base == b_base || prov.has_private_frame() {
+        return None;
+    }
+    if a.size != u32::MAX
+        && !prov.spans.is_empty()
+        && span_base(prov, a.base) == span_base(prov, b_base)
+    {
+        return None;
+    }
+    if matches!((a.root, b_root), (MemRoot::CallerLoc, MemRoot::CallerLoc)) {
+        return None;
+    }
+    Some(roots_may_alias_at(
+        (a.root, a.base),
+        (b_root, b_base),
+        prov,
+        at,
+    ))
+}
+
+pub(crate) fn may_alias_at(a: MemLoc, b: MemLoc, prov: &Provenance, at: Option<Inst>) -> bool {
+    if a.size == 0 || b.size == 0 {
+        return false;
+    }
+    if a.base == b.base {
+        return a.overlaps(b);
+    }
+    if let Some(alias) = prov.frame_alias(a, b) {
+        return alias;
+    }
+    if a.size != u32::MAX && b.size != u32::MAX {
+        let (ba, alo, ahi) = prov.loc_span(a);
+        let (bb, blo, bhi) = prov.loc_span(b);
+        if ba == bb {
+            return alo < bhi && blo < ahi;
+        }
+    }
+    if matches!((a.root, b.root), (MemRoot::CallerLoc, MemRoot::CallerLoc)) {
+        return a.overlaps(b);
+    }
+    roots_may_alias_at((a.root, a.base), (b.root, b.base), prov, at)
 }
 
 fn call_writes_noalias(params: &[AbiParam], args: &[Value], prov: &Provenance, p: u16) -> bool {
@@ -83,9 +132,13 @@ fn call_writes_noalias(params: &[AbiParam], args: &[Value], prov: &Provenance, p
     })
 }
 
+fn is_rodata_sym(func: &Function, sym: u32) -> bool {
+    func.rodata_bytes.iter().any(|&(s, _)| s == sym)
+}
+
 /// Whether `loc` lies in a read-only global section (`func.rodata_bytes`).
 pub(crate) fn is_rodata(func: &Function, loc: MemLoc) -> bool {
-    matches!(loc.root, MemRoot::Global(sym) if func.rodata_bytes.iter().any(|&(s, _)| s == sym))
+    matches!(loc.root, MemRoot::Global(sym) if is_rodata_sym(func, sym))
 }
 
 /// Whether `[off, off + bytes)` lies within `[0, size)` without underflow or overflow.
@@ -278,52 +331,173 @@ pub(crate) fn clobbers_load(
 
 #[derive(Clone)]
 pub(crate) struct KnownLoads {
-    by_base: HashMap<MemBase, (MemRoot, Vec<(i64, Type, Value)>)>,
+    slots: HashMap<StackSlot, Vec<(i64, Type, Value)>>,
+    addrs: HashMap<MemBase, (MemRoot, Vec<(i64, Type, Value)>)>,
+}
+
+fn store_entry(list: &mut Vec<(i64, Type, Value)>, offset: i64, ty: Type, value: Value) {
+    if let Some(entry) = list
+        .iter_mut()
+        .find(|(off, t, _)| *off == offset && *t == ty)
+    {
+        entry.2 = value;
+    } else {
+        list.push((offset, ty, value));
+    }
+}
+
+fn write_may_alias_any_slot(wloc: MemLoc, prov: &Provenance) -> bool {
+    if prov.has_private_frame() {
+        return true;
+    }
+    if matches!(
+        wloc.root,
+        MemRoot::CallerLoc
+            | MemRoot::ThreadCell(_)
+            | MemRoot::NoAliasParam(_)
+            | MemRoot::UniqueHeap(_)
+    ) {
+        return false;
+    }
+    if prov.is_incoming(wloc.base) {
+        return false;
+    }
+    if matches!(wloc.root, MemRoot::Slot(_)) {
+        return true;
+    }
+    prov.any_slot_escaped()
 }
 
 impl KnownLoads {
     pub(crate) fn new() -> Self {
         Self {
-            by_base: HashMap::default(),
+            slots: HashMap::default(),
+            addrs: HashMap::default(),
         }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.by_base.is_empty()
+        self.slots.is_empty() && self.addrs.is_empty()
     }
 
     pub(crate) fn get(&self, base: MemBase, offset: i64, ty: Type) -> Option<Value> {
-        self.by_base
-            .get(&base)?
-            .1
+        self.entries_for(base)
             .iter()
             .find(|&&(off, t, _)| off == offset && t == ty)
             .map(|&(_, _, val)| val)
     }
 
     pub(crate) fn entries_for(&self, base: MemBase) -> &[(i64, Type, Value)] {
-        self.by_base
-            .get(&base)
-            .map_or(&[], |entry| entry.1.as_slice())
+        match base {
+            MemBase::Slot(s) => self.slots.get(&s).map_or(&[], Vec::as_slice),
+            _ => self
+                .addrs
+                .get(&base)
+                .map_or(&[], |entry| entry.1.as_slice()),
+        }
     }
 
     pub(crate) fn remember(&mut self, loc: MemLoc, ty: Type, value: Value) {
-        let (_, list) = self
-            .by_base
-            .entry(loc.base)
-            .or_insert_with(|| (loc.root, Vec::new()));
-        if let Some(entry) = list
-            .iter_mut()
-            .find(|(off, t, _)| *off == loc.offset && *t == ty)
-        {
-            entry.2 = value;
-        } else {
-            list.push((loc.offset, ty, value));
+        match loc.base {
+            MemBase::Slot(s) => {
+                let list = self.slots.entry(s).or_default();
+                store_entry(list, loc.offset, ty, value);
+            }
+            _ => {
+                let (_, list) = self
+                    .addrs
+                    .entry(loc.base)
+                    .or_insert_with(|| (loc.root, Vec::new()));
+                store_entry(list, loc.offset, ty, value);
+            }
         }
     }
 
     pub(crate) fn write(&mut self, loc: MemLoc, ty: Type, value: Value, prov: &Provenance) {
         self.write_at(loc, ty, value, prov, None);
+    }
+
+    fn retain_slot(&mut self, s: StackSlot, wloc: MemLoc, prov: &Provenance, at: Option<Inst>) {
+        if let Some(entries) = self.slots.get_mut(&s) {
+            if wloc.base == MemBase::Slot(s) && !prov.has_private_frame() {
+                entries.retain(|&(off, t, _)| !wloc.overlaps(MemLoc::slot(s, off, t.bytes())));
+            } else {
+                entries.retain(|&(off, t, _)| {
+                    !may_alias_at(wloc, MemLoc::slot(s, off, t.bytes()), prov, at)
+                });
+            }
+            if entries.is_empty() {
+                self.slots.remove(&s);
+            }
+        }
+    }
+
+    fn retain_slots_for_write(&mut self, wloc: MemLoc, prov: &Provenance, at: Option<Inst>) {
+        if self.slots.is_empty() || !write_may_alias_any_slot(wloc, prov) {
+            return;
+        }
+        if !prov.has_private_frame()
+            && let MemRoot::Slot(s) = wloc.root
+        {
+            self.retain_slot(s, wloc, prov, at);
+            return;
+        }
+        self.slots.retain(|&s, entries| {
+            let base = MemBase::Slot(s);
+            let root = MemRoot::Slot(s);
+            match base_may_alias_at(wloc, root, base, prov, at) {
+                Some(false) => true,
+                Some(true) => false,
+                None => {
+                    entries.retain(|&(off, t, _)| {
+                        !may_alias_at(wloc, MemLoc::slot(s, off, t.bytes()), prov, at)
+                    });
+                    !entries.is_empty()
+                }
+            }
+        });
+    }
+
+    fn retain_non_aliasing(
+        &mut self,
+        wloc: MemLoc,
+        prov: &Provenance,
+        at: Option<Inst>,
+        preserve_imm: Option<&Function>,
+    ) {
+        if wloc.size == 0 || self.is_empty() {
+            return;
+        }
+        if let MemBase::Slot(s) = wloc.base
+            && wloc.root == MemRoot::Slot(s)
+            && prov.slot_direct_only(s)
+        {
+            self.retain_slot(s, wloc, prov, at);
+            return;
+        }
+        self.retain_slots_for_write(wloc, prov, at);
+        if self.addrs.is_empty() {
+            return;
+        }
+        self.addrs.retain(|&base, (root, entries)| {
+            if let Some(func) = preserve_imm {
+                match *root {
+                    MemRoot::Global(sym) if is_rodata_sym(func, sym) => return true,
+                    MemRoot::ReadonlyParam(_) if wloc.root != *root => return true,
+                    _ => {}
+                }
+            }
+            match base_may_alias_at(wloc, *root, base, prov, at) {
+                Some(false) => true,
+                Some(true) => false,
+                None => {
+                    entries.retain(|&(off, t, _)| {
+                        !may_alias_at(wloc, MemLoc::new(*root, base, off, t.bytes()), prov, at)
+                    });
+                    !entries.is_empty()
+                }
+            }
+        });
     }
 
     pub(crate) fn write_at(
@@ -334,26 +508,193 @@ impl KnownLoads {
         prov: &Provenance,
         at: Option<Inst>,
     ) {
-        self.by_base.retain(|&base, (root, entries)| {
-            entries.retain(|&(off, t, _)| {
-                !may_alias_at(loc, MemLoc::new(*root, base, off, t.bytes()), prov, at)
-            });
-            !entries.is_empty()
-        });
+        self.retain_non_aliasing(loc, prov, at, None);
         self.remember(loc, ty, value);
     }
 
-    pub(crate) fn invalidate(
+    pub(crate) fn write_at_preserving(
+        &mut self,
+        func: &Function,
+        loc: MemLoc,
+        ty: Type,
+        value: Value,
+        prov: &Provenance,
+        at: Option<Inst>,
+    ) {
+        self.retain_non_aliasing(loc, prov, at, Some(func));
+        self.remember(loc, ty, value);
+    }
+
+    pub(crate) fn invalidate_preserving(
         &mut self,
         func: &Function,
         op: (&Op, Option<Inst>),
         prov: &Provenance,
     ) {
-        self.by_base.retain(|&base, (root, entries)| {
+        self.invalidate_inner(func, op, prov, true);
+    }
+
+    fn invalidate_copy(
+        &mut self,
+        func: &Function,
+        dst: Value,
+        at: Option<Inst>,
+        prov: &Provenance,
+        preserve_imm: bool,
+    ) {
+        let w = prov.loc(dst, 0, u32::MAX);
+        if !self.slots.is_empty() && write_may_alias_any_slot(w, prov) {
+            if !prov.has_private_frame()
+                && let MemRoot::Slot(s) = w.root
+            {
+                self.slots.remove(&s);
+            } else {
+                self.slots.retain(|&s, entries| {
+                    let base = MemBase::Slot(s);
+                    let root = MemRoot::Slot(s);
+                    if w.base == base || w.root == root {
+                        return false;
+                    }
+                    match base_may_alias_at(w, root, base, prov, at) {
+                        Some(false) => true,
+                        Some(true) => false,
+                        None => {
+                            entries.retain(|&(off, t, _)| {
+                                !may_alias_at(w, MemLoc::slot(s, off, t.bytes()), prov, at)
+                            });
+                            !entries.is_empty()
+                        }
+                    }
+                });
+            }
+        }
+        self.addrs.retain(|&base, (root, entries)| {
+            if preserve_imm {
+                match *root {
+                    MemRoot::Global(sym) if is_rodata_sym(func, sym) => return true,
+                    MemRoot::ReadonlyParam(_) => return w.root != *root,
+                    _ => {}
+                }
+            }
+            if w.base == base || (w.root != MemRoot::Unknown && w.root == *root) {
+                return false;
+            }
+            match base_may_alias_at(w, *root, base, prov, at) {
+                Some(false) => true,
+                Some(true) => false,
+                None => {
+                    entries.retain(|&(off, t, _)| {
+                        !may_alias_at(w, MemLoc::new(*root, base, off, t.bytes()), prov, at)
+                    });
+                    !entries.is_empty()
+                }
+            }
+        });
+    }
+
+    fn invalidate_inner(
+        &mut self,
+        func: &Function,
+        op: (&Op, Option<Inst>),
+        prov: &Provenance,
+        preserve_imm: bool,
+    ) {
+        if self.is_empty() {
+            return;
+        }
+        let imm = preserve_imm.then_some(func);
+        match *op.0 {
+            Op::AtomicLoad(_, AtomicOrd::Relaxed) => return,
+            Op::Call { callee, .. } if func.is_fresh_alloc(callee) => return,
+            Op::Store(val, addr, off) => {
+                let w = prov.loc(addr, i64::from(off), func.ty(val).bytes());
+                self.retain_non_aliasing(w, prov, op.1, imm);
+                return;
+            }
+            Op::StackStore(val, slot, off) => {
+                let w = MemLoc::slot(slot, i64::from(off), func.ty(val).bytes());
+                self.retain_non_aliasing(w, prov, None, imm);
+                return;
+            }
+            Op::Move(dst, _, bytes) => {
+                let w = prov.loc(dst, 0, bytes);
+                self.retain_non_aliasing(w, prov, op.1, imm);
+                return;
+            }
+            Op::Copy(dst, _, _) => {
+                self.invalidate_copy(func, dst, op.1, prov, preserve_imm);
+                return;
+            }
+            _ => {}
+        }
+        let atomic_write = match *op.0 {
+            Op::AtomicStore(val, addr, _)
+            | Op::AtomicRmw(_, _, addr, val)
+            | Op::AtomicCas(_, addr, _, val) => Some(prov.loc(addr, 0, func.ty(val).bytes())),
+            _ => None,
+        };
+        let base_uniform = !prov.has_private_frame()
+            && matches!(
+                *op.0,
+                Op::Call { .. }
+                    | Op::TryCall { .. }
+                    | Op::Fence(..)
+                    | Op::VolatileLoad(..)
+                    | Op::VolatileStore(..)
+                    | Op::AtomicLoad(..)
+            );
+        if !self.slots.is_empty() && (prov.has_private_frame() || prov.any_slot_escaped()) {
+            self.slots.retain(|&s, entries| {
+                if base_uniform {
+                    return !clobbers_load(func, op, MemLoc::slot(s, 0, 1), prov);
+                }
+                entries.retain(|&(off, t, _)| {
+                    !clobbers_load(func, op, MemLoc::slot(s, off, t.bytes()), prov)
+                });
+                !entries.is_empty()
+            });
+        }
+        self.addrs.retain(|&base, (root, entries)| {
+            if preserve_imm {
+                match *root {
+                    MemRoot::Global(sym) if is_rodata_sym(func, sym) => return true,
+                    MemRoot::ReadonlyParam(_) => {
+                        return retain_readonly_atomic(atomic_write, (*root, base), entries, prov);
+                    }
+                    _ => {}
+                }
+            }
+            if base_uniform {
+                return !clobbers_load(func, op, MemLoc::new(*root, base, 0, 1), prov);
+            }
             entries.retain(|&(off, t, _)| {
                 !clobbers_load(func, op, MemLoc::new(*root, base, off, t.bytes()), prov)
             });
             !entries.is_empty()
         });
+    }
+}
+
+fn retain_readonly_atomic(
+    atomic_write: Option<MemLoc>,
+    (root, base): (MemRoot, MemBase),
+    entries: &mut Vec<(i64, Type, Value)>,
+    prov: &Provenance,
+) -> bool {
+    let Some(w) = atomic_write else {
+        return true;
+    };
+    if w.root != root {
+        return true;
+    }
+    match base_may_alias_at(w, root, base, prov, None) {
+        Some(false) => true,
+        Some(true) => false,
+        None => {
+            entries.retain(|&(off, t, _)| {
+                !may_alias(w, MemLoc::new(root, base, off, t.bytes()), prov)
+            });
+            !entries.is_empty()
+        }
     }
 }

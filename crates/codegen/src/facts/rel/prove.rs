@@ -79,12 +79,7 @@ impl Path {
         val: Value,
         depth: u8,
     ) -> bool {
-        if self.rel_kinds & kind_bit(RelKind::Ult) != 0
-            && self.steps_from(ty, val, UNSIGNED)
-            && self.rels.iter().any(|r| {
-                r.ty == ty && r.kind == RelKind::Ult && self.reaches(ty, val, r.rhs, UNSIGNED, true)
-            })
-        {
+        if self.rel_kinds & kind_bit(RelKind::Ult) != 0 && self.has_strict_step(ty, val, UNSIGNED) {
             return true;
         }
         if depth >= 2 {

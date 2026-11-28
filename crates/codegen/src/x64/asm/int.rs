@@ -94,6 +94,10 @@ impl Asm {
         if let Ok(small) = i8::try_from(imm) {
             self.encode(prefix, w, &[0x83], op as u8, dst, false);
             self.imm(&[small as u8]);
+        } else if !lock && matches!(dst, Rm::Reg(0)) {
+            self.rex(w, 0, 0, 0, false);
+            self.code.push(op as u8 * 8 + 5);
+            self.imm(&imm.to_le_bytes());
         } else {
             self.encode(prefix, w, &[0x81], op as u8, dst, false);
             self.imm(&imm.to_le_bytes());
@@ -193,8 +197,13 @@ impl Asm {
 
     /// `dst = src * imm`.
     pub fn imul_imm_sized(&mut self, size: Size, dst: Reg, src: impl Into<Rm>, imm: i32) {
-        self.encode(&[], size == Size::Q, &[0x69], dst as u8, src.into(), false);
-        self.imm(&imm.to_le_bytes());
+        if let Ok(small) = i8::try_from(imm) {
+            self.encode(&[], size == Size::Q, &[0x6B], dst as u8, src.into(), false);
+            self.imm(&[small as u8]);
+        } else {
+            self.encode(&[], size == Size::Q, &[0x69], dst as u8, src.into(), false);
+            self.imm(&imm.to_le_bytes());
+        }
     }
 
     /// `dst = src * imm`.
@@ -245,8 +254,12 @@ impl Asm {
 
     pub fn shift_imm(&mut self, size: Size, op: Shift, reg: Reg, imm: u8) {
         self.flags_overwritten();
-        self.sized(false, size, (&[0xC0], &[0xC1]), op as u8, reg.into());
-        self.code.push(imm);
+        if imm == 1 {
+            self.sized(false, size, (&[0xD0], &[0xD1]), op as u8, reg.into());
+        } else {
+            self.sized(false, size, (&[0xC0], &[0xC1]), op as u8, reg.into());
+            self.code.push(imm);
+        }
     }
 
     pub fn shld(&mut self, dst: Reg, src: Reg) {

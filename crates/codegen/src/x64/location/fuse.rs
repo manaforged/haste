@@ -158,6 +158,8 @@ fn collect_binary_candidate(
         if matches!(ty, Type::I32 | Type::I64) {
             cands.cand_bextr.push((b_idx, pos, res, Binary::Band, x, y));
             cands.cand_alu.push((b_idx, pos, res, Binary::Band, x, y));
+        } else if matches!(ty, Type::I8 | Type::I16) && plan.zero_ext[res.index()] {
+            cands.cand_alu.push((b_idx, pos, res, Binary::Band, x, y));
         }
         return;
     }
@@ -177,7 +179,11 @@ fn collect_binary_candidate(
             {
                 cands.cand_sibs.push((b_idx, pos, res));
             }
-            if matches!(ty, Type::I32 | Type::I64) {
+            if matches!(ty, Type::I32 | Type::I64)
+                || (matches!(op, Binary::Bor | Binary::Bxor)
+                    && matches!(ty, Type::I8 | Type::I16)
+                    && plan.zero_ext[res.index()])
+            {
                 cands.cand_alu.push((b_idx, pos, res, op, x, y));
             }
         }
@@ -306,11 +312,11 @@ pub(in super::super) fn fuse(
     func: &Function,
     plan: &mut Plan<Reg>,
     features: &Features,
-) -> (Vec<Option<Root>>, Vec<bool>) {
+) -> (Vec<Option<Root>>, Vec<bool>, Vec<bool>) {
     let n = func.types.len();
     let (mut roots, mut pure_test) = (vec![None; n], vec![false; n]);
     if func.size() > 8192 {
-        return (roots, pure_test);
+        return (roots, pure_test, vec![false; n]);
     }
     let mut info = collect_use_info(func, plan);
     let cands = collect_candidates(func, plan, features, &info);
@@ -415,5 +421,6 @@ pub(in super::super) fn fuse(
     super::sib::fuse_atomic_rmws(func, plan, (&info.uses, &info.pos_of, &info.use_of));
     loads::elide_zero_bases(func, plan, &info.defs);
     loads::restore_paired_loads(func, plan, &info.defs, &info.paired);
-    (roots, pure_test)
+    let narrow_byte = flags::find_narrow_bytes(func, plan, &info.defs);
+    (roots, pure_test, narrow_byte)
 }

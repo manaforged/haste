@@ -140,7 +140,6 @@ pub(crate) fn shrink_wrap<R: Copy + PartialEq>(
 ) -> Option<ShrinkWrap> {
     if !framed
         || func.abort_on_unwind
-        || func.save_all_regs
         || func
             .signature
             .params

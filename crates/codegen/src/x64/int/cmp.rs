@@ -113,7 +113,9 @@ impl Emit<'_> {
         }
         let dst = self.dst(result);
         self.asm.setcc(flags, dst);
-        self.asm.load(Size::B, dst, dst);
+        if !self.narrow_byte[result.index()] {
+            self.asm.load(Size::B, dst, dst);
+        }
         self.put(result, dst);
         if self.ty(x) != Type::I128 {
             self.flags = Some((result, flags));
@@ -174,8 +176,73 @@ impl Emit<'_> {
         }
         let dst = self.dst(result);
         self.asm.setcc(ok, dst);
-        self.asm.load(Size::B, dst, dst);
+        if !self.narrow_byte[result.index()] {
+            self.asm.load(Size::B, dst, dst);
+        }
         self.put(result, dst);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ir::{AbiParam, CallConv, Function, IntCC, Signature, Type};
+    use crate::x64::compile;
+    use crate::{Effort, FunctionBuilder, Target};
+
+    #[test]
+    fn narrow_byte_icmp_bor_brif_skips_movzbl_and_fuses_zf() {
+        let mut sig = Signature::new(CallConv::Native);
+        sig.params = vec![AbiParam::new(Type::I8)];
+        sig.returns = vec![AbiParam::new(Type::I64)];
+        let mut func = Function::new(sig);
+        {
+            let mut b = FunctionBuilder::new(&mut func);
+            let entry = b.create_block();
+            b.append_block_params_for_function_params(entry);
+            let hit = b.create_block();
+            let miss = b.create_block();
+            b.switch_to_block(entry);
+            let ch = b.block_params(entry)[0];
+            let c_quote = b.ins().iconst(Type::I8, 0x22);
+            let c_slash = b.ins().iconst(Type::I8, 0x5c);
+            let c_ctrl = b.ins().iconst(Type::I8, 0x20);
+            let is_quote = b.ins().icmp(IntCC::Equal, ch, c_quote);
+            let is_slash = b.ins().icmp(IntCC::Equal, ch, c_slash);
+            let is_ctrl = b.ins().icmp(IntCC::UnsignedLessThan, ch, c_ctrl);
+            let or1 = b.ins().bor(is_quote, is_slash);
+            let or2 = b.ins().bor(or1, is_ctrl);
+            b.ins().brif(or2, hit, &[], miss, &[]);
+            b.switch_to_block(hit);
+            let one = b.ins().iconst(Type::I64, 1);
+            b.ins().return_(&[one]);
+            b.switch_to_block(miss);
+            let zero = b.ins().iconst(Type::I64, 0);
+            b.ins().return_(&[zero]);
+        }
+        let mut target = *Target::find("x86_64-unknown-linux-gnu").expect("x64 linux target");
+        target.effort = Effort::Full;
+        let compiled = compile(&func, &target).expect("compile x64");
+        assert!(
+            !compiled.bytes.windows(2).any(|w| w == [0x0F, 0xB6]),
+            "narrow I8 icmp+bor+brif must not emit movzbl after setcc"
+        );
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            let mut mem = crate::memory::Memory::default();
+            let addr = mem.write_patched(&compiled, &[]).expect("map");
+            let f: extern "C" fn(u64) -> i64 = unsafe { std::mem::transmute(addr) };
+            for raw in [
+                0xFFFF_FFFF_FFFF_FF69_u64,
+                0xDEAD_BEEF_0000_0022_u64,
+                0x1234_5678_9ABC_DE5C_u64,
+                0xAAAA_BBBB_CCCC_DD1F_u64,
+                0xAAAA_BBBB_CCCC_DD20_u64,
+            ] {
+                let byte = raw as u8;
+                let expected = i64::from(byte == 0x22 || byte == 0x5c || byte < 0x20);
+                assert_eq!(f(raw), expected, "failed for raw={raw:#x}");
+            }
+        }
     }
 }

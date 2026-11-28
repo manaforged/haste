@@ -252,7 +252,7 @@ impl Emit<'_> {
         dst: Reg,
         result: Value,
     ) -> bool {
-        if !matches!(alu, Alu::And) || !self.features.bmi1 {
+        if !matches!(alu, Alu::And) || !self.features.bmi1 || !matches!(size, Size::D | Size::Q) {
             return false;
         }
         let Some((not_val, other)) = [(x, y), (y, x)].into_iter().find_map(|(a, b)| {
@@ -401,7 +401,13 @@ impl Emit<'_> {
         result: Value,
         saved_flags: Option<(Value, Cond)>,
     ) -> Reg {
-        let size = if ty == Type::I32 { Size::D } else { Size::Q };
+        let size = if ty == Type::I8 && self.narrow_byte[result.index()] {
+            Size::B
+        } else if ty == Type::I32 {
+            Size::D
+        } else {
+            Size::Q
+        };
         let (x, y) = self.order_alu_operands(alu, size, dst, (x, y));
         if self.try_andn(alu, size, (x, y), dst, result)
             || self.try_mask_load(alu, (x, y), dst, saved_flags)

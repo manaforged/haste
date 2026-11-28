@@ -1,5 +1,6 @@
 mod chain;
 mod count;
+mod dynamic_region;
 mod memset;
 mod region;
 mod self_loop;
@@ -276,6 +277,7 @@ fn unroll_loop_step(
         vector::flatten(func, each, (global_consts, sad))
             || chain::unroll_chain(func, cfg, each, global_consts)
             || region::unroll(func, cfg, each)
+            || dynamic_region::unroll(func, cfg, each, global_consts)
     } else {
         false
     }

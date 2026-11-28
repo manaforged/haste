@@ -150,7 +150,7 @@ fn scaled(cx: &RewriteCx, ty: Type, v: Value) -> Option<(Value, i64)> {
         Op::Binary(Binary::Ishl, x, k) => Some((x, cx.sconst(k)?)),
         Op::Binary(Binary::Imul, m1, m2) => [(m1, m2), (m2, m1)].into_iter().find_map(|(x, cv)| {
             cx.uconst(cv, ty)
-                .filter(|&m| m > 1 && m.is_power_of_two())
+                .filter(|&m| matches!(m, 2 | 4 | 8))
                 .map(|m| (x, i64::from(m.trailing_zeros())))
         }),
         _ => None,
@@ -212,4 +212,33 @@ pub(super) fn negated_shift_add(
         }
     }
     None
+}
+
+pub(super) fn shift_sum(cx: &mut RewriteCx, a: Value, b: Value) -> Option<Op> {
+    let ty = cx.func.ty(a);
+    let k = cx.count(b, ty)?;
+    if !ty.is_small_int() || k == 0 || !cx.single_use(a) {
+        return None;
+    }
+    let &Op::Binary(Binary::Iadd, p, q) = cx.op(a)? else {
+        return None;
+    };
+    let (v, c) = super::const_addend(cx, p, q)?;
+    let shifted = cx.emit(ty, Op::Binary(Binary::Ishl, v, b));
+    let addend = cx.emit(ty, Op::Const(extend(c.wrapping_shl(k), ty, true)));
+    Some(Op::Binary(Binary::Iadd, shifted, addend))
+}
+
+pub(super) fn mul_pow2_to_shl(cx: &mut RewriteCx, a: Value, b: Value) -> Option<Op> {
+    let ty = cx.func.ty(a);
+    if !ty.is_small_int() {
+        return None;
+    }
+    let (x, shift) = [(a, b), (b, a)].into_iter().find_map(|(x, cv)| {
+        cx.uconst(cv, ty)
+            .filter(|&m| matches!(m, 2 | 4 | 8))
+            .map(|m| (x, i64::from(m.trailing_zeros())))
+    })?;
+    let k = cx.emit(ty, Op::Const(shift));
+    Some(Op::Binary(Binary::Ishl, x, k))
 }

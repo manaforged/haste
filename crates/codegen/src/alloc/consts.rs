@@ -2,7 +2,7 @@ use crate::cfg::Loops;
 use crate::fold::fits_imm32;
 use crate::frame::Abi;
 use crate::ir::{Binary, Function, IntCC, Op, Signature, Type, Value};
-use crate::live::{Live, covers, overlaps};
+use crate::live::{Elided, Live, covers, for_effective_operands, overlaps};
 
 use super::{Location, Regs, Uses};
 
@@ -353,7 +353,7 @@ pub(super) fn promote_loop_syms<R: Copy>(
     func: &Function,
     census: &Uses,
     depths: Option<&[u32]>,
-    elided: &[bool],
+    eff: Elided<'_>,
     locations: &mut [Location<R>],
 ) -> Vec<(usize, Location<R>)> {
     let mut in_loop = vec![false; func.types.len()];
@@ -369,8 +369,8 @@ pub(super) fn promote_loop_syms<R: Copy>(
             let depth = depths[b];
             for &inst in &block.insts {
                 let data = &func.insts[inst.index()];
-                if !data.result.is_some_and(|r| elided[r.index()]) {
-                    data.op.for_operands(|v| {
+                if !data.result.is_some_and(|r| eff.elided[r.index()]) {
+                    for_effective_operands(data, eff, |v| {
                         if matches!(
                             locations[v.index()],
                             Location::SlotAddr(_) | Location::Symbol(_)
@@ -388,7 +388,7 @@ pub(super) fn promote_loop_syms<R: Copy>(
     let mut promoted = Vec::new();
     for (v, loc) in locations.iter_mut().enumerate() {
         if matches!(*loc, Location::SlotAddr(_) | Location::Symbol(_))
-            && !elided[v]
+            && !eff.elided[v]
             && !folds[v]
             && !cold_cell[v]
             && (census.uses[v] >= 2

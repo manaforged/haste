@@ -560,4 +560,84 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn madd_shift_const_uses_two_shifted_adds() {
+        let mut sig = Signature::new(CallConv::Internal);
+        sig.params.push(AbiParam::new(Type::I64));
+        sig.params.push(AbiParam::new(Type::I64));
+        sig.returns.push(AbiParam::new(Type::I64));
+        let mut func = Function::new(sig);
+        {
+            let mut b = FunctionBuilder::new(&mut func);
+            let entry = b.create_block();
+            b.append_block_params_for_function_params(entry);
+            let params = b.block_params(entry).to_vec();
+            b.switch_to_block(entry);
+            let ten = b.ins().iconst(Type::I64, 10);
+            let mul = b.ins().imul(params[0], ten);
+            let sum = b.ins().iadd(mul, params[1]);
+            b.ins().return_(&[sum]);
+        }
+        let words = arm64_words(
+            super::super::compile(&func, &arm64_full()).expect("arm64 madd*10 compiles"),
+        );
+        assert!(
+            !words.iter().any(|&w| (w & 0x7FE0_8000) == 0x1B00_0000),
+            "unexpected madd in {words:#x?}"
+        );
+        assert!(
+            !words.contains(&0xD280_014A),
+            "unexpected mov x10, #10 in {words:#x?}"
+        );
+        let shifted_adds = words
+            .iter()
+            .filter(|&&w| (w & 0xFFE0_0000) == 0x8B00_0000 && ((w >> 10) & 0x3F) != 0)
+            .count();
+        assert!(
+            shifted_adds >= 2,
+            "expected two shifted adds for x*10+y in {words:#x?}"
+        );
+    }
+
+    #[test]
+    fn loop_consts_hoists_expensive_imm_to_preheader() {
+        let mut sig = Signature::new(CallConv::Internal);
+        sig.params.push(AbiParam::new(Type::I64));
+        sig.returns.push(AbiParam::new(Type::I64));
+        let mut func = Function::new(sig);
+        {
+            let mut b = FunctionBuilder::new(&mut func);
+            let entry = b.create_block();
+            let head = b.create_block();
+            let exit = b.create_block();
+            b.append_block_params_for_function_params(entry);
+            let n = b.block_params(entry)[0];
+            let i = b.append_block_param(head, Type::I64);
+            let acc = b.append_block_param(head, Type::I64);
+            b.switch_to_block(entry);
+            let z = b.ins().iconst(Type::I64, 0);
+            b.ins().jump(head, &[n, z]);
+            b.switch_to_block(head);
+            let mask = b.ins().iconst(Type::I64, 0x0A00_0000_0100_0400_u64 as i64);
+            let shifted = b.ins().ushr(mask, i);
+            let acc2 = b.ins().iadd(acc, shifted);
+            let one = b.ins().iconst(Type::I64, 1);
+            let i2 = b.ins().isub(i, one);
+            let nz = b.ins().icmp_imm(IntCC::NotEqual, i2, 0);
+            b.ins().brif(nz, head, &[i2, acc2], exit, &[acc2]);
+            let ret = b.append_block_param(exit, Type::I64);
+            b.switch_to_block(exit);
+            b.ins().return_(&[ret]);
+        }
+        let code = super::super::compile(&func, &arm64_full()).expect("arm64 loop const compiles");
+        let loop_span = code.loops.first().expect("expected loop span");
+        let loop_words: Vec<u32> = code.bytes[loop_span.start as usize..loop_span.end as usize]
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert!(
+            !loop_words.iter().any(|&w| (w & 0xFF80_0000) == 0xF280_0000),
+            "expensive constant must be hoisted out of loop body: {loop_words:#x?}"
+        );
+    }
 }

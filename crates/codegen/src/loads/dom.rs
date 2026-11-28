@@ -2,7 +2,7 @@ use crate::cfg::Cfg;
 use crate::ir::{Block, Function, Inst, Op, Type, Value};
 use crate::mem::{
     KnownLoads, MemBase, MemLoc, MemRoot, Provenance, clobbers_load, is_atomic_barrier, is_rodata,
-    may_alias, may_alias_at,
+    may_alias,
 };
 use crate::merge::find;
 
@@ -84,61 +84,27 @@ pub(super) fn clobbers_loc(
     clobbers_load(func, (op, at), loc, prov)
 }
 
-fn save_immutable_entries(
-    func: &Function,
-    known: &KnownLoads,
-    bases: &[(MemBase, MemRoot)],
-    keep: impl Fn(MemLoc) -> bool,
-) -> Vec<(MemLoc, Type, Value)> {
-    let mut saved = Vec::new();
-    for &(base, root) in bases {
-        if !loc_immutable(func, MemLoc::new(root, base, 0, 1)) {
-            continue;
-        }
-        for &(off, ty, val) in known.entries_for(base) {
-            let loc = MemLoc::new(root, base, off, ty.bytes());
-            if keep(loc) {
-                saved.push((loc, ty, val));
-            }
-        }
-    }
-    saved
-}
-
 pub(super) fn invalidate_preserving(
     func: &Function,
     known: &mut KnownLoads,
-    bases: &[(MemBase, MemRoot)],
+    _bases: &[(MemBase, MemRoot)],
     op: (&Op, Option<Inst>),
     prov: &Provenance,
 ) {
-    let saved =
-        save_immutable_entries(func, known, bases, |loc| !clobbers_loc(func, op, loc, prov));
-    known.invalidate(func, op, prov);
-    for (loc, ty, val) in saved {
-        known.remember(loc, ty, val);
-    }
+    known.invalidate_preserving(func, op, prov);
 }
 
 pub(super) fn write_preserving(
     func: &Function,
     known: &mut KnownLoads,
-    bases: &[(MemBase, MemRoot)],
+    _bases: &[(MemBase, MemRoot)],
     wloc: MemLoc,
     ty: Type,
     value: Value,
     prov: &Provenance,
     at: Option<Inst>,
 ) {
-    let saved = save_immutable_entries(func, known, bases, |loc| {
-        matches!(loc.root, MemRoot::Global(_))
-            || wloc.root != loc.root
-            || !may_alias_at(wloc, loc, prov, at)
-    });
-    known.write_at(wloc, ty, value, prov, at);
-    for (loc, ety, eval) in saved {
-        known.remember(loc, ety, eval);
-    }
+    known.write_at_preserving(func, wloc, ty, value, prov, at);
 }
 
 impl<'a> BlockWrites<'a> {

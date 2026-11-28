@@ -88,6 +88,8 @@ pub(crate) struct Provenance {
     pub slot_offsets: Vec<Option<(StackSlot, i32)>>,
     pub unescaped_slots: Vec<bool>,
     pub addr_unescaped_slots: Vec<bool>,
+    slot_has_addr: Vec<bool>,
+    any_slot_escaped: bool,
     pub unwind_target_slots: Vec<bool>,
     pub call_readonly_slots: Vec<bool>,
     pub return_only_slots: Vec<bool>,
@@ -138,7 +140,10 @@ impl Provenance {
             prov.frontiers = escape::frontiers(func, &mut esc);
         }
         prov.unescaped_slots = esc.unescaped;
+        prov.any_slot_escaped =
+            prov.unescaped_slots.iter().any(|&u| !u) || esc.addr_unescaped.iter().any(|&u| !u);
         prov.addr_unescaped_slots = esc.addr_unescaped;
+        prov.slot_has_addr = esc.has_addr;
         prov.unwind_target_slots = esc.unwind_target;
         prov.call_readonly_slots = esc.call_readonly;
         prov.return_only_slots = esc.return_only;
@@ -321,6 +326,22 @@ impl Provenance {
             .get(slot.index())
             .copied()
             .unwrap_or(false)
+    }
+
+    #[inline]
+    pub(crate) fn slot_direct_only(&self, slot: StackSlot) -> bool {
+        !self.has_private_frame()
+            && !self
+                .slot_has_addr
+                .get(slot.index())
+                .copied()
+                .unwrap_or(true)
+            && self.slot_unescaped(slot)
+    }
+
+    #[inline]
+    pub(crate) fn any_slot_escaped(&self) -> bool {
+        self.any_slot_escaped
     }
 
     /// Whether `slot`'s address is stored into an indirect/wide unwind-drop slot and therefore read on panic unwind.

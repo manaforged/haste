@@ -10,6 +10,7 @@ use crate::mem::{Provenance, may_alias};
 #[derive(Clone, Copy)]
 enum Kind {
     Splat(Value),
+    Gather,
     Param(usize),
     Load(Value, i32),
     Binary(Binary, usize, usize),
@@ -42,9 +43,12 @@ struct Packer<'a> {
 
 fn lane_binary(op: Binary, lane: Lane) -> bool {
     match op {
-        Binary::Iadd | Binary::Isub | Binary::Band | Binary::Bor | Binary::Bxor => true,
+        Binary::Iadd | Binary::Isub | Binary::Band | Binary::Bor | Binary::Bxor => lane.is_int(),
         Binary::Imul => matches!(lane, Lane::I16 | Lane::I32),
-        Binary::Smin | Binary::Smax | Binary::Umin | Binary::Umax => lane != Lane::I64,
+        Binary::Smin | Binary::Smax | Binary::Umin | Binary::Umax => {
+            lane.is_int() && lane != Lane::I64
+        }
+        Binary::Fadd | Binary::Fsub | Binary::Fmul | Binary::Fdiv => lane.is_float(),
         _ => false,
     }
 }
@@ -102,11 +106,58 @@ impl Packer<'_> {
         Some(id)
     }
 
-    fn pack_load(base: Value, off: i32, ty: Type, ops: &[Op]) -> Option<Kind> {
+    fn def_op_any(&self, v: Value) -> Option<&Op> {
+        self.op_of(v).or_else(|| {
+            self.func
+                .insts
+                .iter()
+                .find(|d| d.result == Some(v))
+                .map(|d| &d.op)
+        })
+    }
+
+    fn decompose_addr(&self, addr: Value, off: i32) -> (Vec<Value>, i32) {
+        let mut terms = Vec::new();
+        let mut stack = vec![(addr, 0u8)];
+        let mut total = off;
+        while let Some((cur, depth)) = stack.pop() {
+            if depth < 3
+                && let Some(Op::Binary(Binary::Iadd, a, b)) = self.def_op_any(cur)
+            {
+                if let Some(Op::Const(c)) = self.def_op_any(*b)
+                    && let Ok(d) = i32::try_from(*c)
+                    && let Some(sum) = total.checked_add(d)
+                {
+                    total = sum;
+                    stack.push((*a, depth + 1));
+                    continue;
+                }
+                if let Some(Op::Const(c)) = self.def_op_any(*a)
+                    && let Ok(d) = i32::try_from(*c)
+                    && let Some(sum) = total.checked_add(d)
+                {
+                    total = sum;
+                    stack.push((*b, depth + 1));
+                    continue;
+                }
+                stack.push((*a, depth + 1));
+                stack.push((*b, depth + 1));
+                continue;
+            }
+            terms.push(cur);
+        }
+        terms.sort_unstable_by_key(|v| v.index());
+        (terms, total)
+    }
+
+    fn pack_load(&self, base: Value, off: i32, ty: Type, ops: &[Op]) -> Option<Kind> {
         let step = ty.bytes() as i32;
-        let consecutive = ops.iter().enumerate().all(
-            |(k, op)| matches!(*op, Op::Load(b, o) if b == base && o == off + k as i32 * step),
-        );
+        let (terms0, off0) = self.decompose_addr(base, off);
+        let consecutive = ops.iter().enumerate().all(|(k, op)| {
+            let Op::Load(b, o) = *op else { return false };
+            let (tk, ok) = self.decompose_addr(b, o);
+            tk == terms0 && ok == off0 + k as i32 * step
+        });
         consecutive.then_some(Kind::Load(base, off))
     }
 
@@ -192,7 +243,7 @@ impl Packer<'_> {
 
     fn pack_ops(&mut self, id: usize, ty: Type, lane: Lane, ops: &[Op]) -> Option<Kind> {
         match &ops[0] {
-            Op::Load(base, off) => Self::pack_load(*base, *off, ty, ops),
+            Op::Load(base, off) => self.pack_load(*base, *off, ty, ops),
             Op::Binary(bin, ..) => self.pack_binary(*bin, lane, ops),
             Op::Icmp(cc, ..) => self.pack_icmp(id, *cc, ops),
             Op::Select(..) => self.pack_select(lane, ops),
@@ -208,7 +259,7 @@ impl Packer<'_> {
             return Some(id);
         }
         let ty = self.func.ty(lanes[0]);
-        if !ty.is_small_int() || lanes.iter().any(|&v| self.func.ty(v) != ty) {
+        if !(ty.is_small_int() || ty.is_float()) || lanes.iter().any(|&v| self.func.ty(v) != ty) {
             return None;
         }
         let lane = Lane::from_type(ty)?;
@@ -221,6 +272,12 @@ impl Packer<'_> {
             } else {
                 self.add(lanes, Kind::Splat(lanes[0]), lane)
             };
+        }
+        if lanes
+            .iter()
+            .all(|&v| self.op_of(v).is_none_or(|op| matches!(op, Op::Const(_))))
+        {
+            return self.add(lanes, Kind::Gather, lane);
         }
         if let Some(indices) = self.param_indices(lanes) {
             return self.pack_params(lanes, indices, lane);
@@ -237,10 +294,10 @@ impl Packer<'_> {
     fn nodes_valid(&self, n: usize, count: u8, at: usize) -> bool {
         let late = |v: Value| self.defs.get(&v).is_some_and(|&pos| pos >= at);
         for node in &self.nodes {
-            if let Kind::Splat(v) | Kind::Load(v, _) = node.kind
-                && late(v)
-            {
-                return false;
+            match node.kind {
+                Kind::Splat(v) | Kind::Load(v, _) if late(v) => return false,
+                Kind::Gather if node.lanes.iter().any(|&v| late(v)) => return false,
+                _ => {}
             }
             if let Kind::Load(..) = node.kind {
                 let bytes = node.lane.bytes() * n as u32;
@@ -256,31 +313,36 @@ impl Packer<'_> {
         let data = &self.func.blocks[self.block.index()];
         for (pos, &inst) in data.insts.iter().enumerate() {
             let op = &self.func.insts[inst.index()].op;
-            if writes_memory(op) && !seed.stores.contains(&pos) {
+            if writes_memory(op) && !seed.stores().contains(&pos) {
                 return false;
             }
         }
+        let Seed::Store {
+            stores,
+            base,
+            off,
+            ty,
+        } = seed
+        else {
+            return true;
+        };
         let loads: Vec<usize> = self
             .nodes
             .iter()
             .filter(|node| matches!(node.kind, Kind::Load(..)))
             .flat_map(|node| node.lanes.iter().map(|v| self.defs[v]))
             .collect();
-        let step = seed.ty.bytes();
-        for (k, &spos) in seed.stores.iter().enumerate() {
-            let stored = prov.loc(
-                seed.base,
-                i64::from(seed.off) + i64::from(step) * k as i64,
-                step,
-            );
+        let step = ty.bytes();
+        for (k, &spos) in stores.iter().enumerate() {
+            let stored = prov.loc(*base, i64::from(*off) + i64::from(step) * k as i64, step);
             for &lpos in &loads {
-                let Op::Load(addr, off) = self.func.insts[data.insts[lpos].index()].op else {
+                let Op::Load(addr, loff) = self.func.insts[data.insts[lpos].index()].op else {
                     continue;
                 };
                 let Some(res) = self.func.insts[data.insts[lpos].index()].result else {
                     return false;
                 };
-                let read = prov.loc(addr, i64::from(off), self.func.ty(res).bytes());
+                let read = prov.loc(addr, i64::from(loff), self.func.ty(res).bytes());
                 if spos < lpos && may_alias(stored, read, prov) {
                     return false;
                 }
@@ -316,7 +378,8 @@ impl Packer<'_> {
         let mut seen = vec![(false, false); watched.len()];
         for (b, bd) in self.func.blocks.iter().enumerate() {
             for (pos, &inst) in bd.insts.iter().enumerate() {
-                if tree.contains(&inst) || (b == self.block.index() && seed.stores.contains(&pos)) {
+                if tree.contains(&inst) || (b == self.block.index() && seed.stores().contains(&pos))
+                {
                     continue;
                 }
                 let early = b == self.block.index() && pos < at;
@@ -352,11 +415,33 @@ impl Packer<'_> {
     }
 }
 
-struct Seed {
-    stores: Vec<usize>,
-    base: Value,
-    off: i32,
-    ty: Type,
+enum Seed {
+    Store {
+        stores: Vec<usize>,
+        base: Value,
+        off: i32,
+        ty: Type,
+    },
+    Reduce {
+        values: Vec<Value>,
+        at: usize,
+    },
+}
+
+impl Seed {
+    fn stores(&self) -> &[usize] {
+        match self {
+            Self::Store { stores, .. } => stores,
+            Self::Reduce { .. } => &[],
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Store { stores, .. } => stores.len(),
+            Self::Reduce { values, .. } => values.len(),
+        }
+    }
 }
 
 fn seeds(func: &Function, block: Block) -> Vec<Seed> {
@@ -387,7 +472,7 @@ fn seeds(func: &Function, block: Block) -> Vec<Seed> {
         }
         let len = end - at;
         if len >= 2 && len.is_power_of_two() {
-            out.push(Seed {
+            out.push(Seed::Store {
                 stores: stores[at..end].iter().map(|s| s.3).collect(),
                 base,
                 off,
@@ -396,7 +481,77 @@ fn seeds(func: &Function, block: Block) -> Vec<Seed> {
         }
         at = end;
     }
+    if let Some(back_args) = insts
+        .last()
+        .and_then(|&t| back_edge_args(&func.insts[t.index()].op, block))
+    {
+        collect_reduce_seeds(func, block, back_args, &mut out);
+    }
     out
+}
+
+fn collect_reduce_seeds(func: &Function, block: Block, back_args: &[Value], out: &mut Vec<Seed>) {
+    let data = &func.blocks[block.index()];
+    let defs: HashMap<Value, usize> = data
+        .insts
+        .iter()
+        .enumerate()
+        .filter_map(|(pos, &inst)| func.insts[inst.index()].result.map(|r| (r, pos)))
+        .collect();
+    for (idx, &param) in data.params.iter().enumerate() {
+        let ty = func.ty(param);
+        if !ty.is_float() {
+            continue;
+        }
+        let Some(&start) = back_args.get(idx) else {
+            continue;
+        };
+        let mut cur = start;
+        let mut terms: Vec<(Value, usize)> = Vec::new();
+        while cur != param {
+            let Some(&pos) = defs.get(&cur) else {
+                break;
+            };
+            let Op::Binary(Binary::Fadd, a, b) = func.insts[data.insts[pos].index()].op else {
+                break;
+            };
+            let is_chain = |v: Value| {
+                v == param
+                    || defs.get(&v).is_some_and(|&p| {
+                        matches!(
+                            func.insts[data.insts[p].index()].op,
+                            Op::Binary(Binary::Fadd, ..)
+                        )
+                    })
+            };
+            let (prev, term) = if is_chain(a) {
+                (a, b)
+            } else if is_chain(b) {
+                (b, a)
+            } else {
+                break;
+            };
+            terms.push((term, pos));
+            cur = prev;
+            if terms.len() > 16 {
+                break;
+            }
+        }
+        if cur != param || terms.len() < 2 {
+            continue;
+        }
+        terms.reverse();
+        let width = if ty == Type::F64 { 2 } else { 4 };
+        for chunk in terms.chunks_exact(width) {
+            if chunk.iter().all(|&(v, _)| defs.contains_key(&v)) {
+                let at = chunk.iter().map(|&(_, pos)| pos).min().unwrap_or(0);
+                out.push(Seed::Reduce {
+                    values: chunk.iter().map(|&(v, _)| v).collect(),
+                    at,
+                });
+            }
+        }
+    }
 }
 
 fn lanes_per_vector(nodes: &[Node], n: usize) -> Option<u8> {
@@ -455,14 +610,16 @@ fn plan(func: &Function, prov: &Provenance, block: Block, seed: Seed) -> Option<
         .enumerate()
         .filter_map(|(pos, &inst)| func.insts[inst.index()].result.map(|r| (r, pos)))
         .collect();
-    let values: Vec<Value> = seed
-        .stores
-        .iter()
-        .map(|&pos| match func.insts[data.insts[pos].index()].op {
-            Op::Store(value, ..) => value,
-            _ => unreachable!("seeds hold stores"),
-        })
-        .collect();
+    let values: Vec<Value> = match &seed {
+        Seed::Store { stores, .. } => stores
+            .iter()
+            .map(|&pos| match func.insts[data.insts[pos].index()].op {
+                Op::Store(value, ..) => value,
+                _ => unreachable!("seeds hold stores"),
+            })
+            .collect(),
+        Seed::Reduce { values, .. } => values.clone(),
+    };
     let mut packer = Packer {
         func,
         block,
@@ -474,16 +631,30 @@ fn plan(func: &Function, prov: &Provenance, block: Block, seed: Seed) -> Option<
         params: Vec::new(),
     };
     let root = packer.pack(&values)?;
-    let n = seed.stores.len();
+    let n = seed.len();
     let count = lanes_per_vector(&packer.nodes, n)?;
-    let at = *seed.stores.iter().max()?;
+    let at = match &seed {
+        Seed::Store { stores, .. } => *stores.iter().max()?,
+        Seed::Reduce { at, .. } => *at,
+    };
     if !packer.nodes_valid(n, count, at) || !packer.memory_safe(prov, &seed) {
         return None;
     }
     let (watched, extracts) = packer.count_extracts(&seed, term, at)?;
-    let scalar = n + watched;
-    let vector = packer.nodes.len() + 2 + extracts;
-    (vector * 3 < scalar * 2).then_some(Plan {
+    let has_fdiv = packer
+        .nodes
+        .iter()
+        .any(|node| matches!(node.kind, Kind::Binary(Binary::Fdiv, ..)));
+    let scalar = match &seed {
+        Seed::Store { .. } => n + watched,
+        Seed::Reduce { .. } => watched,
+    };
+    let vector = match &seed {
+        Seed::Store { .. } => packer.nodes.len() + 2 + extracts,
+        Seed::Reduce { .. } => packer.nodes.len() + extracts,
+    };
+    let profitable = vector * 3 < scalar * 2 || (has_fdiv && vector < scalar);
+    profitable.then_some(Plan {
         nodes: packer.nodes,
         params: packer.params,
         seed,

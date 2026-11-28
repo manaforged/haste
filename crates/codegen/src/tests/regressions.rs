@@ -559,3 +559,151 @@ fn algebra_factors_select_over_shared_binary_op() {
         "Select(c, Fadd(acc, Fmul(x, a)), Fadd(acc, Fmul(x, b))) must factor to 1 Fadd + 1 Fmul + 1 Select"
     );
 }
+
+#[test]
+fn loads_sink_preserves_indirect_store_into_slot() {
+    let mut sig = Signature::new(CallConv::Internal);
+    sig.params.push(AbiParam::new(Type::I64));
+    sig.params.push(AbiParam::new(Type::I32));
+    sig.returns.push(AbiParam::new(Type::I64));
+    let mut func = build_fn(sig, |b, p| {
+        let slot = b.create_stack_slot(16, 8);
+        let zero = b.ins().iconst(Type::I64, 0);
+        b.ins().stack_store(zero, slot, 0);
+        b.ins().stack_store(zero, slot, 8);
+        let loop_blk = b.create_block();
+        let panic_blk = b.create_block();
+        let exit_blk = b.create_block();
+        let has_work = b.ins().icmp_imm(IntCC::NotEqual, p[0], 0);
+        b.ins().brif(has_work, loop_blk, &[], exit_blk, &[]);
+
+        b.switch_to_block(loop_blk);
+        let ok = b.ins().icmp_imm(IntCC::UnsignedLessThan, p[0], 4);
+        let write_blk = b.create_block();
+        b.ins().brif(ok, write_blk, &[], panic_blk, &[]);
+
+        b.switch_to_block(write_blk);
+        let base = b.ins().stack_addr(Type::I64, slot, 0);
+        let four = b.ins().iconst(Type::I64, 4);
+        let off = b.ins().imul(p[0], four);
+        let ptr = b.ins().iadd(base, off);
+        b.ins().store(p[1], ptr, 0);
+        b.ins().jump(exit_blk, &[]);
+
+        b.switch_to_block(panic_blk);
+        b.ins().trap();
+
+        b.switch_to_block(exit_blk);
+        let lo = b.ins().stack_load(Type::I64, slot, 0);
+        let hi = b.ins().stack_load(Type::I64, slot, 8);
+        let sum = b.ins().iadd(lo, hi);
+        b.ins().return_(&[sum]);
+    });
+    let target = full_x64();
+    schedule::run(&mut func, Moves::Split, &target);
+    verify::verify(&func, &target).expect("valid IR after store sinking");
+    let exit = func
+        .blocks
+        .iter()
+        .find(|blk| {
+            blk.insts
+                .last()
+                .is_some_and(|i| matches!(func.insts[i.index()].op, Op::Return(_)))
+        })
+        .expect("exit block");
+    assert!(
+        exit.insts
+            .iter()
+            .any(|&i| matches!(func.insts[i.index()].op, Op::StackLoad(..) | Op::Load(..))),
+        "initial zero stores must not sink past the indirect Store into the exit block: {func}"
+    );
+}
+
+#[test]
+fn thread_tail_same_distinguishes_local_def_from_prev_iter_param() {
+    let mut sig = Signature::new(CallConv::Internal);
+    sig.params.push(AbiParam::new(Type::I64));
+    sig.params.push(AbiParam::new(Type::I64));
+    sig.params.push(AbiParam::new(Type::I32));
+    sig.returns.push(AbiParam::new(Type::I32));
+    let mut func = build_fn(sig, |b, p| {
+        let head = b.create_block();
+        let step = b.create_block();
+        let exit = b.create_block();
+        let cur = b.append_block_param(head, Type::I32);
+        let cur64 = b.append_block_param(head, Type::I64);
+        let out = b.append_block_param(exit, Type::I32);
+
+        let init64 = b.ins().uextend(Type::I64, p[2]);
+        let in_bounds = b.ins().icmp(IntCC::UnsignedLessThan, init64, p[1]);
+        b.ins()
+            .brif(in_bounds, head, &[p[2], init64], exit, &[p[2]]);
+
+        b.switch_to_block(head);
+        let four = b.ins().iconst(Type::I64, 4);
+        let off = b.ins().imul(cur64, four);
+        let addr = b.ins().iadd(p[0], off);
+        let next = b.ins().load(Type::I32, addr, 0);
+        let ne = b.ins().icmp(IntCC::NotEqual, next, cur);
+        b.ins().brif(ne, step, &[], exit, &[cur]);
+
+        b.switch_to_block(step);
+        let next64 = b.ins().uextend(Type::I64, next);
+        let keep = b.ins().icmp(IntCC::UnsignedLessThan, next64, p[1]);
+        b.ins().brif(keep, head, &[next, next64], exit, &[next]);
+
+        b.switch_to_block(exit);
+        b.ins().return_(&[out]);
+    });
+    let target = full_x64();
+    schedule::run(&mut func, Moves::Split, &target);
+    verify::verify(&func, &target).expect("valid IR after jump threading");
+    let cfg = func.cfg();
+    assert!(
+        cfg.loops().depths.iter().any(|&d| d > 0),
+        "pointer-chasing loop must not collapse to a single iteration: {func}"
+    );
+}
+
+#[test]
+fn slp_gather_rejects_late_const_lane_after_plan_at() {
+    let mut sig = Signature::new(CallConv::Internal);
+    sig.params.push(AbiParam::new(Type::I64));
+    sig.params.push(AbiParam::new(Type::I64));
+    sig.params.push(AbiParam::new(Type::I64));
+    let mut func = build_fn(sig, |b, p| {
+        let lp = b.create_block();
+        let exit = b.create_block();
+        let i = b.append_block_param(lp, Type::I64);
+        let zero = b.ins().iconst(Type::I64, 0);
+        b.ins().jump(lp, &[zero]);
+
+        b.switch_to_block(lp);
+        let shift = b.ins().iconst(Type::I64, 4);
+        let off = b.ins().ishl(i, shift);
+        let src = b.ins().iadd(p[0], off);
+        let dst = b.ins().iadd(p[1], off);
+        let a0 = b.ins().load(Type::F64, src, 0);
+        let a1 = b.ins().load(Type::F64, src, 8);
+        let c0 = b.ins().iconst(Type::F64, 1.0_f64.to_bits() as i64);
+        let s0 = b.ins().fadd(a0, c0);
+        let t0 = b.ins().fmul(s0, a0);
+        let u0 = b.ins().fdiv(t0, s0);
+        b.ins().store(u0, dst, 0);
+        let c1 = b.ins().iconst(Type::F64, 2.0_f64.to_bits() as i64);
+        let s1 = b.ins().fadd(a1, c1);
+        let t1 = b.ins().fmul(s1, a1);
+        let u1 = b.ins().fdiv(t1, s1);
+        b.ins().store(u1, dst, 8);
+        let one = b.ins().iconst(Type::I64, 1);
+        let next = b.ins().iadd(i, one);
+        let keep = b.ins().icmp(IntCC::UnsignedLessThan, next, p[2]);
+        b.ins().brif(keep, lp, &[next], exit, &[]);
+
+        b.switch_to_block(exit);
+        b.ins().return_(&[]);
+    });
+    let target = full_x64();
+    let _ = crate::slp::run(&mut func);
+    verify::verify(&func, &target).expect("slp must not emit Gather use-before-def");
+}

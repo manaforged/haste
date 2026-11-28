@@ -210,6 +210,17 @@ impl Emit<'_> {
         true
     }
 
+    fn madd_acc(&mut self, c: Value) -> Reg {
+        if self.plan.const_of(c) == Some(0) {
+            return ZR;
+        }
+        let r = self.bits(c, IP);
+        if r == IP {
+            self.clobber_reg(IP);
+        }
+        r
+    }
+
     fn try_alu_shifted_or_madd(
         &mut self,
         op: Binary,
@@ -258,16 +269,21 @@ impl Emit<'_> {
                     self.defs[v.index()]
                 })
         {
+            if let Some((val, mul_shift, out_shift)) =
+                super::super::frames::madd_shift_const(&self.plan, ty, a, b)
+            {
+                let vreg = self.bits(val, A);
+                self.asm
+                    .alu_shifted(Alu::Add, size, Shift::Lsl, mul_shift, C, vreg, vreg);
+                self.clobber_reg(C);
+                let acc = self.madd_acc(c);
+                let out_alu = if sub { Alu::Sub } else { Alu::Add };
+                self.asm
+                    .alu_shifted(out_alu, size, Shift::Lsl, out_shift, dst, acc, C);
+                return true;
+            }
             let (left, right) = self.bits_pair(a, b);
-            let acc = if self.plan.const_of(c) == Some(0) {
-                ZR
-            } else {
-                let r = self.bits(c, IP);
-                if r == IP {
-                    self.clobber_reg(IP);
-                }
-                r
-            };
+            let acc = self.madd_acc(c);
             self.asm.madd(sub, size, dst, (left, right), acc);
             return true;
         }

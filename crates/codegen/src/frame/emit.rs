@@ -16,6 +16,83 @@ pub(crate) fn stack_zero_store(
     (ty.is_small_int() && const_of(val) == Some(0)).then(|| (slots[slot.index()] + off, ty.bytes()))
 }
 
+pub(crate) fn stack_byte_store(
+    func: &Function,
+    slots: &[i32],
+    inst: Inst,
+    const_of: impl FnOnce(Value) -> Option<i64>,
+) -> Option<(i32, u8)> {
+    let Op::StackStore(val, slot, off) = func.insts[inst.index()].op else {
+        return None;
+    };
+    let ty = func.ty(val);
+    if ty.bytes() != 1 {
+        return None;
+    }
+    let byte = const_of(val)? as u8;
+    (byte != 0).then(|| (slots[slot.index()] + off, byte))
+}
+
+fn emit_fill_interval<'a, E: Emitter<'a>>(emit: &mut E, start: i32, stop: i32, byte: u8) {
+    let mut cur = start;
+    while stop - cur >= 4 {
+        emit.emit_fill_frame(cur, 4, byte);
+        cur += 4;
+    }
+    match stop - cur {
+        0 => {}
+        1 | 2 => emit.emit_fill_frame(cur, (stop - cur) as u32, byte),
+        _ => {
+            emit.emit_fill_frame(cur, 2, byte);
+            emit.emit_fill_frame(cur + 2, 1, byte);
+        }
+    }
+}
+
+fn try_emit_byte_fill_run<'a, E: Emitter<'a>>(
+    emit: &mut E,
+    insts: &[Inst],
+    start: usize,
+) -> Option<usize> {
+    let (first_off, byte) = emit.const_byte_stack_store(insts[start])?;
+    let func = emit.func();
+    let mut offs = vec![first_off];
+    let mut k = start + 1;
+    while k < insts.len() {
+        let inst = insts[k];
+        let data = &func.insts[inst.index()];
+        if !matches!(data.op, Op::Call { .. }) && data.result.is_some_and(|res| emit.is_elided(res))
+        {
+            k += 1;
+            continue;
+        }
+        let Some((off, b)) = emit.const_byte_stack_store(inst) else {
+            break;
+        };
+        if b != byte {
+            break;
+        }
+        offs.push(off);
+        k += 1;
+    }
+    if offs.len() < 2 {
+        return None;
+    }
+    offs.sort_unstable();
+    let (mut cur_lo, mut cur_hi) = (offs[0], offs[0] + 1);
+    for &off in &offs[1..] {
+        if off <= cur_hi {
+            cur_hi = cur_hi.max(off + 1);
+        } else {
+            emit_fill_interval(emit, cur_lo, cur_hi, byte);
+            cur_lo = off;
+            cur_hi = off + 1;
+        }
+    }
+    emit_fill_interval(emit, cur_lo, cur_hi, byte);
+    Some(k)
+}
+
 fn emit_zero_interval<'a, E: Emitter<'a>>(emit: &mut E, start: i32, stop: i32) {
     let mut cur = start;
     while stop - cur >= 16 {
@@ -117,7 +194,9 @@ pub(crate) fn emit_body<'a, E: Emitter<'a>>(
             }
         }
         mark_line(emit, loc);
-        if let Some(next_k) = try_emit_zero_run(emit, insts, k) {
+        if let Some(next_k) =
+            try_emit_zero_run(emit, insts, k).or_else(|| try_emit_byte_fill_run(emit, insts, k))
+        {
             k = next_k;
             continue;
         }

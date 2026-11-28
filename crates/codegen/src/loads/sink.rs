@@ -296,6 +296,20 @@ fn is_full_slot_store(func: &Function, op: &Op, slot: StackSlot) -> bool {
     matches!(*op, Op::StackStore(v, s, 0) if s == slot && func.ty(v).bytes() == func.slots[slot.index()].size)
 }
 
+fn inst_writes_slot(func: &Function, inst: Inst, slot: StackSlot, prov: &Provenance) -> bool {
+    match func.insts[inst.index()].op {
+        Op::StackStore(_, s, _) => s == slot,
+        Op::Store(_, addr, _)
+        | Op::VolatileStore(_, addr, _)
+        | Op::AtomicStore(_, addr, _)
+        | Op::AtomicRmw(_, _, addr, _)
+        | Op::AtomicCas(_, addr, ..)
+        | Op::Move(addr, ..)
+        | Op::Copy(addr, ..) => prov.loc(addr, 0, 1).root == MemRoot::Slot(slot),
+        _ => false,
+    }
+}
+
 fn inst_reads_slot(func: &Function, inst: Inst, slot: StackSlot, prov: &Provenance) -> bool {
     if prov.slot_unwind_target(slot) || prov.slot_is_escaped_at(slot, Some(inst)) {
         return true;
@@ -312,6 +326,60 @@ fn inst_reads_slot(func: &Function, inst: Inst, slot: StackSlot, prov: &Provenan
             prov.loc(src, 0, 1).root == MemRoot::Slot(slot)
         }
         _ => false,
+    }
+}
+
+fn record_slot_op(
+    func: &Function,
+    op: &Op,
+    prov: &Provenance,
+    slot_bit: &[u64],
+    (r_mask, k_mask, w_mask): (&mut u64, &mut u64, &mut u64),
+) {
+    let note_read = |addr: Value, r: &mut u64, k: u64| {
+        if let MemRoot::Slot(s) = prov.loc(addr, 0, 1).root {
+            let bit = slot_bit[s.index()];
+            if bit != 0 && k & bit == 0 {
+                *r |= bit;
+            }
+        }
+    };
+    let note_write = |addr: Value, w: &mut u64| {
+        if let MemRoot::Slot(s) = prov.loc(addr, 0, 1).root {
+            *w |= slot_bit[s.index()];
+        }
+    };
+    match *op {
+        Op::StackLoad(s, _) | Op::StackAddr(s, _) => {
+            let bit = slot_bit[s.index()];
+            if bit != 0 && *k_mask & bit == 0 {
+                *r_mask |= bit;
+            }
+        }
+        Op::StackStore(_, s, _) => {
+            let bit = slot_bit[s.index()];
+            if bit != 0 {
+                *w_mask |= bit;
+                if *r_mask & bit == 0 && is_full_slot_store(func, op, s) {
+                    *k_mask |= bit;
+                }
+            }
+        }
+        Op::Store(_, addr, _) | Op::VolatileStore(_, addr, _) | Op::AtomicStore(_, addr, _) => {
+            note_write(addr, w_mask);
+        }
+        Op::Load(addr, _) | Op::VolatileLoad(addr, _) | Op::AtomicLoad(addr, _) => {
+            note_read(addr, r_mask, *k_mask);
+        }
+        Op::AtomicRmw(_, _, addr, _) | Op::AtomicCas(_, addr, ..) => {
+            note_write(addr, w_mask);
+            note_read(addr, r_mask, *k_mask);
+        }
+        Op::Copy(dst, src, _) | Op::Move(dst, src, _) => {
+            note_write(dst, w_mask);
+            note_read(src, r_mask, *k_mask);
+        }
+        _ => {}
     }
 }
 
@@ -388,45 +456,13 @@ fn slot_liveness_batch(
                     }
                 }
             }
-            let op = &func.insts[inst.index()].op;
-            match *op {
-                Op::StackLoad(s, _) | Op::StackAddr(s, _) => {
-                    let bit = slot_bit[s.index()];
-                    if bit != 0 && k_mask & bit == 0 {
-                        r_mask |= bit;
-                    }
-                }
-                Op::StackStore(_, s, _) => {
-                    let bit = slot_bit[s.index()];
-                    if bit != 0 {
-                        w_mask |= bit;
-                        if r_mask & bit == 0 && is_full_slot_store(func, op, s) {
-                            k_mask |= bit;
-                        }
-                    }
-                }
-                Op::Load(addr, _)
-                | Op::VolatileLoad(addr, _)
-                | Op::AtomicLoad(addr, _)
-                | Op::AtomicRmw(_, _, addr, _)
-                | Op::AtomicCas(_, addr, ..) => {
-                    if let MemRoot::Slot(s) = prov.loc(addr, 0, 1).root {
-                        let bit = slot_bit[s.index()];
-                        if bit != 0 && k_mask & bit == 0 {
-                            r_mask |= bit;
-                        }
-                    }
-                }
-                Op::Copy(_, src, _) | Op::Move(_, src, _) => {
-                    if let MemRoot::Slot(s) = prov.loc(src, 0, 1).root {
-                        let bit = slot_bit[s.index()];
-                        if bit != 0 && k_mask & bit == 0 {
-                            r_mask |= bit;
-                        }
-                    }
-                }
-                _ => {}
-            }
+            record_slot_op(
+                func,
+                &func.insts[inst.index()].op,
+                prov,
+                &slot_bit,
+                (&mut r_mask, &mut k_mask, &mut w_mask),
+            );
         }
         reads[bi] = r_mask;
         kill[bi] = k_mask;
@@ -674,7 +710,7 @@ fn sink_stack_stores(func: &mut Function, cfg: &Cfg, prov: &Provenance) -> bool 
                     } else if inst_reads_slot(func, inst, slot, prov) {
                         live_after = true;
                         any_access_after = true;
-                    } else if matches!(*op, Op::StackStore(_, s, _) if s == slot) {
+                    } else if inst_writes_slot(func, inst, slot, prov) {
                         any_access_after = true;
                     }
                 }

@@ -449,8 +449,11 @@ fn simplify_binary(
             .or_else(|| icmp::fuse_cmp_ops(cx, res, false, a, b))
             .or_else(|| shift::merge_fields(cx, res, a, b)),
         Binary::Bxor => simplify_bxor(cx, a, b).or_else(|| shift::simplify_rotate(cx, bin, a, b)),
-        Binary::Ushr | Binary::Ishl => shift::simplify_shift(cx, res, bin, a, b),
-        Binary::Imul => sum::scale_sum(cx, a, b),
+        Binary::Ushr => shift::simplify_shift(cx, res, bin, a, b),
+        Binary::Ishl => {
+            shift::simplify_shift(cx, res, bin, a, b).or_else(|| sum::shift_sum(cx, a, b))
+        }
+        Binary::Imul => sum::scale_sum(cx, a, b).or_else(|| sum::mul_pow2_to_shl(cx, a, b)),
         Binary::Udiv | Binary::Urem => arith::simplify_div_rem(cx, block_udivs, res, (bin, a, b)),
         _ => None,
     };

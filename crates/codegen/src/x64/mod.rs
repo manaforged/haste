@@ -117,7 +117,7 @@ pub(in crate::x64) fn compile_with_features(
         classify(sig, abi_kind)
     })?;
     let func = split.as_ref().unwrap_or(func);
-    let (roots, pure_test) = if full {
+    let (roots, pure_test, narrow_byte) = if full {
         let dropped_before = plan.dropped_count();
         let fused = location::fuse(func, &mut plan, &features);
         if plan.dropped_count() != dropped_before {
@@ -127,7 +127,11 @@ pub(in crate::x64) fn compile_with_features(
         }
         fused
     } else {
-        (vec![None; func.types.len()], vec![false; func.types.len()])
+        (
+            vec![None; func.types.len()],
+            vec![false; func.types.len()],
+            vec![false; func.types.len()],
+        )
     };
     let tail_calls = if full {
         crate::frame::find_tail_calls(func, &plan, &abi, &|sig| classify(sig, abi_kind))
@@ -150,15 +154,16 @@ pub(in crate::x64) fn compile_with_features(
                 &abi.params,
                 &FRAME_REGS,
                 |inst, op| {
-                    crate::frame::is_tail(&tail_calls, inst)
-                        || (preserve_tc
-                            && crate::alloc::is_preserved_call_op(
-                                func,
-                                op,
-                                &plan.through,
-                                &plan.locations,
-                                &plan.elided,
-                            ))
+                    !func.save_all_regs
+                        && (crate::frame::is_tail(&tail_calls, inst)
+                            || (preserve_tc
+                                && crate::alloc::is_preserved_call_op(
+                                    func,
+                                    op,
+                                    &plan.through,
+                                    &plan.locations,
+                                    &plan.elided,
+                                )))
                 },
             )
         })
@@ -182,6 +187,7 @@ pub(in crate::x64) fn compile_with_features(
         let n = func.types.len();
         (vec![false; n], vec![false; n], vec![false; n])
     };
+    let align_loops = plan_loop_aligns(func, &order, full);
     let last_block = order.last().copied();
     let emit = Emit {
         func,
@@ -199,6 +205,7 @@ pub(in crate::x64) fn compile_with_features(
         defs,
         roots,
         pure_test,
+        narrow_byte,
         flags: None,
         spills: crate::spills::SpillState::new(if full {
             crate::spills::pred_totals(func, &order, &copied)
@@ -209,6 +216,7 @@ pub(in crate::x64) fn compile_with_features(
         last_block,
         at_end: false,
         trap_label: None,
+        epilogue_label: None,
         lines: Vec::new(),
         features,
         copied,
@@ -224,6 +232,7 @@ pub(in crate::x64) fn compile_with_features(
         carry_flags: None,
         tails: Tails::new(),
         tail_calls,
+        align_loops,
     };
     drive(emit, &order)
 }
@@ -310,12 +319,14 @@ pub(super) struct Emit<'a> {
     defs: Vec<Option<Inst>>,
     roots: Vec<Option<location::Root>>,
     pure_test: Vec<bool>,
+    narrow_byte: Vec<bool>,
     flags: Option<(Value, Cond)>,
     spills: crate::spills::SpillState<Reg, Xmm>,
     next: Option<Block>,
     last_block: Option<Block>,
     at_end: bool,
     trap_label: Option<Label>,
+    epilogue_label: Option<Label>,
     lines: Vec<(u32, u64)>,
     features: Features,
     copied: Vec<bool>,
@@ -331,4 +342,36 @@ pub(super) struct Emit<'a> {
     carry_flags: Option<(bool, [Value; 3])>,
     tails: Tails<'a, Label>,
     tail_calls: Vec<bool>,
+    align_loops: Vec<u8>,
+}
+
+fn plan_loop_aligns(func: &Function, order: &[Block], full: bool) -> Vec<u8> {
+    let mut align_loops = vec![0u8; func.blocks.len()];
+    if !full {
+        return align_loops;
+    }
+    let cfg = func.cfg();
+    let loops = cfg.loops();
+    if loops.list.is_empty() {
+        return align_loops;
+    }
+    let cold = crate::live::cold(func);
+    let mut pos = vec![usize::MAX; func.blocks.len()];
+    for (i, &b) in order.iter().enumerate() {
+        pos[b.index()] = i;
+    }
+    for each in &loops.list {
+        let inner = each
+            .body
+            .iter()
+            .zip(&loops.depths)
+            .all(|(inside, &depth)| !inside || depth <= each.depth);
+        if inner && !cold[each.head.index()] {
+            let ord = pos[each.head.index()];
+            let falls_through = ord == 0
+                || (ord < order.len() && func.successors(order[ord - 1]).any(|s| s == each.head));
+            align_loops[each.head.index()] = if falls_through { 7 } else { 15 };
+        }
+    }
+    align_loops
 }

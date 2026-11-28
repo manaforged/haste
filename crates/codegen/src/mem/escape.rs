@@ -18,6 +18,7 @@ struct UseCounts {
 pub(super) struct SlotEscapes {
     pub(super) unescaped: Vec<bool>,
     pub(super) addr_unescaped: Vec<bool>,
+    pub(super) has_addr: Vec<bool>,
     pub(super) unwind_target: Vec<bool>,
     pub(super) call_readonly: Vec<bool>,
     pub(super) return_only: Vec<bool>,
@@ -58,6 +59,7 @@ impl SlotEscapes {
         Self {
             unescaped: vec![true; func.slots.len()],
             addr_unescaped: vec![true; func.slots.len()],
+            has_addr: vec![false; func.slots.len()],
             unwind_target: vec![false; func.slots.len()],
             call_readonly: vec![true; func.slots.len()],
             return_only: vec![true; func.slots.len()],
@@ -91,6 +93,7 @@ fn finish_slot_escape(
     let mut esc = SlotEscapes::new(func);
     for v in 0..slots.len() {
         if let Some(s) = slot_root(Value(v as u32), slots, tracked) {
+            esc.has_addr[s.index()] = true;
             let spilled = is_spill.is_some_and(|sp| sp.get(v).copied().unwrap_or(false));
             esc.spilled[s.index()] |= spilled;
             if spilled || counts.safe[v] != counts.total[v] {

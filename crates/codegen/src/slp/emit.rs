@@ -1,6 +1,6 @@
 use rustc_hash::FxHashMap as HashMap;
 
-use super::{Kind, Plan, chunk};
+use super::{Kind, Plan, Seed, chunk};
 use crate::ir::{Block, Convert, Function, Inst, Lane, Op, Type, Value};
 use crate::unroll::{Emit, splat_in};
 
@@ -42,6 +42,7 @@ fn emit_node(
             Some(Op::Const(0)) => e.op(Op::Const(0), ty),
             _ => splat_in(e, ty, v),
         },
+        Kind::Gather => gather(e, &node.lanes, ty),
         Kind::Param(group) => vparams[group],
         Kind::Load(base, off) => {
             let bytes = node.lane.bytes() * node.lanes.len() as u32;
@@ -135,7 +136,7 @@ pub(super) fn apply(func: &mut Function, block: Block, plan: &Plan) {
     let tree: Vec<Inst> = plan
         .nodes
         .iter()
-        .filter(|n| !matches!(n.kind, Kind::Param(_) | Kind::Splat(_)))
+        .filter(|n| !matches!(n.kind, Kind::Param(_) | Kind::Splat(_) | Kind::Gather))
         .flat_map(|n| {
             n.lanes.iter().map(|&v| {
                 insts
@@ -153,23 +154,32 @@ pub(super) fn apply(func: &mut Function, block: Block, plan: &Plan) {
     let mut done = vec![None; plan.nodes.len()];
     let root = emit_node(&mut e, plan, &vparams, &mut done, plan.root);
     let seed = &plan.seed;
-    let n = seed.stores.len();
-    let root_ty = vec_ty(plan.nodes[plan.root].lane, plan.count);
-    if n == usize::from(plan.count) {
-        e.out
-            .push(e.func.add(Op::Store(root, seed.base, seed.off), None));
-    } else {
-        let bytes = seed.ty.bytes() * n as u32;
-        let (_, lane) = chunk(bytes).expect("checked in plan");
-        let holder = vec_ty(lane, (root_ty.bytes() / bytes) as u8);
-        let cast = e.op(Op::Convert(Convert::Bitcast, root), holder);
-        let scalar = e.op(Op::Extract(cast, 0), lane.to_type());
-        e.out
-            .push(e.func.add(Op::Store(scalar, seed.base, seed.off), None));
+    if let Seed::Store {
+        stores,
+        base,
+        off,
+        ty,
+    } = seed
+    {
+        let n = stores.len();
+        let root_ty = vec_ty(plan.nodes[plan.root].lane, plan.count);
+        if n == usize::from(plan.count) {
+            e.out.push(e.func.add(Op::Store(root, *base, *off), None));
+        } else {
+            let bytes = ty.bytes() * n as u32;
+            let (_, lane) = chunk(bytes).expect("checked in plan");
+            let holder = vec_ty(lane, (root_ty.bytes() / bytes) as u8);
+            let cast = e.op(Op::Convert(Convert::Bitcast, root), holder);
+            let scalar = e.op(Op::Extract(cast, 0), lane.to_type());
+            e.out.push(e.func.add(Op::Store(scalar, *base, *off), None));
+        }
     }
     let mut subst: HashMap<Value, Value> = HashMap::default();
     for (id, node) in plan.nodes.iter().enumerate() {
-        if matches!(node.kind, Kind::Splat(_) | Kind::Param(_) | Kind::Icmp(..)) {
+        if matches!(
+            node.kind,
+            Kind::Splat(_) | Kind::Gather | Kind::Param(_) | Kind::Icmp(..)
+        ) {
             continue;
         }
         let v = emit_node(&mut e, plan, &vparams, &mut done, id);
@@ -219,7 +229,7 @@ pub(super) fn apply(func: &mut Function, block: Block, plan: &Plan) {
     let removed: Vec<Inst> = tree
         .iter()
         .copied()
-        .chain(seed.stores.iter().map(|&pos| insts[pos]))
+        .chain(seed.stores().iter().map(|&pos| insts[pos]))
         .collect();
     let mut rebuilt = head;
     for (pos, &inst) in insts.iter().enumerate() {

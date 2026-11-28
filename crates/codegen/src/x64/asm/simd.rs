@@ -92,11 +92,17 @@ impl Asm {
 
     fn vex3(&mut self, map: u8, w: bool, pp: u8, opcode: u8, (dst, src): (u8, u8), rm: Rm) {
         let (x, b) = rm.index_base();
-        self.code.push(0xC4);
-        self.code
-            .push((!dst >> 3 & 1) << 7 | (!x >> 3 & 1) << 6 | (!b >> 3 & 1) << 5 | map);
-        self.code
-            .push((u8::from(w) << 7) | ((!src & 0xF) << 3) | pp);
+        if map == 0b00001 && !w && (x & 8) == 0 && (b & 8) == 0 {
+            self.code.push(0xC5);
+            self.code
+                .push((!dst >> 3 & 1) << 7 | ((!src & 0xF) << 3) | pp);
+        } else {
+            self.code.push(0xC4);
+            self.code
+                .push((!dst >> 3 & 1) << 7 | (!x >> 3 & 1) << 6 | (!b >> 3 & 1) << 5 | map);
+            self.code
+                .push((u8::from(w) << 7) | ((!src & 0xF) << 3) | pp);
+        }
         self.code.push(opcode);
         self.modrm(dst, rm);
     }

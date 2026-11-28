@@ -5,7 +5,7 @@ use super::super::patterns::{
 use super::loads::{load_fuses, reads_reg};
 use super::{FuseCtx, narrows_exactly, preserved};
 use crate::alloc::{Location, Plan};
-use crate::ir::{Binary, Block, Convert, Function, Inst, IntCC, Op, Value};
+use crate::ir::{Binary, Block, Convert, Function, Inst, IntCC, Op, Type, Unary, Value};
 use crate::x64::FRAME_REGS;
 use crate::x64::asm::Reg;
 use crate::x64::frame::SAVED;
@@ -543,4 +543,105 @@ pub(super) fn fuse_flag_cmps(
             }
         }
     }
+}
+
+fn is_narrow_byte_def(
+    func: &Function,
+    plan: &Plan<Reg>,
+    defs: &[Option<Inst>],
+    inst: Inst,
+    res: Value,
+) -> bool {
+    if func.ty(res) != Type::I8
+        || plan.elided[res.index()]
+        || plan.deferred[res.index()]
+        || plan.is_static(res)
+        || plan.reg_of(res).is_none()
+    {
+        return false;
+    }
+    match func.insts[inst.index()].op {
+        Op::Icmp(_, x, _) => !plan.fused[res.index()] && !func.ty(x).is_vector(),
+        Op::Fits(..) => !plan.fused[res.index()],
+        Op::Binary(Binary::Band | Binary::Bor | Binary::Bxor, a, b) => {
+            ![a, b].into_iter().any(|u| {
+                plan.elided[u.index()]
+                    && matches!(
+                        defs[u.index()].map(|i| &func.insts[i.index()].op),
+                        Some(Op::Unary(Unary::Bnot, _))
+                    )
+            })
+        }
+        _ => false,
+    }
+}
+
+pub(super) fn find_narrow_bytes(
+    func: &Function,
+    plan: &mut Plan<Reg>,
+    defs: &[Option<Inst>],
+) -> Vec<bool> {
+    let n = func.types.len();
+    let mut cand = vec![false; n];
+    let mut bitops: Vec<(Value, Value, Value)> = Vec::new();
+    for block in &func.blocks {
+        for &inst in &block.insts {
+            let data = &func.insts[inst.index()];
+            let Some(res) = data.result else { continue };
+            if !is_narrow_byte_def(func, plan, defs, inst, res) {
+                continue;
+            }
+            cand[res.index()] = true;
+            if let Op::Binary(Binary::Band | Binary::Bor | Binary::Bxor, a, b) = data.op {
+                bitops.push((res, a, b));
+            }
+        }
+    }
+    let mut wide = vec![false; n];
+    for block in &func.blocks {
+        for &inst in &block.insts {
+            let data = &func.insts[inst.index()];
+            match &data.op {
+                Op::Brif(_, _, ta, _, ea) => {
+                    for &v in ta.iter().chain(ea) {
+                        wide[v.index()] = true;
+                    }
+                }
+                Op::Trapz(_) => {}
+                Op::Select(_, t, f) => {
+                    wide[t.index()] = true;
+                    wide[f.index()] = true;
+                }
+                Op::Icmp(_, a, _) if func.ty(*a) == Type::I8 => {}
+                Op::Store(_, addr, _) => wide[addr.index()] = true,
+                Op::StackStore(..) => {}
+                Op::Binary(Binary::Band | Binary::Bor | Binary::Bxor, _, _)
+                    if data.result.is_some_and(|r| cand[r.index()]) => {}
+                op => op.for_operands(|v| wide[v.index()] = true),
+            }
+        }
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &(res, a, b) in &bitops {
+            if wide[res.index()] {
+                for u in [a, b] {
+                    if !wide[u.index()] {
+                        wide[u.index()] = true;
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    let mut narrow = vec![false; n];
+    for v in 0..n {
+        if cand[v] && !wide[v] {
+            narrow[v] = true;
+            plan.zero_ext[v] = false;
+            plan.clean_bits[v] = 65;
+        }
+    }
+    narrow
 }

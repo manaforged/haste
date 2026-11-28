@@ -736,6 +736,10 @@ impl Provenance {
     }
 
     /// Whether `loc` lies in the private bytes of this coroutine's own frame, which only addresses derived from the frame start can reach.
+    pub(crate) fn has_private_frame(&self) -> bool {
+        self.frame.private > 0
+    }
+
     pub(crate) fn private_frame(&self, loc: MemLoc) -> bool {
         self.frame.private > 0
             && loc.size != u32::MAX

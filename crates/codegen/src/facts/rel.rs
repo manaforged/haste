@@ -38,7 +38,74 @@ pub(super) struct Rel {
 
 pub(super) const UNSIGNED: (RelKind, RelKind) = (RelKind::Ult, RelKind::Ule);
 const WALK_SEEN: usize = 16;
+const REV_SEEN: usize = 32;
 const _: () = assert!(2 * MAX_RELS <= u128::BITS as usize);
+const _: () = assert!(MAX_RELS <= u64::BITS as usize);
+
+#[inline]
+fn rel_step_matching(r: Rel, cur: Value, strict_k: RelKind) -> Option<(Value, bool)> {
+    if r.kind == RelKind::Eq {
+        if r.lhs == cur {
+            Some((r.rhs, false))
+        } else if r.rhs == cur {
+            Some((r.lhs, false))
+        } else {
+            None
+        }
+    } else if r.lhs == cur {
+        Some((r.rhs, r.kind == strict_k))
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn rel_rev_step_matching(r: Rel, cur: Value, strict_k: RelKind) -> Option<(Value, bool)> {
+    if r.kind == RelKind::Eq {
+        if r.rhs == cur {
+            Some((r.lhs, false))
+        } else if r.lhs == cur {
+            Some((r.rhs, false))
+        } else {
+            None
+        }
+    } else if r.rhs == cur {
+        Some((r.lhs, r.kind == strict_k))
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn push_seen<const N: usize>(
+    seen: &mut [(Value, bool); N],
+    len: &mut usize,
+    seen_mask: &mut u128,
+    next: Value,
+    next_strict: bool,
+) -> bool {
+    let bit = val_bit(next);
+    if *seen_mask & bit != 0
+        && let Some(entry) = seen[..*len].iter_mut().find(|(v, _)| *v == next)
+    {
+        if next_strict && !entry.1 {
+            if *len >= N {
+                return false;
+            }
+            entry.1 = true;
+            seen[*len] = (next, true);
+            *len += 1;
+        }
+        return true;
+    }
+    if *len >= N {
+        return false;
+    }
+    seen[*len] = (next, next_strict);
+    *len += 1;
+    *seen_mask |= bit;
+    true
+}
 
 pub(super) fn rel_step(
     r: Rel,
@@ -96,6 +163,57 @@ pub(super) struct Path {
 pub(super) struct Reached {
     start: Value,
     ends: u128,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum RevReach {
+    No,
+    Weak,
+    Strict,
+    Unknown,
+}
+
+pub(super) struct ReachedInto {
+    target: Value,
+    seen: [(Value, bool); REV_SEEN],
+    len: usize,
+    mask: u128,
+    overflowed: bool,
+}
+
+impl ReachedInto {
+    pub(super) fn is_empty(&self) -> bool {
+        self.len <= 1 && !self.overflowed
+    }
+
+    pub(super) fn get(&self, v: Value) -> RevReach {
+        if v == self.target {
+            return RevReach::Weak;
+        }
+        if self.mask & val_bit(v) != 0 {
+            let mut found_weak = false;
+            for &(node, strict) in &self.seen[1..self.len] {
+                if node == v {
+                    if strict {
+                        return RevReach::Strict;
+                    }
+                    found_weak = true;
+                }
+            }
+            if found_weak {
+                return if self.overflowed {
+                    RevReach::Unknown
+                } else {
+                    RevReach::Weak
+                };
+            }
+        }
+        if self.overflowed {
+            RevReach::Unknown
+        } else {
+            RevReach::No
+        }
+    }
 }
 
 impl Path {
@@ -399,6 +517,82 @@ impl Path {
         self.reach(ty, start, target, kinds, require_strict) == Some(true)
     }
 
+    fn active_rel_mask(&self, ty: Type, kinds: (RelKind, RelKind)) -> u64 {
+        let mut active = 0_u64;
+        for (pos, &r) in self.rels.iter().enumerate() {
+            if r.ty == ty && (r.kind == RelKind::Eq || r.kind == kinds.0 || r.kind == kinds.1) {
+                active |= 1_u64 << pos;
+            }
+        }
+        active
+    }
+
+    pub(super) fn has_strict_step(
+        &self,
+        ty: Type,
+        start: Value,
+        kinds: (RelKind, RelKind),
+    ) -> bool {
+        let needed = kind_bit(kinds.0) | kind_bit(kinds.1) | kind_bit(RelKind::Eq);
+        if self.rel_kinds & needed == 0
+            || self.rel_kinds & kind_bit(kinds.0) == 0
+            || self.rel_src_mask & val_bit(start) == 0
+        {
+            return false;
+        }
+        self.walk_rels(ty, start, kinds, |_, _, strict| strict)
+    }
+
+    pub(super) fn reached_into(
+        &self,
+        ty: Type,
+        target: Value,
+        kinds: (RelKind, RelKind),
+    ) -> ReachedInto {
+        let mut out = ReachedInto {
+            target,
+            seen: [(target, false); REV_SEEN],
+            len: 1,
+            mask: val_bit(target),
+            overflowed: false,
+        };
+        let needed = kind_bit(kinds.0) | kind_bit(kinds.1) | kind_bit(RelKind::Eq);
+        if self.rel_kinds & needed == 0 || self.rel_dst_mask & val_bit(target) == 0 {
+            return out;
+        }
+        let active = self.active_rel_mask(ty, kinds);
+        if active == 0 {
+            return out;
+        }
+        let mut idx = 0;
+        while idx < out.len {
+            let (cur, cur_strict) = out.seen[idx];
+            idx += 1;
+            if self.rel_dst_mask & val_bit(cur) == 0 {
+                continue;
+            }
+            let mut m = active;
+            while m != 0 {
+                let pos = m.trailing_zeros() as usize;
+                m &= m - 1;
+                let Some((prev, step_strict)) = rel_rev_step_matching(self.rels[pos], cur, kinds.0)
+                else {
+                    continue;
+                };
+                if !push_seen(
+                    &mut out.seen,
+                    &mut out.len,
+                    &mut out.mask,
+                    prev,
+                    cur_strict || step_strict,
+                ) {
+                    out.overflowed = true;
+                }
+            }
+        }
+        out
+    }
+
     fn reach(
         &self,
         ty: Type,
@@ -413,23 +607,68 @@ impl Path {
         let needed = kind_bit(kinds.0) | kind_bit(kinds.1) | kind_bit(RelKind::Eq);
         if self.rel_kinds & needed == 0
             || (require_strict && self.rel_kinds & kind_bit(kinds.0) == 0)
+            || self.rel_src_mask & val_bit(start) == 0
+            || self.rel_dst_mask & val_bit(target) == 0
         {
             return None;
         }
-        if !self.steps_from(ty, start, kinds) || !self.steps_into(ty, target, kinds) {
-            return None;
-        }
+        let (mut seen, mut len) = ([(start, false); WALK_SEEN], 1);
+        let mut seen_mask = val_bit(start);
+        let mut active = 0_u64;
+        let mut has_into = false;
         let mut hit = None;
-        let found = self.walk(ty, start, kinds, |next, next_strict| {
+        for (pos, &r) in self.rels.iter().enumerate() {
+            if r.ty != ty {
+                continue;
+            }
+            let is_eq = r.kind == RelKind::Eq;
+            if !is_eq && r.kind != kinds.0 && r.kind != kinds.1 {
+                continue;
+            }
+            active |= 1_u64 << pos;
+            if r.rhs == target || (is_eq && r.lhs == target) {
+                has_into = true;
+            }
+            let Some((next, step_strict)) = rel_step_matching(r, start, kinds.0) else {
+                continue;
+            };
             if next == target {
-                if !require_strict || next_strict {
-                    return true;
+                if !require_strict || step_strict {
+                    return Some(true);
                 }
                 hit = Some(false);
             }
-            false
-        });
-        if found { Some(true) } else { hit }
+            push_seen(&mut seen, &mut len, &mut seen_mask, next, step_strict);
+        }
+        if !has_into || len == 1 {
+            return hit;
+        }
+        let mut idx = 1;
+        while idx < len {
+            let (cur, cur_strict) = seen[idx];
+            idx += 1;
+            if self.rel_src_mask & val_bit(cur) == 0 {
+                continue;
+            }
+            let mut m = active;
+            while m != 0 {
+                let pos = m.trailing_zeros() as usize;
+                m &= m - 1;
+                let Some((next, step_strict)) = rel_step_matching(self.rels[pos], cur, kinds.0)
+                else {
+                    continue;
+                };
+                let next_strict = cur_strict || step_strict;
+                if next == target {
+                    if !require_strict || next_strict {
+                        return Some(true);
+                    }
+                    hit = Some(false);
+                }
+                push_seen(&mut seen, &mut len, &mut seen_mask, next, next_strict);
+            }
+        }
+        hit
     }
 
     /// Walks once from `start` and keeps every value it steps to.
@@ -481,31 +720,32 @@ impl Path {
         kinds: (RelKind, RelKind),
         mut visit: impl FnMut(usize, Value, bool) -> bool,
     ) -> bool {
+        let active = self.active_rel_mask(ty, kinds);
+        if active == 0 {
+            return false;
+        }
         let (mut seen, mut len) = ([(start, false); WALK_SEEN], 1);
+        let mut seen_mask = val_bit(start);
         let mut idx = 0;
         while idx < len {
             let (cur, cur_strict) = seen[idx];
             idx += 1;
-            for (pos, &r) in self.rels.iter().enumerate() {
-                let Some((next, step_strict)) = rel_step(r, cur, ty, kinds) else {
+            if self.rel_src_mask & val_bit(cur) == 0 {
+                continue;
+            }
+            let mut m = active;
+            while m != 0 {
+                let pos = m.trailing_zeros() as usize;
+                m &= m - 1;
+                let Some((next, step_strict)) = rel_step_matching(self.rels[pos], cur, kinds.0)
+                else {
                     continue;
                 };
                 let next_strict = cur_strict || step_strict;
                 if visit(pos, next, next_strict) {
                     return true;
                 }
-                if len < WALK_SEEN {
-                    if let Some(entry) = seen[..len].iter_mut().find(|(v, _)| *v == next) {
-                        if next_strict && !entry.1 {
-                            entry.1 = true;
-                            seen[len] = (next, true);
-                            len += 1;
-                        }
-                    } else {
-                        seen[len] = (next, next_strict);
-                        len += 1;
-                    }
-                }
+                push_seen(&mut seen, &mut len, &mut seen_mask, next, next_strict);
             }
         }
         false

@@ -262,6 +262,32 @@ fn rejoin_returns(func: &mut Function, split: &[SplitReturn]) -> bool {
     kept
 }
 
+fn move_to_sret_prefix_src(
+    func: &Function,
+    defs: &[Option<Inst>],
+    inst: Inst,
+    sret_ptr: Value,
+    bytes: u32,
+) -> Option<(Value, u32)> {
+    match func.insts[inst.index()].op {
+        Op::Move(dst, src, move_bytes)
+            if dst == sret_ptr && src != sret_ptr && move_bytes > 0 && move_bytes <= bytes =>
+        {
+            Some((src, move_bytes))
+        }
+        Op::Copy(dst, src, len_val)
+            if dst == sret_ptr && src != sret_ptr && len_val != sret_ptr =>
+        {
+            let len_inst = (*defs.get(len_val.index())?)?;
+            match func.insts[len_inst.index()].op {
+                Op::Const(imm) if imm > 0 && imm <= i64::from(bytes) => Some((src, imm as u32)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 fn sret_slot_plan(
     func: &Function,
     entry: Block,
@@ -271,8 +297,10 @@ fn sret_slot_plan(
     let info = collect_sret_info(func, entry);
     let mut copies = Vec::new();
     for &(block, pos, inst) in info.uses_of(sret_ptr) {
-        if let Some(slot) = move_to_sret_src(func, &info.defs, inst, sret_ptr, bytes)
-            .and_then(|src| resolve_slot(func, &info.defs, src))
+        if let Some((src, move_bytes)) =
+            move_to_sret_prefix_src(func, &info.defs, inst, sret_ptr, bytes)
+            && let Some(slot) = resolve_slot(func, &info.defs, src)
+            && func.slots[slot.index()].size <= move_bytes
         {
             copies.push((slot, block, pos, inst));
         }

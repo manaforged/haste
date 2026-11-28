@@ -278,11 +278,26 @@ pub(crate) struct Asm {
     pub(super) zeros: Option<super::imm::PendingZeros>,
     /// The offset and symbol of each `rip`-relative displacement, holding its addend.
     pub(super) rips: Vec<(u32, u32)>,
+    pub(super) aligns: Vec<(u32, u8)>,
 }
 
 impl Asm {
     pub fn pos(&self) -> u32 {
         self.code.len() as u32
+    }
+
+    pub fn align(&mut self, max_pad: u8) {
+        if max_pad == 0 {
+            return;
+        }
+        let at = self.pos();
+        if let Some(last) = self.aligns.last_mut()
+            && last.0 == at
+        {
+            last.1 = last.1.max(max_pad);
+        } else {
+            self.aligns.push((at, max_pad));
+        }
     }
 
     pub(super) fn rex(&mut self, w: bool, r: u8, x: u8, b: u8, force: bool) {

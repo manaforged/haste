@@ -175,17 +175,21 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
                 &frame,
                 &abi.params,
                 &[FP, LR, IP],
-                |inst, _| crate::frame::is_tail(&tail_calls, inst),
+                |inst, _| !func.save_all_regs && crate::frame::is_tail(&tail_calls, inst),
             )
         })
         .flatten();
     let mut align_loops = vec![false; func.blocks.len()];
+    let mut loop_heads = vec![false; func.blocks.len()];
+    let mut live_in_regs = Vec::new();
+    let mut loop_consts = frames::LoopConsts::empty();
     if full {
         let cfg = func.cfg();
         let loops = cfg.loops();
         if !loops.list.is_empty() {
             let cold = crate::live::cold(func);
             for each in &loops.list {
+                loop_heads[each.head.index()] = true;
                 let inner = each
                     .body
                     .iter()
@@ -195,6 +199,27 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
                     align_loops[each.head.index()] = true;
                 }
             }
+            frames::shift_align_loops(
+                func,
+                &plan,
+                &frame,
+                &order,
+                &copied,
+                shrink.as_ref(),
+                &mut align_loops,
+            );
+            live_in_regs = frames::compute_live_in_regs(func, &plan, &order);
+            loop_consts = frames::plan_loop_consts(
+                func,
+                &plan,
+                &frame,
+                &cfg,
+                &loops,
+                &cold,
+                &copied,
+                shrink.as_ref(),
+                &live_in_regs,
+            );
         }
     }
     let mut asm = Asm::default();
@@ -225,6 +250,10 @@ pub(crate) fn compile(func: &Function, target: &Target) -> Result<Code, String> 
         next: None,
         copied,
         align_loops,
+        loop_heads,
+        live_in_regs,
+        loop_consts,
+        cur_block: func.entry.unwrap_or(Block(0)),
         direct_calls: target.direct_calls,
         tlv_cells,
         tlv_cache,
@@ -345,6 +374,10 @@ pub(super) struct Emit<'a> {
     next: Option<Block>,
     copied: Vec<bool>,
     align_loops: Vec<bool>,
+    loop_heads: Vec<bool>,
+    live_in_regs: Vec<u64>,
+    loop_consts: frames::LoopConsts,
+    cur_block: Block,
     direct_calls: bool,
     tlv_cells: bool,
     tlv_cache: Option<frames::TlvCache>,
@@ -425,6 +458,7 @@ impl<'a> Emitter<'a> for Emit<'a> {
         self.next = next;
     }
     fn bind_block(&mut self, block: Block) {
+        self.cur_block = block;
         self.invalidate_spills();
         self.resume_spills(block);
         if let Some(cache) = &mut self.tlv_cache {
@@ -434,6 +468,7 @@ impl<'a> Emitter<'a> for Emit<'a> {
         self.asm.bind(self.blocks[block.index()]);
     }
     fn bind_entry(&mut self, block: Block) {
+        self.cur_block = block;
         if let Some(cache) = &mut self.tlv_cache {
             cache.live = cache.dom_known[block.index()];
             cache.may_live = cache.may_known[block.index()];
@@ -517,6 +552,17 @@ impl<'a> Emitter<'a> for Emit<'a> {
                     self.in_fast = false;
                 }
                 self.edge(*block, args)?;
+                if let Some(inits) = self
+                    .loop_consts
+                    .preheader_inits
+                    .get(self.cur_block.index())
+                    .cloned()
+                {
+                    for (imm, reg) in inits {
+                        self.asm.mov_imm(reg, imm);
+                        self.clobber_reg(reg);
+                    }
+                }
                 if self.copied[inst.index()] {
                     return emit_body(self, *block);
                 }
@@ -526,12 +572,20 @@ impl<'a> Emitter<'a> for Emit<'a> {
                 Ok(())
             }
             Op::Brif(condition, then, then_args, otherwise, else_args) => {
-                let res = emit_brif(
-                    self,
+                let res = if self.try_hoist_loop_branch(
                     *condition,
                     (*then, then_args),
                     (*otherwise, else_args),
-                );
+                )? {
+                    Ok(())
+                } else {
+                    emit_brif(
+                        self,
+                        *condition,
+                        (*then, then_args),
+                        (*otherwise, else_args),
+                    )
+                };
                 self.invalidate_spills();
                 res
             }
