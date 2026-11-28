@@ -10,7 +10,7 @@ use super::help::{HelpTopic, help_text, version_string};
 const TOP_COMMANDS: [(Command, &str); 3] = [
     (Command::Serve(ServeAction::Run), "serve"),
     (Command::Prep, "prep"),
-    (Command::Clean, "clean"),
+    (Command::Clean { all: false }, "clean"),
 ];
 
 pub(super) fn usage() -> String {
@@ -21,7 +21,7 @@ pub(super) fn usage() -> String {
         .chain(
             TOP_COMMANDS
                 .into_iter()
-                .filter(|(cmd, _)| !matches!(cmd, Command::Clean))
+                .filter(|(cmd, _)| !matches!(cmd, Command::Clean { .. }))
                 .map(|(_, name)| name),
         )
         .collect();
@@ -31,7 +31,7 @@ pub(super) fn usage() -> String {
         .map(|(_, name)| name)
         .collect();
     format!(
-        "usage: haste [-p PKG] [--workspace] [--lib] [--bins] [--bin NAME | --example NAME] [--tests] [--all-targets] [-F FEATURES] [--all-features] [--no-default-features] [--manifest-path PATH] [--locked] [--offline] [--frozen] [--color WHEN] [--no-run] [--ignored] [--include-ignored] [--target TRIPLE] [-j|--jobs N] [--release | --profile NAME] [--message-format FMT] [-q|--quiet] [--daemon] [--prepared] [--prep-wait MS] [--perf-map] [--watch] [--stats-json PATH] [-o PATH] {} [PATH] [--] [ARGS...]\n       haste serve status [PATH]\n       haste serve stop [PATH | --all]\n       haste clean\n       haste [-j|--jobs N] debug {} PATH [CRATE]\n       haste [--release] debug code PATH DIR\n       haste -V|--version | -h|--help",
+        "usage: haste [-p PKG] [--workspace] [--lib] [--bins] [--bin NAME | --example NAME] [--tests] [--all-targets] [-F FEATURES] [--all-features] [--no-default-features] [--manifest-path PATH] [--locked] [--offline] [--frozen] [--color WHEN] [--no-run] [--ignored] [--include-ignored] [--target TRIPLE] [-j|--jobs N] [--release | --profile NAME] [--message-format FMT] [-q|--quiet] [--daemon] [--prepared] [--prep-wait MS] [--perf-map] [--watch] [--stats-json PATH] [-o PATH] {} [PATH] [--] [ARGS...]\n       haste serve status [PATH]\n       haste serve stop [PATH | --all]\n       haste clean [PATH | --all]\n       haste [-j|--jobs N] debug {} PATH [CRATE]\n       haste [--release] debug code PATH DIR\n       haste -V|--version | -h|--help",
         modes.join("|"),
         queries.join("|"),
     )
@@ -49,7 +49,7 @@ pub(super) enum Command {
     Request(Request),
     Serve(ServeAction),
     Prep,
-    Clean,
+    Clean { all: bool },
     Debug(Query),
 }
 
@@ -425,12 +425,14 @@ fn take_path<I: Iterator<Item = std::ffi::OsString>>(
 ) -> Result<(PathBuf, bool)> {
     match command {
         Command::Serve(ServeAction::Status | ServeAction::Stop { .. })
+        | Command::Clean { .. }
         | Command::Request(_)
         | Command::Serve(ServeAction::Run)
         | Command::Prep => {
             let default_path = if matches!(
                 command,
                 Command::Serve(ServeAction::Status | ServeAction::Stop { .. })
+                    | Command::Clean { .. }
             ) {
                 ""
             } else {
@@ -451,9 +453,12 @@ fn validate_command_opts(command: Command, opts: &ParsedOpts) -> Result<Command>
         Command::Serve(ServeAction::Stop { .. }) => Command::Serve(ServeAction::Stop {
             all: opts.all_daemons,
         }),
+        Command::Clean { .. } => Command::Clean {
+            all: opts.all_daemons,
+        },
         other => {
             if opts.all_daemons {
-                anyhow::bail!("--all is only supported with `haste serve stop`");
+                anyhow::bail!("--all is only supported with `haste serve stop` and `haste clean`");
             }
             other
         }
@@ -538,17 +543,6 @@ fn parse_args_raw(
     if let Some(meta) = consume_options(&mut args, &mut opts)? {
         return Ok(Err(meta.with_command(command)));
     }
-    if matches!(command, Command::Clean) {
-        if args.peek().is_some() {
-            anyhow::bail!("{}", usage());
-        }
-        let command = validate_command_opts(command, &opts)?;
-        let cfg = build_config(command, &opts);
-        return Ok(Ok((
-            (command, PathBuf::new(), Vec::new(), None, None, cfg),
-            opts,
-        )));
-    }
     let (path, explicit_path) = take_path(command, &mut args, opts.manifest_path.is_some())?;
     if !matches!(command, Command::Debug(_))
         && let Some(meta) = consume_options(&mut args, &mut opts)?
@@ -562,6 +556,12 @@ fn parse_args_raw(
         Some(manifest) => manifest_workspace_dir(manifest),
         None => path,
     };
+    if matches!(command, Command::Clean { .. })
+        && opts.all_daemons
+        && (explicit_path || opts.manifest_path.is_some())
+    {
+        anyhow::bail!("cannot pass both a path and `--all`");
+    }
     let command = validate_command_opts(command, &opts)?;
     let rest = collect_rest(args)?;
     let (stats_json, out) = (opts.stats.clone(), opts.out.clone());
@@ -767,5 +767,25 @@ mod tests {
             .expect("valid")
             .expect("not meta");
         assert_eq!(cfg.selection.packages, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn clean_parses_workspace_path_and_all_flag() {
+        let ((cmd, path, _, _, _, _), _) =
+            parse_strs(&["clean"]).expect("valid").expect("not meta");
+        assert!(matches!(cmd, Command::Clean { all: false }) && path.as_os_str().is_empty());
+
+        let ((cmd, path, _, _, _, _), _) = parse_strs(&["clean", "examples/hello"])
+            .expect("valid")
+            .expect("not meta");
+        assert!(matches!(cmd, Command::Clean { all: false }));
+        assert_eq!(path, PathBuf::from("examples/hello"));
+
+        let ((cmd, path, _, _, _, _), _) = parse_strs(&["clean", "--all"])
+            .expect("valid")
+            .expect("not meta");
+        assert!(matches!(cmd, Command::Clean { all: true }) && path.as_os_str().is_empty());
+
+        assert!(parse_strs(&["clean", "--all", "examples/hello"]).is_err());
     }
 }

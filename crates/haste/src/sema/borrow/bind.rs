@@ -10,6 +10,7 @@ use crate::sema::ty::{Kind, Mut, Ty};
 use super::places::{FieldKey, Place, PlaceStep, push_step};
 use super::propagate::{BorrowSource, TupleSources};
 use super::{Checker, Loan, State, merge_states};
+use local::{mark_place_behind_shared, reset_local_binding};
 
 #[derive(Clone, Copy)]
 struct PatCtx {
@@ -21,6 +22,8 @@ struct PatCtx {
     is_param: bool,
     move_only: bool,
     steps_match_fallback: bool,
+    outer_temp_only: bool,
+    strip_outer_temp: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -44,7 +47,11 @@ impl Checker<'_, '_> {
             return;
         }
         let ty = self.local_ty(local);
-        if ty != Ty::NONE && !self.ty_holds_borrow(ty) && !self.ty_has_non_static_param(ty) {
+        if ty != Ty::NONE
+            && !self.ty_holds_borrow(ty)
+            && !self.ty_has_non_static_param(ty)
+            && !site.is_some_and(|e| self.expr_is_capturing_rpit(e))
+        {
             return;
         }
         let is_shared_target = |target: u32| self.is_shared_ref_or_ptr(self.local_ty(target));
@@ -74,6 +81,8 @@ impl Checker<'_, '_> {
             is_param: true,
             move_only: false,
             steps_match_fallback: true,
+            outer_temp_only: false,
+            strip_outer_temp: false,
         };
         let target = PatTarget {
             init: None,
@@ -127,6 +136,8 @@ impl Checker<'_, '_> {
             is_param: false,
             move_only: false,
             steps_match_fallback: init.is_none() && scrut_place.is_none(),
+            outer_temp_only: false,
+            strip_outer_temp: false,
         };
         let target = PatTarget {
             init,
@@ -155,6 +166,8 @@ impl Checker<'_, '_> {
             is_param: false,
             move_only: true,
             steps_match_fallback: false,
+            outer_temp_only: false,
+            strip_outer_temp: false,
         };
         let target = PatTarget {
             init,
@@ -188,10 +201,23 @@ impl Checker<'_, '_> {
         mut ctx: PatCtx,
     ) -> Result<()> {
         let unwrapped_init = target.init.map(|e| self.unwrap_parens(e));
+        if unwrapped_init.is_some_and(|e| self.is_outer_temp_only_expr(e, state))
+            || target.scrut_place.is_some_and(|p| {
+                !p.through_ref
+                    && p.steps.is_empty()
+                    && self.outer_temp_only_locals.contains(&p.local)
+            })
+        {
+            ctx.outer_temp_only = true;
+        }
+        let prev_behind_ref = ctx.behind_ref;
         let (adjusted_place, adjusted_steps, crossed_ref) =
             self.apply_pat_derefs(pat, unwrapped_init, target.scrut_place, target.pat_steps);
         if crossed_ref {
             ctx.behind_ref = true;
+            if prev_behind_ref && ctx.outer_temp_only {
+                ctx.strip_outer_temp = true;
+            }
         }
         let next = PatTarget {
             init: unwrapped_init,
@@ -237,6 +263,8 @@ impl Checker<'_, '_> {
                     self.variance.decl_seq[local as usize] = self.next_decl_seq();
                 }
                 reset_local_binding(local, ctx.init_val, state);
+                self.outer_temp_only_locals.remove(&local);
+                self.peelable_ref_field_locals.remove(&local);
             }
             if ctx.init_val {
                 let is_leaf = sub.is_none_or(|s| matches!(*self.body.pat(s), Pat::Rest));
@@ -261,6 +289,9 @@ impl Checker<'_, '_> {
             Expr::Ref { expr: inner_e, .. } => Some(inner_e),
             _ => None,
         });
+        if let Some(inner_e) = inner_init {
+            ctx.outer_temp_only = self.is_outer_temp_only_ref_expr(inner_e, state);
+        }
         let next_fallback = if inner_init.is_none() {
             if let Some(e) = target.init {
                 self.expr_borrow_sources(e, state)
@@ -292,6 +323,9 @@ impl Checker<'_, '_> {
         let mut next_steps = target.pat_steps.to_vec();
         if inner_init.is_none() {
             push_step(&mut next_steps, PlaceStep::Deref);
+        }
+        if ctx.behind_ref && ctx.outer_temp_only {
+            ctx.strip_outer_temp = true;
         }
         ctx.behind_ref = true;
         let inner_target = PatTarget {
@@ -673,23 +707,6 @@ impl Checker<'_, '_> {
     }
 }
 
-fn mark_place_behind_shared(place: &mut Place) {
-    place.reborrows_shared_field = true;
-    place.behind_shared = true;
-    place.mut_ref_root = false;
-}
-
-fn reset_local_binding(local: u32, init_val: bool, state: &mut State) {
-    state.init[local as usize] = init_val;
-    state.maybe_init[local as usize] = init_val;
-    state.moved[local as usize] = false;
-    state.moved_at[local as usize] = None;
-    state.partial_moves.retain(|m| m.local != local);
-    state.set_tuple_sources(local, None);
-    state.ptr_targets.remove(&local);
-    clear_rebound_loans(local, state);
-}
-
 impl Loan {
     pub(super) fn new(
         target: u32,
@@ -755,20 +772,4 @@ pub(super) fn push_source_loans_filtered(
             );
         }
     }
-}
-
-fn clear_rebound_loans(local: u32, state: &mut State) {
-    state.loans.retain_mut(|l| {
-        if l.holder == Some(local) {
-            return false;
-        }
-        if l.target == local {
-            if l.origin_only || l.through_ref {
-                l.origin_only = true;
-                return true;
-            }
-            return false;
-        }
-        true
-    });
 }

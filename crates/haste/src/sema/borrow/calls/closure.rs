@@ -732,3 +732,36 @@ pub(super) fn impl_self_lifetimes(
     let has_elided = has_lt && named.is_empty() && !bounded_by_lt;
     (has_lt, has_elided, named)
 }
+
+impl Checker<'_, '_> {
+    pub(in super::super) fn iter_trait_path_args(
+        &mut self,
+        sig: &crate::body::sig::Signature,
+        path: crate::body::PathId,
+    ) -> Option<crate::body::Args> {
+        let p = sig.body.path(path);
+        let segs = sig.body.list(p.segments);
+        let &last_seg = segs.last()?;
+        let seg = sig.body.segments[last_seg as usize];
+        if !matches!(
+            crate::names::plain(self.src.text(seg.name)),
+            "IntoIterator" | "Iterator"
+        ) {
+            return None;
+        }
+        if let Some(tr) = super::super::checks::resolve_ast_type_path(
+            self.cx,
+            Some(self.item),
+            &sig.body,
+            self.src,
+            path,
+        ) {
+            if !self.cx.outline.is_sysroot(tr.krate) || !self.is_iter_mod(tr) {
+                return None;
+            }
+        } else if segs.len() != 1 {
+            return None;
+        }
+        seg.args
+    }
+}

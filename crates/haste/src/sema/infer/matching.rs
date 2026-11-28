@@ -35,6 +35,10 @@ impl Infer<'_, '_> {
             } => self.range_expr(expr, (from, to), inclusive),
             Expr::OffsetOf { ty, fields } => self.offset_of(expr, ty, fields),
             Expr::Underscore => Ok(expected.unwrap_or_else(|| self.fresh(Kind::Var))),
+            Expr::Macro { path, .. } => {
+                let (segments, _) = self.resolve_macro(self.body, path);
+                bail!("unsupported expression macro `{}!`", self.spell(&segments))
+            }
             ref other => bail!("unsupported expression {other:?}"),
         }
     }

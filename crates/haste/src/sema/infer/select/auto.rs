@@ -72,7 +72,7 @@ impl<'a> Infer<'_, 'a> {
             .cx
             .has_specific_trait_impl_for_head(of, Head::Adt(item), &holders)
         {
-            return Some(self.has_vars(ty) || self.select_auto_impl(of, ty).0);
+            return Some(self.select_auto_impl(of, ty).0);
         }
         if self.cx.lang(item) == Some("phantom_data") {
             seen.push(ty);
@@ -318,17 +318,48 @@ impl<'a> Infer<'_, 'a> {
         (ok, dep)
     }
 
+    fn collect_open_vars(&self, ty: Ty, out: &mut Vec<Ty>) {
+        if !self.cx.types.has_var_flag(ty) {
+            return;
+        }
+        let ty = self.resolve(ty);
+        match *self.cx.types.kind(ty) {
+            Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) => {
+                if !out.contains(&ty) {
+                    out.push(ty);
+                }
+            }
+            kind => {
+                for child in kind.children(&self.cx.types) {
+                    self.collect_open_vars(child, out);
+                }
+            }
+        }
+    }
+
     fn select_auto_impl(&mut self, of: ItemRef, ty: Ty) -> (bool, usize) {
+        let mut open_vars = Vec::new();
+        if self.has_vars(ty) {
+            self.collect_open_vars(ty, &mut open_vars);
+        }
         let saved_dep = std::mem::replace(&mut self.auto_dep, usize::MAX);
         let asks_before = self.cx.asks.count();
-        let (picked, cycled) = self.probe(|infer| {
+        let (picked, cycled, bound_var) = self.probe(|infer| {
             let before = infer.cycle_hits;
             let picked = infer.select(of, ty, &[]);
-            (picked, infer.cycle_hits != before)
+            let bound_var = matches!(picked, Ok(Some(_)))
+                && open_vars.iter().any(|&v| {
+                    !matches!(
+                        infer.cx.types.kind(infer.resolve(v)),
+                        Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)
+                    )
+                });
+            (picked, infer.cycle_hits != before, bound_var)
         });
         let dep = std::mem::replace(&mut self.auto_dep, saved_dep);
         match picked {
-            Ok(Some(_)) => (true, dep),
+            Ok(Some(_)) if !bound_var => (true, dep),
+            Ok(Some(_)) => (false, usize::MAX),
             Ok(None) if cycled => {
                 self.cycle_hits += 1;
                 (true, 0)
@@ -364,11 +395,7 @@ impl<'a> Infer<'_, 'a> {
             .cx
             .has_specific_trait_impl_for_head(of, Head::Adt(item), &holders);
         let (holds, dep) = if specific {
-            if self.has_vars(ty) || self.has_params(ty) {
-                (true, usize::MAX)
-            } else {
-                self.select_auto_impl(of, ty)
-            }
+            self.select_auto_impl(of, ty)
         } else if self.cx.lang(item) == Some("phantom_data") {
             self.cx
                 .types

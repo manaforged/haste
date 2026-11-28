@@ -5,7 +5,6 @@ use crate::body::{BinOp, BlockKind, Expr, ExprId, List, Pat, PatId, Stmt};
 
 use super::bind::{push_loan, push_source_loans};
 use super::checks::{is_temp_target, merge_break_states, retain_non_loop_state};
-use super::places::PlaceStep;
 use super::propagate::{BorrowSource, TupleSources};
 use super::{
     BreakFrame, Checker, Loan, STMT_TEMP_OFFSET, State, join_moved, merge_branch, merge_states,
@@ -443,9 +442,21 @@ impl Checker<'_, '_> {
         let arm_ids: Vec<u32> = self.body.list(arms).to_vec();
         let mut match_live = outer_live.clone();
         self.collect_match_arms_live(&arm_ids, outer_live, &mut match_live);
-        self.with_let_extend(None, |this| {
+        let match_ty = self.expr_ty(expr_id);
+        let scrut_temp_depth = self.temp_scope_depth.max(depth + STMT_TEMP_OFFSET);
+        let drop_scrut_temps = !value_used
+            || (match_ty != crate::sema::ty::Ty::NONE
+                && !self.ty_holds_borrow(match_ty)
+                && !self.ty_has_non_static_param(match_ty));
+        let saved_temp_scope = self.temp_scope_depth;
+        if drop_scrut_temps {
+            self.temp_scope_depth = scrut_temp_depth;
+        }
+        let scrut_res = self.with_let_extend(None, |this| {
             this.check_expr(scrut, state, true, &match_live, true, depth)
-        })?;
+        });
+        self.temp_scope_depth = saved_temp_scope;
+        scrut_res?;
         let scrut_temp = self.hold_drop_temp(scrut, state);
         let scrut_place = self.root_place(scrut);
         let arm_depth = depth + 1;
@@ -455,7 +466,10 @@ impl Checker<'_, '_> {
         for arm_id in arm_ids {
             let arm = self.body.arms[arm_id as usize];
             let mut arm_state = fallthrough_state.clone();
-            self.bind_pat(
+            if drop_scrut_temps {
+                self.temp_scope_depth = scrut_temp_depth;
+            }
+            let bind_res = self.bind_pat(
                 arm.pat,
                 Some(scrut),
                 scrut_place.as_ref(),
@@ -463,7 +477,9 @@ impl Checker<'_, '_> {
                 &[],
                 &mut arm_state,
                 (true, arm.guard.is_none(), arm_depth),
-            )?;
+            );
+            self.temp_scope_depth = saved_temp_scope;
+            bind_res?;
             let mut arm_live = outer_live.clone();
             self.collect_live_expr(arm.body, &mut arm_live);
             if let Some(g) = arm.guard {
@@ -573,6 +589,9 @@ impl Checker<'_, '_> {
         }
         if let Some(st) = scrut_temp {
             self.release_temp_holder(state, st);
+        }
+        if drop_scrut_temps && !state.diverged {
+            self.check_stmt_temp_escape(state, scrut_temp_depth, &[], outer_live)?;
         }
         Ok(())
     }
@@ -743,57 +762,5 @@ impl Checker<'_, '_> {
         }
         self.strip_loop_locals(state, &loop_locals);
         Ok(())
-    }
-
-    fn finish_loop_iter(
-        &mut self,
-        iter_state: &State,
-        drop_temps: Vec<u32>,
-        exit_cond_states: &mut Vec<State>,
-        loop_locals: &HashSet<u32>,
-        outer_live: &HashSet<u32>,
-        loop_depth: u32,
-    ) -> Result<Option<State>> {
-        let continues = self
-            .breaks
-            .last_mut()
-            .map(|f| std::mem::take(&mut f.continues))
-            .unwrap_or_default();
-        let fallthrough = (!iter_state.diverged).then(|| iter_state.clone());
-        let mut merged_next = merge_break_states(fallthrough, continues);
-        for id in drop_temps {
-            if let Some(ref mut next) = merged_next {
-                self.release_temp_holder(next, id);
-            } else {
-                self.release_temp_in_breaks(id);
-            }
-            Checker::release_temp_states(exit_cond_states, id);
-        }
-        let Some(mut next_state) = merged_next else {
-            return Ok(None);
-        };
-        self.check_drop_order(loop_depth, &next_state)?;
-        retain_non_loop_state(&mut next_state, loop_locals);
-        self.check_block_escape(loop_depth, &next_state, outer_live)?;
-        for loan in &mut next_state.loans {
-            for step in &mut loan.steps {
-                if matches!(step, PlaceStep::Opaque(Some(_))) {
-                    *step = PlaceStep::Opaque(None);
-                }
-            }
-        }
-        Ok(Some(next_state))
-    }
-
-    fn strip_loop_locals(&mut self, state: &mut State, loop_locals: &HashSet<u32>) {
-        retain_non_loop_state(state, loop_locals);
-        for f in &mut self.breaks {
-            for s in &mut f.states {
-                retain_non_loop_state(s, loop_locals);
-            }
-            for s in &mut f.continues {
-                retain_non_loop_state(s, loop_locals);
-            }
-        }
     }
 }

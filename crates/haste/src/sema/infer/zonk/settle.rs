@@ -318,7 +318,7 @@ impl Infer<'_, '_> {
             if !self.captures_settled {
                 return Ok(false);
             }
-            if self.poly.is_some() && self.has_params(self_ty) {
+            if self.poly.is_some() && !self.has_vars(self_ty) && self.has_params(self_ty) {
                 return Ok(self.thread_auto_holds(of, self_ty));
             }
         }

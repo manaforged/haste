@@ -597,3 +597,171 @@ fn pending_opaque_tuple_prefers_layer_over_unrelated_handler_trait() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn specific_auto_impl_does_not_satisfy_generic_or_unrelated_types() {
+    let core_src = concat!(
+        "#![no_core]\n",
+        "#[lang = \"sized\"]\n",
+        "pub trait Sized {}\n",
+        "#[lang = \"deref\"]\n",
+        "pub trait Deref {\n",
+        "    type Target;\n",
+        "    fn deref(&self) -> &Self::Target;\n",
+        "}\n",
+        "#[lang = \"drop\"]\n",
+        "pub trait Drop {\n",
+        "    fn drop(&mut self);\n",
+        "}\n",
+        "pub unsafe auto trait Send {}\n",
+        "#[lang = \"unpin\"]\n",
+        "pub trait Unpin {}\n",
+        "pub struct PhantomPinned;\n",
+    );
+    let app_src = concat!(
+        "use core::{PhantomPinned, Send, Unpin};\n",
+        "pub struct Bad<T>(*const u8, T);\n",
+        "unsafe impl Send for Bad<u8> {}\n",
+        "pub struct GoodSend<T>(*const u8, T);\n",
+        "unsafe impl<T: Send> Send for GoodSend<T> {}\n",
+        "pub struct BadPin<T>(PhantomPinned, T);\n",
+        "unsafe impl Unpin for BadPin<u8> {}\n",
+        "pub fn require_send<T: Send>(_: T) {}\n",
+        "pub fn require_unpin<T: Unpin>(_: T) {}\n",
+        "pub fn bad_generic_send<T>(x: Bad<T>) {\n",
+        "    require_send(x);\n",
+        "}\n",
+        "pub fn bad_concrete_send(x: Bad<*const u8>) {\n",
+        "    require_send(x);\n",
+        "}\n",
+        "pub fn ok_concrete_send(x: Bad<u8>) {\n",
+        "    require_send(x);\n",
+        "}\n",
+        "pub fn ok_generic_send<T: Send>(x: GoodSend<T>) {\n",
+        "    require_send(x);\n",
+        "}\n",
+        "pub fn bad_generic_unpin<T>(x: BadPin<T>) {\n",
+        "    require_unpin(x);\n",
+        "}\n",
+        "pub fn bad_concrete_unpin(x: BadPin<PhantomPinned>) {\n",
+        "    require_unpin(x);\n",
+        "}\n",
+        "pub fn ok_concrete_unpin(x: BadPin<u8>) {\n",
+        "    require_unpin(x);\n",
+        "}\n",
+    );
+    let (dir, outline, names) = load_fixture(
+        "specific_auto_impl",
+        &[
+            TestCrate {
+                name: "core",
+                role: Role::Lib,
+                sysroot: true,
+                deps: &[],
+                src: core_src,
+            },
+            TestCrate {
+                name: "app",
+                role: Role::Lib,
+                sysroot: false,
+                deps: &[0],
+                src: app_src,
+            },
+        ],
+    );
+    let mut cx = Context::new(&outline, &names, Cache::default());
+    let param0 = cx.types.intern(crate::sema::ty::Kind::Param(0));
+    let param_substs = cx.types.intern_substs(&[param0]);
+
+    let bad_gen_send = find_item(&outline, 1, "bad_generic_send");
+    assert!(matches!(
+        build_poly_summary(&mut cx, bad_gen_send, 1),
+        SummaryKind::Error(_)
+    ));
+    assert!(infer(&mut cx, bad_gen_send, param_substs).is_err());
+
+    let bad_con_send = find_item(&outline, 1, "bad_concrete_send");
+    assert!(infer(&mut cx, bad_con_send, Substs::EMPTY).is_err());
+
+    let ok_con_send = find_item(&outline, 1, "ok_concrete_send");
+    assert!(infer(&mut cx, ok_con_send, Substs::EMPTY).is_ok());
+
+    let ok_gen_send = find_item(&outline, 1, "ok_generic_send");
+    assert!(!matches!(
+        build_poly_summary(&mut cx, ok_gen_send, 1),
+        SummaryKind::Error(_)
+    ));
+
+    let bad_gen_pin = find_item(&outline, 1, "bad_generic_unpin");
+    assert!(matches!(
+        build_poly_summary(&mut cx, bad_gen_pin, 1),
+        SummaryKind::Error(_)
+    ));
+    assert!(infer(&mut cx, bad_gen_pin, param_substs).is_err());
+
+    let bad_con_pin = find_item(&outline, 1, "bad_concrete_unpin");
+    assert!(infer(&mut cx, bad_con_pin, Substs::EMPTY).is_err());
+
+    let ok_con_pin = find_item(&outline, 1, "ok_concrete_unpin");
+    assert!(infer(&mut cx, ok_con_pin, Substs::EMPTY).is_ok());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn refutable_fn_param_pattern_rejected_while_uninhabited_option_accepted() {
+    let core_src = concat!(
+        "#![no_core]\n",
+        "#[lang = \"sized\"]\n",
+        "pub trait Sized {}\n",
+        "#[lang = \"deref\"]\n",
+        "pub trait Deref {\n",
+        "    type Target;\n",
+        "    fn deref(&self) -> &Self::Target;\n",
+        "}\n",
+        "#[lang = \"drop\"]\n",
+        "pub trait Drop {\n",
+        "    fn drop(&mut self);\n",
+        "}\n",
+        "pub enum Infallible {}\n",
+        "pub enum Option<T> {\n",
+        "    None,\n",
+        "    Some(T),\n",
+        "}\n",
+    );
+    let app_src = concat!(
+        "use core::{Infallible, Option::{self, None}};\n",
+        "pub fn unsound_none(None: Option<i32>) {}\n",
+        "pub fn ok_infallible_none(None: Option<Infallible>) {}\n",
+    );
+    let (dir, outline, names) = load_fixture(
+        "param_pat_exhaustiveness",
+        &[
+            TestCrate {
+                name: "core",
+                role: Role::Lib,
+                sysroot: true,
+                deps: &[],
+                src: core_src,
+            },
+            TestCrate {
+                name: "app",
+                role: Role::Lib,
+                sysroot: false,
+                deps: &[0],
+                src: app_src,
+            },
+        ],
+    );
+    let mut cx = Context::new(&outline, &names, Cache::default());
+    let unsound = find_item(&outline, 1, "unsound_none");
+    assert!(
+        infer(&mut cx, unsound, Substs::EMPTY).is_err(),
+        "refutable function parameter pattern must be rejected"
+    );
+    let ok = find_item(&outline, 1, "ok_infallible_none");
+    assert!(
+        infer(&mut cx, ok, Substs::EMPTY).is_ok(),
+        "irrefutable Option<Infallible> parameter pattern must pass"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

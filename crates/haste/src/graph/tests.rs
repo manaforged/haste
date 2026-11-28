@@ -137,3 +137,46 @@ fn non_virtual_edition_2021_workspace_keeps_resolver_v2_when_root_pruned() {
 
     drop(std::fs::remove_dir_all(&top));
 }
+
+#[test]
+fn profile_overrides_parse_debug_assertions_and_panic_from_workspace_and_member() {
+    let top = temp_dir("profile-overrides");
+    std::fs::write(
+        top.join("Cargo.toml"),
+        concat!(
+            "[workspace]\n",
+            "members = [\"crates/leaf\"]\n",
+            "[profile.dev]\n",
+            "debug-assertions = false\n",
+            "panic = \"abort\"\n",
+            "[profile.release]\n",
+            "debug-assertions = true\n",
+            "panic = \"unwind\"\n",
+        ),
+    )
+    .expect("write root Cargo.toml");
+    write_member(&top, "crates/leaf", "leaf", "2021");
+
+    let (dev, rel) = manifest::profiles_of(&top);
+    assert_eq!(dev.debug_assertions, Some(false));
+    assert_eq!(rel.debug_assertions, Some(true));
+    assert_eq!(
+        manifest::profile_panic_for(&top, false).as_deref(),
+        Some("abort")
+    );
+    assert_eq!(
+        manifest::profile_panic_for(&top, true).as_deref(),
+        Some("unwind")
+    );
+    let member_dir = top.join("crates/leaf");
+    assert_eq!(
+        manifest::profile_panic_for(&member_dir, false).as_deref(),
+        Some("abort")
+    );
+    assert_eq!(
+        manifest::profile_panic_for(&member_dir, true).as_deref(),
+        Some("unwind")
+    );
+
+    drop(std::fs::remove_dir_all(&top));
+}

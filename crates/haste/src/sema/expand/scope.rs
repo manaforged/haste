@@ -86,7 +86,12 @@ fn use_entry(
     if !pathlike(from..end) || !is_name(src.kind(end - 1)) || !is_name(src.kind(alias)) {
         return false;
     }
-    found.push((joined(end), alias));
+    let path = if end == from + 1 && plain(src.text(from)) == "self" && prefix.len() >= 2 {
+        prefix[..prefix.len() - 2].to_vec()
+    } else {
+        joined(end)
+    };
+    found.push((path, alias));
     true
 }
 
@@ -106,8 +111,7 @@ impl Writer {
                 return Ok(Some(end + 2));
             }
             if src.kind(end) == TokenKind::OpenBrace
-                && end >= at + 3
-                && src.kind(end - 1) == TokenKind::Colon
+                && (end == at + 1 || (end >= at + 3 && src.kind(end - 1) == TokenKind::Colon))
             {
                 return self.note_use_group(src, (at + 1, end));
             }
@@ -239,7 +243,7 @@ impl Writer {
         path: (u32, u32),
     ) -> Result<Option<ItemRef>> {
         for prefix in self.globs.iter().rev() {
-            if let Some(found) = self.resolve_joined(cx, prefix, src, path)? {
+            if let Some(found) = self.resolve_joined(cx, prefix, src, path, 0)? {
                 return Ok(Some(found));
             }
         }
@@ -252,12 +256,13 @@ impl Writer {
         prefix: &Source,
         src: &Source,
         (from, to): (u32, u32),
+        depth: u8,
     ) -> Result<Option<ItemRef>> {
         let mut full = Tokens::default();
         full.copy_range(prefix, 0, prefix.len());
         (from..=to).for_each(|token| full.copy(src, token));
         let joined = full.finish(src.path.clone())?;
-        Ok(self.resolve_macro(cx, &joined, (0, joined.len() - 1)))
+        self.resolve_use_source(cx, &joined, depth)
     }
 
     fn resolve_use_source(
@@ -277,12 +282,10 @@ impl Writer {
             && src.dollar(0).is_none()
         {
             let first = plain(src.text(0));
-            if let Some((_, prefix)) = self.uses.iter().rev().find(|(alias, _)| alias == first) {
-                let mut full = Tokens::default();
-                full.copy_range(prefix, 0, prefix.len());
-                (1..=last).for_each(|token| full.copy(src, token));
-                let joined = full.finish(src.path.clone())?;
-                return self.resolve_use_source(cx, &joined, depth + 1);
+            for (_, prefix) in self.uses.iter().rev().filter(|(alias, _)| alias == first) {
+                if let Some(found) = self.resolve_joined(cx, prefix, src, (1, last), depth + 1)? {
+                    return Ok(Some(found));
+                }
             }
         }
         Ok(None)
@@ -295,20 +298,21 @@ impl Writer {
         path: (u32, u32),
         name: &str,
     ) -> Result<Option<ItemRef>> {
-        if let Some((_, source)) = self
-            .uses
-            .iter()
-            .rev()
-            .find(|(alias, _)| path.0 == path.1 && *alias == name)
-        {
-            return self.resolve_use_source(cx, source, 0);
-        }
-        let first = plain(run.src.text(path.0));
-        if path.0 < path.1
-            && let Some((_, source)) = self.uses.iter().rev().find(|(alias, _)| *alias == first)
-            && let Some(found) = self.resolve_joined(cx, source, run.src, (path.0 + 1, path.1))?
-        {
-            return Ok(Some(found));
+        if path.0 == path.1 {
+            for (_, source) in self.uses.iter().rev().filter(|(alias, _)| *alias == name) {
+                if let Some(found) = self.resolve_use_source(cx, source, 0)? {
+                    return Ok(Some(found));
+                }
+            }
+        } else {
+            let first = plain(run.src.text(path.0));
+            for (_, source) in self.uses.iter().rev().filter(|(alias, _)| *alias == first) {
+                if let Some(found) =
+                    self.resolve_joined(cx, source, run.src, (path.0 + 1, path.1), 0)?
+                {
+                    return Ok(Some(found));
+                }
+            }
         }
         match self
             .resolve_macro(cx, run.src, path)
@@ -352,39 +356,24 @@ mod tests {
         }
     }
 
-    #[test]
-    fn grouped_block_use_with_glob_resolves_exported_and_glob_macros() {
-        let dir = std::env::temp_dir().join(format!("haste_grouped_use_{}", std::process::id()));
+    fn expand_two_crates(
+        tag: &str,
+        dep_src: &str,
+        app_src: &str,
+    ) -> std::sync::Arc<crate::body::Body> {
+        let dir = std::env::temp_dir().join(format!("haste_{tag}_{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create test dir");
-        let dep_path = dir.join("bugreport.rs");
+        let dep_path = dir.join("dep.rs");
         let app_path = dir.join("app.rs");
-        std::fs::write(
-            &dep_path,
-            concat!(
-                "#[macro_export] macro_rules! bugreport { () => { 40u32 }; }\n",
-                "#[macro_export] macro_rules! col_m { () => { 2u32 }; }\n",
-                "pub mod collector { pub use crate::col_m; }\n",
-                "pub mod format { pub struct Markdown; }\n",
-            ),
-        )
-        .expect("write bugreport.rs");
-        std::fs::write(
-            &app_path,
-            concat!(
-                "fn invoke_bugreport() -> u32 {\n",
-                "    use bugreport::{bugreport, collector::*, format::Markdown};\n",
-                "    bugreport!() + col_m!()\n",
-                "}\n",
-            ),
-        )
-        .expect("write app.rs");
+        std::fs::write(&dep_path, dep_src).expect("write dep.rs");
+        std::fs::write(&app_path, app_src).expect("write app.rs");
 
-        let app_deps = vec![("bugreport".to_owned(), 0usize)];
+        let app_deps = vec![("dep".to_owned(), 0usize)];
         let mut outline = Outline {
             roots: vec![
                 Root {
                     unit: 0,
-                    name: "bugreport".to_owned(),
+                    name: "dep".to_owned(),
                     path: dep_path.clone(),
                     role: Role::Lib,
                     edition: "2021".to_owned(),
@@ -408,7 +397,7 @@ mod tests {
         outline.load_all().expect("load outline");
 
         let syms = Symbols::default();
-        let dep_sym = syms.intern("bugreport");
+        let dep_sym = syms.intern("dep");
         let mut dep_names = NamesCrate::default();
         dep_names.edition = "2021".to_owned();
         dep_names.eager = true;
@@ -429,13 +418,105 @@ mod tests {
             file: 0,
             item: 0,
         };
-        let body = cx.body(fn_item).expect("expand body with grouped use");
+        let body = cx.body(fn_item).expect("expand body");
+        let _ = std::fs::remove_dir_all(&dir);
+        body
+    }
+
+    fn assert_all_macros_expanded(body: &crate::body::Body, msg: &str) {
         assert!(
             body.exprs
                 .iter()
                 .all(|expr| !matches!(expr, crate::body::Expr::Macro { .. })),
-            "macros imported via grouped use with wildcard sibling must expand"
+            "{msg}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn grouped_block_use_with_glob_resolves_exported_and_glob_macros() {
+        let body = expand_two_crates(
+            "grouped_use",
+            concat!(
+                "#[macro_export] macro_rules! bugreport { () => { 40u32 }; }\n",
+                "#[macro_export] macro_rules! col_m { () => { 2u32 }; }\n",
+                "pub mod collector { pub use crate::col_m; }\n",
+                "pub mod format { pub struct Markdown; }\n",
+            ),
+            concat!(
+                "fn invoke_bugreport() -> u32 {\n",
+                "    use dep::{bugreport, collector::*, format::Markdown};\n",
+                "    bugreport!() + col_m!()\n",
+                "}\n",
+            ),
+        );
+        assert_all_macros_expanded(
+            &body,
+            "macros imported via grouped use with wildcard sibling must expand",
+        );
+    }
+
+    #[test]
+    fn local_non_macro_use_does_not_shadow_macro() {
+        let body = expand_two_crates(
+            "non_macro_use_shadow",
+            concat!(
+                "pub mod env {}\n",
+                "#[macro_export] macro_rules! env { () => { 40u32 }; }\n",
+                "#[macro_export] macro_rules! inner_m { () => { 2u32 }; }\n",
+                "pub struct sub;\n",
+                "pub mod submod { pub use crate::inner_m as m; }\n",
+            ),
+            concat!(
+                "fn run() -> u32 {\n",
+                "    use dep::*;\n",
+                "    use dep::env;\n",
+                "    use dep::submod as s;\n",
+                "    use dep::sub as s;\n",
+                "    env!() + s::m!()\n",
+                "}\n",
+            ),
+        );
+        assert_all_macros_expanded(
+            &body,
+            "local non-macro `use` must not shadow macro resolution",
+        );
+    }
+
+    #[test]
+    fn def_site_multi_segment_macro_expands_in_caller() {
+        let body = expand_two_crates(
+            "def_site_multi_seg",
+            concat!(
+                "pub mod inner { pub macro m() { 42u32 } }\n",
+                "pub macro outer() { inner::m!() }\n",
+            ),
+            concat!("fn run() -> u32 {\n", "    dep::outer!()\n", "}\n",),
+        );
+        assert_all_macros_expanded(
+            &body,
+            "multi-segment def-site path inside `pub macro` must expand",
+        );
+    }
+
+    #[test]
+    fn grouped_braced_use_and_self_alias_expand_macros() {
+        let body = expand_two_crates(
+            "grouped_braced_self",
+            concat!(
+                "#[macro_export] macro_rules! top { () => { 2u32 }; }\n",
+                "#[macro_export] macro_rules! leaf { () => { 40u32 }; }\n",
+                "pub mod sub { pub use crate::leaf as m; }\n",
+            ),
+            concat!(
+                "fn run() -> u32 {\n",
+                "    use {dep::top, dep::sub::{self as s}};\n",
+                "    top!() + s::m!()\n",
+                "}\n",
+            ),
+        );
+        assert_all_macros_expanded(
+            &body,
+            "braced root `use` and `{self as alias}` must expand macros",
+        );
     }
 }

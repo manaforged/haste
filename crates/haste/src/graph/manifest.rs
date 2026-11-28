@@ -411,29 +411,44 @@ pub fn workspace_of(dir: &Path) -> Result<Option<Table>> {
     Ok(Some(workspace))
 }
 
+fn read_manifest_table(dir: &Path) -> Option<Table> {
+    toml::from_str(&std::fs::read_to_string(dir.join(super::MANIFEST_FILE)).ok()?).ok()
+}
+
+fn profile_table<'a>(root: &'a Table, name: &str) -> Option<&'a Table> {
+    root.get("profile")?.get(name)?.as_table()
+}
+
 /// Reads `[profile.dev]` and `[profile.release]` overrides from `dir/Cargo.toml`, if present.
 pub fn profiles_of(dir: &Path) -> (ProfileOverride, ProfileOverride) {
-    let parse = |table: &Table, name: &str| {
-        let Some(prof) = table
-            .get("profile")
-            .and_then(Value::as_table)
-            .and_then(|p| p.get(name))
-            .and_then(Value::as_table)
-        else {
-            return ProfileOverride::default();
-        };
-        ProfileOverride {
+    let Some(root) = read_manifest_table(dir) else {
+        return Default::default();
+    };
+    let parse = |name| {
+        profile_table(&root, name).map_or_else(ProfileOverride::default, |prof| ProfileOverride {
             debug_assertions: flag(prof, &["debug-assertions", "debug_assertions"]),
             overflow_checks: flag(prof, &["overflow-checks", "overflow_checks"]),
+        })
+    };
+    (parse("dev"), parse("release"))
+}
+
+pub(crate) fn profile_panic_for(manifest_dir: &Path, release: bool) -> Option<String> {
+    let key = if release { "release" } else { "dev" };
+    let panic_in = |root: &Table| {
+        profile_table(root, key)
+            .and_then(|p| text(p, "panic"))
+            .filter(|s| matches!(*s, "unwind" | "abort"))
+            .map(str::to_owned)
+    };
+    for dir in manifest_dir.ancestors() {
+        if let Some(root) = read_manifest_table(dir)
+            && root.contains_key("workspace")
+        {
+            return panic_in(&root);
         }
-    };
-    let Ok(text_of) = std::fs::read_to_string(dir.join(super::MANIFEST_FILE)) else {
-        return Default::default();
-    };
-    let Ok(root) = toml::from_str::<Table>(&text_of) else {
-        return Default::default();
-    };
-    (parse(&root, "dev"), parse(&root, "release"))
+    }
+    read_manifest_table(manifest_dir).and_then(|root| panic_in(&root))
 }
 
 fn inherited_value<'a>(

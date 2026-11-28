@@ -370,7 +370,11 @@ impl Checker<'_, '_> {
     ) -> Result<()> {
         if !sources.is_empty() {
             self.check_assign_escape(p, sources, state)?;
-            if !p.through_ref {
+        }
+        if !p.through_ref {
+            self.outer_temp_only_locals.remove(&p.local);
+            self.peelable_ref_field_locals.remove(&p.local);
+            if !sources.is_empty() {
                 self.push_sources_for_local(p.local, sources, self.current_expr, state);
             }
         }

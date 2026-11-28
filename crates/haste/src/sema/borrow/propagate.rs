@@ -67,7 +67,7 @@ impl Checker<'_, '_> {
         self.expr_borrow_sources_inner(expr, state, true, extend_depth)
     }
 
-    fn expr_borrow_sources_inner(
+    pub(super) fn expr_borrow_sources_inner(
         &mut self,
         expr: ExprId,
         state: &State,
@@ -75,7 +75,7 @@ impl Checker<'_, '_> {
         extend_depth: Option<u32>,
     ) -> Vec<BorrowSource> {
         let ty = self.expr_ty(expr);
-        if ty != Ty::NONE && !self.ty_holds_borrow(ty) {
+        if ty != Ty::NONE && !self.ty_holds_borrow(ty) && !self.expr_is_capturing_rpit(expr) {
             return Vec::new();
         }
         match *self.body.expr(expr) {
@@ -356,10 +356,9 @@ impl Checker<'_, '_> {
             {
                 return true;
             }
-            if self.is_closure_param(s.target) || self.is_param_local(s.target) {
-                return false;
-            }
-            !self.from_caller(s.target, s.through_ref)
+            !self.is_closure_param(s.target)
+                && !self.is_param_local(s.target)
+                && !self.from_caller(s.target, s.through_ref)
                 && self.ty_holds_borrow(self.local_ty(s.target))
         })
     }
@@ -464,7 +463,9 @@ impl Checker<'_, '_> {
                     });
                 } else {
                     for outer in state.loans.iter().filter(|l| l.holder == Some(*local)) {
-                        if self.is_non_static_param(outer.target) {
+                        if self.is_non_static_param(outer.target)
+                            || !self.is_ref_ty(self.local_ty(outer.target))
+                        {
                             joined.push(BorrowSource::from_loan(outer));
                         }
                     }

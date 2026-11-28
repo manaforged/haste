@@ -1,4 +1,5 @@
 mod args;
+mod clean;
 mod debug;
 mod help;
 
@@ -439,7 +440,17 @@ fn report_cases(
     let started = Instant::now();
     let mut build = crate::build::Build::load_oneshot(workspace, targets)?;
     let result = match (request, out) {
-        (Request::Build, Some(path)) => build.emit_executable(workspace, path, stats.is_none()),
+        (Request::Build, Some(path)) => {
+            if let Some(bin) = default_run_bin(workspace) {
+                let mut cfg = crate::config::Config::current();
+                cfg.selection.bin = Some(bin);
+                crate::with_config(std::sync::Arc::new(cfg), || {
+                    build.emit_executable(workspace, path, stats.is_none())
+                })
+            } else {
+                build.emit_executable(workspace, path, stats.is_none())
+            }
+        }
         (Request::Build, None) if stats.is_none() => build
             .compile_binary_oneshot(workspace)
             .and_then(|()| build.check(started.elapsed())),
@@ -483,26 +494,31 @@ fn report_cases(
     result
 }
 
-fn clean_cache() -> Result<()> {
-    if crate::serve::stop(None)? != 0 {
-        anyhow::bail!("failed to stop active haste daemons");
+fn default_run_bin(workspace: &graph::Workspace) -> Option<String> {
+    let sel = crate::selection();
+    if sel.bin.is_some() || sel.example.is_some() {
+        return None;
     }
-    let home = crate::graph::store::home();
-    let quiet = crate::selection().quiet;
-    match std::fs::remove_dir_all(&home) {
-        Ok(()) => {
-            if !quiet {
-                eprintln!("removed {}", home.display());
-            }
+    let mut found = None;
+    for &pkg_idx in &workspace.graph.members {
+        let pkg = &workspace.packages[pkg_idx];
+        if !sel.packages.is_empty() && !sel.packages.contains(&pkg.locked.name) {
+            continue;
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            if !quiet {
-                eprintln!("cache {} is already empty", home.display());
-            }
+        if pkg.manifest.bins.is_empty() {
+            continue;
         }
-        Err(err) => return Err(err).with_context(|| format!("removing {}", home.display())),
+        if found.is_some() {
+            return None;
+        }
+        found = Some(
+            pkg.manifest
+                .default_run
+                .clone()
+                .filter(|_| pkg.manifest.bins.len() > 1),
+        );
     }
-    Ok(())
+    found.flatten()
 }
 
 fn can_serve(command: Command, stats_json: Option<&std::path::Path>) -> bool {
@@ -563,7 +579,7 @@ fn run_parsed(
     out: Option<std::path::PathBuf>,
 ) -> Result<()> {
     match command {
-        Command::Clean => return clean_cache(),
+        Command::Clean { all } => return clean::run(all, &path),
         Command::Debug(Query::Items) => return print_items(&path),
         Command::Debug(Query::Expand) => return print_expanded(&path),
         Command::Serve(ServeAction::Status) => {
@@ -708,7 +724,7 @@ fn report(
         }
         Command::Serve(_) => 0,
         Command::Prep => report_prep(&workspace, &targets).map(|()| 0)?,
-        Command::Clean => 0,
+        Command::Clean { .. } => 0,
         Command::Debug(query) => report_query(query, (&workspace, &targets), argv).map(|()| 0)?,
     };
     if matches!(command, Command::Debug(Query::Graph)) {
@@ -726,62 +742,4 @@ fn report(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn test_outline() -> outline::Outline {
-        outline::Outline {
-            roots: vec![
-                outline::Root {
-                    unit: 0,
-                    name: "my-bin".to_owned(),
-                    path: std::path::PathBuf::from("src/bin/my-bin.rs"),
-                    role: outline::Role::Bin,
-                    edition: "2021".to_owned(),
-                    proc_macro: false,
-                },
-                outline::Root {
-                    unit: 0,
-                    name: "my-test".to_owned(),
-                    path: std::path::PathBuf::from("tests/my-test.rs"),
-                    role: outline::Role::Test,
-                    edition: "2021".to_owned(),
-                    proc_macro: false,
-                },
-            ],
-            crates: Vec::new(),
-            deps: Vec::new(),
-            cache: outline::tree::Files::default(),
-            procs: rustc_hash::FxHashMap::default(),
-            pins: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn test_target_selected_matches_hyphenated_bin_and_test_names() {
-        let outline = test_outline();
-        let by_bin_hyphen = crate::Selection {
-            bin: Some("my-bin".to_owned()),
-            ..crate::Selection::default()
-        };
-        let by_bin_under = crate::Selection {
-            bin: Some("my_bin".to_owned()),
-            ..crate::Selection::default()
-        };
-        assert!(test_target_selected(&outline, 0, &by_bin_hyphen));
-        assert!(test_target_selected(&outline, 0, &by_bin_under));
-        assert!(!test_target_selected(&outline, 1, &by_bin_hyphen));
-
-        let by_test_hyphen = crate::Selection {
-            test: Some("my-test".to_owned()),
-            ..crate::Selection::default()
-        };
-        let by_test_under = crate::Selection {
-            test: Some("my_test".to_owned()),
-            ..crate::Selection::default()
-        };
-        assert!(test_target_selected(&outline, 1, &by_test_hyphen));
-        assert!(test_target_selected(&outline, 1, &by_test_under));
-        assert!(!test_target_selected(&outline, 0, &by_test_hyphen));
-    }
-}
+mod tests;

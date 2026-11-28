@@ -254,7 +254,7 @@ impl<'a> Checker<'_, 'a> {
         iter_sources: &[BorrowSource],
         state: &State,
     ) -> (Vec<BorrowSource>, Option<TupleSources>) {
-        let item_sources = if self.for_iter_item_is_static(iter) {
+        let mut item_sources = if self.for_iter_item_is_static(iter) {
             Vec::new()
         } else {
             let srcs: Vec<BorrowSource> = iter_sources
@@ -269,6 +269,21 @@ impl<'a> Checker<'_, 'a> {
                 srcs
             }
         };
+        if item_sources.is_empty()
+            && !self.for_iter_item_is_static(iter)
+            && let Some(local) = self.expr_plain_local(self.unwrap_parens(iter))
+            && self.is_non_static_param(local)
+            && self.ty_has_non_static_param(self.local_ty(local))
+        {
+            item_sources.push(BorrowSource {
+                target: local,
+                steps: Vec::new(),
+                mutable: false,
+                through_ref: true,
+                env_only: false,
+                origin_only: true,
+            });
+        }
         let item_tuple = self.iter_tuple_sources(iter, state);
         (item_sources, item_tuple)
     }

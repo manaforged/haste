@@ -44,28 +44,63 @@ impl Infer<'_, '_> {
         for (pat, pat_ty) in let_pats {
             self.check_let_irrefutable(pat, pat_ty)?;
         }
+        let named_param_pats = std::mem::take(&mut self.named_param_pats);
+        for (tok, res, pat_ty) in named_param_pats {
+            self.check_named_param_irrefutable(tok, res, pat_ty)?;
+        }
         Ok(())
     }
 
-    fn check_let_irrefutable(&mut self, pat: PatId, pat_ty: Ty) -> Result<()> {
+    fn irrefutable_witness(
+        &mut self,
+        pat_ty: Ty,
+        lower: impl FnOnce(&mut Self, Ty) -> Option<MPat>,
+    ) -> Option<String> {
         if self.cx.outline.crates[self.home.krate as usize].env.fixed {
-            return Ok(());
+            return None;
         }
         let ty = self.peel_match_ref(pat_ty);
         if matches!(
             *self.cx.types.kind(ty),
             Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) | Kind::Param(_) | Kind::Proj(_)
         ) {
-            return Ok(());
+            return None;
         }
-        let rows = vec![vec![self.lower_match_pat(pat, ty)]];
+        let mpat = lower(self, ty)?;
+        let rows = vec![vec![mpat]];
         let mut budget = MAX_BUDGET;
-        if let Some(mut witness) = self.find_witness(&rows, &[ty], &mut budget) {
-            let missing = witness.pop().unwrap_or_else(|| "_".to_owned());
+        let mut witness = self.find_witness(&rows, &[ty], &mut budget)?;
+        Some(witness.pop().unwrap_or_else(|| "_".to_owned()))
+    }
+
+    fn check_let_irrefutable(&mut self, pat: PatId, pat_ty: Ty) -> Result<()> {
+        if let Some(missing) =
+            self.irrefutable_witness(pat_ty, |this, ty| Some(this.lower_match_pat(pat, ty)))
+        {
             return Err(self.diag_pat(
                 DiagnosticKind::Exhaustive,
                 pat,
                 format!("refutable pattern in local binding: `{missing}` not covered"),
+                format!("pattern `{missing}` not covered"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_named_param_irrefutable(&mut self, tok: u32, res: Res, pat_ty: Ty) -> Result<()> {
+        if let Some(missing) = self.irrefutable_witness(pat_ty, |this, ty| match res {
+            Res::Ctor(item, variant, _) => {
+                Some(MPat::Ctor(this.ctor_kind_for(item, variant), Vec::new()))
+            }
+            Res::Fn(item, _) if this.cx.item(item).1.kind == ItemKind::Const => {
+                Some(this.eval_const_pat_item(item, ty).unwrap_or(MPat::Opaque))
+            }
+            _ => None,
+        }) {
+            return Err(self.diag_tok(
+                DiagnosticKind::Exhaustive,
+                tok,
+                format!("refutable pattern in function argument: `{missing}` not covered"),
                 format!("pattern `{missing}` not covered"),
             ));
         }
