@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use rustc_lexer::TokenKind;
 
@@ -7,8 +7,8 @@ use crate::outline::item::{ItemKind, Vis};
 use crate::outline::tree::Crate as Tree;
 
 use super::{
-    Binding, CRATE, Crate, Def, ItemRef, ModRef, Origin, PerNs, SELF, SUPER, Scope, Sym, Symbols,
-    UNDERSCORE, plain,
+    Binding, CRATE, Crate, Def, ItemRef, ModRef, Ns, Origin, PerNs, SELF, SUPER, Scope, Sym,
+    Symbols, UNDERSCORE, plain,
 };
 
 /// What lookups asked for that is not there yet: modules to read, names whose imports must resolve, crates to read whole, and modules whose every import must resolve.
@@ -19,6 +19,7 @@ pub struct Requests {
     pub crates: RefCell<Vec<u32>>,
     pub scopes: RefCell<Vec<ModRef>>,
     pub procs: RefCell<Vec<(ItemRef, String)>>,
+    taint: Cell<usize>,
 }
 
 impl Requests {
@@ -29,6 +30,12 @@ impl Requests {
             + self.crates.borrow().len()
             + self.scopes.borrow().len()
             + self.procs.borrow().len()
+            + self.taint.get()
+    }
+
+    /// Marks this request set as having observed a previously replayed incomplete lookup without copying duplicate entries.
+    pub fn bump_taint(&self) {
+        self.taint.set(self.taint.get().saturating_add(1));
     }
 
     /// Where each list of asks ends now, to take what later lookups add with `since`.
@@ -50,6 +57,7 @@ impl Requests {
             crates: RefCell::new(self.crates.borrow()[mark[2]..].to_vec()),
             scopes: RefCell::new(self.scopes.borrow()[mark[3]..].to_vec()),
             procs: RefCell::new(self.procs.borrow()[mark[4]..].to_vec()),
+            taint: Cell::new(0),
         }
     }
 
@@ -70,9 +78,11 @@ impl Requests {
         self.procs
             .borrow_mut()
             .extend(other.procs.borrow().iter().cloned());
+        self.taint
+            .set(self.taint.get().saturating_add(other.taint.get()));
     }
 
-    pub(super) fn into_parts(self) -> RequestParts {
+    pub(crate) fn into_parts(self) -> RequestParts {
         (
             self.modules.into_inner(),
             self.names.into_inner(),
@@ -82,7 +92,7 @@ impl Requests {
         )
     }
 
-    pub(super) fn extend_parts(&self, (modules, names, crates, scopes, procs): RequestParts) {
+    pub(crate) fn extend_parts(&self, (modules, names, crates, scopes, procs): RequestParts) {
         self.modules.borrow_mut().extend(modules);
         self.names.borrow_mut().extend(names);
         self.crates.borrow_mut().extend(crates);
@@ -458,6 +468,15 @@ impl<'a> Paths<'a> {
 
     /// The bindings of the first segment `word` of a path used in module `at`, merged across namespaces from the local scope, the extern prelude and the std prelude.
     pub fn first(&self, word: Sym, at: ModRef, path: &Path<'_>) -> PerNs {
+        self.first_in(word, at, path, None)
+    }
+
+    /// The binding of the first segment `word` of a path used in module `at` in namespace `ns`.
+    pub fn first_ns(&self, word: Sym, at: ModRef, path: &Path<'_>, ns: Ns) -> Option<Binding> {
+        self.first_in(word, at, path, Some(ns)).get(ns)
+    }
+
+    fn first_in(&self, word: Sym, at: ModRef, path: &Path<'_>, ns: Option<Ns>) -> PerNs {
         let item = |def: Def| Binding {
             def,
             vis: Vis::Pub,
@@ -470,26 +489,78 @@ impl<'a> Paths<'a> {
                 macros: None,
             };
         }
-        let external = self.extern_crate(word).map(item);
         if path.absolute && self.edition_2015 {
             let root = self.member(module(self.krate, 0), word);
             return PerNs {
-                types: root.types.or(external),
+                types: root.types.or_else(|| self.extern_crate(word).map(item)),
                 ..root
             };
         }
         if path.absolute {
+            let types = if ns.is_none_or(|n| n == Ns::Types) {
+                self.extern_crate(word).map(item)
+            } else {
+                None
+            };
             return PerNs {
-                types: external,
+                types,
                 values: None,
                 macros: None,
             };
         }
         let local = self.member(Def::Module(at), word);
-        let prelude = self
-            .prelude
-            .map(|prelude| self.member(Def::Module(prelude), word))
-            .unwrap_or_default();
+        match ns {
+            Some(Ns::Types) => {
+                let types = local
+                    .types
+                    .or_else(|| self.extern_crate(word).map(item))
+                    .or_else(|| {
+                        self.prelude
+                            .and_then(|prelude| self.member(Def::Module(prelude), word).types)
+                    })
+                    .or_else(|| Symbols::primitive(word).map(|found| item(Def::Primitive(found))));
+                return PerNs {
+                    types,
+                    values: None,
+                    macros: None,
+                };
+            }
+            Some(Ns::Values) => {
+                let values = local.values.or_else(|| {
+                    self.prelude
+                        .and_then(|prelude| self.member(Def::Module(prelude), word).values)
+                });
+                return PerNs {
+                    types: None,
+                    values,
+                    macros: None,
+                };
+            }
+            Some(Ns::Macros) => {
+                let macros = local.macros.or_else(|| self.textual(word, at)).or_else(|| {
+                    self.prelude
+                        .and_then(|prelude| self.member(Def::Module(prelude), word).macros)
+                });
+                return PerNs {
+                    types: None,
+                    values: None,
+                    macros,
+                };
+            }
+            None => {}
+        }
+        let external = self.extern_crate(word).map(item);
+        let macros_local = local.macros.or_else(|| self.textual(word, at));
+        let need_prelude = (local.types.is_none() && external.is_none())
+            || local.values.is_none()
+            || macros_local.is_none();
+        let prelude = if need_prelude {
+            self.prelude
+                .map(|prelude| self.member(Def::Module(prelude), word))
+                .unwrap_or_default()
+        } else {
+            PerNs::default()
+        };
         PerNs {
             types: local
                 .types
@@ -497,10 +568,7 @@ impl<'a> Paths<'a> {
                 .or(prelude.types)
                 .or_else(|| Symbols::primitive(word).map(|found| item(Def::Primitive(found)))),
             values: local.values.or(prelude.values),
-            macros: local
-                .macros
-                .or_else(|| self.textual(word, at))
-                .or(prelude.macros),
+            macros: macros_local.or(prelude.macros),
         }
     }
 
@@ -556,7 +624,7 @@ impl<'a> Paths<'a> {
     /// Resolves every segment of `path` in the type namespace, from module `at`.
     pub fn resolve(&self, path: &Path<'_>, at: ModRef) -> Option<Def> {
         let (first, rest) = path.segments.split_first()?;
-        let mut def = self.first(*first, at, path).types?.def;
+        let mut def = self.first_ns(*first, at, path, super::Ns::Types)?.def;
         for segment in rest {
             def = match (*segment, def) {
                 (SUPER, Def::Module(current)) => Def::Module(self.parent(current)?),
@@ -571,7 +639,7 @@ impl<'a> Paths<'a> {
         let Some((first, rest)) = path.segments.split_first() else {
             return Ok(None);
         };
-        let Some(first_binding) = self.first(*first, at, path).types else {
+        let Some(first_binding) = self.first_ns(*first, at, path, super::Ns::Types) else {
             return Ok(None);
         };
         let mut def = first_binding.def;

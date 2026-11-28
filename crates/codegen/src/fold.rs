@@ -467,7 +467,7 @@ pub(crate) fn run(func: &mut Function, effort: crate::Effort) -> Domain {
     if effort == crate::Effort::Full {
         body_changed |= crate::algebra::rewrite(func, &fold.defs)
             | crate::algebra::invert(func)
-            | vector::fold_bitcast_loads(func);
+            | vector::fold_bitcast_loads(func, &fold.defs);
     }
     body_changed |= unused::run(func, &pinned) | unused::dead(func);
     (changed, cfg_changed) = (

@@ -80,6 +80,22 @@ pub(in super::super) fn check_trait_impl_block(cx: &mut Context<'_>, block: Impl
     if !block_is_user(cx, block) {
         return Ok(());
     }
+    let flight = cx.store.lookups.checked_impls.clone();
+    flight
+        .run_cached(
+            cx,
+            block,
+            |cx| {
+                let before = cx.quiet_mark();
+                check_trait_impl_block_uncached(cx, block)?;
+                Ok(cx.quiet_mark() == before)
+            },
+            |_| Ok(false),
+        )
+        .map(|_| ())
+}
+
+fn check_trait_impl_block_uncached(cx: &mut Context<'_>, block: ImplRef) -> Result<()> {
     let Some(of) = cx.impl_trait(block) else {
         return Ok(());
     };
@@ -428,25 +444,22 @@ fn compare_method_sigs(
         usize,
     ),
 ) -> Option<Diagnostic> {
-    let msg = format!("method `{name}` has an incompatible type for trait");
-    let trait_head_span = item_name_span(infer.cx, trait_item);
-    let impl_head_span = item_name_span(infer.cx, impl_item);
     if impl_params.len() != trait_params.len() || impl_sig.variadic != trait_sig.variadic {
         return Some(compat_diag(
-            msg,
-            impl_head_span,
+            format!("method `{name}` has an incompatible type for trait"),
+            item_name_span(infer.cx, impl_item),
             format!(
                 "expected {} parameter(s), found {}",
                 trait_params.len(),
                 impl_params.len()
             ),
-            trait_head_span,
+            item_name_span(infer.cx, trait_item),
         ));
     }
     for (idx, (&trait_p, &impl_p)) in trait_params.iter().zip(impl_params).enumerate() {
         if !types_compatible(infer, trait_p, impl_p) {
             return Some(compat_diag(
-                msg,
+                format!("method `{name}` has an incompatible type for trait"),
                 method_param_span(infer.cx, impl_item, impl_sig, idx),
                 format!(
                     "expected `{}`, found `{}`",
@@ -461,22 +474,22 @@ fn compare_method_sigs(
         trait_sig.is_async || trait_sig.opaque || impl_sig.is_async || impl_sig.opaque;
     if !opaque_or_async && !types_compatible(infer, trait_ret, impl_ret) {
         return Some(compat_diag(
-            msg,
-            impl_head_span,
+            format!("method `{name}` has an incompatible type for trait"),
+            item_name_span(infer.cx, impl_item),
             format!(
                 "expected `{}`, found `{}`",
                 infer.show(trait_ret),
                 infer.show(impl_ret)
             ),
-            trait_head_span,
+            item_name_span(infer.cx, trait_item),
         ));
     }
     if trait_own != impl_own || impl_sig.receiver.is_some() != trait_sig.receiver.is_some() {
         return Some(compat_diag(
-            msg,
-            impl_head_span,
+            format!("method `{name}` has an incompatible type for trait"),
+            item_name_span(infer.cx, impl_item),
             "method signature does not match trait",
-            trait_head_span,
+            item_name_span(infer.cx, trait_item),
         ));
     }
     None
@@ -511,6 +524,9 @@ fn normalize_block_proj(
         return ty;
     }
     let ty = infer.resolve(ty);
+    if !infer.cx.types.has_projs(ty) {
+        return ty;
+    }
     match *infer.cx.types.kind(ty) {
         Kind::Proj(proj_id) => {
             let proj = infer.cx.types.proj(proj_id);

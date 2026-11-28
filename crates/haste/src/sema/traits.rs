@@ -201,10 +201,21 @@ impl<'a> Context<'a> {
 
     /// Whether trait `item` is an auto trait, which every type implements unless an impl says otherwise.
     pub fn is_auto_trait(&self, item: ItemRef) -> bool {
+        if let Some(&known) = self.trait_auto_local.borrow().get(&item) {
+            return known;
+        }
+        if let Some(known) = self.store.lookups.trait_autos.get(&item) {
+            self.trait_auto_local.borrow_mut().insert(item, known);
+            return known;
+        }
         let (src, entry) = self.item(item);
-        entry
-            .name
-            .is_some_and(|name| (entry.start..name).any(|at| src.text(at) == "auto"))
+        let auto = entry.kind == ItemKind::Trait
+            && entry
+                .name
+                .is_some_and(|name| (entry.start..name).any(|at| src.text(at) == "auto"));
+        self.store.lookups.trait_autos.insert(item, auto);
+        self.trait_auto_local.borrow_mut().insert(item, auto);
+        auto
     }
 
     /// The `#[global_allocator]` static item in the crate graph, when one is defined.

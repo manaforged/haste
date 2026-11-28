@@ -241,6 +241,14 @@ impl<K, V> Flight<K, V> {
     {
         self.inner.slots.retain(|k, _| keep(k));
     }
+    pub(super) fn retain_entries(&self, mut keep: impl FnMut(&K, &V) -> bool)
+    where
+        K: Eq + Hash,
+    {
+        self.inner
+            .slots
+            .retain(|k, slot| slot.ready_val.get().is_some_and(|val| keep(k, val)));
+    }
 }
 
 impl<K: Clone + Eq + Hash, V: Clone> Flight<K, V> {
@@ -248,6 +256,27 @@ impl<K: Clone + Eq + Hash, V: Clone> Flight<K, V> {
         &self,
         cx: &mut super::Context<'_>,
         key: K,
+        compute: impl FnOnce(&mut super::Context<'_>) -> Result<V>,
+        on_cycle: impl FnOnce(&mut super::Context<'_>) -> Result<V>,
+    ) -> Result<V> {
+        self.run_inner(cx, key, true, compute, on_cycle)
+    }
+
+    pub(super) fn run_cached(
+        &self,
+        cx: &mut super::Context<'_>,
+        key: K,
+        compute: impl FnOnce(&mut super::Context<'_>) -> Result<V>,
+        on_cycle: impl FnOnce(&mut super::Context<'_>) -> Result<V>,
+    ) -> Result<V> {
+        self.run_inner(cx, key, false, compute, on_cycle)
+    }
+
+    fn run_inner(
+        &self,
+        cx: &mut super::Context<'_>,
+        key: K,
+        drop_on_ask: bool,
         compute: impl FnOnce(&mut super::Context<'_>) -> Result<V>,
         on_cycle: impl FnOnce(&mut super::Context<'_>) -> Result<V>,
     ) -> Result<V> {
@@ -267,7 +296,7 @@ impl<K: Clone + Eq + Hash, V: Clone> Flight<K, V> {
                     let before = cx.quiet_mark();
                     let result = compute(cx);
                     guard.done = true;
-                    if result.is_ok() && cx.quiet_mark() != before {
+                    if drop_on_ask && result.is_ok() && cx.quiet_mark() != before {
                         self.fail(&key, &slot);
                     } else {
                         self.finish(&key, &slot, &result);

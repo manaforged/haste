@@ -180,18 +180,16 @@ impl<'a> Infer<'_, 'a> {
                 self.body_use(*last).values
             };
             local.or_else(|| {
-                self.cx
-                    .paths(self.home.krate)
-                    .first(
-                        *last,
-                        self.home,
-                        &NamePath {
-                            segments,
-                            absolute,
-                            dollar,
-                        },
-                    )
-                    .values
+                self.cx.paths(self.home.krate).first_ns(
+                    *last,
+                    self.home,
+                    &NamePath {
+                        segments,
+                        absolute,
+                        dollar,
+                    },
+                    Ns::Values,
+                )
             })
         } else {
             let path = NamePath {
@@ -291,6 +289,14 @@ impl<'a> Infer<'_, 'a> {
         }
     }
 
+    fn type_scope(&self, path: &NamePath<'_>, checked: bool) -> super::super::lookups::TypeScope {
+        let here = self
+            .anchor()
+            .and_then(|(root, from)| from.map(|at| root.inner(at)));
+        let flags = u8::from(path.absolute) | (u8::from(checked) << 1);
+        (self.home, self.root, here, flags, path.dollar)
+    }
+
     pub(super) fn type_def_checked(
         &mut self,
         path: &NamePath<'_>,
@@ -299,6 +305,32 @@ impl<'a> Infer<'_, 'a> {
         if path.segments.len() <= 1 {
             return Ok(self.type_def(path));
         }
+        let need_check = !self.cx.outline.crates[self.home.krate as usize].env.fixed
+            && !path.dollar.is_some_and(|k| self.cx.outline.is_sysroot(k));
+        let can_cache = self.items.is_empty()
+            && self.block_uses.is_empty()
+            && self.macro_home_of(tok).is_none();
+        let scope = can_cache.then(|| self.type_scope(path, need_check));
+        if let Some(scope) = scope
+            && let Some(found) = self.cx.type_def(scope, path.segments)
+        {
+            return Ok(Some(found));
+        }
+        let before = self.cx.quiet_mark();
+        let found = self.type_def_checked_here(path, tok)?;
+        if let (Some(scope), Some(def)) = (scope, found)
+            && self.cx.quiet_mark() == before
+        {
+            self.cx.set_type_def(scope, path.segments, def);
+        }
+        Ok(found)
+    }
+
+    fn type_def_checked_here(
+        &mut self,
+        path: &NamePath<'_>,
+        tok: Option<u32>,
+    ) -> Result<Option<Def>> {
         match self.local_def(path, Ns::Types) {
             Some(Ok(def)) => Ok(Some(def)),
             Some(Err(skip)) => self.resolve_path_visible(&outside(path, skip), tok),
@@ -331,10 +363,7 @@ impl<'a> Infer<'_, 'a> {
         if !self.items.is_empty() || !self.block_uses.is_empty() {
             return self.type_def_here(path);
         }
-        let here = self
-            .anchor()
-            .and_then(|(root, from)| from.map(|at| root.inner(at)));
-        let scope = (self.home, self.root, here, path.absolute, path.dollar);
+        let scope = self.type_scope(path, false);
         if let Some(found) = self.cx.type_def(scope, path.segments) {
             return Some(found);
         }

@@ -35,10 +35,23 @@ pub(crate) struct Frontier {
 }
 
 impl Frontier {
+    /// Whether the slot's escape frontier covers every instruction in `block`.
+    pub(crate) fn block_seen(&self, block: Block) -> bool {
+        self.seen[block.index() / 64] >> (block.index() % 64) & 1 == 1
+    }
+
+    /// The earliest escaping instruction index inside `block`, if any.
+    pub(crate) fn first_point_in(&self, block: Block) -> Option<u32> {
+        self.points
+            .iter()
+            .filter(|&&(b, _)| b == block.0)
+            .map(|&(_, p)| p)
+            .min()
+    }
+
     /// Whether the slot may have escaped by the instruction at `pos` in `block`, counting that instruction.
     pub(crate) fn reached(&self, (block, pos): (u32, u32)) -> bool {
-        self.seen[block as usize / 64] >> (block % 64) & 1 == 1
-            || self.points.iter().any(|&(b, p)| b == block && p <= pos)
+        self.block_seen(Block(block)) || self.first_point_in(Block(block)).is_some_and(|p| p <= pos)
     }
 }
 

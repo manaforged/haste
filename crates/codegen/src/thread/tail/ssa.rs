@@ -51,7 +51,7 @@ fn used_in_region(
     let vals_mask = vals
         .iter()
         .fold(0_u128, |m, &v| m | (1_u128 << (v.0 & 127)));
-    let val_map = (vals.len() > 8).then(|| {
+    let val_map = (vals.len() > 64).then(|| {
         let mut map = vec![u32::MAX; func.types.len()];
         for (idx, &v) in vals.iter().enumerate() {
             map[v.index()] = idx as u32;
@@ -125,7 +125,7 @@ fn backward_live(
 fn compute_joins(
     func: &Function,
     cfg: &Cfg,
-    exit: Block,
+    (disp, exit): (Block, Block),
     from_exit: &[bool],
     live_list: &mut [Block],
 ) -> Option<(Vec<Block>, Vec<Option<usize>>)> {
@@ -135,38 +135,48 @@ fn compute_joins(
             joins.push(b);
         }
     }
+    if joins.is_empty() {
+        return None;
+    }
     let mut join_of = vec![None; func.blocks.len()];
-    let mut ranked = false;
-    loop {
-        let mut added = false;
-        if !ranked && (joins.len() > 1 || live_list.iter().any(|&b| !cfg.dominates(joins[0], b))) {
-            let rank = Cfg::ranks(&cfg.rpo, func.blocks.len());
-            live_list.sort_unstable_by_key(|b| rank[b.index()]);
-            ranked = true;
+    if joins.len() == 1 && live_list.iter().all(|&b| cfg.dominates(joins[0], b)) {
+        for &b in live_list.iter() {
+            join_of[b.index()] = Some(0);
+        }
+    } else {
+        let rank = Cfg::ranks(&cfg.rpo, func.blocks.len());
+        live_list.sort_unstable_by_key(|b| rank[b.index()]);
+        for (ji, &j) in joins.iter().enumerate() {
+            join_of[j.index()] = Some(ji);
         }
         for &b in live_list.iter() {
             let bi = b.index();
-            let deepest = (0..joins.len())
-                .filter(|&ji| cfg.dominates(joins[ji], b))
-                .find(|&ji| {
-                    (0..joins.len()).all(|other| {
-                        !cfg.dominates(joins[other], b) || cfg.dominates(joins[other], joins[ji])
-                    })
-                });
-            match deepest {
+            if join_of[bi].is_some() {
+                continue;
+            }
+            let mut found = None;
+            let mut cur = cfg.idom[bi];
+            while let Some(c) = cur {
+                if c == disp {
+                    break;
+                }
+                if let Some(ji) = join_of[c.index()] {
+                    found = Some(ji);
+                    break;
+                }
+                cur = cfg.idom[c.index()].filter(|&p| p != c);
+            }
+            match found {
                 Some(ji) => join_of[bi] = Some(ji),
                 None => {
                     if joins.len() >= 8 {
                         return None;
                     }
+                    let ji = joins.len();
                     joins.push(b);
-                    added = true;
-                    break;
+                    join_of[bi] = Some(ji);
                 }
             }
-        }
-        if !added {
-            break;
         }
     }
     for &j in &joins {
@@ -204,7 +214,7 @@ pub(in crate::thread) fn plan_ssa_joins(
         });
     }
     let (from_exit, mut live_list) = backward_live(func, cfg, &from_exit, back);
-    let (joins, join_of) = compute_joins(func, cfg, exit, &from_exit, &mut live_list)?;
+    let (joins, join_of) = compute_joins(func, cfg, (disp, exit), &from_exit, &mut live_list)?;
     Some(SsaRepairPlan {
         need,
         from_exit,

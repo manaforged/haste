@@ -238,16 +238,43 @@ impl<'a> Context<'a> {
 
     /// The module that holds `item`, through any impl, trait or extern block around it.
     pub fn module_of(&mut self, item: ItemRef) -> Result<ModRef> {
+        if let Some(&found) = self.module_of_local.get(&item) {
+            return Ok(found);
+        }
+        let module = self.module_of_uncached(item)?;
+        self.module_of_local.insert(item, module);
+        Ok(module)
+    }
+
+    fn module_of_uncached(&mut self, item: ItemRef) -> Result<ModRef> {
         if let Some((outer, _)) = item.outer() {
             return self.module_of(outer);
         }
-        if let Some(block) = self.owner_impl(item) {
-            return self.impl_module(block);
+        let file = &self.outline.crates[item.krate as usize].files[item.file as usize];
+        let mut entry = &file.items.items[item.item as usize];
+        match entry.parent {
+            Some(parent) => {
+                let kind = file.items.items[parent as usize].kind;
+                if kind == ItemKind::Impl
+                    && let Some(block) = self.owner_impl(item)
+                {
+                    return self.impl_module(block);
+                }
+                if kind == ItemKind::Trait {
+                    return self.module_of(ItemRef {
+                        krate: item.krate,
+                        file: item.file,
+                        item: parent,
+                    });
+                }
+            }
+            None if file.expanded => {
+                if let Some(block) = self.owner_impl(item) {
+                    return self.impl_module(block);
+                }
+            }
+            None => {}
         }
-        if let Some(of) = self.owner_trait(item) {
-            return self.module_of(of);
-        }
-        let (_, mut entry) = self.item(item);
         let mut top = item.item;
         let file = &self.outline.crates[item.krate as usize].files[item.file as usize];
         while let Some(parent) = entry

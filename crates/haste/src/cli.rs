@@ -24,7 +24,11 @@ pub(crate) struct TestItem {
 }
 
 fn item_enabled(tree: &outline::tree::Crate, file_at: usize, at: usize) -> bool {
-    let items = &tree.files[file_at].items.items;
+    let file = &tree.files[file_at];
+    let items = &file.items.items;
+    if !tree.env.test && is_test_only_fn(tree, file, &items[at]) {
+        return false;
+    }
     let mut cur = Some(at);
     while let Some(idx) = cur {
         let item = &items[idx];
@@ -135,6 +139,16 @@ fn is_test_fn(
     item: &outline::item::Item,
 ) -> bool {
     outline::attr::has_attr(&file.source, &item.attrs, &tree.env, "test")
+}
+
+pub(crate) fn is_test_only_fn(
+    tree: &outline::tree::Crate,
+    file: &outline::tree::File,
+    item: &outline::item::Item,
+) -> bool {
+    item.kind == outline::item::ItemKind::Fn
+        && (is_test_fn(tree, file, item)
+            || outline::attr::has_attr(&file.source, &item.attrs, &tree.env, "bench"))
 }
 
 /// Counts enabled `#[test]` functions across loaded member test crates matching target selection.

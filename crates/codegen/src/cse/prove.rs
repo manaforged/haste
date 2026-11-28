@@ -208,12 +208,14 @@ pub(crate) fn dom_proves_want(
         };
         if let Some(&Op::Brif(c, tb, _, eb, _)) = func.last(parent)
             && tb != eb
-            && let Some(t) = (cfg.single_pred(tb) == Some(parent) && cfg.dominates(tb, start))
-                .then_some(true)
-                .or_else(|| {
-                    (cfg.single_pred(eb) == Some(parent) && cfg.dominates(eb, start))
-                        .then_some(false)
-                })
+            && let Some(t) = (cfg.single_pred(tb) == Some(parent)
+                && (tb == cur || (tb == parent && cfg.dominates(tb, start))))
+            .then_some(true)
+            .or_else(|| {
+                (cfg.single_pred(eb) == Some(parent)
+                    && (eb == cur || (eb == parent && cfg.dominates(eb, start))))
+                .then_some(false)
+            })
             && cond_proves_want(func, env, (c, t, 0), ty, want)
         {
             return true;

@@ -278,13 +278,22 @@ impl<'a> Infer<'_, 'a> {
     pub fn impl_frame(&mut self, block: ImplRef, args: &[Ty]) -> Result<(Vec<(&'a str, Ty)>, Ty)> {
         let header = self.cx.impl_header(block)?;
         let generics = named_args(&self.cx.impl_file(block).source, &header.generics, args);
-        let self_ty = match self.generic((Form::Impl(block), args.len()), |infer, params| {
-            Ok(Arc::from(vec![vec![infer.impl_self(block, params)?]]))
-        }) {
-            Some(form) => self.instantiate(form[0][0], args),
-            None => self.impl_self(block, args)?,
-        };
+        let self_ty = self.impl_self_ty(block, args)?;
         Ok((generics, self_ty))
+    }
+
+    pub(super) fn cached_impl_self(&mut self, block: ImplRef, args: &[Ty]) -> Option<Ty> {
+        self.generic((Form::Impl(block), args.len()), |infer, params| {
+            Ok(Arc::from(vec![vec![infer.impl_self(block, params)?]]))
+        })
+        .map(|form| self.instantiate(form[0][0], args))
+    }
+
+    pub(super) fn impl_self_ty(&mut self, block: ImplRef, args: &[Ty]) -> Result<Ty> {
+        match self.cached_impl_self(block, args) {
+            Some(ty) => Ok(ty),
+            None => self.impl_self(block, args),
+        }
     }
 
     /// The self type of impl `block` with its type parameters set to `args`, lowered from its header.
@@ -641,7 +650,7 @@ impl<'a> Infer<'_, 'a> {
     pub fn match_impl(&mut self, block: ImplRef, ty: Ty) -> Option<Vec<Ty>> {
         let count = self.impl_params(block).ok()?;
         let args: Vec<Ty> = (0..count).map(|_| self.fresh(Kind::Var)).collect();
-        let (_, self_ty) = self.impl_frame(block, &args).ok()?;
+        let self_ty = self.impl_self_ty(block, &args).ok()?;
         self.unifies(self_ty, ty).then_some(args)
     }
 

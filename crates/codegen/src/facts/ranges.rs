@@ -1,4 +1,4 @@
-use crate::cfg::dominates;
+use crate::cfg::{Cfg, dominates};
 use crate::ir::{Binary, Block, Function, Inst, InstData, Op, Type, Value};
 
 use super::rel::{RelKind, rel_of};
@@ -19,6 +19,7 @@ struct CfgInfo<'a> {
     edge_args: &'a [bool],
     single: &'a [Option<Block>],
     idom: &'a [Option<Block>],
+    rank: &'a [usize],
 }
 
 pub(super) fn collect_incoming<'a>(
@@ -111,6 +112,11 @@ impl<'a> Ranges<'a> {
             table,
             raised: Vec::new(),
         };
+        let rank = if incoming.is_empty() {
+            Vec::new()
+        } else {
+            Cfg::ranks(order, func.blocks.len())
+        };
         let info = CfgInfo {
             consts,
             incoming,
@@ -118,6 +124,7 @@ impl<'a> Ranges<'a> {
             edge_args,
             single,
             idom,
+            rank: &rank,
         };
         let mut falls_through = vec![0_u32; func.types.len()];
         let mut epoch = 0_u32;
@@ -335,9 +342,17 @@ impl<'a> Ranges<'a> {
         }
         let mut narrowed = false;
         for (k, &p) in func.blocks[block.index()].params.iter().enumerate() {
-            if func.ty(p).is_small_int() {
-                narrowed |= self.refine_param_lo(func, info, (block, p, k));
-                narrowed |= self.refine_param_hi(func, info, (block, p, k));
+            let ty = func.ty(p);
+            if ty.is_small_int() {
+                let (lo, hi) = self.table[p.index()];
+                if lo < hi {
+                    if lo < ty.unsigned_max() {
+                        narrowed |= self.refine_param_lo(func, info, (block, p, k));
+                    }
+                    if hi > 0 {
+                        narrowed |= self.refine_param_hi(func, info, (block, p, k));
+                    }
+                }
             }
         }
         narrowed
@@ -522,6 +537,8 @@ impl<'a> Ranges<'a> {
         }
         if let Some(&Op::Brif(cond, then, _, otherwise, _)) = func.last(block)
             && then != otherwise
+            && info.rank[pred.index()] != usize::MAX
+            && info.rank[pred.index()] >= info.rank[block.index()]
         {
             if info.single[then.index()] == Some(block) && dominates(info.idom, then, pred) {
                 best = combine_bound(

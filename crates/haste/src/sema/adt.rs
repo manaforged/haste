@@ -112,19 +112,10 @@ impl<'a> Context<'a> {
     }
 
     /// The value of `#[lang = "..."]` on `item`.
+    #[inline]
     pub fn lang(&self, item: ItemRef) -> Option<&str> {
         if item.outer().is_some() {
-            let (src, entry) = self.item(item);
-            if entry.attrs.is_empty() {
-                return None;
-            }
-            let at = active_attr_at(
-                &self.outline.crates[item.krate as usize].env,
-                src,
-                &entry.attrs,
-                "lang",
-            )?;
-            return Some(src.text(at + 2).trim_matches('"'));
+            return self.lang_outer(item);
         }
         let langs = self.lang_map.get_or_init(|| {
             Arc::clone(
@@ -138,6 +129,21 @@ impl<'a> Context<'a> {
             return None;
         }
         langs.map.get(&item).map(Box::as_ref)
+    }
+
+    #[cold]
+    fn lang_outer(&self, item: ItemRef) -> Option<&str> {
+        let (src, entry) = self.item(item);
+        if entry.attrs.is_empty() {
+            return None;
+        }
+        let at = active_attr_at(
+            &self.outline.crates[item.krate as usize].env,
+            src,
+            &entry.attrs,
+            "lang",
+        )?;
+        Some(src.text(at + 2).trim_matches('"'))
     }
 
     fn build_lang_map(&self) -> super::lookups::LangMap {

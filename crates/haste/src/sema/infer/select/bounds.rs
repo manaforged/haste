@@ -45,7 +45,10 @@ impl<'a> Infer<'_, 'a> {
             if infer.sets_unsized_param(block, &header, (impl_args, home))? {
                 return Ok(false);
             }
-            infer.self_ty = Some(infer.lower_ty(&header.body, header.self_ty)?);
+            infer.self_ty = Some(match infer.cached_impl_self(block, impl_args) {
+                Some(ty) => ty,
+                None => infer.lower_ty(&header.body, header.self_ty)?,
+            });
             for (ty, bound) in wanted {
                 if !infer.bound_holds(&header.body, home, (ty, bound), depth)? {
                     return Ok(false);
@@ -157,8 +160,14 @@ impl<'a> Infer<'_, 'a> {
     }
 
     pub(in crate::sema) fn compiler_decides(&self, of: ItemRef, ty: Ty) -> bool {
-        let resolved = self.resolve(ty);
         let lang = self.cx.lang(of);
+        if !(lang.is_some_and(|l| BUILTIN.contains(&l)) || self.cx.is_auto_trait(of)) {
+            return false;
+        }
+        if !lang.is_some_and(|l| matches!(l, "copy" | "clone")) {
+            return true;
+        }
+        let resolved = self.resolve(ty);
         let user_concrete_copy = lang == Some("copy")
             && matches!(self.cx.types.kind(resolved), Kind::Adt(item, _) if !self.cx.outline.is_sysroot(item.krate))
             && !self.has_vars(resolved)
@@ -167,9 +176,8 @@ impl<'a> Infer<'_, 'a> {
             && matches!(
                 self.cx.types.kind(resolved),
                 Kind::Adt(..) | Kind::Param(_) | Kind::Proj(_)
-            )
-            && lang.is_some_and(|l| matches!(l, "copy" | "clone"));
-        self.compiler_trait(of) && !by_impl
+            );
+        !by_impl
     }
 
     fn impl_holds(
@@ -178,11 +186,6 @@ impl<'a> Infer<'_, 'a> {
         (of, ty, args): (ItemRef, Ty, &[Ty]),
         depth: u32,
     ) -> Result<bool> {
-        let query = self.query(of, ty, args);
-        if self.selecting.len() > crate::RECURSION_LIMIT || self.selecting.contains(&query) {
-            self.cycle_hits += 1;
-            return Ok(self.obligation_open(ty, args));
-        }
         let (key, local_key) = if super::super::project::has_assoc_bounds(arena, path) {
             (None, None)
         } else {
@@ -190,6 +193,11 @@ impl<'a> Infer<'_, 'a> {
         };
         if let Some(found) = self.cached_selection(key.as_ref(), local_key.as_ref()) {
             return Ok(found.is_some());
+        }
+        let query = self.query(of, ty, args);
+        if self.selecting.len() > crate::RECURSION_LIMIT || self.selecting.contains(&query) {
+            self.cycle_hits += 1;
+            return Ok(self.obligation_open(ty, args));
         }
         let state = self.begin_cache_state();
         self.selecting.push(query);
@@ -331,10 +339,15 @@ impl<'a> Infer<'_, 'a> {
     }
 
     pub(in crate::sema) fn compiler_holds(&mut self, of: ItemRef, ty: Ty) -> bool {
-        if self.is_thread_auto_trait(of) {
+        let lang = self.cx.lang(of);
+        let is_thread_auto = matches!(lang, Some("sync" | "unpin"))
+            || (self.cx.is_auto_trait(of)
+                && self.cx.outline.is_sysroot(of.krate)
+                && self.cx.name(of) == "Send");
+        if is_thread_auto {
             return self.thread_auto_holds(of, ty);
         }
-        let Some(lang) = self.cx.lang(of) else {
+        let Some(lang) = lang else {
             return true;
         };
         let ty = self.resolve(ty);
@@ -712,10 +725,18 @@ impl<'a> Infer<'_, 'a> {
     fn select_auto_impl(&mut self, of: ItemRef, ty: Ty) -> (bool, usize) {
         let saved_dep = std::mem::replace(&mut self.auto_dep, usize::MAX);
         let asks_before = self.cx.asks.count();
-        let picked = self.probe(|infer| infer.select(of, ty, &[]));
+        let (picked, cycled) = self.probe(|infer| {
+            let before = infer.cycle_hits;
+            let picked = infer.select(of, ty, &[]);
+            (picked, infer.cycle_hits != before)
+        });
         let dep = std::mem::replace(&mut self.auto_dep, saved_dep);
         match picked {
             Ok(Some(_)) => (true, dep),
+            Ok(None) if cycled => {
+                self.cycle_hits += 1;
+                (true, 0)
+            }
             Ok(None) if self.cx.asks.count() == asks_before => (false, usize::MAX),
             Ok(None) => (true, usize::MAX),
             Err(_) => {

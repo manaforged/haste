@@ -243,11 +243,14 @@ impl<'a> Infer<'_, 'a> {
         if self.cx.types.is_ground(ty) {
             return true;
         }
-        if self.has_params(ty) {
+        if self.cx.types.has_params(ty) {
             return false;
         }
         let kind = self.cx.types.kind(ty);
-        if matches!(kind, Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_)) {
+        if matches!(
+            kind,
+            Kind::Var(_) | Kind::IntVar(_) | Kind::FloatVar(_) | Kind::Param(_) | Kind::Proj(_)
+        ) {
             return false;
         }
         if let Kind::Closure(parent, args, _) = *kind {
@@ -473,7 +476,11 @@ impl<'a> Infer<'_, 'a> {
         hasher: &mut rustc_hash::FxHasher,
         seen: &mut ([Ty; 16], usize, Vec<Ty>),
     ) {
-        let ty = self.resolve(ty);
+        let ty = if self.cx.types.has_var_flag(ty) {
+            self.resolve(ty)
+        } else {
+            ty
+        };
         let kind = self.cx.types.kind(ty);
         let compound = !matches!(
             kind,

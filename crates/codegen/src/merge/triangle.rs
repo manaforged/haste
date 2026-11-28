@@ -296,10 +296,16 @@ fn collect_triangle_round(func: &Function) -> Vec<(usize, TriangleMatch)> {
     if func.blocks.len() < 3 {
         return Vec::new();
     }
+    let is_small_arm = |b: usize, arm: Block| {
+        arm.index() != b
+            && Some(arm) != func.entry
+            && func.blocks[arm.index()].params.is_empty()
+            && func.blocks[arm.index()].insts.len() <= 5
+            && matches!(func.last(arm), Some(&Op::Brif(_, t2, _, e2, _)) if t2 != e2)
+    };
     let has_brif_pair = func.blocks.iter().enumerate().any(|(b, _)| {
         matches!(func.last(Block(b as u32)), Some(&Op::Brif(_, t1, _, e1, _)) if t1 != e1 && (
-            matches!(func.last(t1), Some(&Op::Brif(_, t2, _, e2, _)) if t2 != e2)
-            || matches!(func.last(e1), Some(&Op::Brif(_, t2, _, e2, _)) if t2 != e2)
+            is_small_arm(b, t1) || is_small_arm(b, e1)
         ))
     });
     if !has_brif_pair {

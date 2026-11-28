@@ -48,35 +48,6 @@ struct AddQuery {
     strict: bool,
 }
 
-fn has_upper_add_terms(
-    values: &[(Value, bool, Option<Steps>)],
-    b: Value,
-    b_steps: &[(Value, u64)],
-    into_b: bool,
-    multi: bool,
-) -> bool {
-    let mut has_any = !b_steps.is_empty();
-    let mut any_pos = b_steps.iter().any(|&(_, k)| k > 0);
-    if has_any && (multi || any_pos) {
-        return true;
-    }
-    for &(s, s_is_add, ref steps) in values {
-        if !into_b && s != b {
-            continue;
-        }
-        has_any |= multi;
-        if s_is_add
-            && s != b
-            && let Some((st, slen)) = steps
-            && *slen > 0
-        {
-            has_any = true;
-            any_pos |= st[..*slen].iter().any(|&(_, k)| k > 0);
-        }
-    }
-    has_any && (multi || any_pos)
-}
-
 impl Bounded {
     fn of(
         &mut self,
@@ -539,41 +510,6 @@ impl Path {
             }
     }
 
-    fn matches_a_form(
-        &self,
-        q: AddQuery,
-        a_form: (Value, u64),
-        b_steps: &[(Value, u64)],
-        values: &[(Value, bool, Option<Steps>)],
-        multi: bool,
-    ) -> bool {
-        let mut from_a = None;
-        if b_steps
-            .iter()
-            .any(|&(b_base, k)| self.matches_upper_term(q, a_form, (q.b, b_base, k), &mut from_a))
-        {
-            return true;
-        }
-        for &(s, s_is_add, ref steps) in values {
-            if !q.into_b && s != q.b {
-                continue;
-            }
-            if multi && self.matches_upper_term(q, a_form, (s, s, 0), &mut from_a) {
-                return true;
-            }
-            if s_is_add
-                && s != q.b
-                && let Some((st, slen)) = steps
-                && st[..*slen].iter().any(|&(s_base, k)| {
-                    self.matches_upper_term(q, a_form, (s, s_base, k), &mut from_a)
-                })
-            {
-                return true;
-            }
-        }
-        false
-    }
-
     fn proves_upper_add_rel(
         &self,
         func: &Function,
@@ -582,25 +518,51 @@ impl Path {
         a_forms: &[(Value, u64)],
         b_steps: &[(Value, u64)],
     ) -> bool {
+        for &a_form in a_forms {
+            let mut from_a = None;
+            if b_steps.iter().any(|&(b_base, k)| {
+                self.matches_upper_term(q, a_form, (q.b, b_base, k), &mut from_a)
+            }) {
+                return true;
+            }
+        }
+        if !q.into_b {
+            return false;
+        }
         let multi = a_forms.len() > 1;
         let mut uppers = self.uppers.0.borrow_mut();
         let (values, any_add) = uppers.of(func, ranges, self.rels(), q.ty);
-        if !multi && b_steps.is_empty() && !(q.into_b && any_add) {
+        if !multi && !any_add {
             return false;
         }
-        if q.into_b && any_add {
-            for (s, s_is_add, steps) in values.iter_mut() {
-                if *s_is_add && *s != q.b {
-                    steps.get_or_insert_with(|| self.non_wrap_iadd_chain(func, ranges, *s, q.ty));
-                }
+        for (s, s_is_add, steps) in values.iter_mut() {
+            let s = *s;
+            let s_is_add = *s_is_add;
+            if !multi && (!s_is_add || s == q.b) {
+                continue;
+            }
+            if s != q.b && !self.reaches(q.ty, s, q.b, UNSIGNED, false) {
+                continue;
+            }
+            if s_is_add && s != q.b {
+                steps.get_or_insert_with(|| self.non_wrap_iadd_chain(func, ranges, s, q.ty));
+            }
+            let st_slice: &[(Value, u64)] = match steps {
+                Some((st, slen)) if s_is_add && s != q.b => &st[..*slen],
+                _ => &[],
+            };
+            let matches_s = a_forms.iter().any(|&a_form| {
+                let mut from_a = None;
+                (multi && self.matches_upper_term(q, a_form, (s, s, 0), &mut from_a))
+                    || st_slice.iter().any(|&(s_base, k)| {
+                        self.matches_upper_term(q, a_form, (s, s_base, k), &mut from_a)
+                    })
+            });
+            if matches_s {
+                return true;
             }
         }
-        if !has_upper_add_terms(values, q.b, b_steps, q.into_b, multi) {
-            return false;
-        }
-        a_forms
-            .iter()
-            .any(|&form| self.matches_a_form(q, form, b_steps, values, multi))
+        false
     }
 
     pub(super) fn proves_add_rel(
@@ -619,10 +581,10 @@ impl Path {
             return false;
         }
         let into_b = has_u && self.steps_into(ty, b, UNSIGNED);
-        let a_is_add = is_iadd(func, ranges, a);
-        if !b_is_add && !into_b && !a_is_add {
+        if !b_is_add && !into_b {
             return false;
         }
+        let a_is_add = is_iadd(func, ranges, a);
         let (forms, len) = if a_is_add {
             self.add_const_chain(func, ranges, a, ty)
         } else {
@@ -630,9 +592,6 @@ impl Path {
         };
         let a_forms = &forms[..len];
         let multi = a_forms.len() > 1;
-        if !b_is_add && !into_b && !multi {
-            return false;
-        }
         let (b_steps, b_len) = if b_is_add {
             self.non_wrap_iadd_chain(func, ranges, b, ty)
         } else {

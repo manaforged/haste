@@ -353,12 +353,42 @@ impl<'a> Infer<'_, 'a> {
     }
 
     fn holders(&mut self, of: ItemRef, self_ty: Ty, args: &[Ty]) -> Vec<u32> {
-        let mut crates = vec![of.krate];
+        let mut inline = [u32::MAX; 8];
+        inline[0] = of.krate;
+        let mut len = 1usize;
+        let mut overflow = Vec::new();
         let mut has_open_arg = false;
-        let mut stack: Vec<Ty> = std::iter::once(self_ty)
-            .chain(args.iter().copied())
-            .collect();
-        while let Some(ty) = stack.pop() {
+        let mut stack_buf = [Ty::NONE; 16];
+        let mut stack_len = 1usize;
+        stack_buf[0] = self_ty;
+        let mut stack_extra = Vec::new();
+        for &arg in args {
+            if stack_len < stack_buf.len() {
+                stack_buf[stack_len] = arg;
+                stack_len += 1;
+            } else {
+                stack_extra.push(arg);
+            }
+        }
+        let mut push_crate = |k: u32| {
+            if inline[..len].contains(&k) || overflow.contains(&k) {
+                return;
+            }
+            if len < inline.len() {
+                inline[len] = k;
+                len += 1;
+            } else {
+                overflow.push(k);
+            }
+        };
+        while let Some(ty) = stack_extra.pop().or_else(|| {
+            if stack_len > 0 {
+                stack_len -= 1;
+                Some(stack_buf[stack_len])
+            } else {
+                None
+            }
+        }) {
             let kind = self.cx.types.kind(self.resolve(ty));
             let named = match kind {
                 Kind::Adt(item, _) | Kind::Dyn(item, ..) => Some(item.krate),
@@ -368,23 +398,34 @@ impl<'a> Infer<'_, 'a> {
                 }
                 _ => None,
             };
-            if let Some(krate) = named.filter(|krate| !crates.contains(krate)) {
-                crates.push(krate);
+            if let Some(krate) = named {
+                push_crate(krate);
             }
-            stack.extend(kind.children(&self.cx.types));
+            for child in kind.children(&self.cx.types) {
+                if stack_len < stack_buf.len() {
+                    stack_buf[stack_len] = child;
+                    stack_len += 1;
+                } else {
+                    stack_extra.push(child);
+                }
+            }
         }
         if has_open_arg && !args.is_empty() && !self.cx.outline.is_sysroot(of.krate) {
             let of_krate = of.krate as usize;
             for (krate, deps) in self.cx.outline.deps.iter().enumerate() {
                 if deps.iter().any(|&(_, dep)| dep == of_krate) {
-                    let k = krate as u32;
-                    if !crates.contains(&k) {
-                        crates.push(k);
-                    }
+                    push_crate(krate as u32);
                 }
             }
         }
-        crates
+        if overflow.is_empty() {
+            inline[..len].to_vec()
+        } else {
+            let mut crates = Vec::with_capacity(len + overflow.len());
+            crates.extend_from_slice(&inline[..len]);
+            crates.extend_from_slice(&overflow);
+            crates
+        }
     }
 
     fn impl_applies(

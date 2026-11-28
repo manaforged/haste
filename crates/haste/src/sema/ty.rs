@@ -1,4 +1,6 @@
+use std::cell::RefCell;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::names::{ItemRef, PRIMITIVES, Primitive};
 use crate::sync::{AtomicU8Slab, AtomicU32Slab, Interner};
@@ -122,15 +124,80 @@ const TY_SLABS: usize = 256;
 const UNIT_TY: Ty = Ty(19);
 const NEVER_TY: Ty = Ty(20);
 const VAR_BASE: u32 = 21;
-const FAST_VARS: u32 = 64;
+const FAST_VARS: u32 = 512;
 const INT_VAR_BASE: u32 = VAR_BASE + FAST_VARS;
-const FAST_INT_VARS: u32 = 32;
+const FAST_INT_VARS: u32 = 64;
 const FLOAT_VAR_BASE: u32 = INT_VAR_BASE + FAST_INT_VARS;
 const FAST_FLOAT_VARS: u32 = 16;
 const VALUE_BASE: u32 = FLOAT_VAR_BASE + FAST_FLOAT_VARS;
-const FAST_VALUES: u32 = 16;
+const FAST_VALUES: u32 = 64;
 const PARAM_BASE: u32 = VALUE_BASE + FAST_VALUES;
-const FAST_PARAMS: u32 = 32;
+const FAST_PARAMS: u32 = 64;
+
+const INTERN_TLS_SIZE: usize = 4096;
+
+static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    static INTERN_TLS: RefCell<Vec<(u64, Kind, Ty)>> = const { RefCell::new(Vec::new()) };
+}
+
+#[inline]
+fn fast_kind_hash(kind: &Kind) -> usize {
+    let mut h: u64 = match *kind {
+        Kind::Prim(p) => 0x100 ^ u64::from(p as u32),
+        Kind::Never => 0x200,
+        Kind::Tuple(s) => 0x300 ^ u64::from(s.0).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+        Kind::Ref(m, t) => 0x400 ^ (u64::from(m as u32) << 32) ^ u64::from(t.0),
+        Kind::Ptr(m, t) => 0x500 ^ (u64::from(m as u32) << 32) ^ u64::from(t.0),
+        Kind::Array(t, l) => 0x600 ^ (u64::from(t.0) << 32) ^ u64::from(l.0),
+        Kind::Slice(t) => 0x700 ^ u64::from(t.0),
+        Kind::Adt(i, s) => {
+            0x800
+                ^ (u64::from(i.krate) << 40)
+                ^ (u64::from(i.file) << 20)
+                ^ u64::from(i.item)
+                ^ u64::from(s.0).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        }
+        Kind::FnDef(i, s) => {
+            0x900
+                ^ (u64::from(i.krate) << 40)
+                ^ (u64::from(i.file) << 20)
+                ^ u64::from(i.item)
+                ^ u64::from(s.0).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        }
+        Kind::FnPtr(s, r) => 0xA00 ^ (u64::from(s.0) << 32) ^ u64::from(r.0),
+        Kind::UnsafeFnPtr(s, r) => 0xB00 ^ (u64::from(s.0) << 32) ^ u64::from(r.0),
+        Kind::Closure(i, s, at) => {
+            0xC00
+                ^ (u64::from(i.krate) << 40)
+                ^ (u64::from(i.item) << 16)
+                ^ u64::from(s.0).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                ^ u64::from(at)
+        }
+        Kind::Dyn(i, s, m, a) => {
+            0xD00
+                ^ (u64::from(i.krate) << 40)
+                ^ u64::from(i.item)
+                ^ u64::from(s.0).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                ^ (u64::from(m.0) << 16)
+                ^ u64::from(a.0)
+        }
+        Kind::Pat(t, r) => 0xE00 ^ (u64::from(t.0) << 32) ^ u64::from(r.0),
+        Kind::Value(v) => {
+            0xF00 ^ (v as u64) ^ ((v >> 64) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        }
+        Kind::Param(p) => 0x1000 ^ u64::from(p),
+        Kind::Proj(p) => 0x1100 ^ u64::from(p.0),
+        Kind::Var(v) => 0x1200 ^ u64::from(v),
+        Kind::IntVar(v) => 0x1300 ^ u64::from(v),
+        Kind::FloatVar(v) => 0x1400 ^ u64::from(v),
+    };
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h >> 27;
+    (h as usize) & (INTERN_TLS_SIZE - 1)
+}
 
 #[derive(Default)]
 struct UnaryCache([AtomicU32Slab<TY_SLAB, TY_SLABS>; 7]);
@@ -138,6 +205,7 @@ struct UnaryCache([AtomicU32Slab<TY_SLAB, TY_SLABS>; 7]);
 /// The type interner.
 #[derive(Clone)]
 pub struct Types {
+    pool_id: u64,
     inner: Arc<Interner<Kind, TY_SHARDS, TY_SLAB, TY_SLABS>>,
     flags: Arc<AtomicU8Slab<TY_SLAB, TY_SLABS>>,
     depths: Arc<AtomicU8Slab<TY_SLAB, TY_SLABS>>,
@@ -151,6 +219,7 @@ pub struct Types {
 impl Default for Types {
     fn default() -> Self {
         let types = Self {
+            pool_id: NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed),
             inner: Arc::default(),
             flags: Arc::default(),
             depths: Arc::default(),
@@ -170,7 +239,7 @@ impl Default for Types {
             .chain((0..FAST_VALUES).map(|bits| Kind::Value(u128::from(bits))))
             .chain((0..FAST_PARAMS as u16).map(Kind::Param));
         for kind in fixed {
-            types.intern_slow(kind);
+            types.intern_slow_uncached(kind);
         }
         types
     }
@@ -362,6 +431,29 @@ impl Types {
     }
 
     fn intern_slow(&self, kind: Kind) -> Ty {
+        let slot_idx = fast_kind_hash(&kind);
+        let hit = INTERN_TLS.with(|tls| {
+            let table = tls.borrow();
+            table
+                .get(slot_idx)
+                .filter(|&&(id, cached, _)| id == self.pool_id && cached == kind)
+                .map(|&(_, _, ty)| ty)
+        });
+        if let Some(ty) = hit {
+            return ty;
+        }
+        let ty = self.intern_slow_uncached(kind);
+        INTERN_TLS.with(|tls| {
+            let mut table = tls.borrow_mut();
+            if table.is_empty() {
+                table.resize(INTERN_TLS_SIZE, (0, Kind::Never, Ty::NONE));
+            }
+            table[slot_idx] = (self.pool_id, kind, ty);
+        });
+        ty
+    }
+
+    fn intern_slow_uncached(&self, kind: Kind) -> Ty {
         Ty(self.inner.intern_owned(kind, |kind, id| {
             self.flags
                 .set(id as usize, self.kind_flags(kind) | FLAG_SET);

@@ -20,6 +20,7 @@ impl<'a> Context<'a> {
         self.store.lookups.summaries = table::Flight::default();
         self.store.lookups.selections.clear();
         self.store.lookups.auto_traits.clear();
+        self.store.lookups.checked_impls = table::Flight::default();
         self.store.lookups.projections.clear();
         self.store.lookups.trait_calls.clear();
         self.store.lookups.assoc_types.clear();
@@ -28,6 +29,9 @@ impl<'a> Context<'a> {
         self.type_defs_single.borrow_mut().clear();
         self.selections_local.borrow_mut().clear();
         self.scope_traits_local.borrow_mut().clear();
+        self.module_of_local.clear();
+        self.trait_auto_local.borrow_mut().clear();
+        self.store.lookups.trait_autos.clear();
         self.store.lookups.scope_traits.clear();
         self.store.lookups.reveals = table::Flight::default();
         self.reveals_local.clear();
@@ -66,6 +70,9 @@ impl<'a> Context<'a> {
             crate_owners: vec![None; outline.crates.len()],
             crate_modules: vec![None; outline.crates.len()],
             crate_heads: vec![None; outline.crates.len()],
+            crate_heads_replayed: vec![false; outline.crates.len()],
+            module_of_local: HashMap::default(),
+            trait_auto_local: std::cell::RefCell::new(HashMap::default()),
             headers_local: HashMap::default(),
             trait_members_local: std::cell::RefCell::new(HashMap::default()),
             impl_members_local: std::cell::RefCell::new(HashMap::default()),
@@ -108,6 +115,9 @@ impl<'a> Context<'a> {
             crate_owners: vec![None; crates],
             crate_modules: vec![None; crates],
             crate_heads: vec![None; crates],
+            crate_heads_replayed: vec![false; crates],
+            module_of_local: HashMap::default(),
+            trait_auto_local: std::cell::RefCell::new(HashMap::default()),
             headers_local: HashMap::default(),
             trait_members_local: std::cell::RefCell::new(HashMap::default()),
             impl_members_local: std::cell::RefCell::new(HashMap::default()),
@@ -150,7 +160,7 @@ impl<'a> Context<'a> {
         scope: TypeScope,
         segments: &[crate::names::Sym],
     ) -> Option<crate::names::Def> {
-        if let (&[sym], (home, None, None, false, None)) = (segments, scope) {
+        if let (&[sym], (home, None, None, 0, None)) = (segments, scope) {
             if let Some(&found) = self.type_defs_single.borrow().get(&(home, sym)) {
                 return Some(found);
             }
@@ -179,7 +189,7 @@ impl<'a> Context<'a> {
     ) {
         let key = (scope, SegKey::from_slice(segments));
         self.store.lookups.type_defs.insert(key.clone(), def);
-        if let (&[sym], (home, None, None, false, None)) = (segments, scope) {
+        if let (&[sym], (home, None, None, 0, None)) = (segments, scope) {
             self.type_defs_single.borrow_mut().insert((home, sym), def);
         } else {
             self.type_defs_local.borrow_mut().insert(key, def);
