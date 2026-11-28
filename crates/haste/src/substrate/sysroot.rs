@@ -22,7 +22,7 @@ use crate::outline::{Outline, Role};
 use crate::sema::impls::Index as ImplIndex;
 use crate::sema::summary::codec::Cursor;
 
-pub(crate) const SYSROOT_VERSION: u32 = 12;
+pub(crate) const SYSROOT_VERSION: u32 = 14;
 const SYSROOT_MAGIC: [u8; 8] = *b"HSTSYS01";
 pub(super) const HEADER_LEN: usize = 36;
 const KEPT_SYSROOTS: usize = 2;

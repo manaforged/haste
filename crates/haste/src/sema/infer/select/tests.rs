@@ -2,12 +2,14 @@ use std::path::PathBuf;
 
 use rustc_hash::FxHashMap as HashMap;
 
+use super::super::infer;
+use super::super::poly::build_poly_summary;
 use crate::names::{Crate as NamesCrate, ItemRef, Names, Symbols};
 use crate::outline::tree::Files;
 use crate::outline::{Outline, Role, Root};
 use crate::sema::impls::tests::declared_crate;
-use crate::sema::infer::infer;
 use crate::sema::substs::Substs;
+use crate::sema::summary::SummaryKind;
 use crate::sema::{Cache, Context};
 
 struct TestCrate<'a> {
@@ -326,6 +328,272 @@ fn try_from_across_external_crates_and_open_closure_params() {
     assert!(
         bad_res.is_err(),
         "missing_try_from_errors must fail trait selection"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn open_var_assoc_binding_resolves_after_field_unify() {
+    let core_src = concat!(
+        "#![no_core]\n",
+        "#[lang = \"sized\"]\n",
+        "pub trait Sized {}\n",
+        "#[lang = \"deref\"]\n",
+        "pub trait Deref {\n",
+        "    type Target;\n",
+        "    fn deref(&self) -> &Self::Target;\n",
+        "}\n",
+        "#[lang = \"drop\"]\n",
+        "pub trait Drop {\n",
+        "    fn drop(&mut self);\n",
+        "}\n",
+        "pub trait From<T> {\n",
+        "    fn from(value: T) -> Self;\n",
+        "}\n",
+        "impl<T> From<T> for T {\n",
+        "    fn from(value: T) -> Self {\n",
+        "        value\n",
+        "    }\n",
+        "}\n",
+        "pub trait Into<T> {\n",
+        "    fn into(self) -> T;\n",
+        "}\n",
+        "impl<T, U> Into<U> for T\n",
+        "where\n",
+        "    U: From<T>,\n",
+        "{\n",
+        "    fn into(self) -> U {\n",
+        "        U::from(self)\n",
+        "    }\n",
+        "}\n",
+        "pub enum Result<T, E> {\n",
+        "    Ok(T),\n",
+        "    Err(E),\n",
+        "}\n",
+    );
+    let app_src = concat!(
+        "use core::{Into, Result};\n",
+        "pub trait Stream {\n",
+        "    type Item;\n",
+        "}\n",
+        "pub trait HttpBody {\n",
+        "    type Data;\n",
+        "    type Error;\n",
+        "}\n",
+        "pub struct Event;\n",
+        "pub struct Bytes;\n",
+        "pub struct BoxError;\n",
+        "pub struct SyncWrapper<T>(pub T);\n",
+        "impl<T> SyncWrapper<T> {\n",
+        "    pub fn new(v: T) -> Self {\n",
+        "        Self(v)\n",
+        "    }\n",
+        "}\n",
+        "pub struct Body;\n",
+        "impl Body {\n",
+        "    pub fn new<B>(_: B) -> Self\n",
+        "    where\n",
+        "        B: HttpBody,\n",
+        "        B::Error: Into<BoxError>,\n",
+        "    {\n",
+        "        Body\n",
+        "    }\n",
+        "}\n",
+        "pub struct SseBody<S> {\n",
+        "    pub event_stream: SyncWrapper<S>,\n",
+        "}\n",
+        "impl<S, E> HttpBody for SseBody<S>\n",
+        "where\n",
+        "    S: Stream<Item = Result<Event, E>>,\n",
+        "{\n",
+        "    type Data = Bytes;\n",
+        "    type Error = E;\n",
+        "}\n",
+        "pub struct Sse<S> {\n",
+        "    pub stream: S,\n",
+        "}\n",
+        "pub fn sse_into_body<S, E>(sse: Sse<S>) -> Body\n",
+        "where\n",
+        "    S: Stream<Item = Result<Event, E>>,\n",
+        "    E: Into<BoxError>,\n",
+        "{\n",
+        "    Body::new(SseBody {\n",
+        "        event_stream: SyncWrapper::new(sse.stream),\n",
+        "    })\n",
+        "}\n",
+        "pub fn sse_missing_into_errors<S, E>(sse: Sse<S>) -> Body\n",
+        "where\n",
+        "    S: Stream<Item = Result<Event, E>>,\n",
+        "{\n",
+        "    Body::new(SseBody {\n",
+        "        event_stream: SyncWrapper::new(sse.stream),\n",
+        "    })\n",
+        "}\n",
+    );
+    let (dir, outline, names) = load_fixture(
+        "open_var_assoc",
+        &[
+            TestCrate {
+                name: "core",
+                role: Role::Lib,
+                sysroot: true,
+                deps: &[],
+                src: core_src,
+            },
+            TestCrate {
+                name: "app",
+                role: Role::Lib,
+                sysroot: false,
+                deps: &[0],
+                src: app_src,
+            },
+        ],
+    );
+    let mut cx = Context::new(&outline, &names, Cache::default());
+    let good = find_item(&outline, 1, "sse_into_body");
+    let good_res = build_poly_summary(&mut cx, good, 2);
+    assert!(
+        !matches!(good_res, SummaryKind::Error(_)),
+        "sse_into_body should infer cleanly: {good_res:?}"
+    );
+    let bad = find_item(&outline, 1, "sse_missing_into_errors");
+    let bad_res = build_poly_summary(&mut cx, bad, 2);
+    assert!(
+        matches!(bad_res, SummaryKind::Error(_)),
+        "sse_missing_into_errors must reject missing E: Into<BoxError>"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pending_opaque_tuple_prefers_layer_over_unrelated_handler_trait() {
+    let core_src = concat!(
+        "#![no_core]\n",
+        "#[lang = \"sized\"]\n",
+        "pub trait Sized {}\n",
+        "#[lang = \"deref\"]\n",
+        "pub trait Deref {\n",
+        "    type Target;\n",
+        "    fn deref(&self) -> &Self::Target;\n",
+        "}\n",
+        "#[lang = \"drop\"]\n",
+        "pub trait Drop {\n",
+        "    fn drop(&mut self);\n",
+        "}\n",
+        "#[lang = \"clone\"]\n",
+        "pub trait Clone {\n",
+        "    fn clone(&self) -> Self;\n",
+        "}\n",
+        "impl<A: Clone, B: Clone> Clone for (A, B) {\n",
+        "    fn clone(&self) -> Self {\n",
+        "        (self.0.clone(), self.1.clone())\n",
+        "    }\n",
+        "}\n",
+    );
+    let app_src = concat!(
+        "use core::Clone;\n",
+        "pub trait Layer<S> {\n",
+        "    type Service;\n",
+        "    fn layer(&self, inner: S) -> Self::Service;\n",
+        "}\n",
+        "impl<A, B, S> Layer<S> for (A, B)\n",
+        "where\n",
+        "    A: Layer<B::Service>,\n",
+        "    B: Layer<S>,\n",
+        "{\n",
+        "    type Service = A::Service;\n",
+        "    fn layer(&self, inner: S) -> Self::Service {\n",
+        "        self.0.layer(self.1.layer(inner))\n",
+        "    }\n",
+        "}\n",
+        "pub trait Service {}\n",
+        "pub trait IntoResponse {}\n",
+        "pub trait IntoResponseParts {}\n",
+        "impl<T1, R> IntoResponse for (T1, R)\n",
+        "where\n",
+        "    T1: IntoResponseParts,\n",
+        "    R: IntoResponse,\n",
+        "{\n",
+        "}\n",
+        "pub struct IntoResponseHandler;\n",
+        "pub struct Layered<L, H, T, S>(L, H, T, S);\n",
+        "pub trait Handler<T, S> {\n",
+        "    fn layer<L>(self, layer: L) -> Layered<L, Self, T, S>\n",
+        "    where\n",
+        "        Self: Sized;\n",
+        "}\n",
+        "impl<T, S> Handler<IntoResponseHandler, S> for T\n",
+        "where\n",
+        "    T: IntoResponse + Clone,\n",
+        "{\n",
+        "    fn layer<L>(self, _layer: L) -> Layered<L, Self, IntoResponseHandler, S> {\n",
+        "        loop {}\n",
+        "    }\n",
+        "}\n",
+        "pub struct Passthrough;\n",
+        "impl Clone for Passthrough {\n",
+        "    fn clone(&self) -> Self {\n",
+        "        Passthrough\n",
+        "    }\n",
+        "}\n",
+        "impl<S> Layer<S> for Passthrough {\n",
+        "    type Service = S;\n",
+        "    fn layer(&self, inner: S) -> S {\n",
+        "        inner\n",
+        "    }\n",
+        "}\n",
+        "pub fn make_layer<S>() -> impl Layer<S, Service = S> + Clone {\n",
+        "    Passthrough\n",
+        "}\n",
+        "pub struct Route;\n",
+        "impl Route {\n",
+        "    pub fn new<T: Service>(_: T) -> Self {\n",
+        "        Route\n",
+        "    }\n",
+        "}\n",
+        "pub fn nest_service<S: Service>(svc: S) -> Route {\n",
+        "    let layer = (make_layer(), make_layer());\n",
+        "    Route::new(layer.layer(svc))\n",
+        "}\n",
+        "pub struct DummySvc;\n",
+        "impl Service for DummySvc {}\n",
+        "fn require_into_response<T: IntoResponse>(_: T) {}\n",
+        "pub fn opaque_tuple_not_into_response() {\n",
+        "    let layer = (make_layer::<DummySvc>(), make_layer::<DummySvc>());\n",
+        "    require_into_response(layer);\n",
+        "}\n",
+    );
+    let (dir, outline, names) = load_fixture(
+        "opaque_tuple_layer",
+        &[
+            TestCrate {
+                name: "core",
+                role: Role::Lib,
+                sysroot: true,
+                deps: &[],
+                src: core_src,
+            },
+            TestCrate {
+                name: "app",
+                role: Role::Lib,
+                sysroot: false,
+                deps: &[0],
+                src: app_src,
+            },
+        ],
+    );
+    let mut cx = Context::new(&outline, &names, Cache::default());
+    let good = find_item(&outline, 1, "nest_service");
+    let good_res = build_poly_summary(&mut cx, good, 1);
+    assert!(
+        !matches!(good_res, SummaryKind::Error(_)),
+        "nest_service should pick Layer::layer over Handler::layer: {good_res:?}"
+    );
+    let bad = find_item(&outline, 1, "opaque_tuple_not_into_response");
+    let bad_res = infer(&mut cx, bad, Substs::EMPTY);
+    assert!(
+        bad_res.is_err(),
+        "pending opaque tuple must not satisfy unrelated IntoResponse trait"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

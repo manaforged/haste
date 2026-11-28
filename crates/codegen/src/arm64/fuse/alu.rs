@@ -1,10 +1,10 @@
 use super::super::asm::Reg;
 use super::super::int::{add_imm_parts, add_imm_split_parts, encode_bitmask_imm};
-use super::flag::try_fuse_flag_operand;
+use super::flag::{cinc_operand, preserves_flags, try_cmp_preserved, try_fuse_flag_operand};
 use super::{
-    alu_shift, bfi, bits, can_peel_uextend, const_of, def_entry, def_inst, ext_from_op,
-    local_single, mem, peel_other_uextend, preserved, shift, shift_parts, shift_uext_ok,
-    shrn_shift, zero_ext_loc,
+    alu_shift, bfi, bits, can_peel_uextend, const_of, def_entry, def_inst, elided_or_deferred,
+    ext_from_op, local_single, mem, peel_other_uextend, preserved, shift, shift_parts,
+    shift_uext_ok, shrn_shift, zero_ext_loc,
 };
 use crate::alloc::Plan;
 use crate::ir::{Binary, Convert, Function, Inst, Op, Type, Unary, Value};
@@ -497,5 +497,122 @@ pub(super) fn fuse_block_shift(
         && !plan.elided[x.index()]
     {
         peel_other_uextend(func, plan, info, (b_idx, pos, res), x);
+    }
+}
+
+pub(in super::super) fn select_step_parts(
+    plan: &Plan<Reg>,
+    ty: Type,
+    is_sub: bool,
+    (sx, sy): (Value, Value),
+) -> Option<(bool, bool, u32)> {
+    let (Some(rx), Some(ry)) = (plan.const_of(sx), plan.const_of(sy)) else {
+        return None;
+    };
+    let mask = ty.unsigned_max();
+    let ux = crate::fold::extend(rx, ty, false) as u64;
+    let uy = crate::fold::extend(ry, ty, false) as u64;
+    if ux == 0 || uy == 0 {
+        return None;
+    }
+    let (invert_cond, base_u) = if (ux.wrapping_add(1) & mask) == uy {
+        if is_sub { (true, uy) } else { (false, ux) }
+    } else if (uy.wrapping_add(1) & mask) == ux {
+        if is_sub { (false, ux) } else { (true, uy) }
+    } else {
+        return None;
+    };
+    let simm = crate::fold::extend(base_u as i64, ty, true);
+    let (sub, imm) = add_imm_parts(is_sub, simm)?;
+    Some((invert_cond, sub, imm))
+}
+
+fn select_cond_preserved(
+    func: &Function,
+    plan: &Plan<Reg>,
+    info @ (uses, pos_of): (&[u32], &[Option<(usize, usize, Inst)>]),
+    (b_idx, spos, pos): (usize, usize, usize),
+    cond_val: Value,
+) -> bool {
+    let def = |v| def_inst(pos_of, v);
+    if plan.elided[cond_val.index()] {
+        let Some((cc, a, b)) = cinc_operand(func, plan, cond_val, &def) else {
+            return false;
+        };
+        let Some((ub, upos, uinst)) = def_entry(pos_of, cond_val) else {
+            return false;
+        };
+        if ub != b_idx {
+            return false;
+        }
+        let (cpos, skip, cmp_val) = match func.insts[uinst.index()].op {
+            Op::Convert(Convert::Uextend, inner) => {
+                if uses[cond_val.index()] != 1 {
+                    return false;
+                }
+                let Some((cb, cp, _)) = def_entry(pos_of, inner) else {
+                    return false;
+                };
+                if cb != b_idx {
+                    return false;
+                }
+                (cp, Some(upos), inner)
+            }
+            _ => (upos, None, cond_val),
+        };
+        return uses[cmp_val.index()] == 1
+            && try_cmp_preserved(func, plan, info, (b_idx, cpos, pos, skip), (cc, a, b, 1))
+                .is_some();
+    }
+    if plan.fused[cond_val.index()] {
+        return uses[cond_val.index()] == 1
+            && func.blocks[b_idx].insts[spos + 1..pos].iter().all(|&ni| {
+                let nd = &func.insts[ni.index()];
+                elided_or_deferred(plan, nd)
+                    || preserves_flags(func, plan, &def, &nd.op, nd.result, true)
+            });
+    }
+    !plan.is_static(cond_val) && preserved(func, plan, b_idx, spos, pos, None, cond_val)
+}
+
+pub(super) fn fuse_select_add(
+    func: &Function,
+    plan: &mut Plan<Reg>,
+    info: (&[u32], &[Option<(usize, usize, Inst)>]),
+) {
+    for (b_idx, block) in func.blocks.iter().enumerate() {
+        for (pos, &inst) in block.insts.iter().enumerate() {
+            let data = &func.insts[inst.index()];
+            let Some(res) = data.result else { continue };
+            let ty = func.ty(res);
+            if plan.elided[res.index()] || !matches!(ty, Type::I32 | Type::I64) {
+                continue;
+            }
+            let Op::Binary(op @ (Binary::Iadd | Binary::Isub), x, y) = data.op else {
+                continue;
+            };
+            let pairs = if op == Binary::Iadd {
+                [Some((x, y)), Some((y, x))]
+            } else {
+                [Some((x, y)), None]
+            };
+            for (other, sel) in pairs.into_iter().flatten() {
+                if plan.elided[other.index()] {
+                    continue;
+                }
+                let Some((spos, sinst)) = local_single(plan, info, b_idx, pos, sel) else {
+                    continue;
+                };
+                let Op::Select(cond_val, sx, sy) = func.insts[sinst.index()].op else {
+                    continue;
+                };
+                if select_step_parts(plan, ty, op == Binary::Isub, (sx, sy)).is_some()
+                    && select_cond_preserved(func, plan, info, (b_idx, spos, pos), cond_val)
+                {
+                    plan.elided[sel.index()] = true;
+                    break;
+                }
+            }
+        }
     }
 }

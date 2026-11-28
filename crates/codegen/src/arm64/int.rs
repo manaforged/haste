@@ -509,4 +509,55 @@ mod tests {
             "must not emit AND for all-ones mask: {words:#x?}"
         );
     }
+
+    #[test]
+    fn select_step_add_and_sub_fuse_into_add_and_csinc() {
+        for is_sub in [false, true] {
+            let mut sig = Signature::new(CallConv::Internal);
+            sig.params.push(AbiParam::new(Type::I64));
+            sig.params.push(AbiParam::new(Type::I8));
+            sig.returns.push(AbiParam::new(Type::I64));
+            let mut func = Function::new(sig);
+            {
+                let mut b = FunctionBuilder::new(&mut func);
+                let entry = b.create_block();
+                b.append_block_params_for_function_params(entry);
+                let params = b.block_params(entry).to_vec();
+                b.switch_to_block(entry);
+                let cmp = b.ins().icmp_imm(IntCC::Equal, params[1], 92);
+                let two = b.ins().iconst(Type::I64, 2);
+                let one = b.ins().iconst(Type::I64, 1);
+                let sel = b.ins().select(cmp, two, one);
+                let out = if is_sub {
+                    b.ins().isub(params[0], sel)
+                } else {
+                    b.ins().iadd(params[0], sel)
+                };
+                b.ins().return_(&[out]);
+            }
+            let words = arm64_words(
+                super::super::compile(&func, &arm64_full())
+                    .expect("arm64 select-step add/sub compiles"),
+            );
+            assert!(
+                words.iter().any(|&w| (w & 0x7FE0_0C00) == 0x1A80_0400),
+                "expected csinc in {words:#x?}"
+            );
+            let (imm_op, expected_imm) = if is_sub {
+                (0xD100_0000_u32, 2_u32)
+            } else {
+                (0x9100_0000_u32, 1_u32)
+            };
+            assert!(
+                words.iter().any(|&w| (w & 0xFF80_0000) == imm_op
+                    && ((w >> 10) & 0xFFF) == expected_imm
+                    && (w & 0x1F) == 10),
+                "expected immediate step into x10 in {words:#x?}"
+            );
+            assert!(
+                !words.contains(&0x5280_002A) && !words.contains(&0xD280_002A),
+                "must not materialize #1 in x10: {words:#x?}"
+            );
+        }
+    }
 }

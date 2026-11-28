@@ -227,7 +227,7 @@ pub(in super::super) fn encode_snapshot(
         let ident = identity_of(workspace, &compilation.outline, krate, &tables.to_local)?;
         write_identity(&mut out, &ident)?;
     }
-    write_env_reads_list(&mut out, spec.env_reads)?;
+    write_env_reads_list(&mut out, &spec.magic, spec.env_reads)?;
 
     write_usize(&mut out, tables.extra_syms.len())?;
     write_usize(&mut out, sym_blob_len)?;
@@ -282,16 +282,19 @@ pub(in super::super) fn encode_snapshot(
     Some((out, heads_map))
 }
 
-fn write_env_reads_list(out: &mut Vec<u8>, env_reads: &[EnvReads]) -> Option<()> {
+fn write_env_reads_list(out: &mut Vec<u8>, magic: &[u8; 8], env_reads: &[EnvReads]) -> Option<()> {
     write_usize(out, env_reads.len())?;
     for reads in env_reads {
         write_usize(out, reads.len())?;
         for (name, value) in reads {
             write_str(out, name)?;
-            match value {
-                Some(v) => {
+            match value
+                .as_deref()
+                .map(|v| crate::graph::store::hash_env_val(magic, name, v))
+            {
+                Some(hash) => {
                     out.push(1);
-                    write_str(out, v)?;
+                    write_u64(out, hash);
                 }
                 None => out.push(0),
             }

@@ -26,7 +26,7 @@ use super::store::{self, FileStamp};
 use super::{Graph, LOCK_FILE, MANIFEST_FILE, Targets, Workspace};
 
 const WS_MAGIC: [u8; 8] = *b"HSTWKS01";
-const WS_VERSION: u32 = 3;
+const WS_VERSION: u32 = 6;
 const HEADER_LEN: usize = 28;
 const MAX_KEPT_SNAPSHOTS: usize = 128;
 
@@ -127,7 +127,7 @@ fn hash_target_dirs(dirs: &[PathBuf], root_files: &[PathBuf]) -> u64 {
     hasher.finish()
 }
 
-fn rustup_settings_path() -> Option<PathBuf> {
+pub(crate) fn rustup_settings_path() -> Option<PathBuf> {
     let home = crate::process_env_var("RUSTUP_HOME")
         .map(PathBuf::from)
         .or_else(|| {
@@ -138,7 +138,7 @@ fn rustup_settings_path() -> Option<PathBuf> {
     Some(home.join("settings.toml"))
 }
 
-fn collect_static_lib_paths(pkg_dir: &Path, out: &Output, paths: &mut Vec<PathBuf>) {
+pub(crate) fn collect_static_lib_paths(pkg_dir: &Path, out: &Output, paths: &mut Vec<PathBuf>) {
     let static_names: Vec<&str> = out
         .link_libs()
         .filter_map(|(kind, name)| (kind == LinkKind::Static).then_some(name))

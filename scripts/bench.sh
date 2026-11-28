@@ -442,12 +442,25 @@ if suite in ("all", "build"):
     h_check_edits, c_check_edits = [], []
     h_emit_edits, c_build_edits = [], []
     h_daemon_edits, c_daemon_check_edits = [], []
-    for i in range(1, 4):
+    cargo_out_bin = os.path.join(cargo_build_target, "debug", "diff" + (".exe" if os.name == "nt" else ""))
+    prev_emit_out = subprocess.check_output([haste_out_bin], stderr=subprocess.DEVNULL)
+    for i in range(1, rounds + 1):
         write_edit(diff_main, orig_src, needle, seed + i * 10)
-        h_check_edits.append(run_timed(haste_check_cmd, env=check_haste_env))
-        c_check_edits.append(run_timed(cargo_check_cmd, env=cargo_env))
-        h_emit_edits.append(run_timed(haste_emit_cmd, env=emit_haste_env))
-        c_build_edits.append(run_timed(cargo_build_cmd, env=cargo_env))
+        if i % 2 == 1:
+            h_check_edits.append(run_timed(haste_check_cmd, env=check_haste_env))
+            c_check_edits.append(run_timed(cargo_check_cmd, env=cargo_env))
+            h_emit_edits.append(run_timed(haste_emit_cmd, env=emit_haste_env))
+            c_build_edits.append(run_timed(cargo_build_cmd, env=cargo_env))
+        else:
+            c_check_edits.append(run_timed(cargo_check_cmd, env=cargo_env))
+            h_check_edits.append(run_timed(haste_check_cmd, env=check_haste_env))
+            c_build_edits.append(run_timed(cargo_build_cmd, env=cargo_env))
+            h_emit_edits.append(run_timed(haste_emit_cmd, env=emit_haste_env))
+        h_out = subprocess.check_output([haste_out_bin], stderr=subprocess.DEVNULL)
+        c_out = subprocess.check_output([cargo_out_bin], stderr=subprocess.DEVNULL)
+        assert h_out == c_out, f"edit {i}: haste output differed from cargo output"
+        assert h_out != prev_emit_out, f"edit {i}: rebuilt executable output did not change"
+        prev_emit_out = h_out
     if os.name == "posix":
         def stop_daemon():
             subprocess.run([haste_bin, "serve", "stop", diff_dir], env=daemon_haste_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -467,10 +480,14 @@ if suite in ("all", "build"):
                 time.sleep(0.1)
             else:
                 sys.exit("haste serve daemon did not become ready")
-            for i in range(4, 7):
+            for i in range(rounds + 1, 2 * rounds + 1):
                 write_edit(diff_main, orig_src, needle, seed + i * 10)
-                h_daemon_edits.append(run_timed(haste_daemon_cmd, env=daemon_haste_env))
-                c_daemon_check_edits.append(run_timed(cargo_check_cmd, env=cargo_env))
+                if i % 2 == 1:
+                    h_daemon_edits.append(run_timed(haste_daemon_cmd, env=daemon_haste_env))
+                    c_daemon_check_edits.append(run_timed(cargo_check_cmd, env=cargo_env))
+                else:
+                    c_daemon_check_edits.append(run_timed(cargo_check_cmd, env=cargo_env))
+                    h_daemon_edits.append(run_timed(haste_daemon_cmd, env=daemon_haste_env))
         finally:
             stop_daemon()
             signal.signal(signal.SIGINT, prev_sigint)
@@ -502,7 +519,7 @@ if suite in ("all", "build"):
             ("Warm cache (`haste build` vs `cargo check`)", h_check_cold, c_check_cold),
             ("Warm cache (`haste build -o` vs `cargo build`)", h_emit_cold, c_build_cold),
         ])
-    print_build_table(f"### Build Speed (`tests/diff`, {case_count} fns)", rows, sections > 0)
+    print_build_table(f"### Build Speed (`tests/diff`, {case_count} cases)", rows, sections > 0)
     sections += 1
 
 if suite in ("all", "self"):
@@ -584,15 +601,33 @@ if suite in ("all", "compute"):
         f"`haste --release` = {fmt_ms(h_base)} | `rustc -O3` = {fmt_ms(c_base)} | `rustc -O3 native+abort` = {fmt_ms(m_base)}"
     )
     print()
-    print("| Workload | haste --release (net / raw) | rustc -O3 (net / raw) | vs -O3 | rustc -O3 native+abort (net / raw) | vs matched | Output |")
+    print("| Workload | haste --release (net / raw) | rustc -O3 (net / raw) | vs -O3 (haste/rustc) | rustc -O3 native+abort (net / raw) | vs matched (haste/rustc) | Output |")
     print("| --- | ---: | ---: | ---: | ---: | ---: | --- |")
     for work in ("sha256", "sieve", "sort", "scan", "fp_iter"):
-        h_raw, h_out = median_ms_checked(rounds, [compute_haste, work, str(mult)])
-        c_raw, c_out = median_ms_checked(rounds, [compute_rustc, work, str(mult)])
-        m_raw, m_out = median_ms_checked(rounds, [compute_rustc_matched, work, str(mult)])
-        if h_out != c_out or h_out != m_out:
-            print(f"MISMATCH on {work}: haste={h_out} rustc={c_out} matched={m_out}", file=sys.stderr)
+        cmds = [
+            ("h", [compute_haste, work, str(mult)]),
+            ("c", [compute_rustc, work, str(mult)]),
+            ("m", [compute_rustc_matched, work, str(mult)]),
+        ]
+        outs = {}
+        times = {"h": [], "c": [], "m": []}
+        for key, cmd in cmds:
+            outs[key] = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=True).stdout.strip()
+        if outs["h"] != outs["c"] or outs["h"] != outs["m"]:
+            print(f"MISMATCH on {work}: haste={outs['h']} rustc={outs['c']} matched={outs['m']}", file=sys.stderr)
             sys.exit(1)
+        for r in range(rounds):
+            order = cmds[r % 3:] + cmds[:r % 3]
+            for key, cmd in order:
+                t0 = time.perf_counter()
+                res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=True)
+                times[key].append((time.perf_counter() - t0) * 1000.0)
+                val = res.stdout.strip()
+                if val != outs[key]:
+                    print(f"NONDETERMINISTIC output for {cmd}: {outs[key]!r} vs {val!r}", file=sys.stderr)
+                    sys.exit(1)
+        h_raw, c_raw, m_raw = median_of(times["h"]), median_of(times["c"]), median_of(times["m"])
+        h_out = outs["h"]
         h_net = max(0.0, h_raw - h_base)
         c_net = max(0.0, c_raw - c_base)
         m_net = max(0.0, m_raw - m_base)

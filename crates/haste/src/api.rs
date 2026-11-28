@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use crate::build::Build;
 use crate::config::Config;
+use crate::graph::store::FileStamp;
 use crate::graph::{Targets, Workspace, cfg};
 use crate::outline::tree::Profile;
 
@@ -316,7 +317,7 @@ impl Compiler {
         Ok(())
     }
 
-    fn load_build(path: &Path) -> Result<(Workspace, Build, PathBuf), Error> {
+    fn resolve_root(path: &Path) -> Result<PathBuf, Error> {
         let root = std::path::absolute(path)
             .map_err(|err| Error::from_anyhow(ErrorKind::Io, err.into()))?;
         std::fs::metadata(&root).map_err(|err| {
@@ -325,10 +326,19 @@ impl Compiler {
                 anyhow::Error::new(err).context(format!("accessing {}", root.display())),
             )
         })?;
-        let targets = Targets {
+        Ok(root)
+    }
+
+    fn targets() -> Targets {
+        Targets {
             target: cfg::Target::of(crate::compile_target()),
             host: cfg::Target::host(),
-        };
+        }
+    }
+
+    fn load_build(path: &Path) -> Result<(Workspace, Build, PathBuf), Error> {
+        let root = Self::resolve_root(path)?;
+        let targets = Self::targets();
         let workspace = crate::cli::load_workspace(&root, &targets).map_err(Error::compile)?;
         let build = Build::load(&workspace, &targets).map_err(Error::compile)?;
         Ok((workspace, build, root))
@@ -341,23 +351,92 @@ impl Compiler {
         )
     }
 
+    fn run_check(workspace: &Workspace, build: &mut Build, oneshot: bool) -> Result<(), Error> {
+        let started = Instant::now();
+        if oneshot {
+            build.compile_binary_oneshot(workspace)
+        } else {
+            build.compile_binary(workspace)
+        }
+        .map_err(Error::compile)?;
+        let status = build.check(started.elapsed()).map_err(Error::compile)?;
+        if status != 0 {
+            return Err(Self::batch_compile_error(
+                build.binary_diagnostics(),
+                "compilation failed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn run_emit(
+        workspace: &Workspace,
+        build: &mut Build,
+        out: &Path,
+        drop_finals: bool,
+    ) -> Result<(), Error> {
+        if let Err(err) = build.emit_executable(workspace, out, drop_finals) {
+            return Err(build.binary_diagnostics().map_or_else(
+                || Error::compile(err),
+                |msg| Error::new(ErrorKind::Compile, msg),
+            ));
+        }
+        Ok(())
+    }
+
+    fn run_jit(
+        workspace: &Workspace,
+        build: &mut Build,
+        root: &Path,
+        args: &[String],
+    ) -> Result<i32, Error> {
+        let argv: Vec<String> = std::iter::once(crate::cli::program_name(root))
+            .chain(args.iter().cloned())
+            .collect();
+        build.run(workspace, &argv).map_err(Error::runtime)
+    }
+
+    fn run_tests(
+        workspace: &Workspace,
+        build: &mut Build,
+        filters: &[String],
+    ) -> Result<i32, Error> {
+        let started = Instant::now();
+        build
+            .compile_cases_filtered(workspace, filters)
+            .map_err(Error::compile)?;
+        if let Some(msg) = build.cases_diagnostics() {
+            return Err(Error::new(ErrorKind::Compile, msg));
+        }
+        build
+            .report(started, started.elapsed(), filters)
+            .map_err(Error::runtime)
+    }
+
+    /// Opens an incremental compilation session keeping a warm in-process build for `path`.
+    pub fn session(&self, path: impl AsRef<Path>) -> Result<Session, Error> {
+        let root = Self::resolve_root(path.as_ref())?;
+        let (targets, regular) = self.run_scoped(false, || {
+            let targets = Self::targets();
+            let regular = LoadedBuild::load(&root, &targets, None)?;
+            Ok((targets, regular))
+        })?;
+        Ok(Session {
+            compiler: self.clone(),
+            root,
+            targets,
+            regular: Some(regular),
+            binary_is_aot: false,
+            tests: None,
+        })
+    }
+
     /// Type-checks, borrow-checks, and lowers reached functions in the workspace at `path`.
     pub fn check(&self, path: impl AsRef<Path>) -> Result<(), Error> {
         let path = path.as_ref();
         self.run_scoped(false, || {
-            let started = Instant::now();
             let (workspace, mut build, _) = Self::load_build(path)?;
-            build
-                .compile_binary_oneshot(&workspace)
-                .map_err(Error::compile)?;
-            let status = build.check(started.elapsed()).map_err(Error::compile)?;
-            if status != 0 {
-                return Err(Self::batch_compile_error(
-                    build.binary_diagnostics(),
-                    "compilation failed",
-                ));
-            }
-            Ok(())
+            Self::run_check(&workspace, &mut build, true)
         })
     }
 
@@ -366,13 +445,7 @@ impl Compiler {
         let (path, out) = (path.as_ref(), out.as_ref());
         self.run_scoped(false, || {
             let (workspace, mut build, _) = Self::load_build(path)?;
-            if let Err(err) = build.emit_executable(&workspace, out, true) {
-                return Err(build.binary_diagnostics().map_or_else(
-                    || Error::compile(err),
-                    |msg| Error::new(ErrorKind::Compile, msg),
-                ));
-            }
-            Ok(())
+            Self::run_emit(&workspace, &mut build, out, true)
         })
     }
 
@@ -382,10 +455,7 @@ impl Compiler {
         self.run_scoped(false, || {
             Self::require_host_target("run")?;
             let (workspace, mut build, root) = Self::load_build(path)?;
-            let argv: Vec<String> = std::iter::once(crate::cli::program_name(&root))
-                .chain(args.iter().cloned())
-                .collect();
-            build.run(&workspace, &argv).map_err(Error::runtime)
+            Self::run_jit(&workspace, &mut build, &root, args)
         })
     }
 
@@ -394,17 +464,160 @@ impl Compiler {
         let path = path.as_ref();
         self.run_scoped(true, || {
             Self::require_host_target("test")?;
-            let started = Instant::now();
             let (workspace, mut build, _) = Self::load_build(path)?;
-            build
-                .compile_cases_filtered(&workspace, filters)
+            Self::run_tests(&workspace, &mut build, filters)
+        })
+    }
+}
+
+struct LoadedBuild {
+    workspace: Workspace,
+    build: Build,
+    manifests: Vec<(PathBuf, FileStamp)>,
+    watch_stamps: Vec<FileStamp>,
+    test_filters: Option<Vec<String>>,
+}
+
+impl LoadedBuild {
+    fn manifest_stamps(workspace: &Workspace, root: &Path) -> Vec<(PathBuf, FileStamp)> {
+        crate::graph::manifest_paths(workspace, root)
+            .into_iter()
+            .map(|path| {
+                let stamp = crate::graph::store::file_stamp(&path);
+                (path, stamp)
+            })
+            .collect()
+    }
+
+    fn capture_watch_stamps(
+        workspace: &Workspace,
+        build: &Build,
+        test_filters: Option<&[String]>,
+    ) -> Vec<FileStamp> {
+        if test_filters.is_some_and(|filters| !filters.is_empty()) {
+            crate::graph::store::file_stamps(&build.watch_paths(workspace))
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn load(
+        root: &Path,
+        targets: &Targets,
+        test_filters: Option<Vec<String>>,
+    ) -> Result<Self, Error> {
+        let workspace = crate::cli::load_workspace(root, targets).map_err(Error::compile)?;
+        let build = Build::load(&workspace, targets).map_err(Error::compile)?;
+        let manifests = Self::manifest_stamps(&workspace, root);
+        let watch_stamps = Self::capture_watch_stamps(&workspace, &build, test_filters.as_deref());
+        Ok(Self {
+            workspace,
+            build,
+            manifests,
+            watch_stamps,
+            test_filters,
+        })
+    }
+
+    fn is_stale(&self, next_filters: Option<&[String]>) -> bool {
+        let manifests_stale = self
+            .manifests
+            .iter()
+            .any(|(path, kept)| crate::graph::store::file_stamp(path) != *kept);
+        let env_stale = self
+            .build
+            .env_reads()
+            .into_iter()
+            .any(|(name, prev)| crate::process_env_var(&name) != prev);
+        let filters_stale =
+            next_filters.is_some_and(|filters| self.test_filters.as_deref() != Some(filters));
+        let filtered_sources_stale = next_filters.is_some_and(|filters| {
+            !filters.is_empty()
+                && self.watch_stamps
+                    != Self::capture_watch_stamps(&self.workspace, &self.build, Some(filters))
+        });
+        manifests_stale || env_stale || filters_stale || filtered_sources_stale
+    }
+
+    fn ensure<'a>(
+        slot: &'a mut Option<Self>,
+        root: &Path,
+        targets: &Targets,
+        next_filters: Option<&[String]>,
+    ) -> Result<&'a mut Self, Error> {
+        let needs_reload = slot
+            .as_ref()
+            .is_none_or(|loaded| loaded.is_stale(next_filters));
+        if needs_reload {
+            *slot = Some(Self::load(
+                root,
+                targets,
+                next_filters.map(<[String]>::to_vec),
+            )?);
+        } else if let Some(loaded) = slot.as_mut() {
+            loaded
+                .build
+                .refresh(&loaded.workspace, targets)
                 .map_err(Error::compile)?;
-            if let Some(msg) = build.cases_diagnostics() {
-                return Err(Error::new(ErrorKind::Compile, msg));
+        }
+        slot.as_mut()
+            .ok_or_else(|| Error::new(ErrorKind::Compile, "session build missing"))
+    }
+}
+
+/// An incremental compilation session keeping a warm in-process build across edits.
+pub struct Session {
+    compiler: Compiler,
+    root: PathBuf,
+    targets: Targets,
+    regular: Option<LoadedBuild>,
+    binary_is_aot: bool,
+    tests: Option<LoadedBuild>,
+}
+
+impl Session {
+    /// Refreshes changed files and type-checks, borrow-checks, and lowers reached functions.
+    pub fn check(&mut self) -> Result<(), Error> {
+        let compiler = self.compiler.clone();
+        compiler.run_scoped(false, || {
+            if self.binary_is_aot {
+                self.regular = None;
+                self.binary_is_aot = false;
             }
-            build
-                .report(started, started.elapsed(), filters)
-                .map_err(Error::runtime)
+            let loaded = LoadedBuild::ensure(&mut self.regular, &self.root, &self.targets, None)?;
+            Compiler::run_check(&loaded.workspace, &mut loaded.build, false)
+        })
+    }
+
+    /// Refreshes changed files and writes a standalone native AOT executable to `out`.
+    pub fn emit(&mut self, out: impl AsRef<Path>) -> Result<(), Error> {
+        let out = out.as_ref();
+        let compiler = self.compiler.clone();
+        compiler.run_scoped(false, || {
+            let loaded = LoadedBuild::ensure(&mut self.regular, &self.root, &self.targets, None)?;
+            self.binary_is_aot = true;
+            Compiler::run_emit(&loaded.workspace, &mut loaded.build, out, false)
+        })
+    }
+
+    /// Refreshes changed files and runs the binary's `main` via JIT with `args`.
+    pub fn run(&mut self, args: &[String]) -> Result<i32, Error> {
+        let compiler = self.compiler.clone();
+        compiler.run_scoped(false, || {
+            Compiler::require_host_target("run")?;
+            let loaded = LoadedBuild::ensure(&mut self.regular, &self.root, &self.targets, None)?;
+            Compiler::run_jit(&loaded.workspace, &mut loaded.build, &self.root, args)
+        })
+    }
+
+    /// Refreshes changed files and runs `#[test]` functions matching `filters`.
+    pub fn test(&mut self, filters: &[String]) -> Result<i32, Error> {
+        let compiler = self.compiler.clone();
+        compiler.run_scoped(true, || {
+            Compiler::require_host_target("test")?;
+            let loaded =
+                LoadedBuild::ensure(&mut self.tests, &self.root, &self.targets, Some(filters))?;
+            Compiler::run_tests(&loaded.workspace, &mut loaded.build, filters)
         })
     }
 }

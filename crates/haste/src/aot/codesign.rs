@@ -252,43 +252,59 @@ fn hash_slice_pair(bytes: &[u8]) -> (u64, u64) {
     (h1.finish(), h2.finish())
 }
 
+const UUID_CHUNK_BYTES: usize = 512 * 1024;
+
 pub(super) fn deterministic_uuid(bytes: &[u8]) -> [u8; 16] {
-    let workers = crate::jobs().min(bytes.len() / (512 * 1024));
-    let (v1, v2) = if workers <= 1 {
-        let (a, b) = hash_slice_pair(bytes);
-        let mut h1 = FxHasher::default();
-        let mut h2 = FxHasher::default();
-        h1.write_u64(0x9E37_79B9_7F4A_7C15);
-        h2.write_u64(0xBF58_476D_1CE4_E5B9);
-        h1.write_usize(bytes.len());
-        h2.write_usize(bytes.len() ^ 0x5555_5555_5555_5555);
+    deterministic_uuid_with_workers(bytes, crate::jobs())
+}
+
+fn deterministic_uuid_with_workers(bytes: &[u8], jobs: usize) -> [u8; 16] {
+    let chunk_count = bytes.len().div_ceil(UUID_CHUNK_BYTES);
+    let workers = jobs.min(chunk_count).max(1);
+    let parts: Vec<(u64, u64)> = if workers <= 1 {
+        bytes
+            .chunks(UUID_CHUNK_BYTES)
+            .map(hash_slice_pair)
+            .collect()
+    } else {
+        let chunks: Vec<(usize, &[u8])> = bytes.chunks(UUID_CHUNK_BYTES).enumerate().collect();
+        let per_worker = chunks.len().div_ceil(workers).max(1);
+        let mut indexed: Vec<(usize, (u64, u64))> = crate::sync::scope(|scope| {
+            let handles: Vec<_> = chunks
+                .chunks(per_worker)
+                .map(|slice| {
+                    scope.spawn(move || {
+                        slice
+                            .iter()
+                            .map(|&(idx, c)| (idx, hash_slice_pair(c)))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            let mut out = Vec::with_capacity(chunks.len());
+            for h in handles {
+                match h.join() {
+                    Ok(batch) => out.extend(batch),
+                    Err(payload) => std::panic::resume_unwind(payload),
+                }
+            }
+            out
+        });
+        indexed.sort_unstable_by_key(|&(idx, _)| idx);
+        indexed.into_iter().map(|(_, pair)| pair).collect()
+    };
+    let mut h1 = FxHasher::default();
+    let mut h2 = FxHasher::default();
+    let total_len = bytes.len() as u64;
+    h1.write_u64(0x9E37_79B9_7F4A_7C15);
+    h2.write_u64(0xBF58_476D_1CE4_E5B9);
+    h1.write_u64(total_len);
+    h2.write_u64(total_len ^ 0x5555_5555_5555_5555);
+    for (a, b) in parts {
         h1.write_u64(a);
         h2.write_u64(b);
-        (h1.finish(), h2.finish())
-    } else {
-        let chunk_len = bytes.len().div_ceil(workers).next_multiple_of(8).max(8);
-        let parts: Vec<(u64, u64)> = crate::sync::scope(|scope| {
-            let handles: Vec<_> = bytes
-                .chunks(chunk_len)
-                .map(|c| scope.spawn(move || hash_slice_pair(c)))
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().unwrap_or((0, 0)))
-                .collect()
-        });
-        let mut h1 = FxHasher::default();
-        let mut h2 = FxHasher::default();
-        h1.write_u64(0x9E37_79B9_7F4A_7C15);
-        h2.write_u64(0xBF58_476D_1CE4_E5B9);
-        h1.write_usize(bytes.len());
-        h2.write_usize(bytes.len() ^ 0x5555_5555_5555_5555);
-        for (a, b) in parts {
-            h1.write_u64(a);
-            h2.write_u64(b);
-        }
-        (h1.finish(), h2.finish())
-    };
+    }
+    let (v1, v2) = (h1.finish(), h2.finish());
     let mut uuid = [0u8; 16];
     uuid[..8].copy_from_slice(&v1.to_le_bytes());
     uuid[8..].copy_from_slice(&v2.to_le_bytes());
@@ -503,5 +519,17 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn deterministic_uuid_is_independent_of_worker_count() {
+        let bytes: Vec<u8> = (0..(UUID_CHUNK_BYTES * 2 + 123))
+            .map(|i| (i.wrapping_mul(31) ^ (i >> 7)) as u8)
+            .collect();
+        let u1 = deterministic_uuid_with_workers(&bytes, 1);
+        let u4 = deterministic_uuid_with_workers(&bytes, 4);
+        let u8 = deterministic_uuid_with_workers(&bytes, 8);
+        assert_eq!(u1, u4);
+        assert_eq!(u1, u8);
     }
 }

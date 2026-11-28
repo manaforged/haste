@@ -323,9 +323,10 @@ impl<'a> BundleEncoder<'a> {
         code: &Arc<AotCode>,
         relocs: &[SymbolSource],
         inlined: &[(u64, u64)],
+        unwind_digest: u64,
     ) -> Option<()> {
         let code_id = self.code_id(code)?;
-        let mut payload = Vec::with_capacity(40 + inlined.len() * 16 + relocs.len() * 12);
+        let mut payload = Vec::with_capacity(48 + inlined.len() * 16 + relocs.len() * 12);
         write_u64(&mut payload, key.item_key);
         write_u64(&mut payload, key.substs_hash);
         write_u64(&mut payload, key.stamps_digest);
@@ -336,6 +337,7 @@ impl<'a> BundleEncoder<'a> {
         write_u32(&mut payload, reloc_count);
         let inlined_count = u32::try_from(inlined.len()).ok()?;
         write_u32(&mut payload, inlined_count);
+        write_u64(&mut payload, unwind_digest);
         for &(f_key, f_stamp) in inlined {
             write_u64(&mut payload, f_key);
             write_u64(&mut payload, f_stamp);

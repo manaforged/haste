@@ -16,8 +16,8 @@ use crate::sema::impls::Index as ImplIndex;
 
 use meta::{
     LOCAL_INDEX_MAGIC, LOCAL_INDEX_VERSION, LocalMeta, collect_watched_files, compute_content_key,
-    crate_ranks, crate_refs, decode_meta, encode_meta, local_lib_topo_order, structural_key,
-    target_fingerprint, validate_env_reads, validate_watched,
+    crate_ranks, crate_refs, decode_meta, encode_meta, hash_env_reads, local_lib_topo_order,
+    structural_key, target_fingerprint, validate_env_reads, validate_watched,
 };
 
 use super::sysroot::{
@@ -370,13 +370,8 @@ pub(crate) fn save(
         };
         let (watched, included) = collect_watched_files(outline, krate);
         let env_reads_vec = collect_env_reads(outline, &[krate]);
-        let content_key = compute_content_key(
-            sk,
-            &watched,
-            &included,
-            env_reads_vec.first().map_or(&[][..], Vec::as_slice),
-            &dep_keys,
-        );
+        let env_hashes = hash_env_reads(env_reads_vec.first().map_or(&[][..], Vec::as_slice));
+        let content_key = compute_content_key(sk, &watched, &included, &env_hashes, &dep_keys);
         let cached = [krate];
         let spec = SnapshotSpec {
             magic: LOCAL_INDEX_MAGIC,
@@ -400,7 +395,7 @@ pub(crate) fn save(
             dep_keys,
             watched,
             included,
-            env_reads: env_reads_vec.into_iter().next().unwrap_or_default(),
+            env_reads: env_hashes,
         };
         let Some(meta_bytes) = encode_meta(sk, &meta) else {
             continue;
@@ -542,7 +537,7 @@ mod tests {
                 (PathBuf::from("/tmp/missing.rs"), None),
             ],
             included: vec![(PathBuf::from("/tmp/msg.txt"), PathBuf::from("/tmp/a.rs"))],
-            env_reads: vec![("K".to_owned(), Some("V".to_owned()))],
+            env_reads: hash_env_reads(&[("K".to_owned(), Some("V".to_owned()))]),
         };
         let bytes = encode_meta(0xdead_beef, &meta).expect("encode meta");
         assert!(decode_meta(&bytes, 0xcafe_babe).is_none());
@@ -696,6 +691,87 @@ mod tests {
 
         with_local_env(&home, true, || {
             assert!(!enabled());
+        });
+
+        drop(std::fs::remove_dir_all(&root));
+        drop(std::fs::remove_dir_all(&home));
+    }
+
+    #[test]
+    fn env_reads_never_leak_secrets_on_disk_and_invalidate_on_change() {
+        let root = temp_dir("env-secret-ws");
+        let home = temp_dir("env-secret-home");
+        write_test_workspace(&root);
+
+        let key_name = "HASTE_TEST_SECRET_22B";
+        let secret_v1 = "SECRET_TOKEN_DO_NOT_LEAK_9911";
+        let secret_v2 = "SECRET_TOKEN_ROTATED_2222";
+
+        with_local_env(&home, false, || {
+            let prev = std::env::var_os(key_name);
+            // SAFETY: serialized by `TEST_HOME_LOCK` via `with_local_env`.
+            unsafe { std::env::set_var(key_name, secret_v1) };
+
+            let targets = test_targets();
+            let ws = crate::graph::load(&root, &targets, &Default::default()).expect("load ws");
+            let sys_key = super::super::sysroot_key(&ws, &targets);
+            let comp = build_comp(&ws, &targets);
+            let lib_krate = comp
+                .outline
+                .roots
+                .iter()
+                .position(|r| r.name == "lib_a" && r.role == Role::Lib)
+                .expect("lib_a");
+            crate::sync::lock(&comp.outline.crates[lib_krate].env.env_reads)
+                .insert(key_name.to_owned(), Some(secret_v1.to_owned()));
+
+            let empty_hits = vec![false; comp.outline.crates.len()];
+            let empty_keys = vec![None; comp.outline.crates.len()];
+            save(&ws, &targets, &comp, sys_key, &empty_hits, &empty_keys);
+
+            let mut stack = vec![home.clone()];
+            let mut file_count = 0usize;
+            while let Some(dir) = stack.pop() {
+                for entry in std::fs::read_dir(&dir).expect("read cache dir").flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        stack.push(path);
+                    } else if path.is_file() {
+                        file_count += 1;
+                        let bytes = std::fs::read(&path).expect("read cached file");
+                        assert!(
+                            !bytes
+                                .windows(secret_v1.len())
+                                .any(|w| w == secret_v1.as_bytes()),
+                            "plaintext env secret leaked in {}",
+                            path.display()
+                        );
+                    }
+                }
+            }
+            assert!(file_count >= 2, "expected .meta and .bin cache files");
+
+            let mut outline_hit = crate::outline::new(&ws, &targets, &[]);
+            let loaded_hit = try_load(&ws, &targets, &mut outline_hit, None, sys_key, true, true);
+            assert!(loaded_hit.hits[lib_krate]);
+            let restored = crate::sync::lock(&outline_hit.crates[lib_krate].env.env_reads)
+                .get(key_name)
+                .cloned();
+            assert_eq!(restored, Some(Some(secret_v1.to_owned())));
+
+            // SAFETY: serialized by `TEST_HOME_LOCK` via `with_local_env`.
+            unsafe { std::env::set_var(key_name, secret_v2) };
+            let mut outline_miss = crate::outline::new(&ws, &targets, &[]);
+            let loaded_miss = try_load(&ws, &targets, &mut outline_miss, None, sys_key, true, true);
+            assert!(!loaded_miss.hits[lib_krate]);
+
+            // SAFETY: serialized by `TEST_HOME_LOCK` via `with_local_env`.
+            unsafe {
+                match prev {
+                    Some(v) => std::env::set_var(key_name, v),
+                    None => std::env::remove_var(key_name),
+                }
+            }
         });
 
         drop(std::fs::remove_dir_all(&root));

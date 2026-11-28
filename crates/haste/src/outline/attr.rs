@@ -138,6 +138,8 @@ pub fn has_attr(src: &Source, attrs: &[Attr], env: &Env, wanted: &str) -> bool {
         Attr::CfgAttr(cfg, inner) if env.eval(cfg) == Truth::Yes => {
             has_attr(src, inner, env, wanted)
         }
+        Attr::Test => wanted == "test",
+        Attr::Bench => wanted == "bench",
         &Attr::Other(at) => attr_is_named(src, at, wanted),
         _ => false,
     })

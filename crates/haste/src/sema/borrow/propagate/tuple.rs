@@ -317,6 +317,78 @@ impl<'a> Checker<'_, 'a> {
         }
     }
 
+    fn is_parametric_zip_iter(
+        &mut self,
+        call_expr: ExprId,
+        fn_item: crate::names::ItemRef,
+        receiver: ExprId,
+        arg: ExprId,
+    ) -> bool {
+        let Ok(sig) = self.cx.signature(fn_item) else {
+            return false;
+        };
+        if !matches!(sig.receiver, Some((crate::body::sig::SelfKind::Value, _)))
+            || sig.params.len() != 1
+            || sig
+                .generics
+                .iter()
+                .any(|g| g.kind == crate::body::sig::GenericKind::Lifetime)
+        {
+            return false;
+        }
+        let fn_src = self.cx.item(fn_item).0;
+        let crate::body::Ty::Path(p) = *sig.body.ty(sig.params[0].1) else {
+            return false;
+        };
+        let path = sig.body.path(p);
+        let segs = sig.body.list(path.segments);
+        if path.qself.is_some() || segs.len() != 1 {
+            return false;
+        }
+        let param_name = fn_src.text(sig.body.segments[segs[0] as usize].name);
+        if !sig.generics.iter().any(|g| {
+            g.kind == crate::body::sig::GenericKind::Type && fn_src.text(g.name) == param_name
+        }) {
+            return false;
+        }
+        let Some(iter_trait) = self
+            .cx
+            .lang_item("next")
+            .and_then(|next| self.cx.owner_trait(next))
+        else {
+            return false;
+        };
+        let Some(into_iter_trait) = self
+            .cx
+            .lang_item("into_iter")
+            .and_then(|m| self.cx.owner_trait(m))
+        else {
+            return false;
+        };
+        let (ret_ty, recv_ty, arg_ty) = (
+            self.expr_ty(call_expr),
+            self.expr_ty(receiver),
+            self.expr_ty(arg),
+        );
+        if ret_ty == Ty::NONE || recv_ty == Ty::NONE || arg_ty == Ty::NONE {
+            return false;
+        }
+        crate::sema::infer::detached(self.cx, self.item, |infer| {
+            let ret_item = infer.project(iter_trait, ret_ty, Vec::new(), "Item")?;
+            let recv_item = infer.project(into_iter_trait, recv_ty, Vec::new(), "Item")?;
+            let arg_item = infer.project(into_iter_trait, arg_ty, Vec::new(), "Item")?;
+            let Kind::Tuple(elems) = *infer.cx.types.kind(ret_item) else {
+                return Ok(false);
+            };
+            let elems = infer.cx.types.substs(elems);
+            Ok(elems.len() == 2
+                && elems[0] == recv_item
+                && elems[1] == arg_item
+                && recv_item != arg_item)
+        })
+        .unwrap_or(false)
+    }
+
     fn iter_tuple_sources(&mut self, expr: ExprId, state: &State) -> Option<TupleSources> {
         let cur = self.unwrap_parens(expr);
         let Expr::Method {
@@ -343,7 +415,10 @@ impl<'a> Checker<'_, 'a> {
                 inner,
             ]));
         }
-        if ((in_iter && name == "zip") || name == "zip_eq") && param_ids.len() == 1 {
+        if param_ids.len() == 1
+            && ((in_iter && name == "zip")
+                || self.is_parametric_zip_iter(cur, fn_item, receiver, ExprId(param_ids[0])))
+        {
             let left = self
                 .iter_tuple_sources(receiver, state)
                 .unwrap_or_else(|| self.leaf_iter_sources(receiver, state));

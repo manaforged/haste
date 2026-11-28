@@ -12,26 +12,28 @@ use crate::lower::stencil::{Form, InlineTemplate};
 use crate::lower::{
     FootprintId, RelocPlan, RodataId, RodataReloc, Slots, SymbolSource, VtableEntry, VtableId, Word,
 };
+use crate::names::ItemRef;
 use crate::outline::Outline;
 use crate::sema::Context;
 use crate::sema::reach::Reached;
-use crate::sema::summary::codec::{write_u32, write_u64};
+use crate::sema::substs::Substs;
+use crate::sema::summary::codec::{Cursor, write_u32, write_u32s, write_u64};
 use crate::sync::lock;
 
 use super::codec::{
     Stamps, find_record, prune_stale_bundles, read_u32_le, read_u64_le, write_bundle,
 };
-use super::plan::{decode_reloc_plan, encode_reloc_plan};
+use super::plan::{
+    decode_inline_shape, decode_reloc_plan, encode_reloc_plan, pack_inline_blob, split_inline_blob,
+};
 use super::relocs::{LocalFileIndex, collect_inlined_local_files};
-use super::tables::{BundleEncoder, CARRY_BIT, read_code_span};
+use super::tables::{BundleEncoder, CARRY_BIT, SharedTables, read_code_span};
 use super::{AotConfigKey, BundleView, MAX_BUNDLES, RECORD_LEN};
 
 pub(super) const INL_MAGIC: [u8; 8] = *b"HSTINL01";
-pub(super) const INL_VERSION: u32 = 1;
+pub(super) const INL_VERSION: u32 = 2;
 const NEG_BODY_ID: u32 = u32::MAX;
-const INL_HEADER_LEN: usize = 56;
-const INL_BODY_HEAD: usize = 13;
-const FORMS: [Form; 4] = [Form::Lean, Form::Loop, Form::Compact, Form::Dense];
+const INL_HEADER_LEN: usize = 60;
 
 pub(crate) enum InlineCacheHit {
     Negative(FootprintId),
@@ -53,6 +55,7 @@ struct CompiledInline {
     footprint: FootprintId,
     template: Option<Arc<InlineTemplate>>,
     inlined: Vec<(u32, u32)>,
+    no_unwind: Vec<(ItemRef, Substs)>,
 }
 
 pub(super) struct InlCache {
@@ -123,7 +126,7 @@ impl InlCache {
 
     pub(super) fn lookup(
         &self,
-        (slots, cx, reached): (&dyn Slots, &Context<'_>, &Reached),
+        (slots, cx, reached): (&dyn Slots, &mut Context<'_>, &Reached),
         key: InlKey,
         file_index: &OnceLock<LocalFileIndex>,
         stamps: &Stamps,
@@ -157,8 +160,9 @@ impl InlCache {
         let footprint = FootprintId(u128::from(fp_lo) | (u128::from(fp_hi) << 64));
         let body_id = read_u32_le(payload, 48);
         let inlined_count = read_u32_le(payload, 52) as usize;
-        let expected_len = INL_HEADER_LEN.checked_add(inlined_count.checked_mul(16)?)?;
-        if payload.len() != expected_len {
+        let no_unwind_count = read_u32_le(payload, 56) as usize;
+        let inlined_end = INL_HEADER_LEN.checked_add(inlined_count.checked_mul(16)?)?;
+        if payload.len() < inlined_end {
             return None;
         }
         for i in 0..inlined_count {
@@ -168,6 +172,22 @@ impl InlCache {
             if local_stamps.get(&f_key).copied() != Some(f_stamp) {
                 return None;
             }
+        }
+        if no_unwind_count == 0 {
+            if payload.len() != inlined_end {
+                return None;
+            }
+        } else {
+            let tables = self
+                .view
+                .shared_tables(cx.outline, &cx.types, file_index, stamps, None)?;
+            decode_valid_no_unwind(
+                tables,
+                cx,
+                reached,
+                payload.get(inlined_end..)?,
+                no_unwind_count,
+            )?;
         }
         if body_id == NEG_BODY_ID {
             self.hits.fetch_add(1, Ordering::Relaxed);
@@ -191,7 +211,7 @@ impl InlCache {
 
     pub(super) fn record(
         &self,
-        (cx, reached): (&Context<'_>, &Reached),
+        (cx, reached): (&mut Context<'_>, &Reached),
         key_parts: (u64, u64, u64),
         config_digest: u64,
         (index, limit, low, compact, sole, is_cold, may_unwind): (
@@ -208,6 +228,9 @@ impl InlCache {
         plan: &RelocPlan,
         relocs: &[SymbolSource],
     ) {
+        if template.is_some() && relocs.is_empty() && (plan.has_calls() || plan.reloc_len() > 0) {
+            return;
+        }
         let Some(key) = self.key_for(
             key_parts,
             config_digest,
@@ -220,6 +243,19 @@ impl InlCache {
         } else {
             collect_inlined_local_files(cx, reached, plan, index, relocs)
         };
+        let mut no_unwind = Vec::new();
+        if template.is_some() {
+            let mut seen = HashSet::default();
+            for sym in relocs {
+                if let SymbolSource::Slot(c_idx) = *sym
+                    && seen.insert(c_idx)
+                    && !reached.may_unwind(cx, c_idx)
+                    && let Some(((item, substs), _)) = reached.list.get(c_idx)
+                {
+                    no_unwind.push((*item, *substs));
+                }
+            }
+        }
         self.has_misses.store(true, Ordering::Relaxed);
         let pair = (key.key_hi, key.key_lo);
         lock(&self.compiled).entry(pair).or_insert(CompiledInline {
@@ -227,6 +263,7 @@ impl InlCache {
             footprint,
             template: template.map(Arc::clone),
             inlined,
+            no_unwind,
         });
     }
 
@@ -288,7 +325,7 @@ impl InlCache {
     pub(super) fn flush(
         mut self,
         state: &AotState,
-        (cx, reached): (&Context<'_>, &Reached),
+        (cx, reached): (&mut Context<'_>, &Reached),
         config: AotConfigKey,
         file_index: &OnceLock<LocalFileIndex>,
         stamps: &Stamps,
@@ -308,7 +345,7 @@ impl InlCache {
         }
         let started = Instant::now();
         let carry_slots = CarrySlots::default();
-        let mut carried_blobs: Vec<((u64, u64), Vec<u8>, Option<CarriedBody<'_>>)> = Vec::new();
+        let mut carried_blobs = Vec::new();
         let mut seen_keys = HashSet::default();
         for (pair, _) in &compiled {
             seen_keys.insert(*pair);
@@ -342,14 +379,33 @@ impl InlCache {
                 }
                 None => NEG_BODY_ID,
             };
+            let Some(no_unwind_count) = u32::try_from(entry.no_unwind.len()).ok() else {
+                continue;
+            };
+            let Some(no_unwind_bytes) = encode_no_unwind(&mut enc, &entry.no_unwind) else {
+                continue;
+            };
             let inlined = convert_inlined_pairs(cx.outline, stamps, &entry.inlined);
-            let payload = pack_payload(&entry.key, entry.footprint, body_id, &inlined);
+            let payload = pack_payload(
+                &entry.key,
+                entry.footprint,
+                body_id,
+                &inlined,
+                no_unwind_count,
+                &no_unwind_bytes,
+            );
             if enc.add_raw_record(pair, &payload).is_some() {
                 flushed += 1;
             }
         }
         let mut code_remap: HashMap<u32, Option<u32>> = HashMap::default();
-        for (pair, mut payload, body) in carried_blobs {
+        for (pair, mut head, no_unwind, body) in carried_blobs {
+            let Some(no_unwind_count) = u32::try_from(no_unwind.len()).ok() else {
+                continue;
+            };
+            let Some(no_unwind_bytes) = encode_no_unwind(&mut enc, &no_unwind) else {
+                continue;
+            };
             let new_body_id = match body {
                 None => NEG_BODY_ID,
                 Some((old_id, returns, height, size, form, plan, func_bytes)) => {
@@ -371,8 +427,10 @@ impl InlCache {
                     id
                 }
             };
-            payload[48..52].copy_from_slice(&new_body_id.to_le_bytes());
-            if enc.add_raw_record(pair, &payload).is_some() {
+            head[48..52].copy_from_slice(&new_body_id.to_le_bytes());
+            head[56..60].copy_from_slice(&no_unwind_count.to_le_bytes());
+            head.extend_from_slice(&no_unwind_bytes);
+            if enc.add_raw_record(pair, &head).is_some() {
                 flushed += 1;
             }
         }
@@ -394,13 +452,13 @@ impl InlCache {
         seen_keys: &HashSet<(u64, u64)>,
         carry_slots: &CarrySlots,
         (cx, reached, file_index, stamps, local_stamps): (
-            &Context<'_>,
+            &mut Context<'_>,
             &Reached,
             &OnceLock<LocalFileIndex>,
             &Stamps,
             &HashMap<u64, u64>,
         ),
-        out: &mut Vec<((u64, u64), Vec<u8>, Option<CarriedBody<'a>>)>,
+        out: &mut Vec<CarriedEntry<'a>>,
     ) {
         let Some(backing) = self.view.backing.as_ref() else {
             return;
@@ -428,11 +486,12 @@ impl InlCache {
             };
             let body_id = read_u32_le(payload, 48);
             let inlined_count = read_u32_le(payload, 52) as usize;
-            let Some(expected) = INL_HEADER_LEN.checked_add(inlined_count.saturating_mul(16))
+            let no_unwind_count = read_u32_le(payload, 56) as usize;
+            let Some(inlined_end) = INL_HEADER_LEN.checked_add(inlined_count.saturating_mul(16))
             else {
                 continue;
             };
-            if payload.len() != expected {
+            if payload.len() < inlined_end {
                 continue;
             }
             if !(0..inlined_count).all(|j| {
@@ -443,8 +502,32 @@ impl InlCache {
             }) {
                 continue;
             }
+            let no_unwind = if no_unwind_count == 0 {
+                if payload.len() != inlined_end {
+                    continue;
+                }
+                Vec::new()
+            } else {
+                let Some(tables) = old_tables else {
+                    continue;
+                };
+                let Some(tail) = payload.get(inlined_end..) else {
+                    continue;
+                };
+                let Some(entries) =
+                    decode_valid_no_unwind(tables, cx, reached, tail, no_unwind_count)
+                else {
+                    continue;
+                };
+                entries
+            };
             if body_id == NEG_BODY_ID {
-                out.push(((key_hi, key_lo), payload.to_vec(), None));
+                out.push((
+                    (key_hi, key_lo),
+                    payload[..inlined_end].to_vec(),
+                    no_unwind,
+                    None,
+                ));
                 continue;
             }
             let Some(tables) = old_tables else {
@@ -486,7 +569,8 @@ impl InlCache {
             };
             out.push((
                 (key_hi, key_lo),
-                payload.to_vec(),
+                payload[..inlined_end].to_vec(),
+                no_unwind,
                 Some((body_id, returns, height, size, form, plan, func_bytes)),
             ));
         }
@@ -494,6 +578,12 @@ impl InlCache {
 }
 
 type CarriedBody<'a> = (u32, bool, u8, u16, Form, RelocPlan, &'a [u8]);
+type CarriedEntry<'a> = (
+    (u64, u64),
+    Vec<u8>,
+    Vec<(ItemRef, Substs)>,
+    Option<CarriedBody<'a>>,
+);
 
 #[derive(Default)]
 struct CarrySlots {
@@ -587,13 +677,50 @@ fn convert_inlined_pairs(
     pairs
 }
 
+fn encode_no_unwind(enc: &mut BundleEncoder<'_>, entries: &[(ItemRef, Substs)]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(entries.len() * 12);
+    for &(item, substs) in entries {
+        let item_id = enc.item_id(item)?;
+        let substs_ids = enc.substs_ids(substs)?;
+        write_u32(&mut out, item_id);
+        write_u32s(&mut out, &substs_ids);
+    }
+    Some(out)
+}
+
+fn decode_valid_no_unwind(
+    tables: &SharedTables,
+    cx: &mut Context<'_>,
+    reached: &Reached,
+    bytes: &[u8],
+    count: usize,
+) -> Option<Vec<(ItemRef, Substs)>> {
+    if count == 0 {
+        return bytes.is_empty().then(Vec::new);
+    }
+    let mut cur = Cursor::new(bytes);
+    let mut out = Vec::with_capacity(count.min(256));
+    for _ in 0..count {
+        let item = tables.item_at(cur.u32().ok()?)?;
+        let substs = tables.read_substs_checked(&cx.types, &mut cur)?;
+        let idx = reached.index.get(&(item, substs)).copied()?;
+        if reached.may_unwind(cx, idx) {
+            return None;
+        }
+        out.push((item, substs));
+    }
+    (cur.pos == bytes.len()).then_some(out)
+}
+
 fn pack_payload(
     key: &InlKey,
     footprint: FootprintId,
     body_id: u32,
     inlined: &[(u64, u64)],
+    no_unwind_count: u32,
+    no_unwind_bytes: &[u8],
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(INL_HEADER_LEN + inlined.len() * 16);
+    let mut out = Vec::with_capacity(INL_HEADER_LEN + inlined.len() * 16 + no_unwind_bytes.len());
     write_u64(&mut out, key.item_key);
     write_u64(&mut out, key.substs_hash);
     write_u64(&mut out, key.stamps_digest);
@@ -602,10 +729,12 @@ fn pack_payload(
     write_u64(&mut out, (footprint.0 >> 64) as u64);
     write_u32(&mut out, body_id);
     write_u32(&mut out, inlined.len() as u32);
+    write_u32(&mut out, no_unwind_count);
     for &(f_key, f_stamp) in inlined {
         write_u64(&mut out, f_key);
         write_u64(&mut out, f_stamp);
     }
+    out.extend_from_slice(no_unwind_bytes);
     out
 }
 
@@ -630,61 +759,4 @@ fn encode_template(
         func_bytes,
     )?;
     enc.push_code_bytes(ptr, &blob)
-}
-
-pub(super) fn pack_inline_blob(
-    returns: bool,
-    height: u8,
-    size: u16,
-    form: Form,
-    plan_bytes: &[u8],
-    func_bytes: &[u8],
-) -> Option<Vec<u8>> {
-    let plan_len = u32::try_from(plan_bytes.len()).ok()?;
-    let func_len = u32::try_from(func_bytes.len()).ok()?;
-    let mut out = Vec::with_capacity(INL_BODY_HEAD + plan_bytes.len() + func_bytes.len());
-    out.push(u8::from(returns));
-    out.push(height);
-    out.extend_from_slice(&size.to_le_bytes());
-    out.push(form as u8);
-    write_u32(&mut out, plan_len);
-    write_u32(&mut out, func_len);
-    out.extend_from_slice(plan_bytes);
-    out.extend_from_slice(func_bytes);
-    Some(out)
-}
-
-fn decode_inline_shape(blob: &[u8]) -> Option<(bool, u8, u16)> {
-    let head = blob.get(..INL_BODY_HEAD)?;
-    let returns = match head[0] {
-        0 => false,
-        1 => true,
-        _ => return None,
-    };
-    let height = head[1];
-    let size = u16::from_le_bytes([head[2], head[3]]);
-    Some((returns, height, size))
-}
-
-pub(super) fn split_inline_blob(blob: &[u8]) -> Option<(bool, u8, u16, Form, &[u8], &[u8])> {
-    let (returns, height, size) = decode_inline_shape(blob)?;
-    let form_tag = blob[4];
-    let form = *FORMS
-        .get(usize::from(form_tag))
-        .filter(|found| **found as u8 == form_tag)?;
-    let plan_len = read_u32_le(blob, 5) as usize;
-    let func_len = read_u32_le(blob, 9) as usize;
-    let plan_end = INL_BODY_HEAD.checked_add(plan_len)?;
-    let func_end = plan_end.checked_add(func_len)?;
-    if func_end != blob.len() {
-        return None;
-    }
-    Some((
-        returns,
-        height,
-        size,
-        form,
-        &blob[INL_BODY_HEAD..plan_end],
-        &blob[plan_end..func_end],
-    ))
 }

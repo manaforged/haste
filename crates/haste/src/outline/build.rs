@@ -39,7 +39,6 @@ const INERT: &[&str] = &[
     "must_use",
     "doc",
     "repr",
-    "test",
     "ignore",
     "should_panic",
     "deprecated",
@@ -325,28 +324,39 @@ impl Loader<'_> {
         if !ATTRIBUTED.contains(&item.kind) {
             return;
         }
+        self.collect_attr_sites(file, module, at, &item.attrs);
+    }
+
+    fn collect_attr_sites(&mut self, file: &Arc<File>, module: usize, at: u32, attrs: &[Attr]) {
         let src = &file.source;
-        for attr in &item.attrs {
-            let Attr::Other(first) = *attr else { continue };
-            let absolute = src.kind(first) == TokenKind::Colon
-                && src.kind(first + 1) == TokenKind::Colon
-                && src.kind(first + 2) == TokenKind::Ident;
-            if !absolute && inert(src.text(first)) {
-                continue;
+        for attr in attrs {
+            match attr {
+                Attr::CfgAttr(cfg, inner) if self.out.env.eval(cfg) == Truth::Yes => {
+                    self.collect_attr_sites(file, module, at, inner);
+                }
+                &Attr::Other(first) => {
+                    let absolute = src.kind(first) == TokenKind::Colon
+                        && src.kind(first + 1) == TokenKind::Colon
+                        && src.kind(first + 2) == TokenKind::Ident;
+                    if !absolute && inert(src.text(first)) {
+                        continue;
+                    }
+                    let mut last = if absolute { first + 2 } else { first };
+                    while src.kind(last + 1) == TokenKind::Colon
+                        && src.kind(last + 2) == TokenKind::Colon
+                        && src.kind(last + 3) == TokenKind::Ident
+                    {
+                        last += 3;
+                    }
+                    self.out.attributed.push(Held {
+                        file: file.clone(),
+                        owner: module,
+                        at,
+                        path: (first, last),
+                    });
+                }
+                _ => {}
             }
-            let mut last = if absolute { first + 2 } else { first };
-            while src.kind(last + 1) == TokenKind::Colon
-                && src.kind(last + 2) == TokenKind::Colon
-                && src.kind(last + 3) == TokenKind::Ident
-            {
-                last += 3;
-            }
-            self.out.attributed.push(Held {
-                file: file.clone(),
-                owner: module,
-                at,
-                path: (first, last),
-            });
         }
     }
 

@@ -13,7 +13,7 @@ use super::super::{Inline, Lower, Slots, is_static, signature, signature_of};
 use super::splice;
 use super::{LowerMode, RelocVec, RodataId, SymbolSource};
 
-pub(super) fn sym_may_unwind(
+pub(crate) fn sym_may_unwind(
     cx: &mut Context<'_>,
     reached: &Reached,
     src: Option<&SymbolSource>,

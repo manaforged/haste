@@ -310,7 +310,7 @@ fn drain_kept(
                 workspace.graph.units[unit].script = Some(output.clone());
                 state.ran.insert(unit, output);
             }
-            Err(error) => report(workspace, unit, &error, &mut state.failed),
+            Err(error) => record_fatal(workspace, unit, Failure::from(error), state),
         }
         if let Some(locks) = locks.as_deref_mut() {
             locks.remove(&unit);
@@ -400,7 +400,7 @@ impl From<String> for Failure {
             error,
             broken: None,
             interrupted: false,
-            fatal: false,
+            fatal: true,
         }
     }
 }
@@ -484,8 +484,8 @@ fn run(
         target: targets.host.clone(),
         host: targets.host.clone(),
     };
-    let mut compilation = crate::macros::load_eager(workspace, &host_targets, &slow_units)?;
     binary::with_script_profile(|| {
+        let mut compilation = crate::macros::load_eager(workspace, &host_targets, &slow_units)?;
         let outline = &compilation.outline;
         let scripts: Vec<(usize, usize)> = outline
             .roots
@@ -721,26 +721,21 @@ impl Driver for Runs<'_, '_> {
                 interrupted: false,
                 fatal: true,
             }),
-            (status, None) => Err(Failure {
-                interrupted: crate::image::interrupted(status),
-                ..Failure::from(format!(
-                    "exited with status {status}; its errors are in {}",
-                    script.log.display()
-                ))
-            }),
+            (status, None) => {
+                if self.executables.contains(&unit) {
+                    crate::with_config(Arc::clone(&self.outer_cfg), || {
+                        binary::distrust(self.workspace, unit);
+                    });
+                }
+                Err(Failure {
+                    interrupted: crate::image::interrupted(status),
+                    ..Failure::from(format!(
+                        "exited with status {status}; its errors are in {}",
+                        script.log.display()
+                    ))
+                })
+            }
         };
-        let result = result.map_err(|failure| {
-            if !self.executables.contains(&unit) || failure.fatal {
-                return failure;
-            }
-            crate::with_config(Arc::clone(&self.outer_cfg), || {
-                binary::distrust(self.workspace, unit);
-            });
-            Failure {
-                interrupted: true,
-                ..failure
-            }
-        });
         if let Ok(output) = &result {
             self.ran.insert(unit, output.clone());
         }

@@ -114,7 +114,13 @@ impl Infer<'_, '_> {
     }
 
     /// The associated type `name` of trait `of` at `args` for `ty`: read from the impl that selection picks, or a variable until `ty` is known.
-    pub(super) fn project(&mut self, of: ItemRef, ty: Ty, args: Vec<Ty>, name: &str) -> Result<Ty> {
+    pub(in super::super) fn project(
+        &mut self,
+        of: ItemRef,
+        ty: Ty,
+        args: Vec<Ty>,
+        name: &str,
+    ) -> Result<Ty> {
         self.project_own(of, ty, args, (name, &[]))
     }
 

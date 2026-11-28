@@ -246,7 +246,7 @@ fn decode_crates_seq(
     Ok((outline_crates, name_crates, heads))
 }
 
-fn read_env_reads_list(cur: &mut Cursor<'_>) -> Result<Vec<EnvReads>> {
+fn read_env_reads_list(cur: &mut Cursor<'_>) -> Result<Vec<Vec<(String, Option<u64>)>>> {
     let crate_count = cur.count()?;
     let mut all = Vec::with_capacity(crate_count);
     for _ in 0..crate_count {
@@ -254,12 +254,12 @@ fn read_env_reads_list(cur: &mut Cursor<'_>) -> Result<Vec<EnvReads>> {
         let mut reads = Vec::with_capacity(len);
         for _ in 0..len {
             let name = read_str(cur)?.to_owned();
-            let val = match cur.u8()? {
+            let hash = match cur.u8()? {
                 0 => None,
-                1 => Some(read_str(cur)?.to_owned()),
+                1 => Some(cur.u64()?),
                 _ => bail!("invalid env read tag"),
             };
-            reads.push((name, val));
+            reads.push((name, hash));
         }
         all.push(reads);
     }
@@ -300,13 +300,21 @@ pub(super) fn read_header_and_match(
     if !match_crate_list_wire(cur, workspace, outline, spec.ref_crates)? {
         return Ok(None);
     }
-    let env_reads = read_env_reads_list(cur)?;
-    for reads in &env_reads {
-        for (name, expected) in reads {
-            if crate::process_env_var(name) != *expected {
+    let env_hashes = read_env_reads_list(cur)?;
+    let mut env_reads = Vec::with_capacity(env_hashes.len());
+    for reads in env_hashes {
+        let mut decoded = Vec::with_capacity(reads.len());
+        for (name, expected_hash) in reads {
+            let actual = crate::process_env_var(&name);
+            let actual_hash = actual
+                .as_deref()
+                .map(|v| crate::graph::store::hash_env_val(&spec.magic, &name, v));
+            if actual_hash != expected_hash {
                 return Ok(None);
             }
+            decoded.push((name, actual));
         }
+        env_reads.push(decoded);
     }
     Ok(Some(env_reads))
 }

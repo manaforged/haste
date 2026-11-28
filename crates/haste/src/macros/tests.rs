@@ -365,3 +365,300 @@ fn include_part_reexport_macro_resolves() {
     );
     assert_eq!(asks.count(), 0);
 }
+
+#[test]
+fn derive_input_with_cfg_pruned_member_keeps_doc_commented_siblings() {
+    let code = concat!(
+        "#[derive(Debug, Serialize, Deserialize)]\n",
+        "pub struct SyntaxSet {\n",
+        "    syntaxes: Vec<u8>,\n",
+        "    /// Stores the syntax index for every path.\n",
+        "    path_syntaxes: Vec<(String, usize)>,\n",
+        "    #[serde(skip)]\n",
+        "    cache: u8,\n",
+        "    /// Metadata docs.\n",
+        "    #[cfg(feature = \"metadata\")]\n",
+        "    pub(crate) metadata: u8,\n",
+        "}\n",
+        "#[derive(Debug, thiserror::Error)]\n",
+        "#[non_exhaustive]\n",
+        "pub enum LoadingError {\n",
+        "    /// error reading a file\n",
+        "    #[error(\"error reading a file: {0}\")]\n",
+        "    Io(#[from] u8),\n",
+        "    /// a metadata file was invalid\n",
+        "    #[cfg(feature = \"metadata\")]\n",
+        "    #[error(\"Failed to parse JSON\")]\n",
+        "    ParseMetadata(u8),\n",
+        "    /// A path given to a method was invalid.\n",
+        "    /// Possibly UTF-8.\n",
+        "    #[error(\"Invalid path\")]\n",
+        "    BadPath,\n",
+        "}\n",
+    );
+    let src = Source::parse(PathBuf::from("syntect.rs"), code.to_owned()).expect("parse source");
+    let items = scan(&src).expect("scan source");
+    let env = Env::default();
+    let deps = Vec::new();
+    let render = |idx: usize| -> String {
+        super::derive_input_in(&src, &items.items[idx], &env, Some((deps.as_slice(), 0)))
+    };
+
+    let syntax_out = render(0);
+    assert!(!syntax_out.contains("metadata"), "{syntax_out}");
+    assert!(!syntax_out.contains(", ,"), "{syntax_out}");
+    assert!(
+        syntax_out.contains("path_syntaxes : Vec < (String , usize) >")
+            || syntax_out.contains("path_syntaxes: Vec<(String, usize)>"),
+        "{syntax_out}"
+    );
+    assert!(syntax_out.contains("cache: u8"), "{syntax_out}");
+    Source::parse(PathBuf::from("out_struct.rs"), syntax_out.clone()).expect("valid struct tokens");
+
+    let err_out = render(1);
+    assert!(!err_out.contains("ParseMetadata"), "{err_out}");
+    assert!(err_out.contains("Io(#[from] u8)"), "{err_out}");
+    assert!(err_out.contains("BadPath"), "{err_out}");
+    assert!(err_out.contains("error reading a file"), "{err_out}");
+    Source::parse(PathBuf::from("out_enum.rs"), err_out.clone()).expect("valid enum tokens");
+}
+
+fn declared_file_crate(path: PathBuf, env: Env) -> Crate {
+    Crate {
+        modules: vec![Module {
+            file: usize::MAX,
+            item: None,
+            parent: None,
+            name: String::new(),
+            dir: path.parent().unwrap_or(path.as_path()).to_path_buf(),
+            parts: Vec::new(),
+            vis: crate::outline::item::Vis::Pub,
+            macro_use: false,
+            state: State::Declared(Decl::File {
+                candidates: vec![path],
+                by_attr: true,
+            }),
+            textual: None,
+        }],
+        env,
+        ..Crate::default()
+    }
+}
+
+#[test]
+fn renamed_prelude_test_and_shadowed_user_test_attr_resolve_by_def() {
+    let seq = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let dir = std::env::temp_dir().join(format!("haste_test_attr_{}-{seq}", std::process::id()));
+    drop(std::fs::remove_dir_all(&dir));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+
+    let write = |name: &str, body: &str| {
+        let p = dir.join(name);
+        std::fs::write(&p, body).expect("write");
+        p
+    };
+    let core_p = write(
+        "core.rs",
+        concat!(
+            "pub macro test($item:item) {}\n",
+            "pub macro bench($item:item) {}\n",
+            "pub mod prelude { pub mod v1 { pub use crate::{bench, test}; } }\n",
+        ),
+    );
+    let std_p = write(
+        "std.rs",
+        "pub mod prelude { pub mod v1 { pub use core::prelude::v1::{bench, test}; } }\n",
+    );
+    let proc_p = write(
+        "my_macros.rs",
+        "#[proc_macro_attribute]\npub fn my_attr() {}\n",
+    );
+    let app_src = concat!(
+        "use std::prelude::v1::test as case;\n",
+        "use my_macros::my_attr as test;\n",
+        "#[case]\nfn hidden_case() {}\n",
+        "#[test]\nfn user_attr_fn() {}\n",
+        "#[cfg_attr(all(), case)]\nfn cfg_hidden_case() {}\n",
+    );
+    let app_non_test_p = write("app_non_test.rs", app_src);
+    let app_test_p = write("app_test.rs", app_src);
+
+    let sys_env = Env {
+        release: true,
+        fixed: true,
+        known: true,
+        ..Env::default()
+    };
+    let non_test_env = Env {
+        test: false,
+        known: true,
+        ..Env::default()
+    };
+    let test_env = Env {
+        test: true,
+        known: true,
+        ..Env::default()
+    };
+    let mut outline = Outline {
+        roots: vec![
+            Root {
+                unit: 0,
+                name: "core".to_owned(),
+                path: core_p.clone(),
+                role: Role::Lib,
+                edition: "2021".to_owned(),
+                proc_macro: false,
+            },
+            Root {
+                unit: 1,
+                name: "std".to_owned(),
+                path: std_p.clone(),
+                role: Role::Lib,
+                edition: "2021".to_owned(),
+                proc_macro: false,
+            },
+            Root {
+                unit: 2,
+                name: "my_macros".to_owned(),
+                path: proc_p.clone(),
+                role: Role::Lib,
+                edition: "2021".to_owned(),
+                proc_macro: true,
+            },
+            Root {
+                unit: 3,
+                name: "app_non_test".to_owned(),
+                path: app_non_test_p.clone(),
+                role: Role::Bin,
+                edition: "2021".to_owned(),
+                proc_macro: false,
+            },
+            Root {
+                unit: 4,
+                name: "app_test".to_owned(),
+                path: app_test_p.clone(),
+                role: Role::Test,
+                edition: "2021".to_owned(),
+                proc_macro: false,
+            },
+        ],
+        crates: vec![
+            declared_file_crate(
+                core_p,
+                Env {
+                    release: true,
+                    fixed: true,
+                    known: true,
+                    ..Env::default()
+                },
+            ),
+            declared_file_crate(std_p, sys_env),
+            declared_file_crate(proc_p, Env::default()),
+            declared_file_crate(app_non_test_p, non_test_env),
+            declared_file_crate(app_test_p, test_env),
+        ],
+        deps: vec![
+            Vec::new(),
+            vec![("core".to_owned(), 0)],
+            Vec::new(),
+            vec![
+                ("core".to_owned(), 0),
+                ("std".to_owned(), 1),
+                ("my_macros".to_owned(), 2),
+            ],
+            vec![
+                ("core".to_owned(), 0),
+                ("std".to_owned(), 1),
+                ("my_macros".to_owned(), 2),
+            ],
+        ],
+        cache: Files::default(),
+        procs: HashMap::default(),
+        pins: vec![None; 5],
+    };
+    outline.load_all().expect("load outline");
+
+    let syms = Symbols::default();
+    let deps_for = |k: usize| {
+        outline.deps[k]
+            .iter()
+            .map(|(n, at)| (syms.intern(n), *at))
+            .collect()
+    };
+    let names = Names {
+        crates: vec![
+            eager_names("2021", deps_for(0)),
+            eager_names("2021", deps_for(1)),
+            eager_names("2021", deps_for(2)),
+            eager_names("2021", deps_for(3)),
+            eager_names("2021", deps_for(4)),
+        ],
+        symbols: syms,
+    };
+    let mut comp = Compilation::for_test(outline, names);
+    comp.names.resolve(&mut comp.outline).expect("resolve");
+    let (bound, _) = comp.names.bind_procs(&mut comp.outline);
+
+    assert_eq!(
+        bound.len(),
+        2,
+        "only shadowed #[test] -> my_attr should bind"
+    );
+    assert!(bound.iter().all(|b| {
+        b.run.krate == 2 && b.kind == ProcKind::Attribute && matches!(b.krate, 3 | 4)
+    }));
+
+    let item_named = |krate: usize, target: &str| -> (u32, u32) {
+        let f = &comp.outline.crates[krate].files[0];
+        let idx = f
+            .items
+            .items
+            .iter()
+            .position(|it| it.name.is_some_and(|n| f.source.text(n) == target))
+            .expect("item exists");
+        (0, idx as u32)
+    };
+
+    let non_test = &comp.outline.crates[3];
+    assert!(non_test.consumed.contains(&item_named(3, "hidden_case")));
+    assert!(
+        non_test
+            .consumed
+            .contains(&item_named(3, "cfg_hidden_case"))
+    );
+    assert!(!non_test.consumed.contains(&item_named(3, "user_attr_fn")));
+    assert!(non_test.resolved_tests.is_empty());
+
+    let with_test = &comp.outline.crates[4];
+    assert!(!with_test.consumed.contains(&item_named(4, "hidden_case")));
+    assert!(
+        with_test
+            .resolved_tests
+            .contains(&item_named(4, "hidden_case"))
+    );
+    assert!(
+        with_test
+            .resolved_tests
+            .contains(&item_named(4, "cfg_hidden_case"))
+    );
+    assert!(
+        !with_test
+            .resolved_tests
+            .contains(&item_named(4, "user_attr_fn"))
+    );
+    assert_eq!(crate::cli::outline_test_count(&comp.outline), 2);
+
+    comp.names.reset(3);
+    comp.names.resolve(&mut comp.outline).expect("re-resolve");
+    let hidden_sym = comp.names.symbols.intern("hidden_case");
+    let cfg_sym = comp.names.symbols.intern("cfg_hidden_case");
+    let user_sym = comp.names.symbols.intern("user_attr_fn");
+    let scopes = &comp.names.crates[3].scopes[0].names;
+    assert!(!scopes.contains_key(&hidden_sym));
+    assert!(!scopes.contains_key(&cfg_sym));
+    assert!(scopes.contains_key(&user_sym));
+
+    drop(std::fs::remove_dir_all(&dir));
+}

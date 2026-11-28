@@ -167,6 +167,14 @@ pub(crate) fn stamps_match(watched: &[(PathBuf, FileStamp)], parallel: bool) -> 
     })
 }
 
+/// Computes an `FxHasher` digest of a string slice.
+pub(crate) fn hash_str(s: &str) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = rustc_hash::FxHasher::default();
+    s.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Computes a domain-separated keyed hash of an environment variable value so plaintext values stay off disk.
 pub(crate) fn hash_env_val(magic: &[u8; 8], name: &str, val: &str) -> u64 {
     use std::hash::{Hash as _, Hasher as _};
@@ -193,7 +201,9 @@ pub fn dir(workspace: &Workspace, unit: usize) -> PathBuf {
     } else {
         "target"
     };
-    let profile = if crate::profile() == crate::outline::tree::Profile::Release {
+    let profile = if entry.side == Side::Target
+        && crate::profile() == crate::outline::tree::Profile::Release
+    {
         "release"
     } else {
         "debug"

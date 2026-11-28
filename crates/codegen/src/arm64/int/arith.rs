@@ -73,6 +73,48 @@ impl Emit<'_> {
         );
     }
 
+    fn try_select_step_add(
+        &mut self,
+        op: Binary,
+        (x, y): (Value, Value),
+        (ty, size): (Type, Size),
+        dst: Reg,
+    ) -> bool {
+        if !matches!(op, Binary::Iadd | Binary::Isub) || !matches!(ty, Type::I32 | Type::I64) {
+            return false;
+        }
+        let is_sub = op == Binary::Isub;
+        let pairs = if is_sub {
+            [Some((x, y)), None]
+        } else {
+            [Some((x, y)), Some((y, x))]
+        };
+        for (other, sel) in pairs.into_iter().flatten() {
+            if !self.plan.elided[sel.index()] || self.plan.elided[other.index()] {
+                continue;
+            }
+            let Some(sinst) = self.defs[sel.index()] else {
+                continue;
+            };
+            let Op::Select(cond_val, sx, sy) = self.func.insts[sinst.index()].op else {
+                continue;
+            };
+            let Some((invert_cond, sub, imm)) =
+                super::super::fuse::select_step_parts(&self.plan, ty, is_sub, (sx, sy))
+            else {
+                continue;
+            };
+            let cond = self.select_cond(cond_val);
+            let cond = if invert_cond { cond.invert() } else { cond };
+            let base = self.bits(other, A);
+            self.asm.add_imm(sub, false, size, C, base, imm);
+            self.asm.csinc(size, cond, dst, C, C);
+            self.clobber_reg(C);
+            return true;
+        }
+        false
+    }
+
     fn try_alu_bit_or_cinc(
         &mut self,
         op: Binary,
@@ -112,6 +154,9 @@ impl Emit<'_> {
             let cond = self.compare(cc, a, b);
             let reg = self.bits(other, A);
             self.asm.csinc(size, cond.invert(), dst, reg, reg);
+            return true;
+        }
+        if self.try_select_step_add(op, (x, y), (ty, size), dst) {
             return true;
         }
         if alu == Alu::Sub

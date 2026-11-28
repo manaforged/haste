@@ -111,9 +111,13 @@ fn member_fns<'a>(
         .flat_map(move |krate| crate_fns(krate, &outline.crates[krate]))
 }
 
+fn target_name_matches(root_name: &str, selected: &str) -> bool {
+    root_name == selected || root_name.replace('-', "_") == selected.replace('-', "_")
+}
+
 fn test_target_selected(outline: &outline::Outline, krate: usize, sel: &crate::Selection) -> bool {
-    let test_name = sel.test.as_deref().map(|n| n.replace('-', "_"));
-    let bin_name = sel.bin.as_deref().map(|n| n.replace('-', "_"));
+    let test_name = sel.test.as_deref();
+    let bin_name = sel.bin.as_deref();
     if !(sel.lib || sel.bins || test_name.is_some() || bin_name.is_some()) {
         return true;
     }
@@ -126,19 +130,32 @@ fn test_target_selected(outline: &outline::Outline, krate: usize, sel: &crate::S
     (sel.lib && is_lib_root)
         || (sel.bins && root.role == outline::Role::Bin)
         || bin_name
-            .as_deref()
-            .is_some_and(|n| root.role == outline::Role::Bin && root.name == n)
-        || test_name
-            .as_deref()
-            .is_some_and(|n| root.role == outline::Role::Test && !is_lib_root && root.name == n)
+            .is_some_and(|n| root.role == outline::Role::Bin && target_name_matches(&root.name, n))
+        || test_name.is_some_and(|n| {
+            root.role == outline::Role::Test && !is_lib_root && target_name_matches(&root.name, n)
+        })
 }
 
-fn is_test_fn(
+fn item_coord(
     tree: &outline::tree::Crate,
     file: &outline::tree::File,
     item: &outline::item::Item,
-) -> bool {
-    outline::attr::has_attr(&file.source, &item.attrs, &tree.env, "test")
+) -> Option<(u32, u32)> {
+    let fidx = tree
+        .files
+        .iter()
+        .position(|f| std::ptr::eq(f.as_ref(), file))? as u32;
+    let idx = file
+        .items
+        .items
+        .iter()
+        .position(|it| std::ptr::eq(it, item))? as u32;
+    Some((fidx, idx))
+}
+
+fn is_test_fn(tree: &outline::tree::Crate, item_ref: ItemRef) -> bool {
+    tree.resolved_tests
+        .contains(&(item_ref.file, item_ref.item))
 }
 
 pub(crate) fn is_test_only_fn(
@@ -147,8 +164,9 @@ pub(crate) fn is_test_only_fn(
     item: &outline::item::Item,
 ) -> bool {
     item.kind == outline::item::ItemKind::Fn
-        && (is_test_fn(tree, file, item)
-            || outline::attr::has_attr(&file.source, &item.attrs, &tree.env, "bench"))
+        && item_coord(tree, file, item).is_some_and(|coord| {
+            tree.consumed.contains(&coord) || tree.resolved_tests.contains(&coord)
+        })
 }
 
 /// Counts enabled `#[test]` functions across loaded member test crates matching target selection.
@@ -159,7 +177,7 @@ pub(crate) fn outline_test_count(outline: &outline::Outline) -> usize {
             outline.crates[krate].env.test && test_target_selected(outline, krate, &sel)
         })
         .flat_map(|krate| crate_fns(krate, &outline.crates[krate]))
-        .filter(|(_, tree, file, item)| is_test_fn(tree, file, item))
+        .filter(|(item_ref, tree, _, _)| is_test_fn(tree, *item_ref))
         .count()
 }
 
@@ -169,10 +187,10 @@ pub(crate) fn test_items(
 ) -> Vec<TestItem> {
     let sel = crate::selection();
     member_fns(workspace, outline)
-        .filter(|(item_ref, tree, file, item)| {
+        .filter(|(item_ref, tree, _, _)| {
             tree.env.test
                 && test_target_selected(outline, item_ref.krate as usize, &sel)
-                && is_test_fn(tree, file, item)
+                && is_test_fn(tree, *item_ref)
         })
         .map(|(item_ref, tree, file, item)| {
             let should_panic =
@@ -705,4 +723,65 @@ fn report(
         std::mem::forget(workspace);
     }
     Ok(status)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_outline() -> outline::Outline {
+        outline::Outline {
+            roots: vec![
+                outline::Root {
+                    unit: 0,
+                    name: "my-bin".to_owned(),
+                    path: std::path::PathBuf::from("src/bin/my-bin.rs"),
+                    role: outline::Role::Bin,
+                    edition: "2021".to_owned(),
+                    proc_macro: false,
+                },
+                outline::Root {
+                    unit: 0,
+                    name: "my-test".to_owned(),
+                    path: std::path::PathBuf::from("tests/my-test.rs"),
+                    role: outline::Role::Test,
+                    edition: "2021".to_owned(),
+                    proc_macro: false,
+                },
+            ],
+            crates: Vec::new(),
+            deps: Vec::new(),
+            cache: outline::tree::Files::default(),
+            procs: rustc_hash::FxHashMap::default(),
+            pins: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_target_selected_matches_hyphenated_bin_and_test_names() {
+        let outline = test_outline();
+        let by_bin_hyphen = crate::Selection {
+            bin: Some("my-bin".to_owned()),
+            ..crate::Selection::default()
+        };
+        let by_bin_under = crate::Selection {
+            bin: Some("my_bin".to_owned()),
+            ..crate::Selection::default()
+        };
+        assert!(test_target_selected(&outline, 0, &by_bin_hyphen));
+        assert!(test_target_selected(&outline, 0, &by_bin_under));
+        assert!(!test_target_selected(&outline, 1, &by_bin_hyphen));
+
+        let by_test_hyphen = crate::Selection {
+            test: Some("my-test".to_owned()),
+            ..crate::Selection::default()
+        };
+        let by_test_under = crate::Selection {
+            test: Some("my_test".to_owned()),
+            ..crate::Selection::default()
+        };
+        assert!(test_target_selected(&outline, 1, &by_test_hyphen));
+        assert!(test_target_selected(&outline, 1, &by_test_under));
+        assert!(!test_target_selected(&outline, 0, &by_test_hyphen));
+    }
 }

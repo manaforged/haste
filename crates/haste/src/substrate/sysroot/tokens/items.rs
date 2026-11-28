@@ -118,6 +118,8 @@ fn write_attrs(out: &mut Vec<u8>, attrs: &[Attr]) -> Option<()> {
                 out.push(9);
                 write_u32(out, *at);
             }
+            Attr::Test => out.push(10),
+            Attr::Bench => out.push(11),
         }
     }
     Some(())
@@ -142,6 +144,8 @@ fn read_attrs(reader: &mut Reader<'_>) -> Result<Vec<Attr>> {
             7 => Attr::NoCore,
             8 => Attr::NoImplicitPrelude,
             9 => Attr::Other(reader.u32()?),
+            10 => Attr::Test,
+            11 => Attr::Bench,
             _ => bail!("invalid attr tag"),
         });
     }

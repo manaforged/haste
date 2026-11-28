@@ -203,7 +203,7 @@ fn inline_template_bundle_round_trip_and_invalidation() {
             false,
         )));
     let names = crate::names::Names::default();
-    let cx = Context::new(&outline, &names, crate::sema::Cache::default());
+    let mut cx = Context::new(&outline, &names, crate::sema::Cache::default());
     let u64_ty = cx.types.intern(Kind::Prim(Primitive::U64));
     let substs = cx.types.intern_substs(&[u64_ty]);
     let item = ItemRef {
@@ -269,7 +269,7 @@ fn inline_template_bundle_round_trip_and_invalidation() {
     let state = AotState::new(0).into_inner().expect("lock");
     let inl = InlCache::open(path.clone(), cfg);
     inl.record(
-        (&cx, &reached),
+        (&mut cx, &reached),
         pos_parts,
         cfg.config_digest,
         (0, 80, true, false, false, false, true),
@@ -279,7 +279,7 @@ fn inline_template_bundle_round_trip_and_invalidation() {
         &relocs,
     );
     inl.record(
-        (&cx, &reached),
+        (&mut cx, &reached),
         neg_parts,
         cfg.config_digest,
         (1, 80, true, false, false, false, false),
@@ -290,7 +290,7 @@ fn inline_template_bundle_round_trip_and_invalidation() {
     );
     let (flushed, _) = inl.flush(
         &state,
-        (&cx, &reached),
+        (&mut cx, &reached),
         cfg,
         &file_index,
         &stamps,
@@ -329,7 +329,7 @@ fn inline_template_bundle_round_trip_and_invalidation() {
         )
         .expect("pos key");
     match reopened.lookup(
-        (&slots, &cx, &reached),
+        (&slots, &mut cx, &reached),
         pos_key_shape,
         &file_index,
         &stamps,
@@ -353,7 +353,7 @@ fn inline_template_bundle_round_trip_and_invalidation() {
         )
         .expect("pos key body");
     match reopened.lookup(
-        (&slots, &cx, &reached),
+        (&slots, &mut cx, &reached),
         pos_key_body,
         &file_index,
         &stamps,
@@ -381,7 +381,7 @@ fn inline_template_bundle_round_trip_and_invalidation() {
         .expect("neg key");
     assert!(matches!(
         reopened.lookup(
-            (&slots, &cx, &reached),
+            (&slots, &mut cx, &reached),
             neg_key,
             &file_index,
             &stamps,
@@ -401,7 +401,7 @@ fn inline_template_bundle_round_trip_and_invalidation() {
     assert!(
         reopened
             .lookup(
-                (&slots, &cx, &reached),
+                (&slots, &mut cx, &reached),
                 bad_limit,
                 &file_index,
                 &stamps,
@@ -423,7 +423,7 @@ fn inline_template_bundle_round_trip_and_invalidation() {
     assert!(
         reopened
             .lookup(
-                (&slots, &cx, &reached),
+                (&slots, &mut cx, &reached),
                 stale_key,
                 &file_index,
                 &stamps,
@@ -433,6 +433,254 @@ fn inline_template_bundle_round_trip_and_invalidation() {
             .is_none()
     );
 
+    drop(reopened);
+    drop(std::fs::remove_dir_all(&tmp));
+}
+
+#[test]
+fn inline_cache_invalidates_when_slot_callee_may_unwind_flips() {
+    let tmp = std::env::temp_dir().join(format!("haste-inl-unwind-test-{}", std::process::id()));
+    drop(std::fs::remove_dir_all(&tmp));
+    std::fs::create_dir_all(&tmp).expect("mkdir");
+    let src = tmp.join("main.rs");
+    let leaf_path = tmp.join("leaf.rs");
+    std::fs::write(&src, "fn main() {}\n").expect("write");
+    std::fs::write(&leaf_path, "fn leaf() {}\n").expect("write leaf");
+    let mut outline = Outline::file(&src, CfgTarget::default());
+    let main_src = Source::parse(src.clone(), "fn main() {}\n".to_owned()).expect("parse main");
+    let main_items = scan(&main_src).expect("scan main");
+    let leaf_src = Source::parse(leaf_path, "fn leaf() {}\n".to_owned()).expect("parse leaf");
+    let leaf_items = scan(&leaf_src).expect("scan leaf");
+    outline.crates[0]
+        .files
+        .push(Arc::new(crate::outline::tree::File::new(
+            main_src, main_items, false,
+        )));
+    outline.crates[0]
+        .files
+        .push(Arc::new(crate::outline::tree::File::new(
+            leaf_src, leaf_items, false,
+        )));
+    outline.crates[0].modules[0].file = 0;
+    outline.crates[0].modules[0].state = crate::outline::tree::State::Loaded;
+    outline.crates[0].modules[0].parts.push(1);
+    let names = crate::names::Names::default();
+    let mut cx = Context::new(&outline, &names, crate::sema::Cache::default());
+    let item = ItemRef {
+        krate: 0,
+        file: 0,
+        item: 0,
+    };
+    let leaf_item = ItemRef {
+        krate: 0,
+        file: 1,
+        item: 0,
+    };
+    let empty_typed = Arc::new(crate::sema::infer::Typed::default());
+    let mut reached = Reached::default();
+    reached.list.push((
+        (item, crate::sema::substs::Substs::EMPTY),
+        Ok(Arc::clone(&empty_typed)),
+    ));
+    reached.list.push((
+        (leaf_item, crate::sema::substs::Substs::EMPTY),
+        Ok(Arc::clone(&empty_typed)),
+    ));
+    reached
+        .index
+        .insert((item, crate::sema::substs::Substs::EMPTY), 0);
+    reached
+        .index
+        .insert((leaf_item, crate::sema::substs::Substs::EMPTY), 1);
+    assert!(!reached.may_unwind(&mut cx, 1));
+
+    let stamps = Stamps::compute(&outline, 0, 1);
+    let file_index = OnceLock::new();
+    let cfg = tests::sample_config(0b10_0010, 1, 2);
+    let path = tmp.join("bundle.inl");
+    let mut local_stamps = HashMap::default();
+    let main_fkey = stable_file_key(&outline, 0, 0).expect("main fkey");
+    let leaf_fkey = stable_file_key(&outline, 0, 1).expect("leaf fkey");
+    local_stamps.insert(main_fkey, stamps.file(0, 0).expect("main stamp"));
+    local_stamps.insert(leaf_fkey, stamps.file(0, 1).expect("leaf stamp"));
+
+    let func = sample_inline_function();
+    let plan = Arc::new(RelocPlan::from_vec(vec![
+        crate::lower::reloc::RelocStep::Const(SymbolSource::Slot(1)),
+    ]));
+    let template = Arc::new(InlineTemplate {
+        body: Arc::clone(&func),
+        returns: true,
+        reloc_plan: Arc::clone(&plan),
+        height: 2,
+        size: 3,
+        form: crate::lower::stencil::Form::Compact,
+    });
+    let relocs = vec![SymbolSource::Slot(1)];
+    let pos_fp = FootprintId(0xDEAD_BEEF_u128);
+    let neg_fp = FootprintId(0xCAFE_BABE_u128);
+    let pos_parts = (0x1111_u64, 0x2222_u64, 0x3333_u64);
+    let neg_parts = (0x4444_u64, 0x5555_u64, 0x6666_u64);
+
+    let state = AotState::new(0).into_inner().expect("lock");
+    let inl = InlCache::open(path.clone(), cfg);
+    inl.record(
+        (&mut cx, &reached),
+        pos_parts,
+        cfg.config_digest,
+        (0, 80, true, false, false, false, false),
+        pos_fp,
+        Some(&template),
+        &plan,
+        &[],
+    );
+    inl.record(
+        (&mut cx, &reached),
+        pos_parts,
+        cfg.config_digest,
+        (0, 80, true, false, false, false, false),
+        pos_fp,
+        Some(&template),
+        &plan,
+        &relocs,
+    );
+    let (flushed, _) = inl.flush(
+        &state,
+        (&mut cx, &reached),
+        cfg,
+        &file_index,
+        &stamps,
+        &local_stamps,
+    );
+    assert_eq!(flushed, 1);
+
+    struct EmptySlots(crate::lower::Bodies);
+    impl Slots for EmptySlots {
+        fn entry(&self, _: usize) -> i64 {
+            0
+        }
+        fn data(&self, _: &[u8]) -> i64 {
+            0
+        }
+        fn zeroed(&self, _: usize) -> i64 {
+            0
+        }
+        fn table(&self, _: &[Word]) -> i64 {
+            0
+        }
+        fn cell(&self, _: usize, _: u32) -> i64 {
+            0
+        }
+        fn bodies(&self) -> &crate::lower::Bodies {
+            &self.0
+        }
+    }
+    let slots = EmptySlots(Default::default());
+    let key = |cache: &InlCache| {
+        cache
+            .key_for_entry(
+                pos_parts,
+                cfg.config_digest,
+                (80, true, false, false, false, false),
+            )
+            .expect("pos key")
+    };
+
+    let carry_inl = InlCache::open(path.clone(), cfg);
+    assert!(matches!(
+        carry_inl.lookup(
+            (&slots, &mut cx, &reached),
+            key(&carry_inl),
+            &file_index,
+            &stamps,
+            &local_stamps,
+            true,
+        ),
+        Some(InlineCacheHit::Shape(fp, true, 2, 3)) if fp == pos_fp
+    ));
+    assert!(matches!(
+        carry_inl.lookup(
+            (&slots, &mut cx, &reached),
+            key(&carry_inl),
+            &file_index,
+            &stamps,
+            &local_stamps,
+            false,
+        ),
+        Some(InlineCacheHit::Body(fp, _)) if fp == pos_fp
+    ));
+    carry_inl.record(
+        (&mut cx, &reached),
+        neg_parts,
+        cfg.config_digest,
+        (0, 80, true, false, false, false, false),
+        neg_fp,
+        None,
+        &RelocPlan::default(),
+        &[],
+    );
+    let (carried_flushed, _) = carry_inl.flush(
+        &state,
+        (&mut cx, &reached),
+        cfg,
+        &file_index,
+        &stamps,
+        &local_stamps,
+    );
+    assert_eq!(carried_flushed, 2);
+
+    let reopened = InlCache::open(path, cfg);
+    assert!(matches!(
+        reopened.lookup(
+            (&slots, &mut cx, &reached),
+            key(&reopened),
+            &file_index,
+            &stamps,
+            &local_stamps,
+            false,
+        ),
+        Some(InlineCacheHit::Body(fp, _)) if fp == pos_fp
+    ));
+
+    let mut unwinding_reached = Reached::default();
+    unwinding_reached
+        .list
+        .push(((item, crate::sema::substs::Substs::EMPTY), Ok(empty_typed)));
+    unwinding_reached.list.push((
+        (leaf_item, crate::sema::substs::Substs::EMPTY),
+        Err("unwinds".to_owned()),
+    ));
+    unwinding_reached
+        .index
+        .insert((item, crate::sema::substs::Substs::EMPTY), 0);
+    unwinding_reached
+        .index
+        .insert((leaf_item, crate::sema::substs::Substs::EMPTY), 1);
+    assert!(unwinding_reached.may_unwind(&mut cx, 1));
+    assert!(
+        reopened
+            .lookup(
+                (&slots, &mut cx, &unwinding_reached),
+                key(&reopened),
+                &file_index,
+                &stamps,
+                &local_stamps,
+                true,
+            )
+            .is_none()
+    );
+    assert!(
+        reopened
+            .lookup(
+                (&slots, &mut cx, &unwinding_reached),
+                key(&reopened),
+                &file_index,
+                &stamps,
+                &local_stamps,
+                false,
+            )
+            .is_none()
+    );
     drop(reopened);
     drop(std::fs::remove_dir_all(&tmp));
 }

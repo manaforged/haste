@@ -1,10 +1,11 @@
 # haste
 
-haste is a standalone Rust compiler, in-memory JIT runner, and zero-linker AOT builder with no LLVM in the compiler binary and no per-project `target/` directory (cached artifacts live under `~/.cache/haste`).
+haste is an experimental Rust compiler, in-memory JIT runner, and zero-linker AOT builder for pure-Rust crates. Shared build artifacts live under `~/.cache/haste` (`HASTE_HOME`) instead of per-project `target/` directories.
 
-- **Sub-10 ms incremental edit checks:** `7.1–8.4 ms` on single-line edits with `--daemon` on bundled `tests/diff` (`8.8x–19.5x` vs `cargo check`); unchanged no-ops exit in `0.5–2.4 ms`.
-- **In-memory execution, tests, and live hot-reload (Unix):** run binaries (`haste run`), unit/integration and `#[tokio::test]` suites (`haste test`), or patch edited functions into a running process (`haste run --watch`).
-- **Zero-linker cross-compilation:** emit native ELF, Mach-O, and PE32+ executables directly for pure-Rust crates (`haste --release build --target ... -o`), with `--release` compute kernels matching or beating `rustc -O3` (`0.68x–1.05x`). See [Limits](#limits) for C archive, debug-info, and trap caveats.
+- **Live hot-reload in a running process (Unix):** edit a function in [`examples/live-server`](examples/live-server/src/main.rs), save, and hit the same TCP server again — same PID, updated response in under 100 ms (`haste run --watch examples/live-server`).
+- **In-memory execution and tests (Unix):** run binaries (`haste run`) and `#[test]` / `#[tokio::test]` suites (`haste test`) without invoking an external linker.
+- **Sub-10 ms resident-daemon edits on bundled `tests/diff`:** `7.1–8.4 ms` on single-line edits with `haste build --daemon` (`8.8x–19.5x` vs `cargo check`; one-shot `haste build` without `--daemon` takes `81.8–130 ms` on the same fixture; unchanged no-ops exit in `0.5–2.4 ms`).
+- **Pure-Rust zero-linker AOT & cross-compilation:** emit native ELF, Mach-O, and experimental PE32+ executables directly for pure-Rust crates (`haste --release build --target ... -o`; Windows is AOT-only — no JIT, daemon, hot-reload, or PDBs). On 5 synthetic compute loops, `--release` output runs at `0.68x–1.05x` of `rustc -O3` time (`< 1.0x` = faster). See [Limits](#limits) for C archive, debug-info, and trap caveats.
 - **Built for fast local dev loops; keep `rustc` in CI:** experimental (`version = "0.0.0"`, no tagged release yet). See [Crate compatibility](#crate-compatibility), [Limits](#limits), and [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Install and quickstart
@@ -44,7 +45,7 @@ If a workspace has no `Cargo.lock`, `haste` runs `cargo generate-lockfile` autom
 
 `haste` has three distinct execution models with different incremental latency:
 
-1. **One-shot CLI (`haste build`):** runs a fresh process per invocation, re-checks the local crate, and caches only dependency summaries on disk. On the bundled `tests/diff` fixture (`144` functions), single-line edits take `81.8–130 ms` (`0.6x–1.7x` vs `cargo check`) and unchanged no-ops take `0.5–2.4 ms`. On an unbundled 340-crate workspace (macOS ARM64, 6 CPUs), leaf edits take `2.35 s` median (`2.33–2.49 s`) and public-type edits take `2.35 s` (`2.33–2.40 s`), compared to `1.95 s` (leaf) and `2.21 s` (public-type) for `cargo check`.
+1. **One-shot CLI (`haste build`):** runs a fresh process per invocation, re-checks the local crate, and caches only dependency summaries on disk. On the bundled `tests/diff` fixture (`144` test cases), single-line edits take `81.8–130 ms` (`0.6x–1.7x` vs `cargo check`) and unchanged no-ops take `0.5–2.4 ms`. On an unbundled 340-crate workspace (macOS ARM64, 6 CPUs), leaf edits take `2.35 s` median (`2.33–2.49 s`) and public-type edits take `2.35 s` (`2.33–2.40 s`), compared to `1.95 s` (leaf) and `2.21 s` (public-type) for `cargo check`.
 2. **Resident daemon (`haste build --daemon`, Unix):** keeps workspace and dependency state warm in a background `haste serve` process (`900 s` idle timeout, configurable via `HASTE_SERVE_IDLE_SECS`). On the bundled `tests/diff` fixture, single-line edits take `7.1–8.4 ms` (`8.8x–19.5x` vs `cargo check`). On the unbundled 340-crate workspace, daemon cold start takes `4.65 s`, leaf edits drop to `22.3 ms` median (`22.1–37.3 ms`, `87x` faster than `cargo check` at `1.95 s`), while cross-crate public-type edits take `3.00 s` (`2.94–3.09 s`, slower than `cargo check` at `2.21 s`). Plain `haste` commands never spawn a daemon, though they reuse an already-running daemon for the same workspace unless `HASTE_NO_DAEMON=1` is set.
 3. **Embeddable library (`haste::Compiler`):** retains configuration across calls, but loads a fresh build on every `check`, `test`, or `emit` call. It does not run a resident daemon, so embedders should not assume `--daemon` edit latency.
 
@@ -58,7 +59,17 @@ haste serve stop haste-demo
 
 ### Live hot-reload
 
-Run `haste run --watch <path>` on a long-running Unix process (such as a loop or server). When you save a file, `haste` recompiles only the affected functions and patches them in memory on their next call. On a local TCP handler (macOS ARM64), save-to-first-changed-response measured `85.3 ms` on a body edit; a compile error keeps serving the previous code and recovers in `135.3 ms` once fixed, while a structural edit keeps serving and prints a restart-required notice.
+Try it right away on the bundled [`examples/live-server`](examples/live-server/src/main.rs) TCP server (Unix):
+
+```bash
+# Terminal 1: start the server with live function patching
+haste run --watch examples/live-server
+
+# Terminal 2: send a request, edit `handle()` in examples/live-server/src/main.rs, save, and repeat
+curl http://127.0.0.1:8080
+```
+
+When you save a file, `haste` recompiles only the affected functions and patches them in memory on their next call while keeping the same PID and open listener socket. On macOS ARM64, save-to-first-changed-response measured `85.3 ms` on a body edit; a compile error keeps serving the previous code and recovers in `135.3 ms` once fixed, while a structural edit keeps serving and prints a restart-required notice.
 
 ### Zero-linker cross-compilation
 
@@ -74,7 +85,7 @@ Pure-Rust executables are zero-linker and standalone. Linux ELF binaries are non
 
 Run `bash scripts/bench.sh` to reproduce build-speed and AOT runtime numbers on your machine (pass `--long` for 4x compute iterations). By default, `scripts/bench.sh` runs with `HASTE_BENCH_COLD=1`, which isolates `HASTE_HOME` and reports two distinct cold rows on `tests/diff` against a fresh `cargo` target directory: **Empty `HASTE_HOME`** (first command after install, including one-time stdlib indexing) and **First project build, stdlib indexed** (first build of a new project after stdlib indexing on `examples/hello`). Set `HASTE_BENCH_COLD=0` to reuse your existing `$HASTE_HOME` and print `Warm cache` rows instead.
 
-### Build speed (`tests/diff`, bundled 144-function fixture, `HASTE_BENCH_COLD=1`)
+### Build speed (`tests/diff`, bundled 144-case fixture, `HASTE_BENCH_COLD=1`)
 
 Resident-daemon edits (`--daemon`) compare a warm background `haste serve` process against one-shot `cargo check` (using `rustup which cargo` so PATH shims do not skew the baseline). `Empty HASTE_HOME` includes one-time stdlib indexing (`915–966 ms` for `haste build` vs `200–249 ms` for `cargo check`); once stdlib is indexed, the first build of a new project drops to `82.0–136 ms` (`1.5x–3.0x` faster than `cargo check`).
 
@@ -108,9 +119,9 @@ On a larger private multi-crate workspace (not bundled; `340` crates, `45` build
 
 The compute tables below show baseline-subtracted `net` times (`scripts/bench.sh` prints both `net` and `raw` times as `<net> (raw <raw>)`), subtracting each compiler's warmed empty-main startup baseline (median of 7) and verifying bit-identical outputs across `haste --release`, stock `rustc -C opt-level=3`, and matched-flag `rustc -C opt-level=3 -C target-cpu=native -C panic=abort`. In `--release` AOT builds (`haste --release build -o`), bounds, divide-by-zero, and signed `MIN / -1` division-overflow checks lower to hardware traps unless `catch_unwind` or `std::thread::{spawn, spawn_unchecked, spawn_scoped, scope}` is reached (while `haste --release test` and JIT always keep unwinding enabled, and integer `+`/`-`/`*` wrap in `--release`).
 
-#### Linux x86-64 (`rustc 1.99.1`, empty-main baseline: 0.2 ms across all three)
+#### Linux x86-64 (`rustc 1.99.1`, empty-main baseline: 0.2 ms across all three; ratios are `haste / rustc`, `< 1.00x` = haste faster)
 
-| Workload | `haste --release` (net) | `rustc -O3` (net) | vs `-O3` | `rustc -O3 native+abort` (net) | vs matched | Output |
+| Workload | `haste --release` (net) | `rustc -O3` (net) | `haste / -O3` | `rustc -O3 native+abort` (net) | `haste / matched` | Output |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
 | `sha256` (2M blocks) | 229 ms | 289 ms | **0.79x** | 253 ms | **0.90x** | exact match (`2980548810864065682`) |
 | `sieve` (20x 4M primes) | 44.7 ms | 65.3 ms | **0.68x** | 51.6 ms | **0.87x** | exact match (`10840522878760`) |
@@ -118,9 +129,9 @@ The compute tables below show baseline-subtracted `net` times (`scripts/bench.sh
 | `scan` (1200x JSON byte scanner) | 66.9 ms | 76.8 ms | **0.87x** | 77.3 ms | **0.87x** | exact match (`2400205310288`) |
 | `fp_iter` (4096x f64 generic iterator) | 164 ms | 161 ms | 1.02x | 164 ms | **1.00x** | exact match (`4733336957083238967`) |
 
-#### macOS ARM64 (`rustc 1.98.1`, empty-main baseline: `haste` 1.6 ms, `-O3` 3.8 ms, matched 3.2 ms)
+#### macOS ARM64 (`rustc 1.98.1`, empty-main baseline: `haste` 1.6 ms, `-O3` 3.8 ms, matched 3.2 ms; ratios are `haste / rustc`, `< 1.00x` = haste faster)
 
-| Workload | `haste --release` (net) | `rustc -O3` (net) | vs `-O3` | `rustc -O3 native+abort` (net) | vs matched | Output |
+| Workload | `haste --release` (net) | `rustc -O3` (net) | `haste / -O3` | `rustc -O3 native+abort` (net) | `haste / matched` | Output |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
 | `sha256` (2M blocks) | 282 ms | 290 ms | **0.97x** | 291 ms | **0.97x** | exact match (`2980548810864065682`) |
 | `sieve` (20x 4M primes) | 61.8 ms | 81.1 ms | **0.76x** | 81.6 ms | **0.76x** | exact match (`10840522878760`) |

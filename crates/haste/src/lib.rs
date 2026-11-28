@@ -43,7 +43,7 @@ pub(crate) const RECURSION_LIMIT: usize = 128;
 /// Environment variable naming an explicit Rust standard library `library/` source directory.
 pub(crate) const LIBRARY_ENV: &str = "HASTE_LIBRARY";
 
-pub use api::{Compiler, CompilerBuilder, Error, ErrorKind, Target};
+pub use api::{Compiler, CompilerBuilder, Error, ErrorKind, Session, Target};
 pub use cli::main;
 pub use diag::{Diagnostic, DiagnosticKind, Label, Span};
 

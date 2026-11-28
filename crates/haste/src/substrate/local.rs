@@ -85,25 +85,17 @@ fn rel_path<'a>(outline: &'a Outline, krate: usize, file: &'a File) -> &'a Path 
         .unwrap_or(&file.source.path)
 }
 
-fn hash_str(s: &str) -> u64 {
-    let mut hasher = FxHasher::default();
-    s.hash(&mut hasher);
-    hasher.finish()
-}
-
 fn hash_env_val(name: &str, val: &str) -> u64 {
-    let mut hasher = FxHasher::default();
-    LOCAL_MAGIC.hash(&mut hasher);
-    name.hash(&mut hasher);
-    0xffu8.hash(&mut hasher);
-    val.hash(&mut hasher);
-    hasher.finish()
+    crate::graph::store::hash_env_val(&LOCAL_MAGIC, name, val)
 }
 
 fn file_hashes(outline: &Outline, krate: usize, file: &File) -> (u64, u64) {
     let mut rh = FxHasher::default();
     rel_path(outline, krate, file).hash(&mut rh);
-    (rh.finish(), hash_str(&file.source.text))
+    (
+        rh.finish(),
+        crate::graph::store::hash_str(&file.source.text),
+    )
 }
 
 fn is_local_proc_macro_dep(workspace: &Workspace, outline: &Outline, krate: usize) -> bool {
@@ -148,7 +140,11 @@ fn crate_iface_key(
     for file in &tree.files {
         let rel = rel_path(outline, krate, file);
         if file.expanded {
-            expanded.push((rel, file.expand_origin, hash_str(&file.source.text)));
+            expanded.push((
+                rel,
+                file.expand_origin,
+                crate::graph::store::hash_str(&file.source.text),
+            ));
         } else {
             let mut fh = FxHasher::default();
             hash_outside_bodies(file, &mut fh);
