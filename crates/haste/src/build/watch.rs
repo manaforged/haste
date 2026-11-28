@@ -1,7 +1,7 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::graph;
 use crate::outline::{self, edit::Edit};
@@ -293,4 +293,204 @@ fn expands(workspace: &graph::Workspace, outline: &outline::Outline, krate: u32)
         .dependents(krate as usize)
         .into_iter()
         .any(|dep| outline.package(workspace, dep).manifest.proc_macro)
+}
+
+pub(super) fn refresh_edits(
+    workspace: &graph::Workspace,
+    stamps: &mut [Watch],
+    outline: &mut outline::Outline,
+) -> Result<(Vec<(u32, u32)>, Vec<u32>, Vec<PathBuf>)> {
+    let changed: Vec<(usize, Stamp)> = if stamps.len() >= 64 && crate::jobs() > 1 {
+        crate::sync::parallel_map((0..stamps.len()).collect(), |idx| {
+            let now = stamp(&stamps[idx].path);
+            (now != stamps[idx].stamp).then_some((idx, now))
+        })
+        .into_iter()
+        .flatten()
+        .collect()
+    } else {
+        stamps
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, watch)| {
+                let now = stamp(&watch.path);
+                (now != watch.stamp).then_some((idx, now))
+            })
+            .collect()
+    };
+    let (mut stale, mut crates, mut paths) = (Vec::new(), Vec::new(), Vec::new());
+    for (idx, now) in changed {
+        if now.is_none() {
+            anyhow::bail!("watched file removed: {}", stamps[idx].path.display());
+        }
+        stamps[idx].stamp = now;
+        let edit = match &stamps[idx].by {
+            Some(by) => outline.reexpand(by)?,
+            None => outline.reread(&stamps[idx].path)?,
+        };
+        match edit {
+            Edit::Same => {}
+            Edit::Bodies(slots)
+                if slots
+                    .iter()
+                    .any(|&(krate, _)| expands(workspace, outline, krate)) =>
+            {
+                crates.extend(slots.iter().map(|&(krate, _)| krate));
+                paths.push(stamps[idx].path.clone());
+            }
+            Edit::Bodies(slots) => {
+                stale.extend(slots);
+                paths.push(stamps[idx].path.clone());
+            }
+            Edit::Items(edited) => {
+                crates.extend(edited);
+                paths.push(stamps[idx].path.clone());
+                if let Some(by) = &stamps[idx].by {
+                    paths.push(by.clone());
+                }
+            }
+        }
+    }
+    Ok((stale, crates, paths))
+}
+
+pub(super) fn update_stamps(
+    workspace: &graph::Workspace,
+    stamps: &mut Vec<Watch>,
+    outline: &outline::Outline,
+    crates: &[u32],
+) {
+    if crates.len() * 4 >= outline.crates.len() {
+        let seen: HashMap<PathBuf, Stamp> = stamps
+            .iter()
+            .map(|watch| (watch.path.clone(), watch.stamp))
+            .collect();
+        *stamps = stamps_with_seen(workspace, outline, &seen);
+        return;
+    }
+    let reloaded_files: HashSet<&Path> = crates
+        .iter()
+        .flat_map(|&krate| {
+            outline.crates[krate as usize]
+                .files
+                .iter()
+                .map(|file| file.source.path.as_path())
+        })
+        .collect();
+    stamps.retain(|watch| {
+        !watch
+            .by
+            .as_ref()
+            .is_some_and(|by| reloaded_files.contains(by.as_path()))
+    });
+    let existing: HashSet<&Path> = stamps
+        .iter()
+        .filter(|watch| watch.by.is_none())
+        .map(|watch| watch.path.as_path())
+        .collect();
+    let mut new_sources = Vec::new();
+    for &krate in crates {
+        for file in &outline.crates[krate as usize].files {
+            let path = &file.source.path;
+            if !path.starts_with("/haste/") && !existing.contains(path.as_path()) {
+                new_sources.push(path.clone());
+            }
+        }
+    }
+    drop(existing);
+    drop(reloaded_files);
+    new_sources.sort();
+    new_sources.dedup();
+    let crate_indices: Vec<usize> = crates.iter().map(|&k| k as usize).collect();
+    let included = collect_included(&crate_indices, outline);
+    stamps.reserve(new_sources.len() + included.len());
+    for path in new_sources {
+        let s = stamp(&path);
+        stamps.push(Watch {
+            path,
+            stamp: s,
+            by: None,
+        });
+    }
+    for (path, by) in included {
+        let s = stamp(&path);
+        stamps.push(Watch {
+            path,
+            stamp: s,
+            by: Some(by),
+        });
+    }
+}
+
+pub(super) fn sync_included_stamps(
+    workspace: &graph::Workspace,
+    stamps: &mut Vec<Watch>,
+    outline: &outline::Outline,
+) {
+    let local: Vec<usize> = (0..outline.roots.len())
+        .filter(|&krate| outline.package(workspace, krate).local())
+        .collect();
+    let mut existing: HashMap<(PathBuf, PathBuf), Stamp> = HashMap::default();
+    stamps.retain(|watch| {
+        if let Some(by) = &watch.by {
+            existing.insert((watch.path.clone(), by.clone()), watch.stamp);
+            false
+        } else {
+            true
+        }
+    });
+    for (path, by) in collect_included(&local, outline) {
+        let key = (path, by);
+        let s = existing.get(&key).copied().unwrap_or_else(|| stamp(&key.0));
+        stamps.push(Watch {
+            path: key.0,
+            stamp: s,
+            by: Some(key.1),
+        });
+    }
+}
+
+pub(super) fn run_watched(
+    workspace: &graph::Workspace,
+    compilation: &mut crate::macros::Compilation,
+    cache: crate::sema::Cache,
+    main: crate::names::ItemRef,
+    args: &[String],
+) -> Result<i32> {
+    let mut watched = stamps(workspace, &compilation.outline);
+    let files = paths(&watched);
+    let mut reread = |compilation: &mut crate::macros::Compilation| {
+        let stale = body_edits(workspace, &mut watched, &mut compilation.outline)
+            .map_err(crate::image::ReloadError::Restart)?;
+        if stale.is_empty() {
+            return Ok(stale);
+        }
+        let syntax_errors = compilation.outline.local_errors(workspace);
+        if !syntax_errors.is_empty() {
+            eprintln!("{}", syntax_errors.join("\n"));
+            return Err(crate::image::ReloadError::Compile(
+                "syntax error in edited file".to_owned(),
+            ));
+        }
+        let (_, errors) = super::batch::check_member_items(
+            workspace,
+            compilation,
+            crate::sema::Cache::default(),
+            Some(main.krate as usize),
+        )
+        .map_err(|e| crate::image::ReloadError::Compile(format!("{e:#}")))?;
+        if !errors.is_empty() {
+            for err in &errors {
+                eprintln!("{err}");
+            }
+            return Err(crate::image::ReloadError::Compile(
+                "compile error in edited file".to_owned(),
+            ));
+        }
+        Ok(stale)
+    };
+    let mut program = crate::image::Program::new(compilation, cache, main)?;
+    let status = program.run_watched(compilation, args, (files, &mut reread));
+    std::mem::forget(program);
+    status
 }

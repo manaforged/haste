@@ -10,6 +10,7 @@ use crate::sema::substs::Substs;
 use crate::sema::ty::{Kind, Ty, Types};
 
 use super::filter::collect_filtered_callees;
+use super::reload::ReloadScope;
 use super::wave;
 use super::{
     Instance, MIN_PARALLEL_WAVE, PANIC_BOUNDS_CHECK, Reached, ReachedEntry, infer_entry,
@@ -27,7 +28,7 @@ pub(in crate::sema) struct WaveItem {
 pub(in crate::sema) type WorkerOut = (Requests, Vec<(Instance, u32)>, Vec<WaveItem>);
 
 fn enqueue_bounds_check(cx: &mut Context<'_>, reached: &mut Reached) -> Vec<usize> {
-    if !unwind_enabled(cx, reached) {
+    if cx.store.lookups.skip_warm_sysroot_bodies || !unwind_enabled(cx, reached) {
         return Vec::new();
     }
     let Some(bounds) = cx.lang_item(PANIC_BOUNDS_CHECK) else {
@@ -150,14 +151,111 @@ pub fn reach_anew_in(
     roots: &[Instance],
     only_crates: Option<&[u32]>,
 ) -> Vec<usize> {
-    reached.filter.forget_crates(only_crates);
+    reach_anew_inner(cx, reached, (dead, &[]), roots, only_crates, None)
+}
+
+/// Drops `dead`, updates `in_place` entries at their existing indices, and re-reaches from `roots` within `scope`.
+pub fn reach_anew_scoped(
+    cx: &mut Context<'_>,
+    reached: &mut Reached,
+    (dead, in_place): (&[usize], &[usize]),
+    roots: &[Instance],
+    scope: &ReloadScope,
+) -> Vec<usize> {
+    reach_anew_inner(
+        cx,
+        reached,
+        (dead, in_place),
+        roots,
+        Some(&scope.crates),
+        Some(scope),
+    )
+}
+
+fn reach_anew_inner(
+    cx: &mut Context<'_>,
+    reached: &mut Reached,
+    (dead, in_place): (&[usize], &[usize]),
+    roots: &[Instance],
+    only_crates: Option<&[u32]>,
+    scope: Option<&ReloadScope>,
+) -> Vec<usize> {
+    let all_local_covered = only_crates.is_none_or(|crates| {
+        reached
+            .list
+            .iter()
+            .enumerate()
+            .all(|(idx, ((item, _), _))| {
+                reached.states[idx] == ReachedEntry::Replaced
+                    || cx.outline.is_fixed(item.krate)
+                    || crates.contains(&item.krate)
+            })
+    });
+    let dead_vec;
+    let dead = if scope.is_none() && !dead.is_empty() {
+        let mut mask = vec![false; reached.list.len()];
+        for &idx in dead {
+            if idx < mask.len() {
+                mask[idx] = true;
+            }
+        }
+        dead_vec = super::reload::close_dead_callers(reached, &mut mask);
+        dead_vec.as_slice()
+    } else {
+        dead
+    };
+    let mut extra_roots = roots.to_vec();
+    if scope.is_none() && !dead.is_empty() {
+        for &idx in dead {
+            if reached.pinned.get(idx) == Some(&true) {
+                let inst = reached.list[idx].0;
+                let live = only_crates.is_none_or(|cs| !cs.contains(&inst.0.krate))
+                    && cx
+                        .outline
+                        .crates
+                        .get(inst.0.krate as usize)
+                        .and_then(|c| c.files.get(inst.0.file as usize))
+                        .and_then(|f| f.items.items.get(inst.0.item as usize))
+                        .is_some();
+                if live && !extra_roots.contains(&inst) {
+                    extra_roots.push(inst);
+                }
+            }
+        }
+    }
+    let dead_items: FxHashSet<crate::names::ItemRef> =
+        dead.iter().map(|&idx| reached.list[idx].0.0).collect();
+    reached.filter.forget_crates(only_crates, &dead_items);
     reached.replace_dead(dead);
-    let mut found = drain(cx, reached, roots.to_vec());
+    if all_local_covered {
+        reached.unlaid.clear();
+    }
+    let mut found = Vec::new();
+    let stale: Vec<usize> = in_place
+        .iter()
+        .copied()
+        .filter(|index| reached.index.get(&reached.list[*index].0) == Some(index))
+        .collect();
+    if !stale.is_empty() {
+        let waves = stale_waves(&cx.types, reached, &stale);
+        let mut queue = Vec::new();
+        for wave in &waves {
+            let (_, next) = run_wave(cx, reached, wave, true, true);
+            queue.extend(next);
+        }
+        found.extend(stale);
+        found.extend(drain(cx, reached, queue));
+    }
+    found.extend(drain(cx, reached, extra_roots));
     let extra = enqueue_bounds_check(cx, reached);
     if !extra.is_empty() {
         found.extend(drain_wave(cx, reached, extra, true));
     }
-    super::crate_check::check_local_crate_items_in(cx, reached, roots, true, only_crates);
+    if let Some(scope) = scope {
+        super::crate_check::check_local_crate_items_scoped(cx, reached, roots, true, scope);
+    } else {
+        super::crate_check::check_local_crate_items_in(cx, reached, roots, true, only_crates);
+    }
     reached.trim_replaced();
     reached.pin_roots(roots);
     reached.link(&found);

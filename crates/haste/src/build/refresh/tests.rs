@@ -1,0 +1,322 @@
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use crate::build::Build;
+use crate::graph::{self, Targets};
+
+struct TempDir(PathBuf);
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn fresh_dir() -> TempDir {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("haste_refresh_{}_{id}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    TempDir(dir)
+}
+
+fn host_targets() -> Targets {
+    let host = crate::graph::cfg::Target::of(&crate::host_target());
+    Targets {
+        target: host.clone(),
+        host,
+    }
+}
+
+fn load_workspace(root: &Path, targets: &Targets, sel: &crate::Selection) -> graph::Workspace {
+    let mut ws = graph::load(root, targets, sel).expect("load workspace");
+    let lib = graph::library().expect("sysroot library");
+    ws.merge(graph::load_sysroot(&lib, targets).expect("load sysroot"));
+    ws
+}
+
+fn write_two_crate_workspace(root: &Path) -> PathBuf {
+    let core_dir = root.join("crates/core_lib/src");
+    let app_dir = root.join("crates/app_bin/src");
+    std::fs::create_dir_all(&core_dir).expect("mkdir core_lib");
+    std::fs::create_dir_all(&app_dir).expect("mkdir app_bin");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/core_lib\", \"crates/app_bin\"]\nresolver = \"2\"\n",
+    )
+    .expect("write workspace Cargo.toml");
+    std::fs::write(
+        root.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"core_lib\"\nversion = \"0.1.0\"\n\n[[package]]\nname = \"app_bin\"\nversion = \"0.1.0\"\ndependencies = [\"core_lib\"]\n",
+    )
+    .expect("write Cargo.lock");
+    std::fs::write(
+        root.join("crates/core_lib/Cargo.toml"),
+        "[package]\nname = \"core_lib\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write core_lib Cargo.toml");
+    std::fs::write(
+        root.join("crates/app_bin/Cargo.toml"),
+        "[package]\nname = \"app_bin\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\ncore_lib = { path = \"../core_lib\" }\n",
+    )
+    .expect("write app_bin Cargo.toml");
+    let core_lib = core_dir.join("lib.rs");
+    std::fs::write(
+        &core_lib,
+        "#[macro_export]\nmacro_rules! id_val { ($x:expr) => { $x }; }\nmacro_rules! def_helper { () => { pub fn inner_val() -> u64 { 10 } }; }\ndef_helper!();\npub fn helper() -> u64 { 40 + inner_val() }\npub fn main_helper() -> u64 { id_val!(helper() + 2) }\n",
+    )
+    .expect("write core_lib lib.rs");
+    std::fs::write(
+        app_dir.join("main.rs"),
+        "fn main() { let _ = core_lib::main_helper(); }\n",
+    )
+    .expect("write app_bin main.rs");
+    core_lib
+}
+
+#[test]
+fn incremental_reload_keeps_dependents_and_handles_pubtype_and_error_recovery() {
+    let dir = fresh_dir();
+    let core_lib = write_two_crate_workspace(&dir.0);
+    let targets = host_targets();
+    let sel = crate::Selection {
+        workspace: true,
+        locked: true,
+        offline: true,
+        ..crate::selection()
+    };
+    let ws = load_workspace(&dir.0, &targets, &sel);
+    let mut build = Build::load(&ws, &targets).expect("load build");
+    build.compile_binary(&ws).expect("compile binary");
+    assert!(
+        build
+            .binary
+            .as_ref()
+            .is_some_and(|b| b.reached.all_live_ok()),
+        "initial live err"
+    );
+
+    let core_krate = build
+        .compilation
+        .outline
+        .roots
+        .iter()
+        .position(|r| r.name == "core_lib")
+        .expect("core_lib crate") as u32;
+    let app_krate = build
+        .compilation
+        .outline
+        .roots
+        .iter()
+        .position(|r| r.name == "app_bin")
+        .expect("app_bin crate") as usize;
+    let app_file0 = Arc::clone(&build.compilation.outline.crates[app_krate].files[0]);
+    let base_reached = build.reached_count();
+    assert!(base_reached > 0);
+
+    let base_src = "#[macro_export]\nmacro_rules! id_val { ($x:expr) => { $x }; }\nmacro_rules! def_helper { () => { pub fn inner_val() -> u64 { 10 } }; }\ndef_helper!();\npub fn helper() -> u64 { 4000 + inner_val() }\npub fn main_helper() -> u64 { id_val!(helper() + 2) }\n";
+    std::fs::write(&core_lib, base_src).expect("fnbody refresh");
+    build.refresh(&ws, &targets).expect("refresh fnbody");
+    assert!(Arc::ptr_eq(
+        &build.compilation.outline.crates[app_krate].files[0],
+        &app_file0
+    ));
+    assert_eq!(build.reached_count(), base_reached);
+    assert!(
+        build
+            .binary
+            .as_ref()
+            .is_some_and(|b| b.broken.is_empty() && b.poly_failures.is_empty())
+    );
+
+    let with_a = format!("{base_src}pub struct BenchA(pub u64);\n");
+    std::fs::write(&core_lib, &with_a).expect("append struct A");
+    build.refresh(&ws, &targets).expect("refresh append A");
+    assert!(Arc::ptr_eq(
+        &build.compilation.outline.crates[app_krate].files[0],
+        &app_file0
+    ));
+    assert_eq!(build.reached_count(), base_reached);
+
+    let with_b = format!("{base_src}pub struct BenchB_1(pub u64);\n");
+    std::fs::write(&core_lib, &with_b).expect("replace struct A -> B");
+    build.refresh(&ws, &targets).expect("refresh replace B");
+    assert!(Arc::ptr_eq(
+        &build.compilation.outline.crates[app_krate].files[0],
+        &app_file0
+    ));
+    assert_eq!(build.reached_count(), base_reached);
+
+    let with_err = format!("{with_b}pub fn bench_err() -> u32 {{ true }}\n");
+    std::fs::write(&core_lib, &with_err).expect("add type error");
+    build.refresh(&ws, &targets).expect("refresh error");
+    assert!(
+        build
+            .binary
+            .as_ref()
+            .is_some_and(|b| b.reached.list.iter().any(|(_, r)| r.is_err()))
+    );
+
+    std::fs::write(&core_lib, &with_b).expect("recover error");
+    build.refresh(&ws, &targets).expect("refresh recover");
+    assert!(Arc::ptr_eq(
+        &build.compilation.outline.crates[app_krate].files[0],
+        &app_file0
+    ));
+    assert_eq!(build.reached_count(), base_reached);
+    let bin = build.binary.as_ref().expect("binary batch");
+    assert!(bin.broken.is_empty(), "broken: {:?}", bin.broken);
+    assert!(
+        bin.poly_failures.is_empty(),
+        "poly: {:?}",
+        bin.poly_failures
+    );
+    assert!(bin.reached.all_live_ok(), "live err");
+
+    let pre = super::snapshot_edited(
+        &build.compilation.outline,
+        &mut build.compilation.names,
+        &[core_krate],
+    );
+    std::fs::write(
+        &core_lib,
+        "#[macro_export]\nmacro_rules! id_val { ($x:expr) => { $x }; }\nmacro_rules! def_helper { () => { pub fn inner_val() -> u64 { 10 } }; }\ndef_helper!();\npub fn helper() -> u64 { 99999 + inner_val() }\npub fn main_helper() -> u64 { id_val!(helper() + 2) }\n",
+    )
+    .expect("fnbody edit for reload_edited");
+    let reloaded = build
+        .compilation
+        .outline
+        .reload_edited(&[core_krate], std::slice::from_ref(&core_lib))
+        .expect("direct outline reload");
+    assert_eq!(reloaded, vec![core_krate as usize]);
+    let resolved = super::resolve_with_dependents(
+        &mut build.compilation,
+        pre,
+        reloaded,
+        std::slice::from_ref(&core_lib),
+    )
+    .expect("resolve_with_dependents")
+    .expect("diff_reload result");
+    assert!(
+        resolved.2.is_some(),
+        "unchanged expanded file must stay scoped"
+    );
+}
+
+#[test]
+fn refresh_fails_on_local_errors_and_catches_poly_fn_body_edits() {
+    let dir = fresh_dir();
+    let src_dir = dir.0.join("src");
+    std::fs::create_dir_all(&src_dir).expect("mkdir src");
+    std::fs::write(
+        dir.0.join("Cargo.toml"),
+        "[package]\nname = \"poly_pkg\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write Cargo.toml");
+    std::fs::write(
+        dir.0.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"poly_pkg\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("write Cargo.lock");
+    let lib_rs = src_dir.join("lib.rs");
+    let ok_src = "pub fn keep<T>(x: T) -> T { x }\npub fn call_site() -> u64 { 1 }\n";
+    std::fs::write(&lib_rs, ok_src).expect("write lib.rs");
+
+    let targets = host_targets();
+    let sel = crate::Selection {
+        locked: true,
+        offline: true,
+        ..crate::selection()
+    };
+    let ws = load_workspace(&dir.0, &targets, &sel);
+    let mut build = Build::load(&ws, &targets).expect("load build");
+    build.compile_binary(&ws).expect("compile");
+    assert_eq!(build.check(Duration::ZERO).expect("initial check"), 0);
+
+    std::fs::write(&lib_rs, format!("{ok_src}compile_error!(\"boom\");\n"))
+        .expect("write compile_error");
+    let err = build
+        .refresh(&ws, &targets)
+        .expect_err("compile_error! must fail refresh");
+    assert!(format!("{err:#}").contains("boom"), "err: {err:#}");
+
+    std::fs::write(&lib_rs, ok_src).expect("recover compile_error");
+    build.refresh(&ws, &targets).expect("recover refresh");
+    build.compile_binary(&ws).expect("recompile");
+
+    std::fs::write(&lib_rs, format!("{ok_src}mod missing_sub;\n")).expect("write mod missing");
+    assert!(
+        build.refresh(&ws, &targets).is_err(),
+        "missing module must fail refresh"
+    );
+
+    std::fs::write(&lib_rs, ok_src).expect("recover mod missing");
+    build.refresh(&ws, &targets).expect("recover mod refresh");
+    build.compile_binary(&ws).expect("recompile after mod");
+
+    let bad_poly =
+        "pub fn keep<T>(x: T) -> T { let _: u32 = true; x }\npub fn call_site() -> u64 { 1 }\n";
+    std::fs::write(&lib_rs, bad_poly).expect("break generic body");
+    build.refresh(&ws, &targets).expect("refresh bad poly");
+    assert!(
+        build
+            .binary
+            .as_ref()
+            .is_some_and(|b| !b.poly_failures.is_empty()),
+        "poly body edit must record poly failure"
+    );
+    assert_ne!(build.check(Duration::ZERO).expect("check bad poly"), 0);
+
+    std::fs::write(&lib_rs, ok_src).expect("fix generic body");
+    build.refresh(&ws, &targets).expect("refresh fixed poly");
+    assert!(
+        build
+            .binary
+            .as_ref()
+            .is_some_and(|b| b.poly_failures.is_empty()),
+        "fixed poly body must clear poly_failures"
+    );
+    assert_eq!(build.check(Duration::ZERO).expect("check fixed poly"), 0);
+}
+
+#[test]
+fn check_lib_skips_binary_target() {
+    let dir = fresh_dir();
+    let src_dir = dir.0.join("src");
+    std::fs::create_dir_all(&src_dir).expect("mkdir src");
+    std::fs::write(
+        dir.0.join("Cargo.toml"),
+        "[package]\nname = \"dual_pkg\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write Cargo.toml");
+    std::fs::write(
+        dir.0.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"dual_pkg\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("write Cargo.lock");
+    std::fs::write(src_dir.join("lib.rs"), "pub fn ok() -> u64 { 42 }\n").expect("write lib.rs");
+    std::fs::write(
+        src_dir.join("main.rs"),
+        "fn main() { let _: u32 = true; }\n",
+    )
+    .expect("write main.rs");
+
+    let cfg = std::sync::Arc::new(crate::config::Config {
+        selection: crate::Selection {
+            lib: true,
+            locked: true,
+            offline: true,
+            ..crate::Selection::default()
+        },
+        ..crate::config::Config::for_target(haste_codegen::Target::host())
+    });
+    crate::with_config(cfg, || {
+        let targets = host_targets();
+        let ws = load_workspace(&dir.0, &targets, &crate::selection());
+        let mut build = Build::load_oneshot(&ws, &targets).expect("load build");
+        build.compile_binary_oneshot(&ws).expect("compile lib only");
+        assert_eq!(build.check(Duration::ZERO).expect("check --lib"), 0);
+    });
+}

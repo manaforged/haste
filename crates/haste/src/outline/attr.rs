@@ -33,7 +33,7 @@ pub fn split_commas(src: &Source, from: u32, to: u32) -> Vec<(u32, u32)> {
     parts
 }
 
-/// Returns the library name declared by an active `#[link(name = "...")]` attribute (ignoring `kind = "static"` and failing `cfg(...)` clauses).
+/// Returns the library name declared by an active `#[link(name = "...")]` attribute (prefixing `framework=` for `kind = "framework"`, and ignoring `kind = "static"` or failing `cfg(...)` clauses).
 pub fn link_name(src: &Source, attrs: &[Attr], env: &Env) -> Option<String> {
     for attr in attrs {
         match attr {
@@ -49,6 +49,7 @@ pub fn link_name(src: &Source, attrs: &[Attr], env: &Env) -> Option<String> {
                 }
                 let close = src.pair(end);
                 let mut name = None;
+                let mut is_framework = false;
                 let mut skip = false;
                 for (from, to) in split_commas(src, end + 1, close) {
                     if from >= to {
@@ -76,16 +77,24 @@ pub fn link_name(src: &Source, attrs: &[Attr], env: &Env) -> Option<String> {
                                     name = Some(trimmed.to_owned());
                                 }
                             }
-                            "kind" if !matches!(val.as_str(), "dylib" | "raw-dylib") => {
-                                skip = true;
-                                break;
-                            }
+                            "kind" => match val.as_str() {
+                                "dylib" | "raw-dylib" => {}
+                                "framework" => is_framework = true,
+                                _ => {
+                                    skip = true;
+                                    break;
+                                }
+                            },
                             _ => {}
                         }
                     }
                 }
                 if !skip && let Some(found) = name {
-                    return Some(found);
+                    return Some(if is_framework {
+                        format!("framework={found}")
+                    } else {
+                        found
+                    });
                 }
             }
             _ => {}
@@ -424,6 +433,30 @@ mod tests {
         );
         assert_eq!(
             parse_first_link(r#"#[link(name = "   ")] extern "C" {}"#, win),
+            None
+        );
+        let mac = "aarch64-apple-darwin";
+        assert_eq!(
+            parse_first_link(
+                r#"#[link(name = "CoreFoundation", kind = "framework")] extern "C" {}"#,
+                mac,
+            )
+            .as_deref(),
+            Some("framework=CoreFoundation")
+        );
+        assert_eq!(
+            parse_first_link(
+                r#"#[cfg_attr(target_os = "macos", link(kind = "framework", name = "Security"))] extern "C" {}"#,
+                mac,
+            )
+            .as_deref(),
+            Some("framework=Security")
+        );
+        assert_eq!(
+            parse_first_link(
+                r#"#[cfg_attr(target_os = "macos", link(kind = "framework", name = "Security"))] extern "C" {}"#,
+                lin,
+            ),
             None
         );
     }

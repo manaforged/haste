@@ -777,3 +777,4 @@ fn decode_func_starts(bytes: &[u8]) -> Vec<u64> {
 }
 
 mod exports;
+mod macho_framework;

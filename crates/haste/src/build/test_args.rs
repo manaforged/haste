@@ -180,6 +180,12 @@ pub(super) fn map_tests(
 }
 
 fn keep_check_crate(outline: &Outline, target: Option<usize>, krate: usize) -> bool {
+    let sel = crate::selection();
+    let lib_only =
+        sel.lib && !sel.bins && !sel.all_targets && sel.bin.is_none() && sel.example.is_none();
+    if lib_only {
+        return outline.roots[krate].role == outline::Role::Lib;
+    }
     target.is_none() || target == Some(krate) || outline.roots[krate].role == outline::Role::Lib
 }
 
@@ -288,4 +294,40 @@ pub(super) fn check_fn_items_in(
         }
     }
     out
+}
+
+pub(super) fn main_items(workspace: &Workspace, outline: &Outline) -> Vec<ItemRef> {
+    let mut items: Vec<ItemRef> = super::main_item(workspace, outline).into_iter().collect();
+    for krate in outline.members(workspace) {
+        let tree = &outline.crates[krate];
+        for (file_idx, file) in tree.files.iter().enumerate() {
+            for (item_idx, entry) in file.items.items.iter().enumerate() {
+                if entry.kind != ItemKind::Fn || entry.attrs.is_empty() {
+                    continue;
+                }
+                let exported = tree
+                    .env
+                    .find_attr(&entry.attrs, outline::tree::Truth::Yes, &|attr| {
+                        matches!(
+                            *attr,
+                            outline::item::Attr::Other(at)
+                                if matches!(file.source.text(at), "no_mangle" | "export_name")
+                        )
+                        .then_some(())
+                    })
+                    .is_some();
+                if exported {
+                    let item = ItemRef {
+                        krate: krate as u32,
+                        file: file_idx as u32,
+                        item: item_idx as u32,
+                    };
+                    if !items.contains(&item) {
+                        items.push(item);
+                    }
+                }
+            }
+        }
+    }
+    items
 }

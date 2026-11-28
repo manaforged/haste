@@ -481,3 +481,20 @@ pub(super) fn prepare_local_check(
         dirty: part.dirty,
     })
 }
+
+pub(super) fn attach_warm_cache(workspace: &graph::Workspace, cache: &mut Cache) {
+    if !enabled() {
+        return;
+    }
+    let target = crate::host_target();
+    let tc_key = toolchain_key(workspace, &target);
+    let key = sema::summary::WarmKey {
+        toolchain_key: tc_key,
+        deps_key: deps_key(workspace, &target, tc_key),
+        target_key: target_hash(&target),
+        workspace_key: workspace_key(workspace, &target, tc_key),
+        release: crate::profile() == outline::tree::Profile::Release,
+    };
+    let backing = crate::substrate::Backing::open(&key.path(), sema::summary::WARM_MIN_LEN).ok();
+    cache.warm_state().set(key, backing);
+}

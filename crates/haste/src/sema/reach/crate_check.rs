@@ -15,6 +15,7 @@ use crate::sema::substs::Substs;
 use crate::sema::summary::expected_param_count;
 use crate::sema::ty::Ty;
 
+use super::reload::ReloadScope;
 use super::{Instance, Reached, ReachedEntry, typed_once};
 
 #[derive(Clone, Copy)]
@@ -102,6 +103,78 @@ pub(super) fn check_local_crate_items_in(
         collect_crate_items(cx, krate, &mut items);
         collect_crate_impls(cx, krate, &mut impls);
     }
+    let tasks = build_check_tasks(items, impls);
+    run_check_tasks(cx, reached, tasks, force_commit);
+}
+
+/// Validates local crate constants, statics, trait impls, and ADTs touched by `scope`.
+pub(super) fn check_local_crate_items_scoped(
+    cx: &mut Context<'_>,
+    reached: &mut Reached,
+    _roots: &[Instance],
+    force_commit: bool,
+    scope: &ReloadScope,
+) {
+    let has_old_dirty = !scope.old_dirty_items.is_empty() || !scope.dirty_files.is_empty();
+    let retry_crates = if has_old_dirty {
+        &scope.dependents
+    } else {
+        &scope.crates
+    };
+    let mut prior_errors = rustc_hash::FxHashSet::default();
+    for &idx in &reached.crate_errors {
+        if let Some(((item, _), _)) = reached.list.get(idx)
+            && retry_crates.contains(&item.krate)
+        {
+            prior_errors.insert(*item);
+        }
+    }
+    reached.retain_crate_errors(|krate| !retry_crates.contains(&krate));
+    let mut crates: Vec<u32> = retry_crates
+        .iter()
+        .copied()
+        .filter(|krate| {
+            !cx.outline.is_fixed(*krate)
+                && (has_old_dirty
+                    || scope.dirty_crates.contains(krate)
+                    || prior_errors.iter().any(|e| e.krate == *krate))
+        })
+        .collect();
+    crates.sort_unstable();
+    crates.dedup();
+    if crates.is_empty() {
+        return;
+    }
+    let mut items = Vec::new();
+    let mut impls = Vec::new();
+    for krate in crates {
+        collect_crate_items(cx, krate, &mut items);
+        collect_crate_impls(cx, krate, &mut impls);
+    }
+    items.retain(|&(item, kind)| {
+        scope.is_item_dirty(item)
+            || prior_errors.contains(&item)
+            || (has_old_dirty
+                && matches!(
+                    kind,
+                    ItemKind::Const
+                        | ItemKind::Static
+                        | ItemKind::Enum
+                        | ItemKind::Union
+                        | ItemKind::Struct
+                ))
+    });
+    impls.retain(|&(_, item)| {
+        scope.is_item_dirty(item) || prior_errors.contains(&item) || has_old_dirty
+    });
+    let tasks = build_check_tasks(items, impls);
+    run_check_tasks(cx, reached, tasks, force_commit);
+}
+
+fn build_check_tasks(
+    items: Vec<(ItemRef, ItemKind)>,
+    impls: Vec<(ImplRef, ItemRef)>,
+) -> Vec<CheckTask> {
     let mut tasks = Vec::with_capacity(items.len() + impls.len());
     for (item, kind) in items {
         match kind {
@@ -115,6 +188,18 @@ pub(super) fn check_local_crate_items_in(
     }
     for (block, item) in impls {
         tasks.push(CheckTask::Impl(block, item));
+    }
+    tasks
+}
+
+fn run_check_tasks(
+    cx: &mut Context<'_>,
+    reached: &mut Reached,
+    tasks: Vec<CheckTask>,
+    force_commit: bool,
+) {
+    if tasks.is_empty() {
+        return;
     }
     let workers = crate::jobs().min(tasks.len() / 4);
     if tasks.len() < 8 || workers <= 1 {

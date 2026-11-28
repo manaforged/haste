@@ -23,7 +23,7 @@ use batch::{Batch, BatchKind};
 use refresh::{refresh_edits, update_stamps};
 use substrate::{cache_with_substrate, save_jit_substrate};
 use test_args::map_tests;
-use watch::{Watch, body_edits, paths, pre_stamps, stamps, stamps_with_pre};
+use watch::{Watch, paths, pre_stamps, run_watched, stamps_with_pre, sync_included_stamps};
 
 /// A loaded workspace kept between requests: its compilation, the `case_` functions and the binary's reach once a request needs them, and the binary once a request runs it.
 pub struct Build {
@@ -36,6 +36,15 @@ pub struct Build {
     outline_span: sema::census::Span,
 }
 
+fn default_run_match(
+    workspace: &graph::Workspace,
+    outline: &outline::Outline,
+    krate: usize,
+) -> bool {
+    let pkg = &workspace.packages[workspace.graph.units[outline.roots[krate].unit].package];
+    pkg.manifest.default_run.as_deref() == Some(outline.roots[krate].name.as_str())
+}
+
 /// The `main` of the selected member binary or example (or the first member binary when neither `--bin` nor `--example` is set).
 pub(crate) fn main_item(
     workspace: &graph::Workspace,
@@ -46,6 +55,16 @@ pub(crate) fn main_item(
         Some(name) => (outline::Role::Example, Some(name.as_str())),
         None => (outline::Role::Bin, sel.bin.as_deref()),
     };
+    if wanted.is_none()
+        && role == outline::Role::Bin
+        && let Some(krate) = outline.members(workspace).find(|&k| {
+            outline.roots[k].role == role
+                && outline.main(k).is_some()
+                && default_run_match(workspace, outline, k)
+        })
+    {
+        return outline.main(krate);
+    }
     let krate = outline.members(workspace).find(|&krate| {
         outline.roots[krate].role == role
             && wanted.is_none_or(|name| outline.roots[krate].name == name)
@@ -75,11 +94,7 @@ fn require_main(workspace: &graph::Workspace, outline: &outline::Outline) -> Res
             let default_matches: Vec<usize> = bins
                 .iter()
                 .copied()
-                .filter(|&k| {
-                    let pkg =
-                        &workspace.packages[workspace.graph.units[outline.roots[k].unit].package];
-                    pkg.manifest.default_run.as_deref() == Some(outline.roots[k].name.as_str())
-                })
+                .filter(|&k| default_run_match(workspace, outline, k))
                 .collect();
             if default_matches.len() == 1 {
                 return outline
@@ -304,11 +319,24 @@ impl Build {
     ) -> Result<()> {
         if self.binary.is_none() {
             let sel = crate::selection();
-            let kind = if main_item(workspace, &self.compilation.outline).is_some() {
+            let lib_only = sel.lib
+                && !sel.bins
+                && !sel.all_targets
+                && sel.bin.is_none()
+                && sel.example.is_none();
+            let kind = if !lib_only && main_item(workspace, &self.compilation.outline).is_some() {
                 self.load_members(workspace)?;
                 BatchKind::MainCheck
             } else if sel.bin.is_some() || sel.example.is_some() {
                 return Err(missing_target_error());
+            } else if lib_only
+                && !self
+                    .compilation
+                    .outline
+                    .members(workspace)
+                    .any(|k| self.compilation.outline.roots[k].role == outline::Role::Lib)
+            {
+                bail!("no library target found");
             } else {
                 self.load_members(workspace)?;
                 BatchKind::LibCheck
@@ -325,7 +353,9 @@ impl Build {
 
     /// Number of reached functions in the compiled binary batch.
     pub(crate) fn reached_count(&self) -> usize {
-        self.binary.as_ref().map_or(0, |bin| bin.reached.list.len())
+        self.binary
+            .as_ref()
+            .map_or(0, |bin| bin.reached.live_count())
     }
 
     /// Local source and included file paths watched by this build.
@@ -366,8 +396,8 @@ impl Build {
                     .chain(stale.iter().map(|&(krate, _)| krate))
                     .collect(),
                 &paths,
-            ),
-            (false, true) => self.again(&stale),
+            )?,
+            (false, true) => self.again(workspace, &stale),
         };
         if !done {
             return self.rebuild(workspace, targets);
@@ -375,16 +405,20 @@ impl Build {
         Ok(())
     }
 
-    fn again(&mut self, stale: &[(u32, u32)]) -> bool {
+    fn again(&mut self, workspace: &graph::Workspace, stale: &[(u32, u32)]) -> bool {
         self.run_checked = false;
         if let Some(program) = &mut self.program {
             program.forget(&self.compilation.outline, Edited::Files(stale));
         }
         let compilation = &self.compilation;
-        [&mut self.cases, &mut self.binary]
+        let ok = [&mut self.cases, &mut self.binary]
             .into_iter()
             .flatten()
-            .all(|batch| batch.again(compilation, stale))
+            .all(|batch| batch.again(workspace, compilation, stale));
+        if ok && !self.stamps.is_empty() {
+            sync_included_stamps(workspace, &mut self.stamps, &self.compilation.outline);
+        }
+        ok
     }
 
     fn reload(
@@ -392,26 +426,40 @@ impl Build {
         workspace: &graph::Workspace,
         edited: Vec<u32>,
         changed_paths: &[PathBuf],
-    ) -> bool {
+    ) -> Result<bool> {
         self.run_checked = false;
+        let pre = refresh::snapshot_edited(
+            &self.compilation.outline,
+            &mut self.compilation.names,
+            &edited,
+        );
         let Ok(reloaded) = self
             .compilation
             .outline
             .reload_edited(&edited, changed_paths)
         else {
-            return false;
+            return Ok(false);
         };
-        let mut crates: Vec<u32> = reloaded.into_iter().map(|at| at as u32).collect();
-        crates.sort_unstable();
-        crates.dedup();
-        crates
-            .iter()
-            .for_each(|&krate| self.compilation.names.reset(krate as usize));
-        if crate::macros::resolve(&mut self.compilation).is_err() {
-            return false;
+        let Ok(Some((crates, dependents, scoped))) =
+            refresh::resolve_with_dependents(&mut self.compilation, pre, reloaded, changed_paths)
+        else {
+            return Ok(false);
+        };
+        let errors = self.compilation.outline.local_errors(workspace);
+        if !errors.is_empty() {
+            update_stamps(
+                workspace,
+                &mut self.stamps,
+                &self.compilation.outline,
+                &crates,
+            );
+            self.cases = None;
+            self.binary = None;
+            self.program = None;
+            bail!("{}", errors.join("\n"));
         }
         if let Some(program) = self.program.take() {
-            let store = program.into_store(&self.compilation.outline, Edited::Crates(&crates));
+            let store = program.into_store(&self.compilation.outline, Edited::Crates(&dependents));
             let main = main_item(workspace, &self.compilation.outline);
             self.program =
                 main.and_then(|main| Program::new(&mut self.compilation, store, main).ok());
@@ -422,11 +470,16 @@ impl Build {
             &self.compilation.outline,
             &crates,
         );
+        let batch_crates = if scoped.is_some() {
+            &crates
+        } else {
+            &dependents
+        };
         let compilation = &self.compilation;
-        [&mut self.cases, &mut self.binary]
+        Ok([&mut self.cases, &mut self.binary]
             .into_iter()
             .flatten()
-            .all(|batch| batch.reload(workspace, compilation, &crates))
+            .all(|batch| batch.reload(workspace, compilation, batch_crates, scoped.as_ref())))
     }
 
     fn rebuild(&mut self, workspace: &graph::Workspace, targets: &Targets) -> Result<()> {
@@ -675,51 +728,6 @@ fn run_loaded(
         }
     };
     std::mem::forget(compilation);
-    status
-}
-
-fn run_watched(
-    workspace: &graph::Workspace,
-    compilation: &mut Compilation,
-    cache: Cache,
-    main: ItemRef,
-    args: &[String],
-) -> Result<i32> {
-    let mut watched = stamps(workspace, &compilation.outline);
-    let files = paths(&watched);
-    let mut reread = |compilation: &mut Compilation| {
-        let stale = body_edits(workspace, &mut watched, &mut compilation.outline)
-            .map_err(crate::image::ReloadError::Restart)?;
-        if stale.is_empty() {
-            return Ok(stale);
-        }
-        let syntax_errors = compilation.outline.local_errors(workspace);
-        if !syntax_errors.is_empty() {
-            eprintln!("{}", syntax_errors.join("\n"));
-            return Err(crate::image::ReloadError::Compile(
-                "syntax error in edited file".to_owned(),
-            ));
-        }
-        let (_, errors) = batch::check_member_items(
-            workspace,
-            compilation,
-            Cache::default(),
-            Some(main.krate as usize),
-        )
-        .map_err(|e| crate::image::ReloadError::Compile(format!("{e:#}")))?;
-        if !errors.is_empty() {
-            for err in &errors {
-                eprintln!("{err}");
-            }
-            return Err(crate::image::ReloadError::Compile(
-                "compile error in edited file".to_owned(),
-            ));
-        }
-        Ok(stale)
-    };
-    let mut program = Program::new(compilation, cache, main)?;
-    let status = program.run_watched(compilation, args, (files, &mut reread));
-    std::mem::forget(program);
     status
 }
 
