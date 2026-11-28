@@ -208,6 +208,7 @@ pub(super) fn resolve_with_dependents(
     compilation: &mut Compilation,
     (edited, mut pre): (Vec<u32>, PreReload),
     reloaded: Vec<usize>,
+    stale_bodies: &[(u32, u32)],
     changed_paths: &[PathBuf],
 ) -> Result<Option<(Vec<u32>, Vec<u32>, Option<ReloadScope>)>> {
     let mut crates: Vec<u32> = reloaded.into_iter().map(|at| at as u32).collect();
@@ -263,6 +264,7 @@ pub(super) fn resolve_with_dependents(
         pre,
         &crates,
         &dependents,
+        stale_bodies,
         &compilation.outline,
         &compilation.names,
     );
@@ -330,6 +332,7 @@ pub(super) fn diff_reload(
     pre: PreReload,
     crates: &[u32],
     dependents: &[u32],
+    stale_bodies: &[(u32, u32)],
     outline: &Outline,
     names: &Names,
 ) -> Option<ReloadScope> {
@@ -381,6 +384,16 @@ pub(super) fn diff_reload(
         for (file_idx, (old_f, new_f)) in old.files.iter().zip(&new_tree.files).enumerate() {
             let f_u32 = file_idx as u32;
             if Arc::ptr_eq(old_f, new_f) || files_identical(old_f, new_f) {
+                if stale_bodies.contains(&(krate, f_u32)) {
+                    crate_dirty = true;
+                    for idx in 0..new_f.items.items.len() {
+                        all_dirty_items.insert(ItemRef {
+                            krate,
+                            file: f_u32,
+                            item: idx as u32,
+                        });
+                    }
+                }
                 if !file_consumed_eq(&old.consumed, &new_tree.consumed, f_u32) {
                     crate_dirty = true;
                     for &(cf, ci) in old.consumed.iter().chain(&new_tree.consumed) {

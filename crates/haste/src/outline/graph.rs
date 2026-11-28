@@ -54,13 +54,18 @@ pub fn roots(workspace: &Workspace, scripts: &[usize]) -> Vec<Root> {
                 });
             roots.extend(bins);
             let sel = crate::selection();
-            if sel.all_targets || sel.example.is_some() {
+            if sel.all_targets || !sel.example.is_empty() {
                 let examples = manifest
                     .examples
                     .iter()
                     .filter(|t| {
                         t.enabled(&entry.features)
-                            && sel.example.as_deref().is_none_or(|wanted| t.name == wanted)
+                            && (sel.example.is_empty()
+                                || sel.all_targets
+                                || sel
+                                    .example
+                                    .iter()
+                                    .any(|want| crate::cli::target_name_matches(&t.name, want)))
                     })
                     .map(|t| Root {
                         unit,
@@ -87,18 +92,23 @@ pub fn roots(workspace: &Workspace, scripts: &[usize]) -> Vec<Root> {
                     });
                 roots.extend(benches);
             }
-            if crate::test_mode()
-                && !sel.lib
-                && !sel.bins
-                && sel.bin.is_none()
-                && sel.example.is_none()
-            {
+            let include_tests = crate::test_mode()
+                && (!sel.test.is_empty()
+                    || sel.tests
+                    || sel.all_targets
+                    || (!sel.lib && !sel.bins && sel.bin.is_empty() && sel.example.is_empty()));
+            if include_tests {
                 let tests = manifest
                     .tests
                     .iter()
                     .filter(|t| {
                         t.enabled(&entry.features)
-                            && sel.test.as_deref().is_none_or(|want| t.name == want)
+                            && (sel.test.is_empty()
+                                || sel.all_targets
+                                || sel
+                                    .test
+                                    .iter()
+                                    .any(|want| crate::cli::target_name_matches(&t.name, want)))
                     })
                     .map(|t| Root {
                         unit,

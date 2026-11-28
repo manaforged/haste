@@ -300,6 +300,10 @@ pub(super) fn write_outline_crate<'a>(
     write_coords(out, &krate.consumed)?;
     write_coords(out, &krate.resolved_tests)?;
     write_local_krates(out, &krate.macro_use, tables)?;
+    write_usize(out, krate.link_libs.len())?;
+    for lib in &krate.link_libs {
+        write_str(out, lib)?;
+    }
     write_usize(out, krate.expansions)?;
     Some(())
 }
@@ -509,6 +513,11 @@ pub(super) fn read_outline_crate(
     let consumed = read_coords(reader)?;
     let resolved_tests = read_coords(reader)?;
     let macro_use = read_remapped_krates(reader, remap, "macro_use crate out of bounds")?;
+    let link_lib_count = reader.count()?;
+    let mut link_libs = Vec::with_capacity(link_lib_count);
+    for _ in 0..link_lib_count {
+        link_libs.push(reader.str()?.to_owned());
+    }
     let expansions = reader.u32()? as usize;
     Ok(OutlineCrate {
         env: Default::default(),
@@ -532,6 +541,7 @@ pub(super) fn read_outline_crate(
         consumed,
         resolved_tests,
         macro_use,
+        link_libs,
         expansions,
         cached_included: None,
     })

@@ -438,6 +438,11 @@ impl<'a> Context<'a> {
         crate::names::plain(self.name(item))
     }
 
+    /// External libraries declared by active `#[link(...)]` extern blocks in crate `krate`.
+    pub fn crate_link_libs(&self, krate: u32) -> &[String] {
+        &self.outline.crates[krate as usize].link_libs
+    }
+
     /// The declared edition of crate `krate`, if non-empty.
     pub fn crate_edition(&self, krate: u32) -> Option<&str> {
         self.names

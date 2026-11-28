@@ -111,7 +111,7 @@ pub(crate) fn meta_stamp(meta: &std::fs::Metadata) -> (u64, i128) {
 /// The byte size and modification timestamp of `path`, or none when unreadable.
 pub(crate) fn file_stamp(path: &Path) -> FileStamp {
     let meta = std::fs::metadata(path).ok()?;
-    Some(meta_stamp(&meta))
+    Some(file_meta_stamp(path, &meta))
 }
 
 /// Computes [`file_stamp`] for each path in `paths` in parallel when `paths.len() >= 64`.
@@ -167,6 +167,23 @@ pub(crate) fn stamps_match(watched: &[(PathBuf, FileStamp)], parallel: bool) -> 
     })
 }
 
+/// Computes an `FxHasher` digest of a byte slice.
+pub(crate) fn hash_bytes(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = rustc_hash::FxHasher::default();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn file_meta_stamp(path: &Path, meta: &std::fs::Metadata) -> (u64, i128) {
+    let (len, nanos) = meta_stamp(meta);
+    let Ok(bytes) = std::fs::read(path) else {
+        return (len, nanos);
+    };
+    let hash = hash_bytes(&bytes);
+    (len, ((hash as i128) << 64) | i128::from(nanos as u64))
+}
+
 /// Computes an `FxHasher` digest of a string slice.
 pub(crate) fn hash_str(s: &str) -> u64 {
     use std::hash::{Hash as _, Hasher as _};
@@ -189,7 +206,11 @@ pub(crate) fn hash_env_val(magic: &[u8; 8], name: &str, val: &str) -> u64 {
 /// The size and modification time of this program, whose changes make what the store kept stale.
 pub(crate) fn program() -> FileStamp {
     static PROGRAM: std::sync::OnceLock<FileStamp> = std::sync::OnceLock::new();
-    *PROGRAM.get_or_init(|| std::env::current_exe().ok().as_deref().and_then(file_stamp))
+    *PROGRAM.get_or_init(|| {
+        let exe = std::env::current_exe().ok()?;
+        let meta = std::fs::metadata(exe).ok()?;
+        Some(meta_stamp(&meta))
+    })
 }
 
 /// The directory that holds the build script output of `unit`: the script's `OUT_DIR`, its standard error, what it printed and the stamp that says when it is current.
@@ -609,7 +630,7 @@ pub(crate) fn walk(path: &Path, into: &mut Vec<(PathBuf, u64, i128)>) {
         return;
     };
     if !meta.is_dir() {
-        let (len, nanos) = meta_stamp(&meta);
+        let (len, nanos) = file_meta_stamp(path, &meta);
         into.push((path.to_owned(), len, nanos));
         return;
     }

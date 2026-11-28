@@ -205,19 +205,79 @@ fn file_stamps_ref(paths: &[&Path]) -> Vec<FileStamp> {
     })
 }
 
-fn stamp_matches_raw(raw_path: &[u8], expected: FileStamp) -> bool {
+fn path_from_raw(raw_path: &[u8]) -> Option<&Path> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt as _;
-        let path = Path::new(std::ffi::OsStr::from_bytes(raw_path));
-        file_stamp(path) == expected
+        Some(Path::new(std::ffi::OsStr::from_bytes(raw_path)))
     }
     #[cfg(not(unix))]
     {
-        std::str::from_utf8(raw_path)
-            .ok()
-            .is_some_and(|s| file_stamp(Path::new(s)) == expected)
+        std::str::from_utf8(raw_path).ok().map(Path::new)
     }
+}
+
+fn stamp_matches_raw(raw_path: &[u8], expected: FileStamp) -> bool {
+    path_from_raw(raw_path).is_some_and(|path| file_stamp(path) == expected)
+}
+
+/// Returns whether `candidate` equals or lies inside any workspace path in `roots`.
+pub(crate) fn path_in_workspace(candidate: &Path, roots: &[PathBuf]) -> bool {
+    let matches_any = |p: &Path| roots.iter().any(|r| p == r || p.starts_with(r));
+    if matches_any(candidate) {
+        return true;
+    }
+    std::fs::canonicalize(candidate).is_ok_and(|c| matches_any(&c))
+}
+
+/// Returns whether an encoded no-op `.stamp` buffer watches any path inside `roots`.
+pub(crate) fn matches_workspace(data: &[u8], roots: &[PathBuf]) -> bool {
+    if data.len() < HEADER_LEN || data[..8] != NOOP_MAGIC {
+        return false;
+    }
+    let total_count = read_u32(data, 40) as usize;
+    let dir_count = read_u32(data, 44) as usize;
+    let env_count = read_u32(data, 48) as usize;
+    let mut pos = HEADER_LEN;
+    for _ in 0..env_count {
+        if read_utf8(data, &mut pos).is_none() {
+            return false;
+        }
+        let Some(&present) = read_bytes(data, &mut pos, 1).and_then(<[u8]>::first) else {
+            return false;
+        };
+        match present {
+            0 => {}
+            1 => {
+                if read_bytes(data, &mut pos, 8).is_none() {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    for _ in 0..total_count {
+        let Some((raw_path, _)) = read_raw_entry(data, &mut pos) else {
+            return false;
+        };
+        if path_from_raw(raw_path).is_some_and(|path| path_in_workspace(path, roots)) {
+            return true;
+        }
+    }
+    for _ in 0..dir_count {
+        let Some(dir) = read_path(data, &mut pos) else {
+            return false;
+        };
+        if path_in_workspace(&dir, roots) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+pub(crate) fn encode_test_stamp(path: &Path) -> Vec<u8> {
+    encode_stamp_file(0, 1, 0, 1, &[(path, None)], &[path.to_path_buf()], &[]).unwrap_or_default()
 }
 
 fn write_path_ref(out: &mut Vec<u8>, path: &Path) -> Option<()> {

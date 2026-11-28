@@ -370,19 +370,13 @@ mod tests {
         };
         let names = Names::default();
         let mut cx = Context::new(&outline, &names, Cache::default());
-        let writer = Writer {
-            out: Tokens::default(),
-            calls: HashMap::default(),
-            offset: 0,
-            home: ModRef {
+        let writer = Writer::new(
+            ModRef {
                 krate: 0,
                 module: 0,
             },
-            locals: Vec::new(),
-            uses: Vec::new(),
-            globs: Vec::new(),
-            externs: Vec::new(),
-        };
+            0,
+        );
         let run = Run {
             src: &call_src,
             from: 0,

@@ -179,17 +179,57 @@ pub(super) fn map_tests(
         .collect()
 }
 
-fn keep_check_crate(outline: &Outline, target: Option<usize>, krate: usize) -> bool {
-    let sel = crate::selection();
-    let lib_only =
-        sel.lib && !sel.bins && !sel.all_targets && sel.bin.is_none() && sel.example.is_none();
-    if lib_only {
-        return outline.roots[krate].role == outline::Role::Lib;
-    }
-    target.is_none() || target == Some(krate) || outline.roots[krate].role == outline::Role::Lib
+pub(super) fn lib_only_selection(sel: &crate::Selection) -> bool {
+    sel.lib
+        && !sel.bins
+        && !sel.all_targets
+        && !sel.tests
+        && sel.bin.is_empty()
+        && sel.example.is_empty()
+        && sel.test.is_empty()
 }
 
-pub(super) fn checked_member_crates(
+fn keep_check_crate(outline: &Outline, target: Option<usize>, krate: usize) -> bool {
+    let sel = crate::selection();
+    let root = &outline.roots[krate];
+    if lib_only_selection(&sel) {
+        return root.role == outline::Role::Lib;
+    }
+    let has_explicit = sel.lib
+        || sel.bins
+        || sel.tests
+        || !sel.bin.is_empty()
+        || !sel.example.is_empty()
+        || !sel.test.is_empty();
+    if !sel.all_targets && has_explicit {
+        if root.role == outline::Role::Lib {
+            return true;
+        }
+        if crate::cli::is_lib_test_root(outline, root) {
+            return sel.tests || (sel.lib && crate::test_mode());
+        }
+        return ((sel.bins || sel.tests) && root.role == outline::Role::Bin)
+            || (root.role == outline::Role::Bin
+                && sel
+                    .bin
+                    .iter()
+                    .any(|n| crate::cli::target_name_matches(&root.name, n)))
+            || (root.role == outline::Role::Example
+                && sel
+                    .example
+                    .iter()
+                    .any(|n| crate::cli::target_name_matches(&root.name, n)))
+            || (root.role == outline::Role::Test
+                && (sel.tests
+                    || sel
+                        .test
+                        .iter()
+                        .any(|n| crate::cli::target_name_matches(&root.name, n))));
+    }
+    target.is_none() || target == Some(krate) || root.role == outline::Role::Lib
+}
+
+pub(crate) fn checked_member_crates(
     workspace: &Workspace,
     outline: &Outline,
     target: Option<usize>,
@@ -209,12 +249,12 @@ pub(super) fn check_target(
         return None;
     }
     let sel = crate::selection();
-    (sel.bin.is_some() || sel.example.is_some())
+    (sel.bin.len() + sel.example.len() == 1 && sel.test.is_empty() && !sel.tests)
         .then(|| super::main_item(workspace, outline).map(|m| m.krate as usize))
         .flatten()
 }
 
-pub(super) fn check_fn_items(
+pub(crate) fn check_fn_items(
     workspace: &Workspace,
     outline: &Outline,
     target: Option<usize>,

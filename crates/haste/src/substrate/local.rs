@@ -565,5 +565,54 @@ pub fn record(outline: &Outline, dirty: &[DirtyCrate], failed_crates: &HashSet<u
     }
 }
 
+fn watch_matches_workspace(
+    data: &[u8],
+    mut pos: usize,
+    inc_count: usize,
+    env_count: usize,
+    roots: &[PathBuf],
+) -> bool {
+    let Some((included, _)) = read_watch_data(data, &mut pos, inc_count, env_count) else {
+        return false;
+    };
+    included
+        .iter()
+        .any(|(path, _)| super::noop::path_in_workspace(path, roots))
+}
+
+/// Returns whether an encoded `.check` entry watches any path inside `roots`.
+pub(crate) fn check_matches_workspace(data: &[u8], roots: &[PathBuf]) -> bool {
+    if data.len() < CHECK_HEADER_LEN || data[0..8] != LOCAL_MAGIC {
+        return false;
+    }
+    let inc_count = read_u32(data, 16) as usize;
+    let env_count = read_u32(data, 20) as usize;
+    watch_matches_workspace(data, CHECK_HEADER_LEN, inc_count, env_count, roots)
+}
+
+/// Returns whether an encoded `.files` entry watches any path inside `roots`.
+pub(crate) fn files_matches_workspace(data: &[u8], roots: &[PathBuf]) -> bool {
+    if data.len() < FILES_HEADER_LEN || data[0..8] != FILES_MAGIC {
+        return false;
+    }
+    let file_count = read_u32(data, 16) as usize;
+    let inc_count = read_u32(data, 20) as usize;
+    let env_count = read_u32(data, 24) as usize;
+    let Some(pos) = FILES_HEADER_LEN.checked_add(file_count.saturating_mul(16)) else {
+        return false;
+    };
+    watch_matches_workspace(data, pos, inc_count, env_count, roots)
+}
+
+#[cfg(test)]
+pub(crate) fn encode_test_check(included: &Path) -> Vec<u8> {
+    encode_entry(0, &[(included.to_path_buf(), None)], &[]).unwrap_or_default()
+}
+
+#[cfg(test)]
+pub(crate) fn encode_test_files(included: &Path) -> Vec<u8> {
+    encode_files_entry(0, &[], &[(included.to_path_buf(), None)], &[]).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests;

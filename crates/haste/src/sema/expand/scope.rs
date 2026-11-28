@@ -9,7 +9,7 @@ use crate::outline::rules::{self, Rule};
 use crate::outline::source::{Source, Tokens};
 use crate::sema::Context;
 
-use super::writer::{Local, Run, Writer, def_site_macro};
+use super::writer::{Local, Run, Writer};
 
 fn use_entries(
     src: &Source,
@@ -202,7 +202,13 @@ impl Writer {
         Ok(())
     }
 
-    pub(super) fn note_extern(&mut self, cx: &Context<'_>, src: &Source, at: u32) -> Option<u32> {
+    pub(super) fn note_extern(
+        &mut self,
+        cx: &Context<'_>,
+        src: &Source,
+        at: u32,
+        macro_use: bool,
+    ) -> Option<u32> {
         let orig = plain(src.text(at + 2));
         let (alias, end) = match (src.text(at + 3), src.kind(at + 3)) {
             (_, TokenKind::Semi) => (orig, at + 4),
@@ -211,14 +217,17 @@ impl Writer {
             }
             _ => return None,
         };
-        if alias != "_"
-            && let Some(root) = extern_crate_root(
-                orig,
-                self.home.krate,
-                &cx.outline.deps[self.home.krate as usize],
-            )
-        {
-            self.externs.push((alias.to_owned(), root));
+        if let Some(root) = extern_crate_root(
+            orig,
+            self.home.krate,
+            &cx.outline.deps[self.home.krate as usize],
+        ) {
+            if macro_use && !self.macro_uses.contains(&root) {
+                self.macro_uses.push(root);
+            }
+            if alias != "_" {
+                self.externs.push((alias.to_owned(), root));
+            }
         }
         Some(end)
     }
@@ -316,10 +325,20 @@ impl Writer {
         }
         match self
             .resolve_macro(cx, run.src, path)
-            .or_else(|| def_site_macro(cx, run.src, path))
+            .or_else(|| self.def_site_macro(cx, run.src, path))
         {
             Some(found) => Ok(Some(found)),
-            None => self.resolve_glob(cx, run.src, path),
+            None => {
+                if let Some(found) = self.resolve_glob(cx, run.src, path)? {
+                    return Ok(Some(found));
+                }
+                for &root in self.macro_uses.iter().rev() {
+                    if let Some(found) = macro_at(&cx.paths(root.krate), run.src, path, root) {
+                        return Ok(Some(found));
+                    }
+                }
+                Ok(None)
+            }
         }
     }
 }
@@ -360,6 +379,15 @@ mod tests {
         tag: &str,
         dep_src: &str,
         app_src: &str,
+    ) -> std::sync::Arc<crate::body::Body> {
+        expand_two_crates_at(tag, dep_src, app_src, 0)
+    }
+
+    fn expand_two_crates_at(
+        tag: &str,
+        dep_src: &str,
+        app_src: &str,
+        item: u32,
     ) -> std::sync::Arc<crate::body::Body> {
         let dir = std::env::temp_dir().join(format!("haste_{tag}_{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create test dir");
@@ -416,7 +444,7 @@ mod tests {
         let fn_item = ItemRef {
             krate: 1,
             file: 0,
-            item: 0,
+            item,
         };
         let body = cx.body(fn_item).expect("expand body");
         let _ = std::fs::remove_dir_all(&dir);
@@ -517,6 +545,69 @@ mod tests {
         assert_all_macros_expanded(
             &body,
             "braced root `use` and `{self as alias}` must expand macros",
+        );
+    }
+
+    #[test]
+    fn local_inner_macros_argument_macro_expands_without_caller_import() {
+        let body = expand_two_crates(
+            "local_inner_arg_macro",
+            concat!(
+                "#[macro_export]\n",
+                "macro_rules! relative_eq { ($l:expr, $r:expr) => { $l == $r }; }\n",
+                "#[macro_export]\n",
+                "macro_rules! __assert_approx { ($eq:ident, $l:expr, $r:expr) => { if !($eq!($l, $r)) {} }; }\n",
+                "#[macro_export(local_inner_macros)]\n",
+                "macro_rules! assert_relative_eq { ($l:expr, $r:expr) => { __assert_approx!(relative_eq, $l, $r) }; }\n",
+            ),
+            concat!(
+                "fn run() {\n",
+                "    use dep::assert_relative_eq;\n",
+                "    assert_relative_eq!(1u32, 1u32);\n",
+                "}\n",
+            ),
+        );
+        assert_all_macros_expanded(
+            &body,
+            "macro ident emitted by #[macro_export(local_inner_macros)] must expand",
+        );
+    }
+
+    #[test]
+    fn macro_use_extern_crate_with_cfg_attr_and_local_extern_expands() {
+        let dep_src =
+            "#[macro_export] macro_rules! relative_eq { ($l:expr, $r:expr) => { $l == $r }; }\n";
+        let root_body = expand_two_crates_at(
+            "macro_use_cfg_attr",
+            dep_src,
+            concat!(
+                "#[cfg_attr(all(), macro_use)]\n",
+                "pub extern crate dep;\n",
+                "fn run() -> bool {\n",
+                "    relative_eq!(1u32, 1u32)\n",
+                "}\n",
+            ),
+            1,
+        );
+        assert_all_macros_expanded(
+            &root_body,
+            "#[cfg_attr(..., macro_use)] pub extern crate must import macros",
+        );
+
+        let local_body = expand_two_crates(
+            "macro_use_local_extern",
+            dep_src,
+            concat!(
+                "fn run() -> bool {\n",
+                "    #[macro_use]\n",
+                "    extern crate dep;\n",
+                "    relative_eq!(1u32, 1u32)\n",
+                "}\n",
+            ),
+        );
+        assert_all_macros_expanded(
+            &local_body,
+            "function-local #[macro_use] extern crate must import macros",
         );
     }
 }

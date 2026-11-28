@@ -233,11 +233,11 @@ impl Emit<'_> {
             _ => IntCC::UnsignedGreaterThan,
         };
         let dst = self.xmm_of(result).unwrap_or(X2);
-        self.fget(X0, x);
-        self.fget(X1, y);
-        if lane == Lane::I64 && !self.features.sse41 {
+        if lane == Lane::I64 && !self.features.sse42 {
             self.scalarize_int_binary(op, lane, count, x, y, dst);
         } else {
+            self.fget(X0, x);
+            self.fget(X1, y);
             self.emit_icmp_regs(cc, lane, X0, X1, X2);
             self.fget(X0, x);
             self.fget(X1, y);

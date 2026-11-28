@@ -180,38 +180,24 @@ impl<'a> Loader<'a> {
 }
 
 impl Loader<'_> {
-    /// Reads the declared module `module` as `load` does, and after the root module adds the `#[macro_use]` extern crates it names.
+    /// Reads the declared module `module` as `load` does.
     pub fn load_module(&mut self, module: usize) -> Result<()> {
-        self.load(module)?;
-        if module == 0 {
-            self.macro_use_externs();
-        }
-        Ok(())
+        self.load(module)
     }
 
-    fn macro_use_externs(&mut self) {
-        let Some(root) = self.out.modules.first().filter(|root| root.loaded()) else {
+    fn register_macro_use(&mut self, src: &Source, item: &Item) {
+        let Some(pos) = (item.start..item.end).find(|&tok| src.text(tok) == "crate") else {
             return;
         };
-        let files: Vec<Arc<File>> = std::iter::once(root.file)
-            .chain(root.parts.iter().copied())
-            .filter_map(|idx| self.out.files.get(idx).cloned())
-            .collect();
-        for file in files {
-            let externs = file.items.items.iter().filter(|item| {
-                item.kind == ItemKind::ExternCrate
-                    && item.parent.is_none()
-                    && item.attrs.contains(&Attr::MacroUse)
-            });
-            for item in externs {
-                let name = file.source.text(item.start + 2);
-                let Some(&(_, at)) = self.deps.iter().find(|(dep, _)| dep == name) else {
-                    continue;
-                };
-                if !self.out.macro_use.contains(&at) {
-                    self.out.macro_use.push(at);
-                }
-            }
+        if pos + 1 >= item.end {
+            return;
+        }
+        let name = crate::names::plain(src.text(pos + 1));
+        let Some(&(_, at)) = self.deps.iter().find(|(dep, _)| dep == name) else {
+            return;
+        };
+        if !self.out.macro_use.contains(&at) {
+            self.out.macro_use.push(at);
         }
     }
 
@@ -311,6 +297,21 @@ impl Loader<'_> {
             }
             ItemKind::Impl => self.impl_block(index, module, at, file)?,
             ItemKind::Trait => self.trait_block(index, module, at, file)?,
+            ItemKind::ExternCrate
+                if self
+                    .out
+                    .env
+                    .has_attr(&item.attrs, &|a| matches!(a, Attr::MacroUse)) =>
+            {
+                self.register_macro_use(&file.source, item);
+            }
+            ItemKind::ExternBlock if !item.attrs.is_empty() => {
+                if let Some(lib) = super::attr::link_name(&file.source, &item.attrs, &self.out.env)
+                    && !self.out.link_libs.contains(&lib)
+                {
+                    self.out.link_libs.push(lib);
+                }
+            }
             ItemKind::Struct | ItemKind::Enum | ItemKind::Union => {
                 self.derive(file, module, (at, item))?;
             }

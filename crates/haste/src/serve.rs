@@ -10,26 +10,20 @@ pub use control::{status, stop};
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::fd::{FromRawFd, RawFd};
-use std::path::Path;
-#[cfg(unix)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::graph::{self, Targets};
 use anyhow::{Result, bail};
 
 use crate::build::Build;
-#[cfg(unix)]
 use crate::graph::store::{FileStamp, file_stamp, watched_stamps};
 #[cfg(unix)]
 use crate::outline::tree::Profile;
 
-/// The workspace a server answers for: its root, targets and graph, and the stamps of the lock file, local manifests, build scripts, target directories, and watched inputs it was loaded from.
-#[cfg(unix)]
-struct Served<'a> {
-    root: &'a Path,
-    targets: &'a Targets,
-    workspace: &'a mut graph::Workspace,
+/// Snapshot of workspace manifests, target discovery, build-script watches, and rustflags environment.
+pub(crate) struct WorkspaceWatch {
+    root: PathBuf,
     manifests: Vec<(PathBuf, FileStamp)>,
     target_stamp: u64,
     rustflags_env: (Option<String>, Option<String>),
@@ -39,8 +33,7 @@ struct Served<'a> {
     ),
 }
 
-#[cfg(unix)]
-impl Served<'_> {
+impl WorkspaceWatch {
     fn rustflags_snapshot() -> (Option<String>, Option<String>) {
         (
             crate::process_env_var("RUSTFLAGS"),
@@ -48,7 +41,7 @@ impl Served<'_> {
         )
     }
 
-    fn manifests(workspace: &graph::Workspace, root: &Path) -> Vec<(PathBuf, FileStamp)> {
+    fn manifest_stamps(workspace: &graph::Workspace, root: &Path) -> Vec<(PathBuf, FileStamp)> {
         graph::manifest_paths(workspace, root)
             .into_iter()
             .map(|path| {
@@ -85,35 +78,79 @@ impl Served<'_> {
             .collect()
     }
 
-    /// Loads the workspace again, running changed build scripts, when the lock file, a local manifest, a local build script, a target directory, or a watched input changed since it loaded; returns whether it did.
-    fn reload(&mut self) -> Result<bool> {
-        let manifests_ok = self
-            .manifests
+    /// Captures all workspace, build-script, and environment freshness inputs for `workspace` at `root`.
+    pub(crate) fn capture(workspace: &graph::Workspace, root: &Path) -> Self {
+        Self {
+            root: root.to_owned(),
+            manifests: Self::manifest_stamps(workspace, root),
+            target_stamp: crate::substrate::noop::target_discovery_stamp(workspace),
+            rustflags_env: Self::rustflags_snapshot(),
+            watched: watched_stamps(workspace),
+        }
+    }
+
+    /// Returns whether every compiler-recorded `env!`/`option_env!` read on `build` still matches.
+    pub(crate) fn env_reads_fresh(build: &Build) -> bool {
+        !build
+            .env_reads()
+            .into_iter()
+            .any(|(name, prev)| crate::process_env_var(&name) != prev)
+    }
+
+    /// Returns whether manifests, discovered targets, and rustflags environment match the captured snapshot.
+    fn workspace_inputs_fresh(&self, workspace: &graph::Workspace) -> bool {
+        self.manifests
             .iter()
-            .all(|(path, kept)| file_stamp(path) == *kept);
-        let targets_ok =
-            crate::substrate::noop::target_discovery_stamp(self.workspace) == self.target_stamp;
-        let rustflags_now = Self::rustflags_snapshot();
-        let watched_now = watched_stamps(self.workspace);
-        if manifests_ok && targets_ok && rustflags_now == self.rustflags_env {
-            if watched_now == self.watched {
+            .all(|(path, kept)| file_stamp(path) == *kept)
+            && crate::substrate::noop::target_discovery_stamp(workspace) == self.target_stamp
+            && Self::rustflags_snapshot() == self.rustflags_env
+    }
+
+    /// Returns whether manifests, discovered targets, build-script watches, rustflags, and `build` env reads are all unchanged.
+    pub(crate) fn is_fresh(&self, workspace: &graph::Workspace, build: Option<&Build>) -> bool {
+        self.workspace_inputs_fresh(workspace)
+            && watched_stamps(workspace) == self.watched
+            && build.is_none_or(Self::env_reads_fresh)
+    }
+
+    /// Refreshes `workspace` when manifests, targets, rustflags, or build-script watches changed; returns whether cached build state is invalidated.
+    pub(crate) fn refresh_workspace(
+        &mut self,
+        workspace: &mut graph::Workspace,
+        targets: &Targets,
+    ) -> Result<bool> {
+        if self.workspace_inputs_fresh(workspace) {
+            if watched_stamps(workspace) == self.watched {
                 return Ok(false);
             }
-            let before = Self::local_script_snapshot(self.workspace);
+            let before = Self::local_script_snapshot(workspace);
             for &(unit, _, _) in &before {
-                self.workspace.graph.units[unit].script = None;
+                workspace.graph.units[unit].script = None;
             }
-            crate::scripts::settle(self.workspace, self.targets)?;
-            self.watched = watched_stamps(self.workspace);
-            let after = Self::local_script_snapshot(self.workspace);
+            crate::scripts::settle(workspace, targets)?;
+            self.watched = watched_stamps(workspace);
+            let after = Self::local_script_snapshot(workspace);
             return Ok(before != after);
         }
-        *self.workspace = crate::cli::load_workspace(self.root, self.targets)?;
-        self.manifests = Served::manifests(self.workspace, self.root);
-        self.target_stamp = crate::substrate::noop::target_discovery_stamp(self.workspace);
-        self.rustflags_env = rustflags_now;
-        self.watched = watched_stamps(self.workspace);
+        *workspace = crate::cli::load_workspace(&self.root, targets)?;
+        *self = Self::capture(workspace, &self.root);
         Ok(true)
+    }
+}
+
+/// The workspace a server answers for: its targets, graph, and captured watch state.
+#[cfg(unix)]
+struct Served<'a> {
+    targets: &'a Targets,
+    workspace: &'a mut graph::Workspace,
+    watch: WorkspaceWatch,
+}
+
+#[cfg(unix)]
+impl Served<'_> {
+    /// Loads the workspace again, running changed build scripts, when the lock file, a local manifest, a local build script, a target directory, or a watched input changed since it loaded; returns whether it did.
+    fn reload(&mut self) -> Result<bool> {
+        self.watch.refresh_workspace(self.workspace, self.targets)
     }
 }
 
@@ -306,22 +343,25 @@ mod unix_ipc {
             crate::MessageFormat::JsonRenderDiagnostics => Some("json-render-diagnostics"),
         };
         let jobs = jobs.to_string();
-        for pkg in &sel.packages {
-            args.push("-p".to_owned());
-            args.push(pkg.clone());
+        for (flag, vals) in [
+            ("-p", &sel.packages),
+            ("--bin", &sel.bin),
+            ("--example", &sel.example),
+            ("--test", &sel.test),
+        ] {
+            for val in vals {
+                args.extend([flag.to_owned(), val.clone()]);
+            }
         }
         for (flag, val) in [
-            ("--bin", sel.bin.as_deref()),
-            ("--example", sel.example.as_deref()),
-            ("--test", sel.test.as_deref()),
             ("-F", features.as_deref()),
             ("--message-format", message_format),
             ("-j", Some(jobs.as_str())),
-        ] {
-            if let Some(val) = val {
-                args.push(flag.to_owned());
-                args.push(val.to_owned());
-            }
+        ]
+        .into_iter()
+        .filter_map(|(f, v)| v.map(|s| (f, s)))
+        {
+            args.extend([flag.to_owned(), val.to_owned()]);
         }
         args
     }
@@ -556,9 +596,7 @@ mod unix_ipc {
             &key_hex, root, &sock_name,
         )?));
         let started = Instant::now();
-        let manifests = Served::manifests(workspace, root);
-        let target_stamp = crate::substrate::noop::target_discovery_stamp(workspace);
-        let watched = watched_stamps(workspace);
+        let watch = WorkspaceWatch::capture(workspace, root);
         let mut build = Some(Build::load(workspace, targets)?);
         if let Some(ref mut warm) = build {
             match std::env::var_os("HASTE_SERVE_WARM")
@@ -571,13 +609,9 @@ mod unix_ipc {
             }
         }
         let mut served = Served {
-            root,
             targets,
             workspace,
-            manifests,
-            target_stamp,
-            rustflags_env: Served::rustflags_snapshot(),
-            watched,
+            watch,
         };
         let idle_ms = idle_timeout_ms();
         eprintln!(
@@ -657,11 +691,9 @@ mod unix_ipc {
                 let cenv = Some(std::sync::Arc::new(payload.env));
                 crate::with_client_env(cenv, || {
                     served.reload().and_then(|reloaded| {
-                        let env_stale = build.as_ref().is_some_and(|b| {
-                            b.env_reads()
-                                .into_iter()
-                                .any(|(name, prev)| crate::process_env_var(&name) != prev)
-                        });
+                        let env_stale = build
+                            .as_ref()
+                            .is_some_and(|b| !WorkspaceWatch::env_reads_fresh(b));
                         let kept = build.take().filter(|_| !reloaded && !env_stale);
                         let (workspace, targets) = (&*served.workspace, served.targets);
                         current(kept, workspace, targets).and_then(|fresh| {
@@ -713,15 +745,7 @@ mod unix_ipc {
             let root = Path::new("/tmp/sample-ws");
             let base = crate::config::Config::for_target(haste_codegen::Target::host());
             let k_base = socket_key_for(root, &base);
-            let mut variants = [
-                base.clone(),
-                base.clone(),
-                base.clone(),
-                base.clone(),
-                base.clone(),
-                base.clone(),
-                base.clone(),
-            ];
+            let mut variants: [_; 7] = std::array::from_fn(|_| base.clone());
             variants[0].debug_info = !base.debug_info;
             variants[1].symbols = !base.symbols;
             variants[2].x64_baseline = !base.x64_baseline;
@@ -738,6 +762,7 @@ mod unix_ipc {
         fn daemon_args_forwards_all_selection_flags_and_jobs() {
             let sel = crate::Selection {
                 packages: vec!["pkg".to_owned(), "pkg2".to_owned()],
+                test: vec!["payments".to_owned(), "receipts".to_owned()],
                 workspace: true,
                 all_targets: true,
                 tests: true,
@@ -749,29 +774,22 @@ mod unix_ipc {
                 ..crate::Selection::default()
             };
             let args = daemon_args(&sel, true, true, 6);
-            for expected in [
-                "--release",
-                "--prepared",
-                "--workspace",
-                "--tests",
-                "--all-targets",
-                "--locked",
-                "--offline",
-                "-q",
-            ] {
+            for expected in
+                "--release --prepared --workspace --tests --all-targets --locked --offline -q"
+                    .split_whitespace()
+            {
                 assert!(args.iter().any(|a| a == expected), "missing {expected}");
             }
             for pair in [
                 ["-p", "pkg"],
                 ["-p", "pkg2"],
+                ["--test", "payments"],
+                ["--test", "receipts"],
                 ["-F", "a,b"],
                 ["--message-format", "json"],
                 ["-j", "6"],
             ] {
-                assert!(
-                    args.windows(2).any(|w| w == pair),
-                    "missing flag pair {pair:?}"
-                );
+                assert!(args.windows(2).any(|w| w == pair), "missing {pair:?}");
             }
         }
     }

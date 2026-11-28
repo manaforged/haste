@@ -16,7 +16,7 @@ mod json_diag;
 mod refresh;
 mod report;
 pub(crate) mod substrate;
-mod test_args;
+pub(crate) mod test_args;
 mod watch;
 
 use batch::{Batch, BatchKind};
@@ -51,9 +51,9 @@ pub(crate) fn main_item(
     outline: &outline::Outline,
 ) -> Option<ItemRef> {
     let sel = crate::selection();
-    let (role, wanted) = match &sel.example {
+    let (role, wanted) = match sel.example.last() {
         Some(name) => (outline::Role::Example, Some(name.as_str())),
-        None => (outline::Role::Bin, sel.bin.as_deref()),
+        None => (outline::Role::Bin, sel.bin.last().map(String::as_str)),
     };
     if wanted.is_none()
         && role == outline::Role::Bin
@@ -67,16 +67,18 @@ pub(crate) fn main_item(
     }
     let krate = outline.members(workspace).find(|&krate| {
         outline.roots[krate].role == role
-            && wanted.is_none_or(|name| outline.roots[krate].name == name)
+            && wanted.is_none_or(|name| {
+                crate::cli::target_name_matches(&outline.roots[krate].name, name)
+            })
     })?;
     outline.main(krate)
 }
 
 fn missing_target_error() -> anyhow::Error {
     let sel = crate::selection();
-    if let Some(name) = &sel.example {
+    if let Some(name) = sel.example.last() {
         anyhow::anyhow!("no example target named '{name}'")
-    } else if let Some(name) = &sel.bin {
+    } else if let Some(name) = sel.bin.last() {
         anyhow::anyhow!("no bin target named '{name}'")
     } else {
         anyhow::anyhow!("no member binary has a `main`")
@@ -85,7 +87,7 @@ fn missing_target_error() -> anyhow::Error {
 
 fn require_main(workspace: &graph::Workspace, outline: &outline::Outline) -> Result<ItemRef> {
     let sel = crate::selection();
-    if sel.bin.is_none() && sel.example.is_none() {
+    if sel.bin.is_empty() && sel.example.is_empty() {
         let bins: Vec<usize> = outline
             .members(workspace)
             .filter(|&k| outline.roots[k].role == outline::Role::Bin && outline.main(k).is_some())
@@ -230,6 +232,7 @@ impl Build {
         workspace: &graph::Workspace,
         filters: &[String],
     ) -> Result<()> {
+        crate::cli::validate_selected_targets(workspace)?;
         if self.cases.is_none() {
             self.load_members(workspace)?;
             let discovered = test_items(workspace, &self.compilation.outline);
@@ -317,17 +320,14 @@ impl Build {
         workspace: &graph::Workspace,
         drop_finals: bool,
     ) -> Result<()> {
+        crate::cli::validate_selected_targets(workspace)?;
         if self.binary.is_none() {
             let sel = crate::selection();
-            let lib_only = sel.lib
-                && !sel.bins
-                && !sel.all_targets
-                && sel.bin.is_none()
-                && sel.example.is_none();
+            let lib_only = test_args::lib_only_selection(&sel);
             let kind = if !lib_only && main_item(workspace, &self.compilation.outline).is_some() {
                 self.load_members(workspace)?;
                 BatchKind::MainCheck
-            } else if sel.bin.is_some() || sel.example.is_some() {
+            } else if !sel.bin.is_empty() || !sel.example.is_empty() {
                 return Err(missing_target_error());
             } else if lib_only
                 && !self
@@ -389,14 +389,15 @@ impl Build {
         };
         let done = match (stale.is_empty(), crates.is_empty()) {
             (true, true) => return Ok(()),
-            (_, false) => self.reload(
-                workspace,
-                crates
+            (_, false) => {
+                let mut edited: Vec<u32> = crates
                     .into_iter()
                     .chain(stale.iter().map(|&(krate, _)| krate))
-                    .collect(),
-                &paths,
-            )?,
+                    .collect();
+                edited.sort_unstable();
+                edited.dedup();
+                self.reload(workspace, edited, &stale, &paths)?
+            }
             (false, true) => self.again(workspace, &stale),
         };
         if !done {
@@ -425,6 +426,7 @@ impl Build {
         &mut self,
         workspace: &graph::Workspace,
         edited: Vec<u32>,
+        stale_bodies: &[(u32, u32)],
         changed_paths: &[PathBuf],
     ) -> Result<bool> {
         self.run_checked = false;
@@ -440,9 +442,13 @@ impl Build {
         else {
             return Ok(false);
         };
-        let Ok(Some((crates, dependents, scoped))) =
-            refresh::resolve_with_dependents(&mut self.compilation, pre, reloaded, changed_paths)
-        else {
+        let Ok(Some((crates, dependents, scoped))) = refresh::resolve_with_dependents(
+            &mut self.compilation,
+            pre,
+            reloaded,
+            stale_bodies,
+            changed_paths,
+        ) else {
             return Ok(false);
         };
         let errors = self.compilation.outline.local_errors(workspace);
@@ -501,6 +507,7 @@ impl Build {
         path: &std::path::Path,
         drop_finals: bool,
     ) -> Result<i32> {
+        crate::cli::validate_selected_targets(workspace)?;
         let started = Instant::now();
         if self
             .binary
@@ -620,6 +627,7 @@ impl Build {
 
     /// Runs the binary's `main` with `args` as argv in a forked child, compiling each function on its first call and keeping that code for the next run.
     pub fn run(&mut self, workspace: &graph::Workspace, args: &[String]) -> Result<i32> {
+        crate::cli::validate_selected_targets(workspace)?;
         let main = require_main(workspace, &self.compilation.outline)?;
         let target = Some(main.krate as usize);
         if self.program.is_some() {

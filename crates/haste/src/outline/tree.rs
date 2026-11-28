@@ -278,6 +278,7 @@ pub struct Crate {
     pub consumed: rustc_hash::FxHashSet<(u32, u32)>,
     pub resolved_tests: rustc_hash::FxHashSet<(u32, u32)>,
     pub macro_use: Vec<usize>,
+    pub link_libs: Vec<String>,
     pub expansions: usize,
     pub cached_included: Option<Vec<(PathBuf, PathBuf)>>,
 }
@@ -418,6 +419,14 @@ const OFF: [&str; 10] = [
 ];
 
 impl Env {
+    /// Whether `attrs` contains an attribute matching `pred`, directly or under an active `cfg_attr`.
+    pub fn has_attr(&self, attrs: &[Attr], pred: &impl Fn(&Attr) -> bool) -> bool {
+        attrs.iter().any(|attr| {
+            pred(attr)
+                || matches!(attr, Attr::CfgAttr(cfg, inner) if self.eval(cfg) == Truth::Yes && self.has_attr(inner, pred))
+        })
+    }
+
     /// The value `env!` gives variable `name`: what the build script or Cargo set for this crate, else the process or client environment's.
     pub fn var(&self, name: &str) -> Option<String> {
         let set = self

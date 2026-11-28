@@ -79,20 +79,7 @@ fn compiler_api_checks_runs_tests_and_emits_standalone_executable() {
         "api",
         "e2e",
         "api_fixture",
-        r#"
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(String::as_str) == Some("exit42") {
-        std::process::exit(42);
-    }
-    println!("api-ok:{:?}", args);
-}
-
-#[test]
-fn sanity_math() {
-    assert_eq!(6 * 7, 42);
-}
-"#,
+        "fn main() {\n    let args: Vec<String> = std::env::args().collect();\n    if args.get(1).map(String::as_str) == Some(\"exit42\") { std::process::exit(42); }\n    println!(\"api-ok:{:?}\", args);\n}\n#[test]\nfn sanity_math() { assert_eq!(6 * 7, 42); }\n",
     );
 
     let compiler = Compiler::builder().jobs(2).build().expect("valid compiler");
@@ -124,8 +111,7 @@ fn sanity_math() {
         .expect("run emitted binary");
     assert!(out.status.success());
     let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
-    assert!(stdout.contains("api-ok:"));
-    assert!(stdout.contains("\"hello\""));
+    assert!(stdout.contains("api-ok:") && stdout.contains("\"hello\""));
 }
 
 #[test]
@@ -134,17 +120,7 @@ fn cli_run_isolates_argv_and_test_prints_panic_stderr() {
         "cli",
         "argv_panic",
         "cli_argv_panic",
-        r#"
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    println!("ARGS={}", args[1..].join("|"));
-}
-
-#[test]
-fn failing_assertion_reports_message() {
-    assert_eq!(2 + 2, 5, "custom_panic_marker_8472");
-}
-"#,
+        "fn main() {\n    let args: Vec<String> = std::env::args().collect();\n    println!(\"ARGS={}\", args[1..].join(\"|\"));\n}\n#[test]\nfn failing_assertion_reports_message() { assert_eq!(2 + 2, 5, \"custom_panic_marker_8472\"); }\n",
     );
     let haste = env!("CARGO_BIN_EXE_haste");
 
@@ -159,8 +135,12 @@ fn failing_assertion_reports_message() {
         "stderr: {}",
         String::from_utf8_lossy(&run_out.stderr)
     );
-    let stdout = String::from_utf8(run_out.stdout).expect("utf8 stdout");
-    assert_eq!(stdout.trim(), "ARGS=--release|alpha|beta");
+    assert_eq!(
+        String::from_utf8(run_out.stdout)
+            .expect("utf8 stdout")
+            .trim(),
+        "ARGS=--release|alpha|beta"
+    );
 
     let test_out = Command::new(haste)
         .args(["test"])
@@ -195,12 +175,7 @@ fn cli_daemon_is_opt_in_and_serve_status_stop_controls_lifecycle() {
         "cli",
         "daemon",
         "cli_daemon_probe",
-        r#"
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    println!("DAEMON_ARGS={}", args[1..].join(","));
-}
-"#,
+        "fn main() {\n    let args: Vec<String> = std::env::args().collect();\n    println!(\"DAEMON_ARGS={}\", args[1..].join(\",\"));\n}\n",
     );
     let haste = env!("CARGO_BIN_EXE_haste");
 
@@ -562,23 +537,7 @@ fn compiler_test_filters_match_cli_behavior() {
         "api-filter",
         "test_filter",
         "api_test_filter",
-        r#"
-unsafe extern "C" {
-    fn haste_nonexistent_test_symbol_49123();
-}
-
-#[test]
-fn selected_passing_test() {
-    assert_eq!(2 + 2, 4);
-}
-
-#[test]
-fn unselected_broken_test() {
-    unsafe {
-        haste_nonexistent_test_symbol_49123();
-    }
-}
-"#,
+        "unsafe extern \"C\" { fn haste_nonexistent_test_symbol_49123(); }\n#[test]\nfn selected_passing_test() { assert_eq!(2 + 2, 4); }\n#[test]\nfn unselected_broken_test() { unsafe { haste_nonexistent_test_symbol_49123(); } }\n",
     );
     let haste = env!("CARGO_BIN_EXE_haste");
     let cli_out = Command::new(haste)
@@ -611,17 +570,8 @@ fn unselected_broken_test() {
 }
 
 fn write_worktree_test_fixture(name: &str) -> FixtureDir {
-    let dir = FixtureDir::new("tmpdir-wt", name);
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname = \"shared_wt_pkg\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-    )
-    .expect("write Cargo.toml");
-    std::fs::write(
-        dir.path().join("Cargo.lock"),
-        "version = 4\n\n[[package]]\nname = \"shared_wt_pkg\"\nversion = \"0.1.0\"\n",
-    )
-    .expect("write Cargo.lock");
+    let dir = FixtureDir::write_crate("tmpdir-wt", name, "shared_wt_pkg", "");
+    drop(std::fs::remove_file(dir.path().join("src/main.rs")));
     std::fs::write(dir.path().join("src/lib.rs"), "").expect("write src/lib.rs");
     std::fs::create_dir_all(dir.path().join("tests")).expect("create tests dir");
     std::fs::write(
@@ -774,4 +724,72 @@ fn session_checks_incrementally_across_edits_error_and_recovery() {
     assert!(out.status.success());
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "session-ok:42");
     session.check().expect("session check after emit succeeds");
+}
+
+#[test]
+fn session_rebuilds_when_build_script_watched_data_changes() {
+    let dir = FixtureDir::write_crate(
+        "api-session",
+        "watch-data",
+        "api_watch_data",
+        "include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));\nfn main() {\n    let expected: i32 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);\n    assert_eq!(generated(), expected);\n}\n",
+    );
+    std::fs::write(dir.path().join("data.txt"), "10").expect("write initial data.txt");
+    std::fs::write(
+        dir.path().join("build.rs"),
+        "fn main() {\n    println!(\"cargo:rerun-if-changed=data.txt\");\n    let out = std::path::PathBuf::from(std::env::var(\"OUT_DIR\").expect(\"OUT_DIR\"));\n    let raw = std::fs::read_to_string(\"data.txt\").expect(\"read data.txt\");\n    let val = raw.trim();\n    std::fs::write(out.join(\"gen.rs\"), format!(\"pub fn generated() -> i32 {{ {val} }}\\n\")).expect(\"write gen.rs\");\n}\n",
+    )
+    .expect("write build.rs");
+
+    let compiler = Compiler::builder().jobs(1).build().expect("valid compiler");
+    let mut session = compiler.session(dir.path()).expect("open session");
+    session.check().expect("initial session check succeeds");
+    assert_eq!(session.run(&["10".to_owned()]).expect("initial run"), 0);
+
+    std::fs::write(dir.path().join("data.txt"), "\"bad\"").expect("write broken data.txt");
+    let err = session
+        .check()
+        .expect_err("type error in build.rs-generated file must fail check");
+    assert_eq!(err.kind(), ErrorKind::Compile);
+
+    std::fs::write(dir.path().join("data.txt"), "42").expect("write updated data.txt");
+    session.check().expect("updated data.txt check succeeds");
+    assert_eq!(session.run(&["42".to_owned()]).expect("updated run"), 0);
+}
+
+#[test]
+fn session_catches_same_size_and_same_mtime_edit() {
+    let dir = FixtureDir::write_crate(
+        "api-session",
+        "same-stamp",
+        "api_same_stamp",
+        "fn main() {\n    let _: u32 = 123;\n}\n",
+    );
+    let main_rs = dir.path().join("src/main.rs");
+    let mtime = std::fs::metadata(&main_rs)
+        .expect("metadata")
+        .modified()
+        .expect("mtime");
+    let write_with_mtime = |src: &str| {
+        std::fs::write(&main_rs, src).expect("write main.rs");
+        std::fs::File::options()
+            .write(true)
+            .open(&main_rs)
+            .expect("open main.rs")
+            .set_modified(mtime)
+            .expect("restore mtime");
+    };
+
+    let compiler = Compiler::builder().jobs(1).build().expect("valid compiler");
+    let mut session = compiler.session(dir.path()).expect("open session");
+    session.check().expect("initial check passes");
+
+    write_with_mtime("fn main() {\n    let _: u32 = \"a\";\n}\n");
+    let err = session
+        .check()
+        .expect_err("same-size same-mtime type error must fail check");
+    assert_eq!(err.kind(), ErrorKind::Compile);
+
+    write_with_mtime("fn main() {\n    let _: u32 = 456;\n}\n");
+    session.check().expect("recovered check passes");
 }
