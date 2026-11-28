@@ -1,11 +1,14 @@
 use anyhow::{Context as _, Result, bail};
 use rustc_hash::FxHashMap as HashMap;
 
+use std::sync::Arc;
+
 use crate::names::{
-    Binding, Crate as NamesCrate, Def, ItemRef, ModRef, Ns, Origin, PRIMITIVES, PerNs, Scope, Sym,
-    UNDERSCORE, Unresolved, collect::Pending,
+    Binding, Crate as NamesCrate, Def, ItemRef, ModRef, Ns, Origin, PRIMITIVES, PerNs, Scope,
+    ScopeNames, Sym, UNDERSCORE, Unresolved, collect::Pending,
 };
 use crate::sema::summary::codec::write_u32;
+use crate::substrate::Backing;
 
 use super::tokens::{
     Reader, read_vis, u32_le, vis_from_tag, vis_tag, write_opt_u32, write_str, write_usize,
@@ -290,17 +293,18 @@ pub(super) fn write_names_crate(
     Some(())
 }
 
-fn decode_scope(slice: &[u8], remap: &[u32], sym_remap: &[Sym]) -> Result<Scope> {
+pub(crate) fn decode_scope_map(
+    slice: &[u8],
+    remap: &[u32],
+    sym_remap: &[Sym],
+) -> Result<HashMap<Sym, PerNs>> {
     let mut reader = Reader::new(slice);
     let name_len = reader.u32()? as usize;
     if name_len == 0 {
         if !reader.is_empty() {
             bail!("trailing bytes in sysroot scope");
         }
-        return Ok(Scope {
-            names: HashMap::default(),
-            log: Vec::new(),
-        });
+        return Ok(HashMap::default());
     }
     let mut names = HashMap::with_capacity_and_hasher(name_len, Default::default());
     for _ in 0..name_len {
@@ -333,17 +337,13 @@ fn decode_scope(slice: &[u8], remap: &[u32], sym_remap: &[Sym]) -> Result<Scope>
     if !reader.is_empty() {
         bail!("trailing bytes in sysroot scope");
     }
-    Ok(Scope {
-        names,
-        log: Vec::new(),
-    })
+    Ok(names)
 }
 
 pub(super) struct ScopeTable<'a> {
     pub end_bytes: &'a [u8],
     pub scope_bytes: &'a [u8],
     pub count: usize,
-    pub total_bytes: usize,
 }
 
 pub(super) fn split_names_crate_scopes<'a>(reader: &mut Reader<'a>) -> Result<ScopeTable<'a>> {
@@ -366,59 +366,49 @@ pub(super) fn split_names_crate_scopes<'a>(reader: &mut Reader<'a>) -> Result<Sc
         end_bytes,
         scope_bytes,
         count: scope_len,
-        total_bytes: scope_byte_len,
     })
 }
 
-pub(super) fn decode_scope_range(
+pub(super) fn lazy_scopes(
     table: &ScopeTable<'_>,
-    start: usize,
-    end: usize,
-    remap: &[u32],
-    sym_remap: &[Sym],
+    backing: &Arc<Backing>,
+    remap: &Arc<[u32]>,
+    sym_remap: &Arc<[Sym]>,
 ) -> Result<Vec<Scope>> {
-    if start >= end {
+    if table.count == 0 {
+        if !table.scope_bytes.is_empty() {
+            bail!("trailing bytes in sysroot scopes");
+        }
         return Ok(Vec::new());
     }
-    let mut prev = if start == 0 {
-        0
-    } else {
-        u32_le(table.end_bytes, (start - 1) * 4) as usize
-    };
-    let mut scopes = Vec::with_capacity(end - start);
-    for c in table.end_bytes[start * 4..end * 4].chunks_exact(4) {
-        let end_off = u32_le(c, 0) as usize;
-        scopes.push(decode_scope(
-            &table.scope_bytes[prev..end_off],
-            remap,
-            sym_remap,
-        )?);
-        prev = end_off;
+    let backing_base = backing.as_slice().as_ptr() as usize;
+    let scope_base = (table.scope_bytes.as_ptr() as usize)
+        .checked_sub(backing_base)
+        .context("scope bytes outside backing")?;
+    let mut scopes = Vec::with_capacity(table.count);
+    let mut prev = 0usize;
+    for chunk in table.end_bytes.chunks_exact(4) {
+        let end = u32_le(chunk, 0) as usize;
+        if end < prev || end > table.scope_bytes.len() {
+            bail!("non-monotonic sysroot scope offset");
+        }
+        let names = ScopeNames::compact(
+            Arc::clone(backing),
+            scope_base + prev,
+            scope_base + end,
+            Arc::clone(remap),
+            Arc::clone(sym_remap),
+        )?;
+        scopes.push(Scope {
+            names,
+            log: Vec::new(),
+        });
+        prev = end;
+    }
+    if prev != table.scope_bytes.len() {
+        bail!("trailing bytes in sysroot scopes");
     }
     Ok(scopes)
-}
-
-fn read_scopes(
-    reader: &mut Reader<'_>,
-    remap: &[u32],
-    sym_remap: &[Sym],
-    parallel: bool,
-) -> Result<Vec<Scope>> {
-    let table = split_names_crate_scopes(reader)?;
-    if parallel && table.count >= 16 && table.total_bytes >= 8 * 1024 && crate::jobs() > 1 {
-        let mut slices = Vec::with_capacity(table.count);
-        let mut prev = 0usize;
-        for c in table.end_bytes.chunks_exact(4) {
-            let end_off = u32_le(c, 0) as usize;
-            slices.push(&table.scope_bytes[prev..end_off]);
-            prev = end_off;
-        }
-        crate::sync::parallel_map(slices, |s| decode_scope(s, remap, sym_remap))
-            .into_iter()
-            .collect::<Result<Vec<_>>>()
-    } else {
-        decode_scope_range(&table, 0, table.count, remap, sym_remap)
-    }
 }
 
 fn read_prelude(reader: &mut Reader<'_>, remap: &[u32]) -> Result<Option<ModRef>> {
@@ -605,10 +595,11 @@ pub(super) fn read_names_crate_body(
 
 pub(super) fn read_names_crate(
     reader: &mut Reader<'_>,
-    remap: &[u32],
-    sym_remap: &[Sym],
-    parallel_scopes: bool,
+    backing: &Arc<Backing>,
+    remap: &Arc<[u32]>,
+    sym_remap: &Arc<[Sym]>,
 ) -> Result<NamesCrate> {
-    let scopes = read_scopes(reader, remap, sym_remap, parallel_scopes)?;
+    let table = split_names_crate_scopes(reader)?;
+    let scopes = lazy_scopes(&table, backing, remap, sym_remap)?;
     read_names_crate_body(reader, scopes, remap, sym_remap)
 }

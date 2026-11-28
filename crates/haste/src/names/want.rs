@@ -55,6 +55,9 @@ impl Names {
                 .cloned()
                 .unwrap_or_default();
             let globs = entry.globs.get(&at.module).cloned().unwrap_or_default();
+            if !named.is_empty() || !globs.is_empty() {
+                entry.settled = false;
+            }
             for index in named.into_iter().chain(globs.iter().copied()) {
                 entry.pending[index].active = true;
             }
@@ -78,11 +81,18 @@ impl Names {
             };
             if !entry.eager && entry.whole.insert(at.module) {
                 new = true;
-                entry
+                let mut touched = false;
+                for pending in entry
                     .pending
                     .iter_mut()
                     .filter(|pending| pending.module == at.module)
-                    .for_each(|pending| pending.active = true);
+                {
+                    pending.active = true;
+                    touched = true;
+                }
+                if touched {
+                    entry.settled = false;
+                }
             }
             let globs = entry.globs.get(&at.module).into_iter().flatten();
             let targets: Vec<ModRef> = globs

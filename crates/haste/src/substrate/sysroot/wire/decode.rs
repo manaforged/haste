@@ -6,7 +6,7 @@ use rustc_hash::FxHashMap as HashMap;
 use crate::graph::Workspace;
 use crate::names::{Crate as NamesCrate, Sym, Symbols};
 use crate::outline::Outline;
-use crate::outline::source::{DiskSource, Outputs, Source, SourceText, SourceTokens};
+use crate::outline::source::{DiskSource, Outputs, Source, SourceMarks, SourceText, SourceTokens};
 use crate::outline::tree::{Crate as OutlineCrate, File, Macro, Textual};
 use crate::sema::impls::Index as ImplIndex;
 use crate::sema::summary::codec::Cursor;
@@ -16,8 +16,7 @@ use super::super::impls::read_impl_index;
 use super::super::names::read_names_crate;
 use super::super::outline::read_outline_crate;
 use super::super::tokens::{
-    Reader, frag_from_tag, read_items, read_marks_reader, read_origins, read_rules, read_str,
-    u32_le,
+    Reader, frag_from_tag, read_items, read_origins, read_rules, read_str, u32_le,
 };
 use super::super::{EnvReads, HEADER_LEN, match_crate_list_wire};
 use super::batch::decode_snapshot_parallel;
@@ -138,7 +137,7 @@ fn decode_symbols_with(
 fn decode_files_seq(
     backing: &Arc<Backing>,
     file_slices: Vec<(usize, &[u8], Option<u32>)>,
-    remap: &[u32],
+    remap: &Arc<[u32]>,
     scope_bit: u32,
 ) -> Result<Vec<Arc<File>>> {
     let mut files: Vec<Arc<File>> = Vec::with_capacity(file_slices.len());
@@ -198,6 +197,7 @@ fn decode_macros_seq(
 }
 
 fn decode_crates_seq(
+    backing: &Arc<Backing>,
     outline_slices: Vec<&[u8]>,
     name_slices: Vec<&[u8]>,
     impl_slices: Vec<&[u8]>,
@@ -205,15 +205,14 @@ fn decode_crates_seq(
     macros: &[Arc<Macro>],
     textuals: &[Arc<Textual>],
     local_crates: &[usize],
-    remap: &[u32],
-    sym_remap: &[Sym],
+    remap: &Arc<[u32]>,
+    sym_remap: &Arc<[Sym]>,
 ) -> Result<(
     Vec<(usize, OutlineCrate)>,
     Vec<(usize, NamesCrate)>,
     HashMap<u32, Arc<ImplIndex>>,
 )> {
     let crate_count = local_crates.len();
-    let parallel_scopes = crate_count < 4;
     let mut outline_crates = Vec::with_capacity(crate_count);
     for (&k, slice) in local_crates.iter().zip(outline_slices) {
         let mut creader = Reader::new(slice);
@@ -226,7 +225,7 @@ fn decode_crates_seq(
     let mut name_crates = Vec::with_capacity(crate_count);
     for (&k, slice) in local_crates.iter().zip(name_slices) {
         let mut creader = Reader::new(slice);
-        let krate = read_names_crate(&mut creader, remap, sym_remap, parallel_scopes)?;
+        let krate = read_names_crate(&mut creader, backing, remap, sym_remap)?;
         if !creader.is_empty() {
             bail!("trailing bytes in snapshot names crate");
         }
@@ -397,7 +396,7 @@ pub(in super::super) fn decode_snapshot(
     let Some(env_reads) = read_header_and_match(&mut cur, data, spec, workspace, outline)? else {
         return Ok(None);
     };
-    let remap: Vec<u32> = spec.ref_crates.iter().map(|&k| k as u32).collect();
+    let remap: Arc<[u32]> = spec.ref_crates.iter().map(|&k| k as u32).collect();
     let mut sreader = Reader::new(&data[cur.pos..]);
     let sections = read_sections(
         &mut sreader,
@@ -423,10 +422,12 @@ pub(in super::super) fn decode_snapshot(
     }
     let (owned_symbols, sym_remap) =
         decode_symbols_with(sections.sym_ends, sections.sym_blob, existing_symbols)?;
+    let sym_remap: Arc<[Sym]> = sym_remap.into();
     let files = decode_files_seq(backing, sections.file_slices, &remap, spec.scope_bit)?;
     let macros = decode_macros_seq(sections.macro_slices, &files, &remap)?;
     let textuals = decode_textuals(&sections.textual_raw, &macros)?;
     let (outline_crates, name_crates, heads) = decode_crates_seq(
+        backing,
         sections.outline_slices,
         sections.name_slices,
         sections.impl_slices,
@@ -452,7 +453,7 @@ pub(super) fn read_file(
     backing: &Arc<Backing>,
     file_off: usize,
     base: Option<Arc<File>>,
-    remap: &[u32],
+    remap: &Arc<[u32]>,
     scope_bit: u32,
 ) -> Result<File> {
     let path = reader.path()?;
@@ -478,7 +479,19 @@ pub(super) fn read_file(
     reader.take(tok_bytes)?;
     let tok_end = file_off + (slice_len - reader.len());
     let tokens = SourceTokens::compact(Arc::clone(backing), tok_start, tok_end, tok_count)?;
-    let marks = read_marks_reader(reader, remap, scope_bit)?;
+    let marks_count = reader.count()?;
+    let marks_bytes = reader.count()?;
+    let marks_start = file_off + (slice_len - reader.len());
+    reader.take(marks_bytes)?;
+    let marks_end = file_off + (slice_len - reader.len());
+    let marks = SourceMarks::compact(
+        Arc::clone(backing),
+        marks_start,
+        marks_end,
+        marks_count,
+        Arc::clone(remap),
+        scope_bit,
+    )?;
     let opaque_len = reader.count()?;
     let opaque = if opaque_len == 0 {
         Vec::new()
@@ -506,6 +519,7 @@ pub(super) fn read_file(
         outputs: Outputs::default(),
         origins,
         line_starts: std::sync::OnceLock::new(),
+        disk_len: None,
     };
     let mut file = File::new(source, items, expanded);
     file.expand_origin = expand_origin;

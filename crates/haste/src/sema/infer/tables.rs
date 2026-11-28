@@ -174,12 +174,23 @@ impl std::ops::DerefMut for BodyTables {
     }
 }
 
-/// Either eagerly materialized body tables, a lazy polymorphic instantiation, or a stripped check-only summary.
+#[derive(Clone, Debug)]
+pub struct ReachMemo {
+    pub calls: Box<[(ItemRef, Substs)]>,
+    pub indirect: Box<[(ItemRef, Substs)]>,
+    pub vdce_dyn_tys: Box<[Ty]>,
+    pub unwind_split: u16,
+    pub direct_unwinds: bool,
+    pub skip_drops: bool,
+    pub has_catch_unwind: bool,
+}
+
 #[derive(Clone, Debug)]
 pub enum LazyTables {
     Eager(Arc<BodyTables>),
     Poly(Box<PolyInst>),
     CheckOnly(Box<PolyCheck>),
+    ReachMemo(Box<ReachMemo>),
 }
 
 /// The inferred types and resolutions of one function body at one set of type arguments.
@@ -214,6 +225,9 @@ impl std::ops::Deref for Typed {
             LazyTables::Eager(tables) => tables,
             LazyTables::Poly(poly) => poly.materialized(),
             LazyTables::CheckOnly(_) => panic!("check-only Typed has no BodyTables"),
+            LazyTables::ReachMemo(_) => {
+                panic!("reach-memo Typed must be materialized before lowering")
+            }
         }
     }
 }
@@ -353,17 +367,25 @@ impl Typed {
         self.ret.unwrap_or(Ty::NONE)
     }
 
+    pub fn is_reach_memo(&self) -> bool {
+        matches!(self.tables, LazyTables::ReachMemo(_))
+    }
+
     /// Materializes and returns the concrete body tables of this instance.
     pub fn ensure_tables(&self, types: &Types) -> &BodyTables {
         match &self.tables {
             LazyTables::Eager(tables) => tables,
             LazyTables::Poly(poly) => poly.ensure_tables(types),
-            LazyTables::CheckOnly(_) => panic!("check-only Typed cannot materialize BodyTables"),
+            LazyTables::CheckOnly(_) | LazyTables::ReachMemo(_) => {
+                panic!("unmaterialized Typed cannot materialize BodyTables")
+            }
         }
     }
 
     /// Returns the raw coercions and expression types, borrowing template tables when no coercions need instantiation.
     pub fn raw_coercions_and_exprs(&self, types: &Types) -> (&PackedMap<ExprId, Coercion>, &[Ty]) {
+        static EMPTY_COERCIONS: std::sync::OnceLock<PackedMap<ExprId, Coercion>> =
+            std::sync::OnceLock::new();
         let tables = match &self.tables {
             LazyTables::Eager(tables) => tables,
             LazyTables::Poly(poly) if !poly.summary.template.coercions.is_empty() => {
@@ -371,6 +393,9 @@ impl Typed {
             }
             LazyTables::Poly(poly) => &poly.summary.template,
             LazyTables::CheckOnly(check) => &check.summary.template,
+            LazyTables::ReachMemo(_) => {
+                return (EMPTY_COERCIONS.get_or_init(PackedMap::default), &[]);
+            }
         };
         (&tables.coercions, &tables.exprs)
     }
@@ -394,7 +419,7 @@ impl Typed {
                 Some(tables) => std::borrow::Cow::Owned(self.with_tables(tables)),
                 None => std::borrow::Cow::Borrowed(self),
             },
-            LazyTables::CheckOnly(_) => {
+            LazyTables::CheckOnly(_) | LazyTables::ReachMemo(_) => {
                 std::borrow::Cow::Owned(self.with_tables(BodyTables::empty()))
             }
         }
@@ -402,10 +427,12 @@ impl Typed {
 
     /// The instantiation-invariant syntax tables of this body.
     pub fn syntax(&self) -> &SyntaxTables {
+        static EMPTY_SYNTAX: std::sync::OnceLock<SyntaxTables> = std::sync::OnceLock::new();
         match &self.tables {
             LazyTables::Eager(tables) => &tables.syntax,
             LazyTables::Poly(poly) => &poly.summary.template.syntax,
             LazyTables::CheckOnly(check) => &check.summary.template.syntax,
+            LazyTables::ReachMemo(_) => EMPTY_SYNTAX.get_or_init(SyntaxTables::default),
         }
     }
 
@@ -415,6 +442,7 @@ impl Typed {
             LazyTables::Eager(tables) => !tables.closures.is_empty(),
             LazyTables::Poly(poly) => !poly.summary.template.closures.is_empty(),
             LazyTables::CheckOnly(check) => !check.summary.template.closures.is_empty(),
+            LazyTables::ReachMemo(_) => false,
         }
     }
 
@@ -424,6 +452,7 @@ impl Typed {
             LazyTables::Eager(tables) => !tables.awaits.is_empty(),
             LazyTables::Poly(poly) => !poly.summary.template.awaits.is_empty(),
             LazyTables::CheckOnly(check) => !check.summary.template.awaits.is_empty(),
+            LazyTables::ReachMemo(_) => false,
         }
     }
 
@@ -436,7 +465,9 @@ impl Typed {
                 .copied()
                 .unwrap_or(Ty::NONE),
             LazyTables::Poly(poly) => poly.expr_ty(types, expr),
-            LazyTables::CheckOnly(_) => panic!("check-only Typed has no expr_ty"),
+            LazyTables::CheckOnly(_) | LazyTables::ReachMemo(_) => {
+                panic!("unmaterialized Typed has no expr_ty")
+            }
         }
     }
 
@@ -445,7 +476,9 @@ impl Typed {
         match &self.tables {
             LazyTables::Eager(tables) => tables.pats.get(&pat).copied(),
             LazyTables::Poly(poly) => poly.pat_ty(types, pat),
-            LazyTables::CheckOnly(_) => panic!("check-only Typed has no pat_ty"),
+            LazyTables::CheckOnly(_) | LazyTables::ReachMemo(_) => {
+                panic!("unmaterialized Typed has no pat_ty")
+            }
         }
     }
 
@@ -454,7 +487,17 @@ impl Typed {
         match &self.tables {
             LazyTables::Eager(tables) => tables.site_res(key),
             LazyTables::Poly(poly) => poly.site_res(types, key),
-            LazyTables::CheckOnly(_) => panic!("check-only Typed has no site_res"),
+            LazyTables::CheckOnly(_) | LazyTables::ReachMemo(_) => {
+                panic!("unmaterialized Typed has no site_res")
+            }
+        }
+    }
+
+    pub fn try_site_res(&self, types: &Types, key: SiteKey) -> Option<Res> {
+        match &self.tables {
+            LazyTables::Eager(tables) => tables.site_res(key),
+            LazyTables::Poly(poly) => poly.site_res(types, key),
+            LazyTables::CheckOnly(_) | LazyTables::ReachMemo(_) => None,
         }
     }
 
@@ -466,7 +509,9 @@ impl Typed {
                 _ => None,
             },
             LazyTables::Poly(poly) => poly.site_fn(key),
-            LazyTables::CheckOnly(_) => panic!("check-only Typed has no site_fn"),
+            LazyTables::CheckOnly(_) | LazyTables::ReachMemo(_) => {
+                panic!("unmaterialized Typed has no site_fn")
+            }
         }
     }
 
@@ -480,7 +525,9 @@ impl Typed {
         match &self.tables {
             LazyTables::Eager(tables) => tables.autoderefs.get(&expr).copied().unwrap_or(0),
             LazyTables::Poly(poly) => poly.autoderefs_at(expr),
-            LazyTables::CheckOnly(_) => panic!("check-only Typed has no autoderefs"),
+            LazyTables::CheckOnly(_) | LazyTables::ReachMemo(_) => {
+                panic!("unmaterialized Typed has no autoderefs")
+            }
         }
     }
 
@@ -494,7 +541,9 @@ impl Typed {
                 .fors
                 .get(&expr)
                 .map(|f| poly.sub_ty(types, f.iter)),
-            LazyTables::CheckOnly(_) => panic!("check-only Typed has no for_iter"),
+            LazyTables::CheckOnly(_) | LazyTables::ReachMemo(_) => {
+                panic!("unmaterialized Typed has no for_iter")
+            }
         }
     }
 
@@ -508,7 +557,9 @@ impl Typed {
                 .awaits
                 .get(&expr)
                 .map(|a| poly.sub_ty(types, a.future)),
-            LazyTables::CheckOnly(_) => panic!("check-only Typed has no await_future"),
+            LazyTables::CheckOnly(_) | LazyTables::ReachMemo(_) => {
+                panic!("unmaterialized Typed has no await_future")
+            }
         }
     }
 
@@ -518,6 +569,7 @@ impl Typed {
             LazyTables::Eager(tables) => tables.awaits.contains_key(&expr),
             LazyTables::Poly(poly) => poly.summary.template.awaits.contains_key(&expr),
             LazyTables::CheckOnly(check) => check.summary.template.awaits.contains_key(&expr),
+            LazyTables::ReachMemo(_) => false,
         }
     }
 
@@ -526,7 +578,9 @@ impl Typed {
         match &self.tables {
             LazyTables::Eager(tables) => tables.overloaded.contains(&expr),
             LazyTables::Poly(poly) => poly.is_overloaded_call(expr),
-            LazyTables::CheckOnly(_) => panic!("check-only Typed has no overloaded call table"),
+            LazyTables::CheckOnly(_) | LazyTables::ReachMemo(_) => {
+                panic!("unmaterialized Typed has no overloaded call table")
+            }
         }
     }
 
@@ -537,17 +591,35 @@ impl Typed {
             LazyTables::Eager(t) => Box::new(body_calls(t, true).chain(shaped)),
             LazyTables::Poly(poly) => Box::new(poly.calls().chain(shaped)),
             LazyTables::CheckOnly(check) => Box::new(check.calls().chain(shaped)),
+            LazyTables::ReachMemo(memo) => {
+                let end = if memo.skip_drops {
+                    usize::from(memo.unwind_split).min(memo.calls.len())
+                } else {
+                    memo.calls.len()
+                };
+                Box::new(memo.calls[..end].iter().copied())
+            }
         }
     }
 
     /// Every function the body calls, with its interned type arguments.
     pub fn calls(&self) -> Box<dyn Iterator<Item = (ItemRef, Substs)> + '_> {
+        if let LazyTables::ReachMemo(memo) = &self.tables {
+            return Box::new(memo.calls.iter().copied());
+        }
         let drops = self.drops.iter().filter_map(res_fn);
         Box::new(self.calls_without_drops().chain(drops))
     }
 
     /// Visits all semantic callees of this body excluding `Coercion::Vtable` method and super edges.
     pub fn non_vtable_callees(&self, types: &Types, mut on_callee: impl FnMut(ItemRef, Substs)) {
+        if let LazyTables::ReachMemo(memo) = &self.tables {
+            memo.calls
+                .iter()
+                .copied()
+                .for_each(|(i, s)| on_callee(i, s));
+            return;
+        }
         for (item, substs) in self
             .drops
             .iter()
@@ -570,6 +642,7 @@ impl Typed {
             }
             LazyTables::Poly(poly) => poly.calls().for_each(|(i, s)| on_callee(i, s)),
             LazyTables::CheckOnly(check) => check.calls().for_each(|(i, s)| on_callee(i, s)),
+            LazyTables::ReachMemo(_) => unreachable!(),
         }
     }
 
@@ -611,6 +684,18 @@ impl Typed {
                     .filter_map(res_fn)
                     .for_each(|(i, s)| push(i, s, false));
                 visit_summary_edges(&check.summary, &check.resolved_calls, &mut push);
+            }
+            LazyTables::ReachMemo(memo) => {
+                for inst in &memo.calls {
+                    if let Some(&id) = index.get(inst) {
+                        calls.push(id);
+                    }
+                }
+                for inst in &memo.indirect {
+                    if let Some(&id) = index.get(inst) {
+                        indirect.push(id);
+                    }
+                }
             }
         }
         (calls, indirect)

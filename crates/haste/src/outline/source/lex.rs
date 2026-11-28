@@ -145,6 +145,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    #[inline]
     fn push(&mut self, token: Token, joint: bool) {
         if joint
             && !self.after_doc
@@ -152,13 +153,16 @@ impl<'a> Lexer<'a> {
         {
             last.set_joint(true);
         }
-        self.after_doc = doc(token.kind).is_some();
-        if let Some(run) = self.run.filter(|run| !self.continues(run, token.kind)) {
+        let doc_kind = doc(token.kind);
+        self.after_doc = doc_kind.is_some();
+        if let Some(run) = self.run
+            && !self.continues(&run, token.kind)
+        {
             self.run = None;
             self.settle(run);
         }
         let keep = self.group().keep;
-        match doc(token.kind) {
+        match doc_kind {
             Some(inner) if keep => self.expand(token, inner),
             Some(_) => {
                 self.start_run().docs = true;
@@ -169,7 +173,7 @@ impl<'a> Lexer<'a> {
                     self.start_run();
                 }
                 self.tokens.push(token);
-                self.track(token.kind);
+                self.track(token);
             }
         }
     }
@@ -247,7 +251,9 @@ impl<'a> Lexer<'a> {
         );
     }
 
-    fn track(&mut self, kind: TokenKind) {
+    #[inline]
+    fn track(&mut self, token: Token) {
+        let kind = token.kind;
         if opens(kind) {
             self.open();
         } else if closes(kind) {
@@ -255,10 +261,12 @@ impl<'a> Lexer<'a> {
         } else {
             let word = matches!(kind, TokenKind::Ident | TokenKind::RawIdent);
             let named_macro = kind == TokenKind::Ident
+                && (token.end() - token.start) == 5
                 && self
-                    .tokens
-                    .last()
-                    .is_some_and(|last| self.piece(last) == "macro");
+                    .text
+                    .as_bytes()
+                    .get(token.start as usize..token.end() as usize)
+                    == Some(b"macro");
             let group = self.group();
             if kind == TokenKind::Semi || (word && group.after_brace) {
                 group.shown = false;

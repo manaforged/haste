@@ -206,6 +206,7 @@ fn typed_mentions_dirty<F: Fn(ItemRef) -> bool>(
             check.calls().any(|(i, s)| !naming.fn_kept(i, s))
                 || poly_summary_dirty(&check.summary, naming, old_ref_dirty)
         }
+        LazyTables::ReachMemo(memo) => memo.calls.iter().any(|&(i, s)| !naming.fn_kept(i, s)),
     }
 }
 

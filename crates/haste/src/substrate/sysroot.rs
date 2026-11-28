@@ -5,6 +5,7 @@ mod names;
 mod outline;
 pub(crate) mod tokens;
 mod wire;
+pub(crate) use names::decode_scope_map;
 pub(super) use wire::{DecodeSpec, SnapshotSpec, prepare_wire};
 pub(crate) use wire::{PreparedWire, decode_prepared_batch};
 
@@ -662,9 +663,9 @@ pub(crate) fn save(
         ref_crates: &sysroot_crates,
         env_reads: &[],
     };
-    let (bytes, heads) = wire::encode_snapshot(&spec, workspace, compilation)?;
+    let (encoded, heads) = wire::encode_snapshot_chunks(&spec, workspace, compilation, false)?;
     let heads = Arc::new(heads);
-    if let Err(error) = super::backing::write_raw(&path, &bytes) {
+    if let Err(error) = crate::graph::store::write_new_with(&path, |w| encoded.write_to(w)) {
         eprintln!("haste: cannot save sysroot cache: {error:#}");
         return Some(heads);
     }

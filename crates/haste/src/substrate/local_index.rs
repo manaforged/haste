@@ -64,6 +64,32 @@ pub(crate) fn enabled() -> bool {
     super::enabled() && !crate::env_flag("HASTE_NO_LOCAL_INDEX")
 }
 
+pub(crate) fn member_local_deps(workspace: &Workspace, outline: &Outline) -> Vec<bool> {
+    let mut deps = vec![false; outline.crates.len()];
+    if !enabled() {
+        return deps;
+    }
+    let mut stack: Vec<usize> = (0..outline.crates.len())
+        .filter(|&k| {
+            workspace
+                .graph
+                .members
+                .contains(&workspace.graph.units[outline.roots[k].unit].package)
+        })
+        .collect();
+    while let Some(k) = stack.pop() {
+        for &(_, dep) in &outline.deps[k] {
+            if !outline.is_fixed(dep as u32)
+                && outline.roots[dep].role == crate::outline::Role::Lib
+                && !std::mem::replace(&mut deps[dep], true)
+            {
+                stack.push(dep);
+            }
+        }
+    }
+    deps
+}
+
 fn cache_dir() -> PathBuf {
     store::home().join("local-index")
 }

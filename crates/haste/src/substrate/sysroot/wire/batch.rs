@@ -13,9 +13,7 @@ use crate::substrate::Backing;
 use super::super::EnvReads;
 use super::super::names::split_names_crate_scopes;
 use super::super::tokens::{Reader, u32_le};
-use super::dag::{
-    BatchInput, DagCtx, DagTask, ItemState, chunk_scope_ranges, plan_sym_chunks, worker_loop,
-};
+use super::dag::{BatchInput, DagCtx, DagTask, ItemState, plan_sym_chunks, worker_loop};
 use super::decode::{
     DecodeSpec, DecodedSnapshot, WireSections, read_header_and_match, read_sections,
 };
@@ -24,7 +22,7 @@ pub(crate) struct PreparedWire {
     pub backing: Arc<Backing>,
     pub magic: [u8; 8],
     pub cached_crates: Vec<usize>,
-    pub remap: Vec<u32>,
+    pub remap: Arc<[u32]>,
     pub scope_bit: u32,
     pub env_reads: Vec<EnvReads>,
     pub sections_off: usize,
@@ -42,7 +40,7 @@ pub(in crate::substrate) fn prepare_wire(
         return Ok(None);
     };
     let sections_off = cur.pos;
-    let remap: Vec<u32> = spec.ref_crates.iter().map(|&k| k as u32).collect();
+    let remap: Arc<[u32]> = spec.ref_crates.iter().map(|&k| k as u32).collect();
     Ok(Some(PreparedWire {
         backing,
         magic: spec.magic,
@@ -105,7 +103,7 @@ fn decode_batch_sections<'a>(
         let sym_chunk_slots: Vec<_> = (0..sym_chunk_count).map(|_| Mutex::new(None)).collect();
         let sym_remap = OnceLock::new();
         if sym_chunk_count == 0 {
-            let _ = sym_remap.set(Vec::new());
+            let _ = sym_remap.set(Arc::from(Vec::new()));
         } else {
             for (chunk_idx, chunk) in item_sym_chunks.iter().enumerate() {
                 initial.push(DagTask::SymChunk {
@@ -193,38 +191,16 @@ fn decode_batch_sections<'a>(
         }
 
         let mut name_tables = Vec::with_capacity(sec.name_slices.len());
-        let mut scope_chunks = Vec::with_capacity(sec.name_slices.len());
-        let mut pending_names = Vec::new();
+        let mut pending_names = Vec::with_capacity(sec.name_slices.len());
         for (pos, &slice) in sec.name_slices.iter().enumerate() {
             let mut nreader = Reader::new(slice);
             let table = split_names_crate_scopes(&mut nreader)?;
             let body_slice = &slice[slice.len() - nreader.len()..];
-            if table.total_bytes >= 24 * 1024 && table.count >= 2 && crate::jobs() > 1 {
-                let ranges = chunk_scope_ranges(&table);
-                scope_chunks.push((0..ranges.len()).map(|_| OnceLock::new()).collect());
-                for (cidx, (start, end, weight)) in ranges.into_iter().enumerate() {
-                    pending_names.push(DagTask::ScopeChunk {
-                        item_idx,
-                        pos,
-                        cidx,
-                        start,
-                        end,
-                        weight,
-                    });
-                }
-                pending_names.push(DagTask::NamesBody {
-                    item_idx,
-                    pos,
-                    weight: body_slice.len(),
-                });
-            } else {
-                scope_chunks.push(Vec::new());
-                pending_names.push(DagTask::NamesFull {
-                    item_idx,
-                    pos,
-                    weight: table.total_bytes + body_slice.len(),
-                });
-            }
+            pending_names.push(DagTask::NamesFull {
+                item_idx,
+                pos,
+                weight: table.count * 16 + body_slice.len(),
+            });
             name_tables.push((table, body_slice));
         }
         pending_names.sort_unstable_by_key(|t| t.weight());
@@ -263,7 +239,6 @@ fn decode_batch_sections<'a>(
             outline_slots: (0..crate_count).map(|_| OnceLock::new()).collect(),
             name_slots: (0..crate_count).map(|_| OnceLock::new()).collect(),
             impl_slots: (0..crate_count).map(|_| OnceLock::new()).collect(),
-            scope_chunks,
         });
     }
 
@@ -317,27 +292,8 @@ fn decode_batch_sections<'a>(
             .collect::<Result<Vec<_>>>()?;
 
         let mut name_crates = Vec::with_capacity(input.cached_crates.len());
-        for ((&k, nslot), chunks) in input
-            .cached_crates
-            .iter()
-            .zip(state.name_slots)
-            .zip(state.scope_chunks)
-        {
-            let mut krate = nslot.into_inner().context("missing decoded names crate")?;
-            if !chunks.is_empty() {
-                let mut decoded_chunks = Vec::with_capacity(chunks.len());
-                let mut total_scopes = 0usize;
-                for cslot in chunks {
-                    let scopes = cslot.into_inner().context("missing decoded scope chunk")?;
-                    total_scopes += scopes.len();
-                    decoded_chunks.push(scopes);
-                }
-                let mut scopes = Vec::with_capacity(total_scopes);
-                for chunk in decoded_chunks {
-                    scopes.extend(chunk);
-                }
-                krate.scopes = scopes;
-            }
+        for (&k, nslot) in input.cached_crates.iter().zip(state.name_slots) {
+            let krate = nslot.into_inner().context("missing decoded names crate")?;
             name_crates.push((k, krate));
         }
 
@@ -414,7 +370,7 @@ pub(crate) fn decode_prepared_batch(
 pub(super) fn decode_snapshot_parallel(
     backing: &Arc<Backing>,
     cached_crates: &[usize],
-    remap: &[u32],
+    remap: &Arc<[u32]>,
     scope_bit: u32,
     env_reads: Vec<EnvReads>,
     sections: WireSections<'_>,

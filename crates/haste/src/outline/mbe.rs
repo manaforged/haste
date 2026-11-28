@@ -224,13 +224,17 @@ impl Writer<'_> {
         for piece in pieces {
             match piece {
                 Piece::Token(token) => {
-                    let scope = Mark::Scope {
-                        id: self.scope,
-                        parent: self.def.scope(*token).0,
-                    };
                     let home = match self.def.kind(*token) {
-                        TokenKind::Ident | TokenKind::RawIdent => Some(self.home.unwrap_or(scope)),
-                        TokenKind::Literal { .. } => Some(scope),
+                        TokenKind::Ident | TokenKind::RawIdent => {
+                            Some(self.home.unwrap_or_else(|| Mark::Scope {
+                                id: self.scope,
+                                parent: self.def.scope(*token).0,
+                            }))
+                        }
+                        TokenKind::Literal { .. } => Some(Mark::Scope {
+                            id: self.scope,
+                            parent: self.def.scope(*token).0,
+                        }),
                         _ => None,
                     };
                     self.out.copy_marked(self.def, *token, home);
@@ -243,7 +247,8 @@ impl Writer<'_> {
                 Piece::Crate(fixed) => self.out.dollar_crate(fixed.unwrap_or(self.krate)),
                 Piece::CratePath => {
                     self.out.dollar_crate(self.krate);
-                    self.out.lexed("::");
+                    self.out.punct(TokenKind::Colon, ":", true);
+                    self.out.punct(TokenKind::Colon, ":", false);
                 }
                 Piece::Meta(meta) => self.meta(meta, rounds),
                 Piece::Var(name, _, slot) => self.var(*name, *slot, rounds)?,
@@ -277,11 +282,11 @@ impl Writer<'_> {
                 };
                 let grouped = frag == Frag::Expr && fragment::tree(self.input, from) != to;
                 if grouped {
-                    self.out.lexed("(");
+                    self.out.punct(TokenKind::OpenParen, "(", false);
                 }
                 self.out.copy_range(self.input, from, to);
                 if grouped {
-                    self.out.lexed(")");
+                    self.out.punct(TokenKind::CloseParen, ")", false);
                 }
                 if !matches!(
                     frag,
@@ -398,7 +403,10 @@ pub fn expand(
                 krate,
                 home,
                 scope: SCOPES.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                out: Tokens::default(),
+                out: Tokens::with_capacity(
+                    rule.body.len().saturating_mul(2).max(16),
+                    rule.body.len().saturating_mul(12).max(96),
+                ),
             };
             writer.emit(&rule.body, &mut Vec::new())?;
             return writer.out.finish(input.path.clone());

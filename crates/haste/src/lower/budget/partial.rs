@@ -507,6 +507,9 @@ fn partial_body(
     let Ok(typed) = typed_res else {
         return Ok(None);
     };
+    if typed.is_reach_memo() {
+        return Ok(None);
+    }
     let typed = typed.scoped(&cx.types);
     let typed: &Typed = &typed;
     let Shape::Body = typed.shape else {

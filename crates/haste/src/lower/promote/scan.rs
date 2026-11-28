@@ -210,6 +210,7 @@ impl Lower<'_, '_> {
         let owner = self.reached.list[self.index].0.0;
         let env = &self.cx.outline.crates[source.krate as usize].env;
         let readable = matches!(typed.shape, Shape::Body)
+            && !typed.is_reach_memo()
             && (env.release
                 || env.fixed
                 || source.krate == owner.krate

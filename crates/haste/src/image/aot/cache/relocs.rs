@@ -580,6 +580,9 @@ fn resolve_inline_origin(
         return find_vtable_slot_callee(plan, relocs, base, expr, slot);
     }
     let typed = reached.list.get(index)?.1.as_ref().ok()?;
+    if typed.is_reach_memo() {
+        return None;
+    }
     let (item, substs) = resolve_site_from_typed(typed, origin)?;
     reached.index.get(&(item, substs)).copied()
 }

@@ -385,6 +385,7 @@ mod tests {
             vars: Vec::new(),
             release: false,
             fixed: false,
+            fixed_files: Vec::new(),
             test: false,
             profile_override: Default::default(),
             env_reads: Default::default(),

@@ -4,7 +4,7 @@ mod tokens;
 pub(crate) use lex::pair_up as pair_up_tokens;
 use lex::{lex, pair_up};
 pub(crate) use storage::DiskSource;
-pub use storage::{SourceText, SourceTokens};
+pub use storage::{SourceMarks, SourceText, SourceTokens};
 pub use tokens::Tokens;
 
 use super::{rules::Frag, tree::File};
@@ -105,7 +105,7 @@ pub struct Source {
     pub path: PathBuf,
     pub text: SourceText,
     pub tokens: SourceTokens,
-    pub marks: Vec<(u32, Mark)>,
+    pub marks: SourceMarks,
     /// The token ranges, by index in this layer, that a macro wrote from an opaque fragment, with its kind.
     pub opaque: Vec<(u32, u32, Frag)>,
     pub base: Option<Arc<File>>,
@@ -115,6 +115,7 @@ pub struct Source {
     /// Where the tokens of this layer lie in the file at `path` as read from disk.
     pub origins: Origins,
     pub(crate) line_starts: OnceLock<Vec<u32>>,
+    pub(crate) disk_len: Option<u32>,
 }
 
 /// Where the tokens of a source lie in the file at its path as read from disk: every token where it is, or the listed tokens, by index, at the byte offsets of the tokens a macro copied them from.
@@ -198,9 +199,28 @@ impl Source {
             Ok(text)
         };
         let text = read().with_context(|| format!("reading {}", path.display()))?;
+        let disk_len = u32::try_from(text.len()).ok();
         let mut source = Source::parse(path.to_owned(), text)?;
         source.origins = Origins::Read;
+        source.disk_len = disk_len;
         Ok(source)
+    }
+
+    pub fn pristine(&self) -> Option<Source> {
+        let read = matches!(self.origins, Origins::Read) && self.base.is_none();
+        (read && self.marks.is_empty() && self.opaque.is_empty()).then(|| Source {
+            path: self.path.clone(),
+            text: self.text.duplicate(),
+            tokens: self.tokens.duplicate(),
+            marks: SourceMarks::default(),
+            opaque: Vec::new(),
+            base: None,
+            offset: self.offset,
+            outputs: Outputs::default(),
+            origins: Origins::Read,
+            disk_len: self.disk_len,
+            line_starts: OnceLock::new(),
+        })
     }
 
     /// Lexes `text` as the contents of `path`.
@@ -212,13 +232,14 @@ impl Source {
             path,
             text: text.into(),
             tokens: tokens.into(),
-            marks: Vec::new(),
+            marks: SourceMarks::default(),
             opaque: Vec::new(),
             base: None,
             offset: 0,
             outputs: Outputs::default(),
             origins: Origins::Copied(Vec::new()),
             line_starts: OnceLock::new(),
+            disk_len: None,
         })
     }
 
@@ -257,7 +278,11 @@ impl Source {
                 return false;
             }
         }
-        (from..to).any(|at| self.text(at) == word)
+        let ident = word
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_');
+        (from..to).any(|at| (!ident || self.kind(at) == TokenKind::Ident) && self.text(at) == word)
     }
 
     /// The text of token `at`.

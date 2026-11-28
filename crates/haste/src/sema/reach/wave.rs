@@ -271,6 +271,8 @@ fn wavefront_worker(
     let mut local_filter = seed_filter.seed_clone();
     let mut synced_len = *seed_lens;
     let sync_filter = cx.store.lookups.skip_warm_sysroot_bodies;
+    let reach_memo = cx.store.lookups.reach_memo.clone();
+    let mut memo_scratch = super::memo::MemoLookupScratch::default();
     let mut active = ActiveGuard(mutex, cvar, 0);
     loop {
         let delta = {
@@ -333,7 +335,14 @@ fn wavefront_worker(
             let asks0 = cx.asks.count();
             let mut unlaid = Vec::new();
             let before = cx.deferred_evals.len();
-            let typed = infer_entry(cx, &instance, &mut unlaid, false);
+            let typed = if let Some(hit) = reach_memo
+                .as_deref()
+                .and_then(|m| m.lookup(cx, instance, &mut memo_scratch))
+            {
+                Ok(hit)
+            } else {
+                infer_entry(cx, &instance, &mut unlaid, false)
+            };
             let deferred = cx.deferred_evals.len() > before;
             let asked = cx.asks.count() > asks0;
             if !deferred && (force_commit || !asked) {

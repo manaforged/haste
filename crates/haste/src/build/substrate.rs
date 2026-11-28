@@ -90,6 +90,15 @@ pub(crate) fn cache_with_substrate(
     cache_from_slot(open_batch_substrate(workspace), warm_sysroot_bodies)
 }
 
+pub(crate) fn cache_with_substrate_or_reused(
+    workspace: &graph::Workspace,
+    reused: Option<SubstrateSlot>,
+    warm_sysroot_bodies: bool,
+) -> (Option<SubstrateSlot>, Cache) {
+    let slot = reused.or_else(|| open_batch_substrate(workspace));
+    cache_from_slot(slot, warm_sysroot_bodies)
+}
+
 pub(crate) fn cache_with_toolchain_substrate(
     workspace: &graph::Workspace,
 ) -> (Option<SubstrateSlot>, Cache) {
@@ -99,7 +108,7 @@ pub(crate) fn cache_with_toolchain_substrate(
 fn open_toolchain_layer(
     workspace: &graph::Workspace,
 ) -> Option<(u64, u64, haste_codegen::Target, Option<Arc<Substrate>>)> {
-    if !enabled() {
+    if !enabled() || !crate::scripts::sysroot_scripts_settled(workspace) {
         return None;
     }
     let target = crate::host_target();
@@ -432,6 +441,21 @@ impl LocalCheckState {
     pub(super) fn set_fixed(&self, outline: &mut outline::Outline, fixed: bool) {
         for &k in &self.hits {
             outline.crates[k].env.fixed = fixed;
+        }
+        for entry in &self.dirty {
+            if fixed {
+                if let Some(ref dirty_files) = entry.dirty_files {
+                    let mut mask = vec![true; outline.crates[entry.krate].files.len()];
+                    for &f in dirty_files {
+                        if let Some(slot) = mask.get_mut(f) {
+                            *slot = false;
+                        }
+                    }
+                    outline.crates[entry.krate].env.fixed_files = mask;
+                }
+            } else {
+                outline.crates[entry.krate].env.fixed_files.clear();
+            }
         }
     }
 

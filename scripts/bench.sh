@@ -300,6 +300,7 @@ fi
 python3 - "$tmp" "$haste_bin" "$suite" "$cache_dir" "$cargo_tmp" "$bench_long" <<'PYEOF'
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -373,6 +374,11 @@ def fmt_ms(ms):
         return f"{round(ms)} ms"
     return f"{ms:.1f} ms"
 
+def fmt_ms_exact(ms):
+    if ms >= 100.0:
+        return f"{round(ms)} ms"
+    return f"{ms:.1f} ms"
+
 def fmt_net_raw(net_ms, raw_ms):
     return f"{fmt_ms(net_ms)} (raw {fmt_ms(raw_ms)})"
 
@@ -383,9 +389,10 @@ def print_build_table(title, rows, has_prev):
     print()
     print("| Benchmark | haste | cargo | Speedup |")
     print("| --- | ---: | ---: | ---: |")
-    for label, h_ms, c_ms in rows:
+    for label, h_ms, c_ms, *exact in rows:
+        fmt = fmt_ms_exact if exact else fmt_ms
         speedup = f"{c_ms / max(h_ms, 1e-6):.1f}x"
-        print(f"| {label} | {fmt_ms(h_ms)} | {fmt_ms(c_ms)} | {speedup} |")
+        print(f"| {label} | {fmt(h_ms)} | {fmt(c_ms)} | {speedup} |")
 
 def write_edit(path, orig_src, needle, value):
     new_src = orig_src.replace(needle, f"(x + {value})", 1)
@@ -418,17 +425,25 @@ if suite in ("all", "build"):
     h_check_empty = None
     h_emit_empty = None
     if run_cold:
-        empty_check_env = isolated_haste_env("empty_check")
-        empty_emit_env = isolated_haste_env("empty_emit")
-        h_check_empty = run_timed(haste_check_cmd, env=empty_check_env)
-        h_emit_empty = run_timed(haste_emit_cmd, env=empty_emit_env)
+        h_check_empties, h_emit_empties = [], []
+        for i in range(rounds):
+            h_check_empties.append(run_timed(haste_check_cmd, env=isolated_haste_env(f"empty_check_{i}")))
+            h_emit_empties.append(run_timed(haste_emit_cmd, env=isolated_haste_env(f"empty_emit_{i}")))
+        h_check_empty = median_of(h_check_empties)
+        h_emit_empty = median_of(h_emit_empties)
         for env in (check_haste_env, emit_haste_env, daemon_haste_env):
             subprocess.run([haste_bin, "build", hello_dir], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
     h_check_cold = run_timed(haste_check_cmd, env=check_haste_env)
-    c_check_cold = run_timed(cargo_check_cmd, env=cargo_env)
     h_emit_cold = run_timed(haste_emit_cmd, env=emit_haste_env)
-    c_build_cold = run_timed(cargo_build_cmd, env=cargo_env)
+    c_check_colds, c_build_colds = [], []
+    for _ in range(rounds if run_cold else 1):
+        shutil.rmtree(cargo_check_target, ignore_errors=True)
+        shutil.rmtree(cargo_build_target, ignore_errors=True)
+        c_check_colds.append(run_timed(cargo_check_cmd, env=cargo_env))
+        c_build_colds.append(run_timed(cargo_build_cmd, env=cargo_env))
+    c_check_cold = median_of(c_check_colds)
+    c_build_cold = median_of(c_build_colds)
 
     h_check_noop = median_ms(5, haste_check_cmd, env=check_haste_env)
     c_check_noop = median_ms(5, cargo_check_cmd, env=cargo_env)
@@ -509,8 +524,8 @@ if suite in ("all", "build"):
     ])
     if run_cold:
         rows.extend([
-            ("Empty HASTE_HOME (`haste build` vs `cargo check`)", h_check_empty, c_check_cold),
-            ("Empty HASTE_HOME (`haste build -o` vs `cargo build`)", h_emit_empty, c_build_cold),
+            ("Empty HASTE_HOME (`haste build` vs `cargo check`)", h_check_empty, c_check_cold, True),
+            ("Empty HASTE_HOME (`haste build -o` vs `cargo build`)", h_emit_empty, c_build_cold, True),
             ("First project build, stdlib indexed (`haste build` vs `cargo check`)", h_check_cold, c_check_cold),
             ("First project build, stdlib indexed (`haste build -o` vs `cargo build`)", h_emit_cold, c_build_cold),
         ])

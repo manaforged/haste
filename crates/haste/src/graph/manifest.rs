@@ -261,11 +261,35 @@ fn lib_of(dir: &Path, root: &Table) -> (Option<PathBuf>, bool) {
     (path, proc_macro)
 }
 
+fn infer_target_path(
+    dir: &Path,
+    folder: &str,
+    target_name: &str,
+    default_main: Option<&str>,
+) -> PathBuf {
+    if default_main == Some(target_name) {
+        let main = dir.join("src/main.rs");
+        if main.is_file() {
+            return main;
+        }
+    }
+    let flat = dir.join(format!("{folder}/{target_name}.rs"));
+    if flat.is_file() {
+        return flat;
+    }
+    let nested = dir.join(format!("{folder}/{target_name}/main.rs"));
+    if nested.is_file() {
+        return nested;
+    }
+    flat
+}
+
 fn targets_of(
     dir: &Path,
     root: &Table,
     package: &Table,
     (table_key, auto_key, folder): (&str, &str, &str),
+    default_main: Option<&str>,
 ) -> Vec<TargetSpec> {
     let listed = root
         .get(table_key)
@@ -277,7 +301,7 @@ fn targets_of(
         .filter_map(|entry| {
             let target_name = text(entry, "name")?.to_owned();
             let path = text(entry, "path").map_or_else(
-                || dir.join(format!("{folder}/{target_name}.rs")),
+                || infer_target_path(dir, folder, &target_name, default_main),
                 |path| dir.join(path),
             );
             let required_features = strings(
@@ -324,7 +348,13 @@ fn targets_of(
 }
 
 fn bins_of(dir: &Path, name: &str, root: &Table, package: &Table) -> Vec<TargetSpec> {
-    let mut bins = targets_of(dir, root, package, ("bin", "autobins", "src/bin"));
+    let mut bins = targets_of(
+        dir,
+        root,
+        package,
+        ("bin", "autobins", "src/bin"),
+        Some(name),
+    );
     let auto = flag(package, &["autobins"]).unwrap_or(true);
     let main = dir.join("src/main.rs");
     if auto && main.is_file() && !bins.iter().any(|t| t.path == main) {
@@ -594,11 +624,55 @@ fn manifest_of(dir: &Path, root: &Table, workspace: Option<&Table>) -> Result<Ma
             .map(str::to_owned),
         proc_macro,
         bins: bins_of(dir, &name, root, package),
-        examples: targets_of(dir, root, package, ("example", "autoexamples", "examples")),
-        tests: targets_of(dir, root, package, ("test", "autotests", "tests")),
-        benches: targets_of(dir, root, package, ("bench", "autobenches", "benches")),
+        examples: targets_of(
+            dir,
+            root,
+            package,
+            ("example", "autoexamples", "examples"),
+            None,
+        ),
+        tests: targets_of(dir, root, package, ("test", "autotests", "tests"), None),
+        benches: targets_of(
+            dir,
+            root,
+            package,
+            ("bench", "autobenches", "benches"),
+            None,
+        ),
         features: features_of(root),
         deps: all_deps(&scope, root)?,
         name,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inferred_bin_path_prefers_src_main_for_package_name() {
+        let dir =
+            std::env::temp_dir().join(format!("haste-manifest-bin-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src/bin/nested")).expect("mkdir");
+        std::fs::write(dir.join("src/main.rs"), "fn main() {}\n").expect("write main");
+        std::fs::write(dir.join("src/bin/nested/main.rs"), "fn main() {}\n").expect("write nested");
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            concat!(
+                "[package]\nname = \"tokei\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                "[[bin]]\nname = \"tokei\"\nrequired-features = [\"cli\"]\n",
+                "[[bin]]\nname = \"nested\"\n",
+            ),
+        )
+        .expect("write Cargo.toml");
+
+        let manifest = read(&dir, None).expect("read manifest");
+        assert_eq!(manifest.bins.len(), 2);
+        assert_eq!(manifest.bins[0].name, "tokei");
+        assert_eq!(manifest.bins[0].path, dir.join("src/main.rs"));
+        assert_eq!(manifest.bins[1].name, "nested");
+        assert_eq!(manifest.bins[1].path, dir.join("src/bin/nested/main.rs"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

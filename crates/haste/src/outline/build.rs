@@ -272,7 +272,9 @@ impl Loader<'_> {
             if item.parent != owner || !self.out.env.enabled(&item.attrs) {
                 continue;
             }
-            if self.out.consumed.contains(&(index as u32, at as u32)) {
+            if !self.out.consumed.is_empty()
+                && self.out.consumed.contains(&(index as u32, at as u32))
+            {
                 continue;
             }
             self.attributes(file, module, (at as u32, item));

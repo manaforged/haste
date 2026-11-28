@@ -38,7 +38,7 @@ pub(crate) use inline::InlineCacheHit;
 use inline::{InlCache, inline_bundle_path};
 #[cfg(test)]
 use relocs::stable_file_key;
-pub(crate) use relocs::{LocalFileIndex, hash_str};
+pub(crate) use relocs::{LocalFileIndex, LocalItemRecord, hash_str};
 use relocs::{TransitiveLocalFiles, collect_inlined_local_files_cached, relocs_unwind_digest};
 #[cfg(test)]
 use rustc_hash::FxHasher;

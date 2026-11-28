@@ -19,30 +19,20 @@ use anyhow::{Context as _, Result, bail};
 const COMPRESSED_MAGIC: [u8; 8] = *b"HSTZ0002";
 const COMPRESSED_HEADER: usize = 16;
 
-/// Atomically writes `chunks` compressed with fast LZ4 (`HSTZ0002` framing) to `path`.
-pub(crate) fn write_compressed(path: &Path, chunks: &[&[u8]]) -> Result<()> {
-    let raw_len: usize = chunks.iter().map(|c| c.len()).sum();
-    let compressed = if chunks.len() == 1 {
-        lz4_flex::block::compress(chunks[0])
-    } else {
-        let mut combined = Vec::with_capacity(raw_len);
-        for chunk in chunks {
-            combined.extend_from_slice(chunk);
-        }
-        lz4_flex::block::compress(&combined)
-    };
-    crate::graph::store::write_new_with(path, |writer| {
-        writer.write_all(&COMPRESSED_MAGIC)?;
-        writer.write_all(&(raw_len as u64).to_le_bytes())?;
-        writer.write_all(&compressed)
-    })
-    .with_context(|| format!("writing {}", path.display()))
-}
-
 /// Atomically writes raw uncompressed `bytes` to `path`.
 pub(crate) fn write_raw(path: &Path, bytes: &[u8]) -> Result<()> {
     crate::graph::store::write_new_bytes(path, bytes)
         .with_context(|| format!("writing {}", path.display()))
+}
+
+pub(crate) fn write_raw_chunks(path: &Path, chunks: &[&[u8]]) -> Result<()> {
+    crate::graph::store::write_new_with(path, |writer| {
+        for chunk in chunks {
+            writer.write_all(chunk)?;
+        }
+        Ok(())
+    })
+    .with_context(|| format!("writing {}", path.display()))
 }
 
 fn decompress_slice(bytes: &[u8], min_len: usize) -> Result<Box<[u8]>> {

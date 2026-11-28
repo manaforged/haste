@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
+use rustc_hash::FxHashMap;
+use rustc_lexer::TokenKind;
 
 use super::Outline;
 use super::item::{Attr, Import, Item, ItemKind, Items};
@@ -58,23 +60,24 @@ impl Outline {
             return Ok(Edit::Items(crates));
         };
         let expanded_include = self.crates.iter().enumerate().any(|(ck, tree)| {
+            let mut scan = IncludeScan::new(self, ck);
             tree.files.iter().any(|entry| {
                 entry.expanded
                     && entry.source.path == path
-                    && !crate_included_calls(self, ck, &entry.source, None, 0).is_empty()
+                    && !scan.calls(&entry.source, None, 0).is_empty()
             })
         });
         let old = &self.crates[krate as usize].files[file as usize];
         let skipped = body_skipped(old);
-        let outside_include =
-            (0..old.source.tokens.len() as u32).any(|at| {
-                !skipped[at as usize]
-                    && matches!(
-                        old.source.text(at),
-                        "include" | "include_str" | "include_bytes"
-                    )
-            }) || !crate_included_calls(self, krate as usize, &old.source, Some(&skipped), 0)
-                .is_empty();
+        let mut scan = IncludeScan::new(self, krate as usize);
+        let outside_include = (0..old.source.tokens.len() as u32).any(|at| {
+            !skipped[at as usize]
+                && old.source.kind(at) == TokenKind::Ident
+                && matches!(
+                    old.source.text(at),
+                    "include" | "include_str" | "include_bytes"
+                )
+        }) || !scan.calls(&old.source, Some(&skipped), 0).is_empty();
         if expanded_include || !old.source.marks.is_empty() || outside_include {
             return Ok(Edit::Items(crates));
         }
@@ -92,14 +95,14 @@ impl Outline {
         if let Some(cached) = &tree.cached_included {
             return cached.clone();
         }
-        tree.files
-            .iter()
-            .flat_map(|file| {
-                crate_included_calls(self, krate, &file.source, None, 0)
-                    .into_iter()
-                    .map(move |path| (file.source.beside(&path), file.source.path.clone()))
-            })
-            .collect()
+        let mut scan = IncludeScan::new(self, krate);
+        let mut out = Vec::new();
+        for file in &tree.files {
+            for path in scan.calls(&file.source, None, 0) {
+                out.push((file.source.beside(&path), file.source.path.clone()));
+            }
+        }
+        out
     }
 
     fn places_of(&self, path: &Path) -> (Vec<(u32, u32)>, Vec<u32>) {
@@ -123,120 +126,138 @@ impl Outline {
     }
 }
 
-fn find_macro_def<'a>(
+struct IncludeScan<'a> {
     outline: &'a Outline,
     krate: usize,
-    name: &str,
-) -> Option<&'a std::sync::Arc<super::tree::Macro>> {
-    let tree = &outline.crates[krate];
-    tree.exports
-        .get(name)
-        .or_else(|| {
-            tree.defined.iter().find_map(|(&(f, i), mac)| {
-                let file = tree.files.get(f as usize)?;
-                let ntok = file.items.items.get(i as usize)?.name?;
-                (crate::names::plain(file.source.text(ntok)) == name).then_some(mac)
-            })
-        })
-        .or_else(|| {
-            outline.deps[krate]
-                .iter()
-                .find_map(|&(_, dep)| outline.crates[dep].exports.get(name))
-        })
+    defined: Option<FxHashMap<&'a str, &'a Arc<super::tree::Macro>>>,
+    may_include: FxHashMap<*const File, bool>,
 }
 
-fn macro_may_include(src: &Source) -> bool {
-    ["include", "include_str", "include_bytes"]
-        .iter()
-        .any(|word| src.holds_word((0, src.len()), word))
-}
-
-fn resolve_include_path(
-    outline: &Outline,
-    krate: usize,
-    src: &Source,
-    (from, to): (u32, u32),
-    depth: usize,
-) -> Option<String> {
-    if depth >= 16 || from >= to {
-        return None;
-    }
-    if let Some(plain) = super::build::path_text(src, (from, to), &outline.crates[krate].env) {
-        return Some(plain);
-    }
-    if src.text(from) == "(" && src.pair(from) == to - 1 {
-        return resolve_include_path(outline, krate, src, (from + 1, to - 1), depth + 1);
-    }
-    if to < from + 3 || src.text(from + 1) != "!" || src.pair(from + 2) != to - 1 {
-        return None;
-    }
-    let name = crate::names::plain(src.text(from));
-    if name == "concat" {
-        return src
-            .args(from + 2)
-            .into_iter()
-            .map(|arg| resolve_include_path(outline, krate, src, arg, depth + 1))
-            .collect();
-    }
-    let def = find_macro_def(outline, krate, name)?;
-    let expanded = super::mbe::expand(
-        &def.file.source,
-        &def.rules,
-        src,
-        (from + 2, krate as u32),
-        None,
-    )
-    .ok()?;
-    resolve_include_path(outline, krate, &expanded, (0, expanded.len()), depth + 1)
-}
-
-fn crate_included_calls(
-    outline: &Outline,
-    krate: usize,
-    src: &Source,
-    skipped: Option<&[bool]>,
-    depth: usize,
-) -> Vec<String> {
-    if depth >= 16 {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    for open in 2..src.tokens.len() as u32 {
-        if !super::source::opens(src.kind(open)) || src.text(open - 1) != "!" {
-            continue;
+impl<'a> IncludeScan<'a> {
+    fn new(outline: &'a Outline, krate: usize) -> Self {
+        Self {
+            outline,
+            krate,
+            defined: None,
+            may_include: FxHashMap::default(),
         }
-        if skipped.is_some_and(|mask| mask[(open - 2) as usize]) {
-            continue;
+    }
+
+    fn find_macro(&mut self, name: &str) -> Option<&'a Arc<super::tree::Macro>> {
+        let tree = &self.outline.crates[self.krate];
+        if let Some(mac) = tree.exports.get(name) {
+            return Some(mac);
         }
-        let name = crate::names::plain(src.text(open - 2));
-        if matches!(name, "include" | "include_str" | "include_bytes") {
-            if let Some(arg) = src.args(open).first().copied()
-                && let Some(path) = resolve_include_path(outline, krate, src, arg, depth)
-            {
-                out.push(path);
+        if !tree.defined.is_empty() {
+            let defined = self.defined.get_or_insert_with(|| {
+                let mut map = FxHashMap::default();
+                for (&(f, i), mac) in &tree.defined {
+                    if let Some(file) = tree.files.get(f as usize)
+                        && let Some(ntok) = file.items.items.get(i as usize).and_then(|e| e.name)
+                    {
+                        map.entry(crate::names::plain(file.source.text(ntok)))
+                            .or_insert(mac);
+                    }
+                }
+                map
+            });
+            if let Some(&mac) = defined.get(name) {
+                return Some(mac);
             }
-            continue;
         }
-        if let Some(def) = find_macro_def(outline, krate, name)
-            && macro_may_include(&def.file.source)
-            && let Ok(expanded) = super::mbe::expand(
-                &def.file.source,
-                &def.rules,
-                src,
-                (open, krate as u32),
-                None,
-            )
-        {
-            out.extend(crate_included_calls(
-                outline,
-                krate,
-                &expanded,
-                None,
-                depth + 1,
-            ));
-        }
+        self.outline.deps[self.krate]
+            .iter()
+            .find_map(|&(_, dep)| self.outline.crates[dep].exports.get(name))
     }
-    out
+
+    fn file_may_include(&mut self, file: &Arc<File>) -> bool {
+        let key = Arc::as_ptr(file);
+        if let Some(&cached) = self.may_include.get(&key) {
+            return cached;
+        }
+        let yes = ["include", "include_str", "include_bytes"]
+            .iter()
+            .any(|word| file.source.holds_word((0, file.source.len()), word));
+        self.may_include.insert(key, yes);
+        yes
+    }
+
+    fn resolve_path(
+        &mut self,
+        src: &Source,
+        (from, to): (u32, u32),
+        depth: usize,
+    ) -> Option<String> {
+        if depth >= 16 || from >= to {
+            return None;
+        }
+        if let Some(plain) =
+            super::build::path_text(src, (from, to), &self.outline.crates[self.krate].env)
+        {
+            return Some(plain);
+        }
+        if src.text(from) == "(" && src.pair(from) == to - 1 {
+            return self.resolve_path(src, (from + 1, to - 1), depth + 1);
+        }
+        if to < from + 3 || src.kind(from + 1) != TokenKind::Bang || src.pair(from + 2) != to - 1 {
+            return None;
+        }
+        let name = crate::names::plain(src.text(from));
+        if name == "concat" {
+            return src
+                .args(from + 2)
+                .into_iter()
+                .map(|arg| self.resolve_path(src, arg, depth + 1))
+                .collect();
+        }
+        let def = self.find_macro(name)?;
+        let expanded = super::mbe::expand(
+            &def.file.source,
+            &def.rules,
+            src,
+            (from + 2, self.krate as u32),
+            None,
+        )
+        .ok()?;
+        self.resolve_path(&expanded, (0, expanded.len()), depth + 1)
+    }
+
+    fn calls(&mut self, src: &Source, skipped: Option<&[bool]>, depth: usize) -> Vec<String> {
+        if depth >= 16 {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for open in 2..src.tokens.len() as u32 {
+            if src.kind(open - 1) != TokenKind::Bang || !super::source::opens(src.kind(open)) {
+                continue;
+            }
+            if skipped.is_some_and(|mask| mask[(open - 2) as usize]) {
+                continue;
+            }
+            let name = crate::names::plain(src.text(open - 2));
+            if matches!(name, "include" | "include_str" | "include_bytes") {
+                if let Some(arg) = src.args(open).first().copied()
+                    && let Some(path) = self.resolve_path(src, arg, depth)
+                {
+                    out.push(path);
+                }
+                continue;
+            }
+            if let Some(def) = self.find_macro(name)
+                && self.file_may_include(&def.file)
+                && let Ok(expanded) = super::mbe::expand(
+                    &def.file.source,
+                    &def.rules,
+                    src,
+                    (open, self.krate as u32),
+                    None,
+                )
+            {
+                out.extend(self.calls(&expanded, None, depth + 1));
+            }
+        }
+        out
+    }
 }
 
 fn same_places(old: &File, new: &File) -> bool {
@@ -717,7 +738,8 @@ mod tests {
         f1.source.marks = vec![
             (1, Mark::Scope { id: 100, parent: 0 }),
             (2, Mark::Scope { id: 100, parent: 0 }),
-        ];
+        ]
+        .into();
         let mut f2 = File::new(
             Source::parse(src_path, "pub fn inner() -> u64 { 10 }".into()).expect("f2"),
             Items::default(),
@@ -726,9 +748,14 @@ mod tests {
         f2.source.marks = vec![
             (1, Mark::Scope { id: 250, parent: 0 }),
             (2, Mark::Scope { id: 250, parent: 0 }),
-        ];
+        ]
+        .into();
         assert!(files_identical(&f1, &f2));
-        f2.source.marks[1].1 = Mark::Scope { id: 251, parent: 0 };
+        f2.source.marks = vec![
+            (1, Mark::Scope { id: 250, parent: 0 }),
+            (2, Mark::Scope { id: 251, parent: 0 }),
+        ]
+        .into();
         assert!(!files_identical(&f1, &f2));
     }
 }

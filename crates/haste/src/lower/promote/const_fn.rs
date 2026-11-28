@@ -44,6 +44,9 @@ impl<'l, 'a, 'r> ConstEnv<'l, 'a, 'r> {
             let ((source, _), Ok(typed)) = &self.lower.reached.list[index] else {
                 return None;
             };
+            if typed.is_reach_memo() {
+                return None;
+            }
             return is_readable_const_body(self.lower.cx, owner, *source, typed)
                 .then(|| (*source, typed.clone()));
         }

@@ -170,14 +170,14 @@ fn scan_body_ops(
     matches!(entry, BodyScan::Unwinds)
 }
 
-struct UnwindScratch {
+pub(super) struct UnwindScratch {
     body_cache: FxHashMap<(ItemRef, bool), BodyScan>,
     item_cache: FxHashMap<ItemRef, ItemUnwind>,
     call_callees: Vec<bool>,
 }
 
 impl UnwindScratch {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             body_cache: FxHashMap::default(),
             item_cache: FxHashMap::default(),
@@ -259,7 +259,7 @@ fn item_unwind(
     })
 }
 
-fn direct_may_unwind(
+pub(super) fn direct_may_unwind(
     cx: &mut Context<'_>,
     reached: &Reached,
     index: usize,
@@ -269,13 +269,19 @@ fn direct_may_unwind(
         return (true, false);
     };
     let item = *item;
+    let Ok(typed) = res else {
+        return match item_unwind(cx, item, &mut scratch.item_cache) {
+            ItemUnwind::Intrinsic(u) | ItemUnwind::Foreign(u) => (u, false),
+            ItemUnwind::Normal => (true, false),
+        };
+    };
+    if let LazyTables::ReachMemo(memo) = &typed.tables {
+        return (memo.direct_unwinds, memo.skip_drops);
+    }
     match item_unwind(cx, item, &mut scratch.item_cache) {
         ItemUnwind::Intrinsic(u) | ItemUnwind::Foreign(u) => return (u, false),
         ItemUnwind::Normal => {}
     }
-    let Ok(typed) = res else {
-        return (true, false);
-    };
     let mut skip_drops = false;
     match &typed.shape {
         Shape::Virtual(_) | Shape::Asm(_) | Shape::Anon(_) => return (true, false),

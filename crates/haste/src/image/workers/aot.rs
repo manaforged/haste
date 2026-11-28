@@ -37,7 +37,7 @@ fn seed_aot_roots(reached: &Reached, roots: &[usize]) -> (Vec<AtomicBool>, Vec<u
 impl Image {
     pub(in crate::image) fn build_aot_streaming(
         cx: &mut Context<'_>,
-        reached: &Reached,
+        reached: &mut Reached,
         roots: &[usize],
     ) -> Result<(Image, FxHashMap<usize, String>)> {
         let mut image = Self::create(reached, ImageMode::Aot, (0, 0, 0))?;
@@ -92,7 +92,18 @@ impl Image {
                     }
                 }
                 image.apply_records();
-                if deferred.is_empty() || eval_requests.is_empty() {
+                let mut to_mat = image
+                    .aot()
+                    .map(|aot| std::mem::take(&mut lock(aot).need_materialize))
+                    .unwrap_or_default();
+                let materialized = !to_mat.is_empty();
+                if materialized {
+                    to_mat.sort_unstable();
+                    to_mat.dedup();
+                    reached.materialize_memos(cx, &to_mat);
+                    deferred.extend(to_mat);
+                }
+                if deferred.is_empty() || (eval_requests.is_empty() && !materialized) {
                     break;
                 }
                 if !eval_requests.is_empty() {
@@ -138,13 +149,23 @@ impl Image {
     fn drain_aot_serial(
         &mut self,
         cx: &mut Context<'_>,
-        reached: &Reached,
+        reached: &mut Reached,
         queue: &AotQueue,
         plan: Plan,
         broken: &mut FxHashMap<usize, String>,
     ) {
         loop {
             let mut batch = queue.take_all_pending();
+            let mut to_mat = self
+                .aot()
+                .map(|aot| std::mem::take(&mut lock(aot).need_materialize))
+                .unwrap_or_default();
+            if !to_mat.is_empty() {
+                to_mat.sort_unstable();
+                to_mat.dedup();
+                reached.materialize_memos(cx, &to_mat);
+                batch.extend(to_mat);
+            }
             if batch.is_empty() {
                 break;
             }

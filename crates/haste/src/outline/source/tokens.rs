@@ -30,6 +30,16 @@ fn is_punct_kind(kind: TokenKind) -> bool {
 }
 
 impl Tokens {
+    pub fn with_capacity(tokens: usize, text: usize) -> Self {
+        Self {
+            text: String::with_capacity(text),
+            tokens: Vec::with_capacity(tokens),
+            marks: Vec::new(),
+            opaque: Vec::new(),
+            origins: Vec::new(),
+        }
+    }
+
     fn append(&mut self, kind: TokenKind, text: &str, joint: bool) {
         let start = self.text.len() as u32;
         self.text.push_str(text);
@@ -63,6 +73,11 @@ impl Tokens {
             &layer.text[token.start as usize..token.end() as usize],
             token.joint(),
         );
+    }
+
+    #[inline]
+    pub fn punct(&mut self, kind: TokenKind, text: &str, joint: bool) {
+        self.append(kind, text, joint);
     }
 
     /// Writes the name `name`, marked as coming from `mark`.
@@ -111,13 +126,14 @@ impl Tokens {
             path,
             text: self.text.into(),
             tokens: tokens.into(),
-            marks: self.marks,
+            marks: self.marks.into(),
             opaque: self.opaque,
             base: None,
             offset: 0,
             outputs: Outputs::default(),
             origins: Origins::Copied(self.origins),
             line_starts: OnceLock::new(),
+            disk_len: None,
         })
     }
 

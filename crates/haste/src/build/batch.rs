@@ -18,7 +18,7 @@ use crate::sema::{self, Cache};
 
 use super::require_main;
 use super::substrate::{
-    SubstrateSlot, attach_warm_cache, cache_with_substrate, export_pre_summaries,
+    SubstrateSlot, attach_warm_cache, cache_with_substrate_or_reused, export_pre_summaries,
     load_local_check_crates, prepare_local_check, save_batch_substrate,
 };
 use super::test_args::{
@@ -369,7 +369,8 @@ fn finish_batch(
         .map(|inst| reached.index[inst])
         .collect();
     let start_indices = test_indices(&test_starts, &reached);
-    if drop_finals {
+    let has_memo = reached.has_reach_memo();
+    if drop_finals && !has_memo {
         cx.compact_for_oneshot_codegen();
     }
     let (mut image, broken) = if mode == ImageMode::Aot && roots.len() == 2 {
@@ -379,10 +380,20 @@ fn finish_batch(
                 .iter()
                 .filter_map(|inst| reached.index.get(inst).copied()),
         );
-        Image::build_aot(&mut cx, &reached, &aot_roots)?
+        Image::build_aot(&mut cx, &mut reached, &aot_roots)?
     } else {
         Image::build(&mut cx, &reached, mode)?
     };
+    if mode == ImageMode::Aot
+        && broken.is_empty()
+        && reached.unlaid.is_empty()
+        && let Some(memo) = cx.store().reach_memo().cloned()
+    {
+        memo.flush(&mut cx, &reached);
+    }
+    if drop_finals && has_memo {
+        cx.compact_for_oneshot_codegen();
+    }
     let codegen_span = codegen_clock.elapsed();
     let labels = batch_labels(&mut cx, kind, &valid);
     let outline = cx.outline;
@@ -498,7 +509,11 @@ impl Batch {
         if use_local_check {
             load_local_check_crates(workspace, compilation, kind != BatchKind::LibCheck)?;
         }
-        let (mut substrate, mut cache) = cache_with_substrate(workspace, mode != ImageMode::Check);
+        let (mut substrate, mut cache) = cache_with_substrate_or_reused(
+            workspace,
+            compilation.take_substrate_slot(),
+            mode != ImageMode::Check,
+        );
         if substrate.is_some() && mode == ImageMode::Aot {
             attach_warm_cache(workspace, &mut cache);
         }
@@ -523,7 +538,7 @@ impl Batch {
             let roots = item_roots(&items);
             (items, roots)
         };
-        let (cache, member_errors) = run_member_check(
+        let (mut cache, member_errors) = run_member_check(
             workspace,
             compilation,
             cache,
@@ -532,6 +547,9 @@ impl Batch {
         )?;
         if !member_errors.is_empty() {
             return empty_batch(kind, cache, member_errors, reach_clock.elapsed());
+        }
+        if kind == BatchKind::MainAot {
+            cache.set_reach_memo_enabled(true);
         }
         if let Some(state) = check_state {
             state.set_fixed(&mut compilation.outline, true);

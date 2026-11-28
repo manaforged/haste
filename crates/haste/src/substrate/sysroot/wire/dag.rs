@@ -3,14 +3,14 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use anyhow::{Context as _, Result, bail};
 
-use crate::names::{Crate as NamesCrate, Scope, Sym, Symbols};
+use crate::names::{Crate as NamesCrate, Sym, Symbols};
 use crate::outline::tree::{Crate as OutlineCrate, File, Macro, Textual};
 use crate::sema::impls::Index as ImplIndex;
 use crate::substrate::Backing;
 
 use super::super::EnvReads;
 use super::super::impls::read_impl_index;
-use super::super::names::{ScopeTable, decode_scope_range, read_names_crate_body};
+use super::super::names::{ScopeTable, lazy_scopes, read_names_crate_body};
 use super::super::outline::read_outline_crate;
 use super::super::tokens::{Reader, read_rules, u32_le};
 use super::decode::{WireSections, decode_textuals, read_file};
@@ -99,32 +99,10 @@ fn decode_sym_chunk(chunk: &SymChunk<'_>, syms: &Symbols) -> Result<Vec<Sym>> {
     Ok(out)
 }
 
-pub(super) fn chunk_scope_ranges(table: &ScopeTable<'_>) -> Vec<(usize, usize, usize)> {
-    const TARGET_BYTES: usize = 32 * 1024;
-    const MAX_SCOPES: usize = 256;
-    let mut chunks = Vec::new();
-    let mut chunk_start = 0usize;
-    let mut chunk_base_off = 0usize;
-    for (idx, c) in table.end_bytes.chunks_exact(4).enumerate() {
-        let end_off = u32_le(c, 0) as usize;
-        let cur_bytes = end_off - chunk_base_off;
-        let cur_len = idx + 1 - chunk_start;
-        if cur_bytes >= TARGET_BYTES || cur_len >= MAX_SCOPES {
-            chunks.push((chunk_start, idx + 1, cur_bytes));
-            chunk_start = idx + 1;
-            chunk_base_off = end_off;
-        }
-    }
-    if chunk_start < table.count {
-        chunks.push((chunk_start, table.count, table.total_bytes - chunk_base_off));
-    }
-    chunks
-}
-
 pub(super) struct BatchInput<'a> {
     pub backing: &'a Arc<Backing>,
     pub cached_crates: &'a [usize],
-    pub remap: &'a [u32],
+    pub remap: &'a Arc<[u32]>,
     pub scope_bit: u32,
     pub env_reads: Vec<EnvReads>,
 }
@@ -167,19 +145,6 @@ pub(super) enum DagTask {
         pos: usize,
         weight: usize,
     },
-    NamesBody {
-        item_idx: usize,
-        pos: usize,
-        weight: usize,
-    },
-    ScopeChunk {
-        item_idx: usize,
-        pos: usize,
-        cidx: usize,
-        start: usize,
-        end: usize,
-        weight: usize,
-    },
 }
 
 impl DagTask {
@@ -192,9 +157,7 @@ impl DagTask {
             | DagTask::Textuals { weight, .. }
             | DagTask::Impls { weight, .. }
             | DagTask::Outline { weight, .. }
-            | DagTask::NamesFull { weight, .. }
-            | DagTask::NamesBody { weight, .. }
-            | DagTask::ScopeChunk { weight, .. } => weight,
+            | DagTask::NamesFull { weight, .. } => weight,
         }
     }
 
@@ -223,14 +186,13 @@ pub(super) struct ItemState<'a> {
     pub sym_chunks: Vec<SymChunk<'a>>,
     pub sym_chunk_slots: Vec<Mutex<Option<Vec<Sym>>>>,
     pub sym_rem: AtomicUsize,
-    pub sym_remap: OnceLock<Vec<Sym>>,
+    pub sym_remap: OnceLock<Arc<[Sym]>>,
     pub name_tables: Vec<(ScopeTable<'a>, &'a [u8])>,
     pub pending_names: Vec<DagTask>,
     pub outline_tasks: Vec<DagTask>,
     pub outline_slots: Vec<OnceLock<OutlineCrate>>,
     pub name_slots: Vec<OnceLock<NamesCrate>>,
     pub impl_slots: Vec<OnceLock<Option<Arc<ImplIndex>>>>,
-    pub scope_chunks: Vec<Vec<OnceLock<Vec<Scope>>>>,
 }
 
 pub(super) struct DagCtx<'a, 'b> {
@@ -359,7 +321,7 @@ fn run_dag_task(ctx: &DagCtx<'_, '_>, task: DagTask) -> Result<()> {
                         bail!("missing decoded symbol chunk");
                     }
                 }
-                let _ = state.sym_remap.set(flat);
+                let _ = state.sym_remap.set(Arc::from(flat));
                 if !state.pending_names.is_empty() {
                     push_unlocked(ctx, state.pending_names.iter().copied());
                 }
@@ -457,46 +419,13 @@ fn run_dag_task(ctx: &DagCtx<'_, '_>, task: DagTask) -> Result<()> {
                 .get()
                 .context("missing decoded symbol remap")?;
             let (ref table, body_slice) = state.name_tables[pos];
-            let scopes = decode_scope_range(table, 0, table.count, input.remap, sym_remap)?;
+            let scopes = lazy_scopes(table, input.backing, input.remap, sym_remap)?;
             let mut creader = Reader::new(body_slice);
             let krate = read_names_crate_body(&mut creader, scopes, input.remap, sym_remap)?;
             if !creader.is_empty() {
                 bail!("trailing bytes in snapshot names crate");
             }
             let _ = state.name_slots[pos].set(krate);
-        }
-        DagTask::NamesBody { item_idx, pos, .. } => {
-            let state = &ctx.states[item_idx];
-            let input = &ctx.inputs[item_idx];
-            let sym_remap = state
-                .sym_remap
-                .get()
-                .context("missing decoded symbol remap")?;
-            let (_, body_slice) = state.name_tables[pos];
-            let mut creader = Reader::new(body_slice);
-            let krate = read_names_crate_body(&mut creader, Vec::new(), input.remap, sym_remap)?;
-            if !creader.is_empty() {
-                bail!("trailing bytes in snapshot names crate");
-            }
-            let _ = state.name_slots[pos].set(krate);
-        }
-        DagTask::ScopeChunk {
-            item_idx,
-            pos,
-            cidx,
-            start,
-            end,
-            ..
-        } => {
-            let state = &ctx.states[item_idx];
-            let input = &ctx.inputs[item_idx];
-            let sym_remap = state
-                .sym_remap
-                .get()
-                .context("missing decoded symbol remap")?;
-            let (ref table, _) = state.name_tables[pos];
-            let scopes = decode_scope_range(table, start, end, input.remap, sym_remap)?;
-            let _ = state.scope_chunks[pos][cidx].set(scopes);
         }
     }
     Ok(())

@@ -216,7 +216,7 @@ impl SubstrateBuilder {
         self.blob.shrink_to_fit();
         let mut tables = Vec::with_capacity(total - self.blob.len());
         self.encode_tables(&mut tables);
-        super::backing::write_compressed(path, &[&tables, &self.blob])?;
+        super::backing::write_raw_chunks(path, &[&tables, &self.blob])?;
         Ok(true)
     }
 

@@ -90,6 +90,7 @@ impl<'a> Infer<'_, 'a> {
         let Some(ret) = sig.ret else {
             bail!("constant {} has no type", self.cx.name(item));
         };
+        let asks0 = self.cx.asks.count();
         let mut width = None;
         let folded = self.with_const_body(item, substs, |infer, body, root| {
             let ty = infer.lower_ty(&sig.body, ret)?;
@@ -101,12 +102,45 @@ impl<'a> Infer<'_, 'a> {
             Ok((value & mask(int.0), int))
         });
         match (folded, width) {
+            (Ok((value, int)), _) => {
+                if !substs.iter().any(|&ty| self.has_vars(ty)) && self.cx.asks.count() == asks0 {
+                    let interned = self.cx.types.intern_substs(substs);
+                    self.cx.store.evaluated.insert((item, interned), value);
+                }
+                Ok((value, int))
+            }
             (Err(error), _) if evaluate::is_const_arithmetic_error(&error) => Err(error),
             (Err(error), Some(int)) if !substs.iter().any(|&ty| self.has_vars(ty)) => {
                 let interned = self.cx.types.intern_substs(substs);
                 self.run_instance(&(item, interned), int, error)
             }
             (found, _) => found,
+        }
+    }
+
+    pub(in crate::sema) fn fold_const_item(
+        cx: &mut super::super::Context<'_>,
+        item: ItemRef,
+    ) -> Option<Result<u128>> {
+        let asks0 = cx.asks.count();
+        let folded = super::detached(cx, item, |infer| {
+            let sig = infer.cx.signature(item)?;
+            let Some(ret) = sig.ret else {
+                bail!("constant has no type");
+            };
+            infer.with_const_body(item, &[], |infer, body, root| {
+                let ty = infer.lower_ty(&sig.body, ret)?;
+                let Some(int) = infer.int_of(ty) else {
+                    bail!("constant of a type that is not an integer");
+                };
+                let (value, _) = infer.const_typed(body, root, int)?;
+                Ok(value & mask(int.0))
+            })
+        });
+        match folded {
+            Ok(value) if cx.asks.count() == asks0 => Some(Ok(value)),
+            Err(err) if evaluate::is_const_arithmetic_error(&err) => Some(Err(err)),
+            _ => None,
         }
     }
 

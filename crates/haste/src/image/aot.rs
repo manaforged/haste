@@ -156,6 +156,7 @@ pub(crate) struct AotState {
     frontier_vtables: Vec<bool>,
     frontier_rodata: Vec<bool>,
     pub(super) cache: Option<Arc<cache::AotCache>>,
+    pub(super) need_materialize: Vec<usize>,
 }
 
 impl AotState {
@@ -175,6 +176,7 @@ impl AotState {
             frontier_vtables: Vec::new(),
             frontier_rodata: Vec::new(),
             cache: None,
+            need_materialize: Vec::new(),
         })
     }
 
@@ -395,13 +397,42 @@ impl Image {
         pass: &mut super::Pass,
     ) -> Vec<usize> {
         let Some(cache) = self.aot_cache() else {
-            return work.to_vec();
+            let mut misses = Vec::with_capacity(work.len());
+            let mut memo_misses = Vec::new();
+            for &index in work {
+                if reached.is_reach_memo(index) {
+                    memo_misses.push(index);
+                } else {
+                    misses.push(index);
+                }
+            }
+            if !memo_misses.is_empty()
+                && let Some(aot) = self.aot()
+            {
+                lock(aot).need_materialize.extend(memo_misses);
+            }
+            return misses;
         };
         if !cache.has_loaded_bundle() {
             cache.mark_miss();
-            return work.to_vec();
+            let mut misses = Vec::with_capacity(work.len());
+            let mut memo_misses = Vec::new();
+            for &index in work {
+                if reached.is_reach_memo(index) {
+                    memo_misses.push(index);
+                } else {
+                    misses.push(index);
+                }
+            }
+            if !memo_misses.is_empty()
+                && let Some(aot) = self.aot()
+            {
+                lock(aot).need_materialize.extend(memo_misses);
+            }
+            return misses;
         }
         let mut misses = Vec::new();
+        let mut memo_misses = Vec::new();
         let mut ty_memo = HashMap::default();
         let mut hit_inlined = Vec::new();
         let mut hits = Vec::with_capacity(work.len());
@@ -430,12 +461,22 @@ impl Image {
                 hits.push((index, entry));
             } else {
                 cache.note_miss();
-                misses.push(index);
+                if reached.is_reach_memo(index) {
+                    memo_misses.push(index);
+                } else {
+                    misses.push(index);
+                }
             }
         }
         cache.note_hits(hit_count);
         cache.record_hit_inlined_batch(hit_inlined);
         self.record_aot_batch(hits);
+        if !memo_misses.is_empty() {
+            cache.mark_miss();
+            if let Some(aot) = self.aot() {
+                lock(aot).need_materialize.extend(memo_misses);
+            }
+        }
         if !misses.is_empty() {
             cache.mark_miss();
             if self.allow_inline()

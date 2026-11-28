@@ -268,8 +268,11 @@ fn items_in(tree: &Tree, files: &[(u32, Option<u32>)]) -> Vec<(u32, u32)> {
         let items = &tree.files[file as usize].items.items;
         for (at, item) in items.iter().enumerate() {
             let in_block = item.parent.is_some_and(|parent| {
-                items[parent as usize].kind == ItemKind::ExternBlock
-                    && items[parent as usize].parent == owner
+                let block = &items[parent as usize];
+                block.kind == ItemKind::ExternBlock
+                    && block.parent == owner
+                    && tree.env.enabled(&block.attrs)
+                    && !tree.consumed.contains(&(file, parent))
             });
             if item.parent == owner || in_block {
                 out.push((file, at as u32));

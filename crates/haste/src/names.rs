@@ -4,6 +4,11 @@ pub mod procs;
 pub mod resolve;
 mod want;
 
+use std::fmt;
+use std::ops::Deref;
+use std::sync::{Arc, OnceLock};
+
+use anyhow::{Context as _, Result};
 use rustc_hash::FxHashMap;
 
 use crate::outline::item::Vis;
@@ -246,13 +251,23 @@ impl PerNs {
     }
 
     /// Adds `binding` in `ns` unless a binding that shadows it is there; returns whether the scope changed.
-    pub fn insert(&mut self, ns: Ns, binding: Binding) -> bool {
+    pub fn insert(&mut self, ns: Ns, mut binding: Binding) -> bool {
         let slot = self.slot(ns);
         match slot {
-            Some(old) if old.def == binding.def && old.origin == binding.origin => false,
             Some(old) if old.origin == Origin::Glob && binding.origin != Origin::Glob => {
+                if old.def == binding.def && vis_rank(old.vis) > vis_rank(binding.vis) {
+                    binding.vis = old.vis;
+                }
                 *slot = Some(binding);
                 true
+            }
+            Some(old) if old.def == binding.def => {
+                if vis_rank(binding.vis) > vis_rank(old.vis) {
+                    old.vis = binding.vis;
+                    true
+                } else {
+                    false
+                }
             }
             Some(_) => false,
             None => {
@@ -263,17 +278,184 @@ impl PerNs {
     }
 }
 
+enum ScopeNamesRepr {
+    Eager(FxHashMap<Sym, PerNs>),
+    Compact {
+        _backing: Arc<crate::substrate::Backing>,
+        ptr: *const u8,
+        byte_len: usize,
+        remap: Arc<[u32]>,
+        sym_remap: Arc<[Sym]>,
+        decoded: OnceLock<FxHashMap<Sym, PerNs>>,
+    },
+}
+
+// SAFETY: `Compact::ptr` points into immutable read-only bytes kept alive by `_backing`.
+unsafe impl Send for ScopeNamesRepr {}
+// SAFETY: `ScopeNamesRepr` exposes only immutable reads and synchronized `OnceLock` initialization.
+unsafe impl Sync for ScopeNamesRepr {}
+
+pub struct ScopeNames(ScopeNamesRepr);
+
+impl ScopeNames {
+    pub fn eager(map: FxHashMap<Sym, PerNs>) -> Self {
+        Self(ScopeNamesRepr::Eager(map))
+    }
+
+    pub(crate) fn compact(
+        backing: Arc<crate::substrate::Backing>,
+        start: usize,
+        end: usize,
+        remap: Arc<[u32]>,
+        sym_remap: Arc<[Sym]>,
+    ) -> Result<Self> {
+        let slice = backing
+            .as_slice()
+            .get(start..end)
+            .context("compact scope out of bounds")?;
+        if slice.len() == 4 && u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]) == 0 {
+            return Ok(Self::default());
+        }
+        let (ptr, byte_len) = (slice.as_ptr(), slice.len());
+        Ok(Self(ScopeNamesRepr::Compact {
+            _backing: backing,
+            ptr,
+            byte_len,
+            remap,
+            sym_remap,
+            decoded: OnceLock::new(),
+        }))
+    }
+
+    #[inline]
+    pub fn as_map(&self) -> &FxHashMap<Sym, PerNs> {
+        match &self.0 {
+            ScopeNamesRepr::Eager(map) => map,
+            ScopeNamesRepr::Compact {
+                ptr,
+                byte_len,
+                remap,
+                sym_remap,
+                decoded,
+                ..
+            } => decoded.get_or_init(|| {
+                // SAFETY: `ptr` is valid for `byte_len` immutable bytes kept alive by `_backing`.
+                let bytes = unsafe { std::slice::from_raw_parts(*ptr, *byte_len) };
+                crate::substrate::sysroot::decode_scope_map(bytes, remap, sym_remap)
+                    .expect("valid sysroot compact scope")
+            }),
+        }
+    }
+
+    pub fn as_map_mut(&mut self) -> &mut FxHashMap<Sym, PerNs> {
+        if matches!(self.0, ScopeNamesRepr::Compact { .. }) {
+            let map = self.as_map().clone();
+            self.0 = ScopeNamesRepr::Eager(map);
+        }
+        match &mut self.0 {
+            ScopeNamesRepr::Eager(map) => map,
+            ScopeNamesRepr::Compact { .. } => unreachable!(),
+        }
+    }
+}
+
+impl Default for ScopeNames {
+    fn default() -> Self {
+        Self::eager(FxHashMap::default())
+    }
+}
+
+impl Clone for ScopeNames {
+    fn clone(&self) -> Self {
+        match &self.0 {
+            ScopeNamesRepr::Eager(map) => Self::eager(map.clone()),
+            ScopeNamesRepr::Compact {
+                _backing,
+                ptr,
+                byte_len,
+                remap,
+                sym_remap,
+                decoded,
+            } => {
+                if let Some(map) = decoded.get() {
+                    Self::eager(map.clone())
+                } else {
+                    Self(ScopeNamesRepr::Compact {
+                        _backing: Arc::clone(_backing),
+                        ptr: *ptr,
+                        byte_len: *byte_len,
+                        remap: Arc::clone(remap),
+                        sym_remap: Arc::clone(sym_remap),
+                        decoded: OnceLock::new(),
+                    })
+                }
+            }
+        }
+    }
+}
+
+impl Deref for ScopeNames {
+    type Target = FxHashMap<Sym, PerNs>;
+
+    #[inline]
+    fn deref(&self) -> &FxHashMap<Sym, PerNs> {
+        self.as_map()
+    }
+}
+
+impl<'a> IntoIterator for &'a ScopeNames {
+    type Item = (&'a Sym, &'a PerNs);
+    type IntoIter = std::collections::hash_map::Iter<'a, Sym, PerNs>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_map().iter()
+    }
+}
+
+impl fmt::Debug for ScopeNames {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            ScopeNamesRepr::Eager(map) => fmt::Debug::fmt(map, f),
+            ScopeNamesRepr::Compact {
+                byte_len, decoded, ..
+            } => {
+                if let Some(map) = decoded.get() {
+                    fmt::Debug::fmt(map, f)
+                } else {
+                    f.debug_struct("CompactScope")
+                        .field("bytes", byte_len)
+                        .finish()
+                }
+            }
+        }
+    }
+}
+
+fn vis_rank(vis: Vis) -> u8 {
+    match vis {
+        Vis::Private | Vis::SelfMod => 0,
+        Vis::Super => 1,
+        Vis::In(_) | Vis::Crate => 2,
+        Vis::Pub => 3,
+    }
+}
+
 /// The names declared in or imported into one module.
 #[derive(Clone, Debug, Default)]
 pub struct Scope {
-    pub names: FxHashMap<Sym, PerNs>,
+    pub names: ScopeNames,
     pub log: Vec<Sym>,
 }
 
 impl Scope {
     /// Adds `binding` for `name` in `ns` and logs the name when the scope changed; returns whether it changed.
     pub fn bind(&mut self, name: Sym, ns: Ns, binding: Binding) -> bool {
-        let changed = self.names.entry(name).or_default().insert(ns, binding);
+        let changed = self
+            .names
+            .as_map_mut()
+            .entry(name)
+            .or_default()
+            .insert(ns, binding);
         if changed {
             self.log.push(name);
         }

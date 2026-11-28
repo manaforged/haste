@@ -3,14 +3,15 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use rustc_abi::BackendRepr;
 
-use crate::body::{BinOp, Body, Expr};
+use crate::body::{BinOp, Body, Expr, ExprId, Pat, Stmt};
 use crate::names::ItemRef;
 use crate::outline::item::{Item, ItemKind};
 use crate::outline::tree::Crate;
 use crate::sema::Context;
 use crate::sema::evaluate;
 use crate::sema::impls::ImplRef;
-use crate::sema::infer::{Infer, Typed, check_union_fields, type_params};
+use crate::sema::infer::{Infer, Res, SiteKey, Typed, check_union_fields, type_params};
+use crate::sema::intrinsic::Intrinsic;
 use crate::sema::substs::Substs;
 use crate::sema::summary::expected_param_count;
 use crate::sema::ty::Ty;
@@ -373,6 +374,9 @@ fn local_crates(cx: &Context<'_>, roots: &[Instance]) -> Vec<u32> {
 fn collect_crate_items(cx: &Context<'_>, krate: u32, out: &mut Vec<(ItemRef, ItemKind)>) {
     let tree = &cx.outline.crates[krate as usize];
     for (file_at, file) in tree.files.iter().enumerate() {
+        if cx.outline.is_fixed_file(krate, file_at as u32) {
+            continue;
+        }
         let items = &file.items.items;
         for (at, entry) in items.iter().enumerate() {
             if !matches!(
@@ -403,6 +407,9 @@ fn collect_crate_items(cx: &Context<'_>, krate: u32, out: &mut Vec<(ItemRef, Ite
 fn collect_crate_impls(cx: &Context<'_>, krate: u32, out: &mut Vec<(ImplRef, ItemRef)>) {
     let tree = &cx.outline.crates[krate as usize];
     for (index, entry) in tree.impls.iter().enumerate() {
+        if cx.outline.is_fixed_file(krate, entry.file as u32) {
+            continue;
+        }
         let block = ImplRef::Module {
             krate,
             index: index as u32,
@@ -479,13 +486,29 @@ fn check_const_outcome(
             }
         }
     };
-    if !const_may_fail(&body, &typed) || !evaluate::is_installed() {
+    if !const_may_fail(cx, &body, &typed) || !evaluate::is_installed() {
         return outcome;
     }
     let Some(bits) = const_eval_bits(cx, typed.ret) else {
         return outcome;
     };
+    if cx.store.evaluated.get(&instance).is_some() {
+        return outcome;
+    }
     let eval_asks0 = cx.asks.count();
+    if let Some(folded) = Infer::fold_const_item(cx, item) {
+        match folded {
+            Ok(value) => {
+                cx.store.evaluated.insert(instance, value);
+            }
+            Err(err) if force_commit || cx.asks.count() == eval_asks0 => {
+                let err = anyhow::anyhow!("evaluation of constant value failed: {err:#}");
+                outcome.error = Some((instance, crate::diag::format_error(cx.name(item), &err)));
+            }
+            Err(_) => {}
+        }
+        return outcome;
+    }
     if let Err(err) = evaluate::run(cx, &instance, bits)
         && (force_commit || cx.asks.count() == eval_asks0)
     {
@@ -495,18 +518,189 @@ fn check_const_outcome(
     outcome
 }
 
-fn const_may_fail(body: &Body, typed: &Typed) -> bool {
-    if typed.calls().next().is_some() {
+fn const_may_fail(cx: &mut Context<'_>, body: &Body, typed: &Typed) -> bool {
+    if !typed.drops.is_empty() {
         return true;
     }
-    body.exprs.iter().any(|expr| {
-        matches!(
-            expr,
-            Expr::Binary(BinOp::Div | BinOp::Rem | BinOp::Shl | BinOp::Shr, ..)
-                | Expr::Index(..)
-                | Expr::Loop { .. }
-                | Expr::While { .. }
-        )
+    let Some(root) = body.root else {
+        return false;
+    };
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        if expr_may_fail(cx, body, typed, id, &mut stack) {
+            return true;
+        }
+    }
+    false
+}
+
+fn expr_may_fail(
+    cx: &mut Context<'_>,
+    body: &Body,
+    typed: &Typed,
+    id: ExprId,
+    stack: &mut Vec<ExprId>,
+) -> bool {
+    match *body.expr(id) {
+        Expr::Method { .. }
+        | Expr::Macro { .. }
+        | Expr::Binary(BinOp::Div | BinOp::Rem | BinOp::Shl | BinOp::Shr, ..)
+        | Expr::AssignOp(BinOp::Div | BinOp::Rem | BinOp::Shl | BinOp::Shr, ..)
+        | Expr::Index(..)
+        | Expr::Loop { .. }
+        | Expr::While { .. }
+        | Expr::For { .. } => return true,
+        Expr::Call(callee, args) => {
+            if call_may_fail(cx, typed, callee) {
+                return true;
+            }
+            for &arg in body.list(args) {
+                stack.push(ExprId(arg));
+            }
+            return false;
+        }
+        Expr::Path(_) => {
+            return match typed.try_site_res(&cx.types, SiteKey::ExprRes(id)) {
+                Some(Res::Fn(item, _)) => cx.item(item).1.kind == ItemKind::Const,
+                None => typed
+                    .calls_without_drops()
+                    .any(|(item, _)| cx.item(item).1.kind == ItemKind::Const),
+                _ => false,
+            };
+        }
+        Expr::Block { stmts, tail, .. } => {
+            stack.extend(tail);
+            for &stmt in body.list(stmts) {
+                match body.stmts[stmt as usize] {
+                    Stmt::Let {
+                        init, otherwise, ..
+                    } => {
+                        stack.extend(init);
+                        stack.extend(otherwise);
+                    }
+                    Stmt::Expr(e, _) => stack.push(e),
+                    Stmt::Macro { .. } => return true,
+                    Stmt::Item(..) | Stmt::Empty => {}
+                }
+            }
+            return false;
+        }
+        _ => {}
+    }
+    push_expr_children(body, id, stack);
+    false
+}
+
+fn call_may_fail(cx: &mut Context<'_>, typed: &Typed, callee: ExprId) -> bool {
+    match typed.try_site_res(&cx.types, SiteKey::ExprRes(callee)) {
+        Some(Res::Ctor(..)) => false,
+        Some(Res::Fn(target, _)) => !is_infallible_const_fn(cx, target),
+        _ => true,
+    }
+}
+
+fn push_expr_children(body: &Body, id: ExprId, stack: &mut Vec<ExprId>) {
+    match *body.expr(id) {
+        Expr::Unary(_, e)
+        | Expr::Field(e, _)
+        | Expr::TupleField(e, _)
+        | Expr::Cast(e, _)
+        | Expr::Ref { expr: e, .. }
+        | Expr::Paren(e)
+        | Expr::Try(e)
+        | Expr::Await(e)
+        | Expr::Become(e)
+        | Expr::Let(_, e) => stack.push(e),
+        Expr::Binary(_, a, b)
+        | Expr::Assign(a, b)
+        | Expr::AssignOp(_, a, b)
+        | Expr::Repeat(a, b) => stack.extend([a, b]),
+        Expr::If(c, t, e) => {
+            stack.extend([c, t]);
+            stack.extend(e);
+        }
+        Expr::Match(s, arms) => {
+            stack.push(s);
+            for &arm in body.list(arms) {
+                let a = &body.arms[arm as usize];
+                stack.extend(a.guard);
+                stack.push(a.body);
+            }
+        }
+        Expr::Tuple(list) | Expr::Array(list) => {
+            stack.extend(body.list(list).iter().map(|&e| ExprId(e)));
+        }
+        Expr::Struct { fields, base, .. } => {
+            stack.extend(base);
+            stack.extend(
+                body.list(fields)
+                    .iter()
+                    .map(|&f| body.fields[f as usize].value),
+            );
+        }
+        Expr::Range { from, to, .. } => {
+            stack.extend(from);
+            stack.extend(to);
+        }
+        Expr::Return(e) | Expr::Break(_, e) | Expr::Yield(e) => stack.extend(e),
+        _ => {}
+    }
+}
+
+fn is_infallible_const_fn(cx: &mut Context<'_>, target: ItemRef) -> bool {
+    if let Some(intr) = cx.intrinsic(target) {
+        return matches!(
+            intr,
+            Intrinsic::SizeOf | Intrinsic::AlignOf | Intrinsic::NeedsDrop
+        );
+    }
+    if cx.outline.is_sysroot(target.krate)
+        && matches!(cx.name(target), "size_of" | "align_of" | "needs_drop")
+    {
+        return true;
+    }
+    if cx.foreign(target) {
+        return false;
+    }
+    let (Ok(sig), Ok(body)) = (cx.signature(target), cx.body(target)) else {
+        return false;
+    };
+    if body.root.is_none() {
+        return false;
+    }
+    let src = cx.body_src(target);
+    let mut params = Vec::with_capacity(sig.params.len());
+    for &(pat, _) in &sig.params {
+        let Pat::Bind {
+            name, sub: None, ..
+        } = *sig.body.pat(pat)
+        else {
+            return false;
+        };
+        params.push(crate::names::plain(src.text(name)));
+    }
+    body.exprs.iter().all(|expr| match *expr {
+        Expr::Lit(..)
+        | Expr::Struct { .. }
+        | Expr::Tuple(..)
+        | Expr::Array(..)
+        | Expr::Ref { .. }
+        | Expr::Field(..)
+        | Expr::TupleField(..)
+        | Expr::Paren(..) => true,
+        Expr::Block { stmts, .. } => body.list(stmts).is_empty(),
+        Expr::Path(path) => {
+            let entry = body.path(path);
+            let [seg] = body.list(entry.segments) else {
+                return false;
+            };
+            entry.qself.is_none()
+                && !entry.global
+                && params.contains(&crate::names::plain(
+                    src.text(body.segments[*seg as usize].name),
+                ))
+        }
+        _ => false,
     })
 }
 

@@ -311,6 +311,16 @@ impl Crate {
         self.env.fixed
     }
 
+    pub fn is_fixed_file(&self, file: u32) -> bool {
+        self.env.fixed
+            || self
+                .env
+                .fixed_files
+                .get(file as usize)
+                .copied()
+                .unwrap_or(false)
+    }
+
     /// The modules declared but not read yet.
     pub fn declared(&self) -> impl Iterator<Item = usize> + '_ {
         self.modules
@@ -387,6 +397,7 @@ pub struct Env {
     pub release: bool,
     /// Whether the crate's sources cannot change while haste runs: the standard library, or a registry or git package.
     pub fixed: bool,
+    pub fixed_files: Vec<bool>,
     /// Whether `cfg(test)` is enabled for this crate.
     pub test: bool,
     /// Manifest `[profile.*]` overrides for `debug_assertions` and `overflow_checks`.
@@ -607,13 +618,16 @@ fn not(value: Truth) -> Truth {
 
 type Slot = Arc<OnceLock<Result<Arc<File>, String>>>;
 
+static KEPT: Mutex<HashMap<PathBuf, Slot>> =
+    Mutex::new(HashMap::with_hasher(rustc_hash::FxBuildHasher));
+
 /// Files read and scanned once, shared by every crate that includes them.
 #[derive(Default)]
 pub struct Files {
     slots: Mutex<HashMap<PathBuf, Slot>>,
 }
 
-const PER_WORKER: usize = 4;
+const PER_WORKER: usize = 2;
 
 fn slot(slots: &Mutex<HashMap<PathBuf, Slot>>, path: &Path) -> Result<Slot> {
     Ok(crate::sync::lock(slots)
@@ -664,6 +678,27 @@ impl Files {
     pub fn forget(&self, paths: &[PathBuf]) {
         if let Ok(mut slots) = self.slots.lock() {
             paths.iter().for_each(|path| _ = slots.remove(path));
+        }
+    }
+
+    pub fn keep_fixed(crates: &[Crate]) {
+        let mut kept = crate::sync::lock(&KEPT);
+        for file in crates
+            .iter()
+            .filter(|c| c.is_fixed())
+            .flat_map(|c| &c.files)
+        {
+            if let Some(source) = (!file.expanded).then(|| file.source.pristine()).flatten() {
+                let slot = Slot::default();
+                _ = slot.set(Ok(Arc::new(File::new(source, file.items.clone(), false))));
+                kept.insert(file.source.path.clone(), slot);
+            }
+        }
+    }
+
+    pub fn take_kept() -> Files {
+        Files {
+            slots: Mutex::new(std::mem::take(&mut *crate::sync::lock(&KEPT))),
         }
     }
 

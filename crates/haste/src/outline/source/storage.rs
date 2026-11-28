@@ -8,9 +8,9 @@ use std::sync::{Arc, OnceLock};
 use anyhow::{Context as _, Result};
 
 use crate::substrate::Backing;
-use crate::substrate::sysroot::tokens::decode_compact_tokens;
+use crate::substrate::sysroot::tokens::{decode_compact_tokens, decode_marks_body};
 
-use super::Token;
+use super::{Mark, Token};
 
 /// Lazily reads an unmodified on-disk source file's text (plus optional lexed doc-comment tail) without re-lexing.
 pub(crate) struct DiskSource {
@@ -96,6 +96,18 @@ impl SourceText {
             }
             TextRepr::Disk(disk) => disk.load(),
         }
+    }
+
+    pub fn duplicate(&self) -> Self {
+        Self(match &self.0 {
+            TextRepr::Owned(boxed) => TextRepr::Owned(boxed.clone()),
+            TextRepr::Mapped { _backing, ptr, len } => TextRepr::Mapped {
+                _backing: Arc::clone(_backing),
+                ptr: *ptr,
+                len: *len,
+            },
+            TextRepr::Disk(disk) => TextRepr::Disk(Arc::clone(disk)),
+        })
     }
 
     /// Returns the byte length of the source text without forcing an on-disk read.
@@ -234,6 +246,25 @@ impl SourceTokens {
         }))
     }
 
+    pub fn duplicate(&self) -> Self {
+        Self(match &self.0 {
+            TokensRepr::Eager(tokens) => TokensRepr::Eager(tokens.clone()),
+            TokensRepr::Compact {
+                _backing,
+                ptr,
+                byte_len,
+                count,
+                ..
+            } => TokensRepr::Compact {
+                _backing: Arc::clone(_backing),
+                ptr: *ptr,
+                byte_len: *byte_len,
+                count: *count,
+                decoded: OnceLock::new(),
+            },
+        })
+    }
+
     /// Returns the number of tokens without forcing lazy decoding.
     #[inline]
     pub fn len(&self) -> usize {
@@ -315,6 +346,149 @@ impl fmt::Debug for SourceTokens {
                     fmt::Debug::fmt(tokens, f)
                 } else {
                     f.debug_struct("CompactTokens")
+                        .field("count", count)
+                        .finish()
+                }
+            }
+        }
+    }
+}
+
+enum MarksRepr {
+    Eager(Vec<(u32, Mark)>),
+    Compact {
+        _backing: Arc<Backing>,
+        ptr: *const u8,
+        byte_len: usize,
+        count: usize,
+        remap: Arc<[u32]>,
+        scope_bit: u32,
+        decoded: OnceLock<Vec<(u32, Mark)>>,
+    },
+}
+
+// SAFETY: `MarksRepr::Compact::ptr` points into immutable read-only bytes kept alive by `_backing`.
+unsafe impl Send for MarksRepr {}
+// SAFETY: `MarksRepr` exposes only immutable reads and synchronized `OnceLock` initialization.
+unsafe impl Sync for MarksRepr {}
+
+pub struct SourceMarks(MarksRepr);
+
+impl SourceMarks {
+    pub fn eager(marks: Vec<(u32, Mark)>) -> Self {
+        Self(MarksRepr::Eager(marks))
+    }
+
+    pub fn compact(
+        backing: Arc<Backing>,
+        start: usize,
+        end: usize,
+        count: usize,
+        remap: Arc<[u32]>,
+        scope_bit: u32,
+    ) -> Result<Self> {
+        let slice = backing
+            .as_slice()
+            .get(start..end)
+            .context("compact source marks out of bounds")?;
+        if count == 0 {
+            if !slice.is_empty() {
+                anyhow::bail!("trailing bytes in empty source marks");
+            }
+            return Ok(Self::eager(Vec::new()));
+        }
+        let (ptr, byte_len) = (slice.as_ptr(), slice.len());
+        Ok(Self(MarksRepr::Compact {
+            _backing: backing,
+            ptr,
+            byte_len,
+            count,
+            remap,
+            scope_bit,
+            decoded: OnceLock::new(),
+        }))
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        match &self.0 {
+            MarksRepr::Eager(marks) => marks.len(),
+            MarksRepr::Compact { count, .. } => *count,
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[(u32, Mark)] {
+        match &self.0 {
+            MarksRepr::Eager(marks) => marks.as_slice(),
+            MarksRepr::Compact {
+                ptr,
+                byte_len,
+                count,
+                remap,
+                scope_bit,
+                decoded,
+                ..
+            } => decoded.get_or_init(|| {
+                // SAFETY: `ptr` is valid for `byte_len` immutable bytes kept alive by `_backing`.
+                let bytes = unsafe { std::slice::from_raw_parts(*ptr, *byte_len) };
+                decode_marks_body(*count, bytes, remap, *scope_bit)
+                    .expect("valid sysroot compact mark stream")
+            }),
+        }
+    }
+}
+
+impl Default for SourceMarks {
+    fn default() -> Self {
+        Self::eager(Vec::new())
+    }
+}
+
+impl From<Vec<(u32, Mark)>> for SourceMarks {
+    fn from(marks: Vec<(u32, Mark)>) -> Self {
+        Self::eager(marks)
+    }
+}
+
+impl Deref for SourceMarks {
+    type Target = [(u32, Mark)];
+
+    #[inline]
+    fn deref(&self) -> &[(u32, Mark)] {
+        self.as_slice()
+    }
+}
+
+impl AsRef<[(u32, Mark)]> for SourceMarks {
+    #[inline]
+    fn as_ref(&self) -> &[(u32, Mark)] {
+        self.as_slice()
+    }
+}
+
+impl PartialEq for SourceMarks {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for SourceMarks {}
+
+impl fmt::Debug for SourceMarks {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            MarksRepr::Eager(marks) => fmt::Debug::fmt(marks, f),
+            MarksRepr::Compact { count, decoded, .. } => {
+                if let Some(marks) = decoded.get() {
+                    fmt::Debug::fmt(marks, f)
+                } else {
+                    f.debug_struct("CompactMarks")
                         .field("count", count)
                         .finish()
                 }

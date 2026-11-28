@@ -44,6 +44,9 @@ pub fn reach_wave(
     roots: &[Instance],
     force_commit: bool,
 ) {
+    if cx.store.lookups.reach_memo_enabled && cx.store.lookups.reach_memo.is_none() {
+        cx.store.lookups.reach_memo = super::memo::ReachMemoCache::open(cx);
+    }
     let mut initial = reached.take_blocked();
     initial.extend(enqueue(reached, roots.to_vec()));
     initial.extend(enqueue_bounds_check(cx, reached));
@@ -330,11 +333,22 @@ fn serial_wave(
 ) -> (Vec<usize>, Vec<Instance>) {
     let mut settled = Vec::with_capacity(wave.len());
     let mut next = Vec::new();
+    let reach_memo = (!check_undeclared)
+        .then(|| cx.store.lookups.reach_memo.clone())
+        .flatten();
+    let mut memo_scratch = super::memo::MemoLookupScratch::default();
     for &at in wave {
         let instance = reached.list[at].0;
         let asks0 = cx.asks.count();
         let mut unlaid = Vec::new();
-        let typed = infer_entry(cx, &instance, &mut unlaid, check_undeclared);
+        let typed = if let Some(hit) = reach_memo
+            .as_deref()
+            .and_then(|m| m.lookup(cx, instance, &mut memo_scratch))
+        {
+            Ok(hit)
+        } else {
+            infer_entry(cx, &instance, &mut unlaid, check_undeclared)
+        };
         if !force_commit && cx.asks.count() > asks0 {
             reached.set_entry(at, ReachedEntry::Blocked, typed);
             continue;

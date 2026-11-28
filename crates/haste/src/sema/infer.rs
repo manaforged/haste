@@ -50,7 +50,7 @@ pub use object::{ALIGN_SLOT, SIZE_SLOT, Vtable, virtual_slot};
 pub use pat::{position, rest_split};
 pub use path::{parse_int, segments};
 pub use scope::{Form, header_bound_traits, type_params};
-pub use tables::{BodyTables, LazyTables, SiteKey, SyntaxTables, Typed};
+pub use tables::{BodyTables, LazyTables, ReachMemo, SiteKey, SyntaxTables, Typed};
 pub(super) use tables::{CallSites, recount_call_sites, shape_calls};
 
 use rustc_hash::FxHashMap as HashMap;
@@ -724,6 +724,7 @@ pub(super) fn detached_summary<T>(
         outputs: Default::default(),
         origins: crate::outline::source::Origins::Read,
         line_starts: std::sync::OnceLock::new(),
+        disk_len: None,
     });
     let home = cx.module_of(item).unwrap_or(ModRef {
         krate: item.krate,

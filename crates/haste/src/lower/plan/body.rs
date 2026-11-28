@@ -53,7 +53,9 @@ pub(super) fn eval_body_footprint(
             tables,
             cycle_root,
         ),
-        LazyTables::CheckOnly(_) => bail!("cannot lower check-only sysroot instance"),
+        LazyTables::CheckOnly(_) | LazyTables::ReachMemo(_) => {
+            bail!("cannot lower unmaterialized sysroot instance")
+        }
     }
 }
 

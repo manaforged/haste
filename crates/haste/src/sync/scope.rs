@@ -8,7 +8,7 @@ use super::lock;
 
 type Job = Box<dyn FnOnce() -> bool + Send + 'static>;
 
-const WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
+const WORKER_STACK_SIZE: usize = 32 * 1024 * 1024;
 
 fn spawn_worker<F, T>(f: F)
 where

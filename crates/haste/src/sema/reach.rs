@@ -13,6 +13,7 @@ mod collect;
 mod crate_check;
 pub(in crate::sema) mod filter;
 mod items;
+pub(crate) mod memo;
 mod order;
 mod reload;
 mod unwind;
@@ -142,6 +143,13 @@ impl Reached {
                 continue;
             }
             let Ok(typed) = res else { continue };
+            if let super::infer::LazyTables::ReachMemo(memo) = &typed.tables
+                && memo.has_catch_unwind
+            {
+                self.catch_unwind_state
+                    .store(CATCH_UNWIND_FOUND | (start + idx + 1), Ordering::Release);
+                return true;
+            }
             for (callee, _) in typed.calls() {
                 if !cache.checked_callees.insert(callee) {
                     continue;
@@ -352,6 +360,33 @@ impl Reached {
     /// Whether declared function `index` has not been inferred yet.
     pub fn is_untyped(&self, index: usize) -> bool {
         self.untyped_count > 0 && self.states.get(index) == Some(&ReachedEntry::Declared)
+    }
+
+    pub fn is_reach_memo(&self, index: usize) -> bool {
+        self.list
+            .get(index)
+            .and_then(|(_, res)| res.as_ref().ok())
+            .is_some_and(|t| t.is_reach_memo())
+    }
+
+    pub fn has_reach_memo(&self) -> bool {
+        self.list
+            .iter()
+            .any(|(_, res)| res.as_ref().is_ok_and(|t| t.is_reach_memo()))
+    }
+
+    pub fn materialize_memos(&mut self, cx: &mut Context<'_>, indices: &[usize]) -> usize {
+        let mut materialized = 0;
+        for &index in indices {
+            if !self.is_reach_memo(index) {
+                continue;
+            }
+            let instance = self.list[index].0;
+            let typed = typed_once(cx, &instance, &mut self.unlaid);
+            self.set_entry(index, ReachedEntry::Settled, typed);
+            materialized += 1;
+        }
+        materialized
     }
 
     /// The prelinked callee indices of reached function `index`, when `link` has populated them.

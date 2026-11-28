@@ -148,12 +148,43 @@ fn write_chunked<T>(
     Some((ends, blob))
 }
 
+pub(in super::super) struct EncodedSnapshot {
+    prefix: Vec<u8>,
+    file_chunks: Vec<Vec<u8>>,
+    suffix: Vec<u8>,
+    pub total_len: usize,
+}
+
+impl EncodedSnapshot {
+    pub(in super::super) fn write_to(
+        &self,
+        writer: &mut impl std::io::Write,
+    ) -> std::io::Result<()> {
+        writer.write_all(&self.prefix)?;
+        for chunk in &self.file_chunks {
+            writer.write_all(chunk)?;
+        }
+        writer.write_all(&self.suffix)
+    }
+
+    pub(in super::super) fn into_bytes(self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.total_len);
+        out.extend_from_slice(&self.prefix);
+        for chunk in &self.file_chunks {
+            out.extend_from_slice(chunk);
+        }
+        out.extend_from_slice(&self.suffix);
+        out
+    }
+}
+
 pub(in super::super) fn encode_snapshot(
     spec: &SnapshotSpec<'_>,
     workspace: &Workspace,
     compilation: &Compilation,
 ) -> Option<(Vec<u8>, HashMap<u32, Arc<ImplIndex>>)> {
-    encode_snapshot_with(spec, workspace, compilation, false)
+    let (snap, heads) = encode_snapshot_chunks(spec, workspace, compilation, false)?;
+    Some((snap.into_bytes(), heads))
 }
 
 pub(in super::super) fn encode_snapshot_with(
@@ -162,9 +193,14 @@ pub(in super::super) fn encode_snapshot_with(
     compilation: &Compilation,
     inline_text: bool,
 ) -> Option<(Vec<u8>, HashMap<u32, Arc<ImplIndex>>)> {
-    if spec.ref_crates.get(..spec.cached_crates.len()) != Some(spec.cached_crates) {
-        return None;
-    }
+    let (snap, heads) = encode_snapshot_chunks(spec, workspace, compilation, inline_text)?;
+    Some((snap.into_bytes(), heads))
+}
+
+fn encode_tables<'a>(
+    spec: &SnapshotSpec<'a>,
+    compilation: &'a Compilation,
+) -> Option<(Tables<'a>, Vec<u32>, Vec<u8>, Vec<u32>, Vec<u8>)> {
     let mut tables = Tables::new(
         compilation.outline.crates.len(),
         spec.ref_crates,
@@ -176,7 +212,83 @@ pub(in super::super) fn encode_snapshot_with(
     let (name_ends, names_blob) = write_chunked(spec.cached_crates, |buf, &krate| {
         write_names_crate(buf, &compilation.names.crates[krate], &mut tables)
     })?;
-    let built_heads = build_module_heads(compilation, spec.cached_crates);
+    Some((tables, crate_ends, crates_blob, name_ends, names_blob))
+}
+
+struct PreparedBody<'a> {
+    tables: Tables<'a>,
+    crate_ends: Vec<u32>,
+    crates_blob: Vec<u8>,
+    name_ends: Vec<u32>,
+    names_blob: Vec<u8>,
+    file_chunks: Vec<Vec<u8>>,
+    files_blob_len: usize,
+    macro_ends: Vec<u32>,
+    macros_blob: Vec<u8>,
+    prefix: Vec<u8>,
+}
+
+fn encode_body<'a>(
+    spec: &SnapshotSpec<'a>,
+    workspace: &Workspace,
+    compilation: &'a Compilation,
+    inline_text: bool,
+) -> Option<PreparedBody<'a>> {
+    let (tables, crate_ends, crates_blob, name_ends, names_blob) =
+        encode_tables(spec, compilation)?;
+    let (file_chunks, file_table, files_blob_len) = encode_files(
+        &tables.files,
+        &tables.file_map,
+        &tables.to_local,
+        inline_text,
+    )?;
+    let (macro_ends, macros_blob) = write_chunked(&tables.macros, |buf, mac| {
+        let file_id = *tables.file_map.get(&(Arc::as_ptr(&mac.file) as usize))?;
+        write_u32(buf, file_id);
+        write_u32(buf, tables.local_krate(mac.krate)?);
+        write_rules(buf, &mac.rules, &tables.to_local)
+    })?;
+    let prefix = build_prefix(spec, workspace, compilation, &tables, &file_table)?;
+    Some(PreparedBody {
+        tables,
+        crate_ends,
+        crates_blob,
+        name_ends,
+        names_blob,
+        file_chunks,
+        files_blob_len,
+        macro_ends,
+        macros_blob,
+        prefix,
+    })
+}
+
+pub(in super::super) fn encode_snapshot_chunks(
+    spec: &SnapshotSpec<'_>,
+    workspace: &Workspace,
+    compilation: &Compilation,
+    inline_text: bool,
+) -> Option<(EncodedSnapshot, HashMap<u32, Arc<ImplIndex>>)> {
+    if spec.ref_crates.get(..spec.cached_crates.len()) != Some(spec.cached_crates) {
+        return None;
+    }
+    let (body_res, built_heads) = if spec.cached_crates.len() >= 2 && crate::jobs() > 1 {
+        let mut heads_out = Vec::new();
+        let mut body_out = None;
+        crate::sync::scope(|scope| {
+            scope.spawn(|| {
+                heads_out = build_module_heads(compilation, spec.cached_crates);
+            });
+            body_out = encode_body(spec, workspace, compilation, inline_text);
+        });
+        (body_out, heads_out)
+    } else {
+        (
+            encode_body(spec, workspace, compilation, inline_text),
+            build_module_heads(compilation, spec.cached_crates),
+        )
+    };
+    let mut body = body_res?;
     let (impl_ends, impls_blob) = write_chunked(
         &spec
             .cached_crates
@@ -184,7 +296,7 @@ pub(in super::super) fn encode_snapshot_with(
             .copied()
             .zip(built_heads.iter())
             .collect::<Vec<_>>(),
-        |buf, &(krate, index)| write_impl_index(buf, index.as_ref(), krate as u32, &tables),
+        |buf, &(krate, index)| write_impl_index(buf, index.as_ref(), krate as u32, &body.tables),
     )?;
     let mut heads_map = HashMap::default();
     for (&krate, index) in spec.cached_crates.iter().zip(built_heads) {
@@ -192,103 +304,124 @@ pub(in super::super) fn encode_snapshot_with(
             heads_map.insert(krate as u32, Arc::new(index));
         }
     }
+    let suffix = build_suffix(
+        spec,
+        &body.tables,
+        &body.macro_ends,
+        &body.macros_blob,
+        &body.crate_ends,
+        &body.crates_blob,
+        &body.name_ends,
+        &body.names_blob,
+        &impl_ends,
+        &impls_blob,
+    )?;
 
-    let mut files_blob = Vec::new();
-    let mut file_table = Vec::with_capacity(tables.files.len() * 8);
-    for file in &tables.files {
-        write_file(&mut files_blob, file, &tables.to_local, inline_text)?;
-        let end = u32::try_from(files_blob.len()).ok()?;
-        let base_id = file
-            .source
-            .base
-            .as_ref()
-            .and_then(|b| tables.file_map.get(&(Arc::as_ptr(b) as usize)).copied());
-        write_u32(&mut file_table, end);
-        write_opt_u32(&mut file_table, base_id);
-    }
+    let total_len = body.prefix.len() + body.files_blob_len + suffix.len();
+    const LEN_AT: usize = 28;
+    body.prefix[LEN_AT..LEN_AT + 8].copy_from_slice(&(total_len as u64).to_le_bytes());
+    Some((
+        EncodedSnapshot {
+            prefix: body.prefix,
+            file_chunks: body.file_chunks,
+            suffix,
+            total_len,
+        },
+        heads_map,
+    ))
+}
 
-    let (macro_ends, macros_blob) = write_chunked(&tables.macros, |buf, mac| {
-        let file_id = *tables.file_map.get(&(Arc::as_ptr(&mac.file) as usize))?;
-        write_u32(buf, file_id);
-        write_u32(buf, tables.local_krate(mac.krate)?);
-        write_rules(buf, &mac.rules, &tables.to_local)
-    })?;
-
+fn build_prefix(
+    spec: &SnapshotSpec<'_>,
+    workspace: &Workspace,
+    compilation: &Compilation,
+    tables: &Tables<'_>,
+    file_table: &[u8],
+) -> Option<Vec<u8>> {
     let sym_blob_len: usize = tables.extra_syms.iter().map(|s| s.len()).sum();
-    let mut out = Vec::with_capacity(
-        crates_blob.len()
-            + names_blob.len()
-            + files_blob.len()
-            + file_table.len()
-            + macros_blob.len()
-            + sym_blob_len
-            + 65536,
-    );
-    out.extend_from_slice(&spec.magic);
-    write_u32(&mut out, spec.version);
-    write_u32(&mut out, u32::try_from(spec.cached_crates.len()).ok()?);
-    write_u32(&mut out, u32::try_from(spec.ref_crates.len()).ok()?);
-    write_u64(&mut out, spec.key);
-    let len_at = out.len();
-    write_u64(&mut out, 0);
+    let mut prefix = Vec::with_capacity(file_table.len() + sym_blob_len + 16384);
+    prefix.extend_from_slice(&spec.magic);
+    write_u32(&mut prefix, spec.version);
+    write_u32(&mut prefix, u32::try_from(spec.cached_crates.len()).ok()?);
+    write_u32(&mut prefix, u32::try_from(spec.ref_crates.len()).ok()?);
+    write_u64(&mut prefix, spec.key);
+    write_u64(&mut prefix, 0);
 
     for &krate in spec.ref_crates {
         let ident = identity_of(workspace, &compilation.outline, krate, &tables.to_local)?;
-        write_identity(&mut out, &ident)?;
+        write_identity(&mut prefix, &ident)?;
     }
-    write_env_reads_list(&mut out, &spec.magic, spec.env_reads)?;
+    write_env_reads_list(&mut prefix, &spec.magic, spec.env_reads)?;
 
-    write_usize(&mut out, tables.extra_syms.len())?;
-    write_usize(&mut out, sym_blob_len)?;
+    write_usize(&mut prefix, tables.extra_syms.len())?;
+    write_usize(&mut prefix, sym_blob_len)?;
     let mut sym_end = 0usize;
     for sym in &tables.extra_syms {
         sym_end += sym.len();
-        write_usize(&mut out, sym_end)?;
+        write_usize(&mut prefix, sym_end)?;
     }
     for sym in &tables.extra_syms {
-        out.extend_from_slice(sym.as_bytes());
+        prefix.extend_from_slice(sym.as_bytes());
     }
 
-    write_usize(&mut out, tables.files.len())?;
-    out.extend_from_slice(&file_table);
-    out.extend_from_slice(&files_blob);
+    write_usize(&mut prefix, tables.files.len())?;
+    prefix.extend_from_slice(file_table);
+    Some(prefix)
+}
 
-    write_usize(&mut out, macro_ends.len())?;
-    for end in macro_ends {
-        write_u32(&mut out, end);
+#[allow(
+    clippy::too_many_arguments,
+    reason = "internal wire suffix builder mirrors fixed header fields"
+)]
+fn build_suffix(
+    spec: &SnapshotSpec<'_>,
+    tables: &Tables<'_>,
+    macro_ends: &[u32],
+    macros_blob: &[u8],
+    crate_ends: &[u32],
+    crates_blob: &[u8],
+    name_ends: &[u32],
+    names_blob: &[u8],
+    impl_ends: &[u32],
+    impls_blob: &[u8],
+) -> Option<Vec<u8>> {
+    let mut suffix = Vec::with_capacity(
+        macros_blob.len() + crates_blob.len() + names_blob.len() + impls_blob.len() + 4096,
+    );
+    write_usize(&mut suffix, macro_ends.len())?;
+    for &end in macro_ends {
+        write_u32(&mut suffix, end);
     }
-    out.extend_from_slice(&macros_blob);
+    suffix.extend_from_slice(macros_blob);
 
-    write_usize(&mut out, tables.textuals.len())?;
+    write_usize(&mut suffix, tables.textuals.len())?;
     for node in &tables.textuals {
-        write_str(&mut out, &node.name)?;
+        write_str(&mut suffix, &node.name)?;
         write_u32(
-            &mut out,
+            &mut suffix,
             *tables.macro_map.get(&(Arc::as_ptr(&node.def) as usize))?,
         );
         let next_id = node
             .next
             .as_ref()
             .and_then(|n| tables.textual_map.get(&(Arc::as_ptr(n) as usize)).copied());
-        write_opt_u32(&mut out, next_id);
+        write_opt_u32(&mut suffix, next_id);
     }
 
-    for end in crate_ends {
-        write_u32(&mut out, end);
+    for &end in crate_ends {
+        write_u32(&mut suffix, end);
     }
-    out.extend_from_slice(&crates_blob);
-    for end in name_ends {
-        write_u32(&mut out, end);
+    suffix.extend_from_slice(crates_blob);
+    for &end in name_ends {
+        write_u32(&mut suffix, end);
     }
-    out.extend_from_slice(&names_blob);
-    for end in impl_ends {
-        write_u32(&mut out, end);
+    suffix.extend_from_slice(names_blob);
+    for &end in impl_ends {
+        write_u32(&mut suffix, end);
     }
-    out.extend_from_slice(&impls_blob);
-    out.extend_from_slice(&spec.magic);
-    let total_len = out.len() as u64;
-    out[len_at..len_at + 8].copy_from_slice(&total_len.to_le_bytes());
-    Some((out, heads_map))
+    suffix.extend_from_slice(impls_blob);
+    suffix.extend_from_slice(&spec.magic);
+    Some(suffix)
 }
 
 fn write_env_reads_list(out: &mut Vec<u8>, magic: &[u8; 8], env_reads: &[EnvReads]) -> Option<()> {
@@ -339,11 +472,16 @@ fn disk_text_tail(file: &File) -> Option<&str> {
     {
         return None;
     }
-    let meta = std::fs::metadata(&src.path).ok()?;
-    if !meta.is_file() {
-        return None;
-    }
-    let disk_len = usize::try_from(meta.len()).ok()?;
+    let disk_len = match src.disk_len {
+        Some(len) => len as usize,
+        None => {
+            let meta = std::fs::metadata(&src.path).ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            usize::try_from(meta.len()).ok()?
+        }
+    };
     if src.text.len() < disk_len || !src.text.is_char_boundary(disk_len) {
         return None;
     }
@@ -380,4 +518,52 @@ fn write_file(
     out.push(u8::from(file.expanded));
     write_u64(out, file.expand_origin);
     Some(())
+}
+
+fn encode_files(
+    files: &[&Arc<File>],
+    file_map: &HashMap<usize, u32>,
+    to_local: &[Option<u32>],
+    inline_text: bool,
+) -> Option<(Vec<Vec<u8>>, Vec<u8>, usize)> {
+    let encode_chunk = |slice: &[&Arc<File>]| -> Option<(Vec<u8>, Vec<(u32, Option<u32>)>)> {
+        let mut buf = Vec::with_capacity(slice.len().saturating_mul(2048));
+        let mut entries = Vec::with_capacity(slice.len());
+        for file in slice {
+            write_file(&mut buf, file, to_local, inline_text)?;
+            let end = u32::try_from(buf.len()).ok()?;
+            let base_id = file
+                .source
+                .base
+                .as_ref()
+                .and_then(|b| file_map.get(&(Arc::as_ptr(b) as usize)).copied());
+            entries.push((end, base_id));
+        }
+        Some((buf, entries))
+    };
+    let jobs = crate::jobs();
+    let encoded = if files.len() >= 64 && jobs > 1 {
+        let chunks = jobs.min(files.len() / 32).max(1);
+        let step = files.len().div_ceil(chunks);
+        let slices: Vec<&[&Arc<File>]> = files.chunks(step).collect();
+        crate::sync::parallel_map(slices, encode_chunk)
+            .into_iter()
+            .collect::<Option<Vec<_>>>()?
+    } else {
+        vec![encode_chunk(files)?]
+    };
+    let mut file_table = Vec::with_capacity(files.len() * 8);
+    let mut file_chunks = Vec::with_capacity(encoded.len());
+    let mut offset = 0usize;
+    for (buf, entries) in encoded {
+        let chunk_len = buf.len();
+        for (local_end, base_id) in entries {
+            let end = u32::try_from(offset + local_end as usize).ok()?;
+            write_u32(&mut file_table, end);
+            write_opt_u32(&mut file_table, base_id);
+        }
+        offset += chunk_len;
+        file_chunks.push(buf);
+    }
+    Some((file_chunks, file_table, offset))
 }

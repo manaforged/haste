@@ -635,7 +635,7 @@ fn read_varint_slice(data: &mut &[u8]) -> Result<u32> {
     }
 }
 
-fn decode_marks_body(
+pub(crate) fn decode_marks_body(
     count: usize,
     mut rem: &[u8],
     remap: &[u32],
@@ -692,6 +692,7 @@ fn decode_marks_body(
     Ok(marks)
 }
 
+#[cfg(test)]
 pub(super) fn read_marks_reader(
     reader: &mut Reader<'_>,
     remap: &[u32],

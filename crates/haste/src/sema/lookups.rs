@@ -227,6 +227,8 @@ pub(super) struct Lookups {
     pub(super) file_index: Arc<std::sync::OnceLock<Arc<summary::codec::FileIndex>>>,
     pub(super) lang_items: Arc<std::sync::OnceLock<Arc<LangMap>>>,
     pub(super) skip_warm_sysroot_bodies: bool,
+    pub(super) reach_memo_enabled: bool,
+    pub(super) reach_memo: Option<Arc<reach::memo::ReachMemoCache>>,
     pub(super) warm: Arc<summary::WarmState>,
 }
 
@@ -463,6 +465,13 @@ impl Cache {
         self.lookups.skip_warm_sysroot_bodies = !warm;
     }
 
+    pub(crate) fn set_reach_memo_enabled(&mut self, enabled: bool) {
+        self.lookups.reach_memo_enabled = enabled;
+        if !enabled {
+            self.lookups.reach_memo = None;
+        }
+    }
+
     /// Whether warm `.substrate` sysroot lookups eagerly parse bodies for lowering.
     pub fn warm_sysroot_bodies(&self) -> bool {
         !self.lookups.skip_warm_sysroot_bodies
@@ -493,6 +502,10 @@ impl Cache {
     /// Returns the attached frozen sysroot substrate, if any.
     pub fn substrate(&self) -> Option<&Arc<crate::substrate::Substrate>> {
         self.lookups.substrate.as_ref()
+    }
+
+    pub(crate) fn reach_memo(&self) -> Option<&Arc<reach::memo::ReachMemoCache>> {
+        self.lookups.reach_memo.as_ref()
     }
 
     /// Drains newly built fixed `PolySummary` and concrete instance entries into `toolchain` and `deps` builders.
@@ -537,6 +550,7 @@ impl Cache {
             substrate: self.lookups.substrate.clone(),
             file_index: Arc::clone(&self.lookups.file_index),
             skip_warm_sysroot_bodies: self.lookups.skip_warm_sysroot_bodies,
+            reach_memo_enabled: self.lookups.reach_memo_enabled,
             ..Lookups::default()
         };
     }

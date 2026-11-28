@@ -502,7 +502,7 @@ pub(super) fn pre_collect_callees(
     let caller_is_fixed = cx.outline.is_fixed(caller.0.krate);
     let prune_fixed = check_only && caller_is_fixed && !matches!(typed.shape, Shape::Glue(_));
     let mut push = |item: ItemRef, substs: Substs| {
-        if check_only && cx.outline.is_fixed(item.krate) {
+        if check_only && cx.outline.is_fixed_file(item.krate, item.file) {
             return;
         }
         push_filtered_callee(cx, filter, prune_fixed, (item, substs), out)
@@ -524,6 +524,11 @@ pub(super) fn pre_collect_callees(
         ),
         LazyTables::Eager(_) => {
             for (item, substs) in typed.calls() {
+                push(item, substs);
+            }
+        }
+        LazyTables::ReachMemo(memo) => {
+            for &(item, substs) in &memo.calls {
                 push(item, substs);
             }
         }

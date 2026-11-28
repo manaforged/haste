@@ -2,10 +2,12 @@
 
 use std::sync::Arc;
 
+use rustc_hash::FxHashMap;
+
 use crate::outline::Outline;
 use crate::outline::item::{ItemKind, ProcKind};
 use crate::outline::source::Source;
-use crate::outline::tree::{File, Held, Waiting};
+use crate::outline::tree::{Held, Waiting};
 
 use super::path::{Paths, Requests};
 use super::resolve::{macro_at, paths_of};
@@ -124,29 +126,42 @@ fn defer_derives(bound: &mut Vec<Bound>, start: usize, left: &mut Vec<(bool, Sit
         .iter()
         .filter(|(asked, _)| *asked)
         .map(|(_, site)| (site, false));
-    let attrs: Vec<(Arc<File>, u32, u32, bool)> = ready
-        .chain(pending)
-        .filter_map(|(site, ready)| match site {
-            Site::Attribute(held) => Some((held.file.clone(), held.at, held.path.0, ready)),
-            _ => None,
-        })
-        .collect();
+    let mut attrs: FxHashMap<(usize, u32), (u32, u32)> = FxHashMap::default();
+    for (site, is_ready) in ready.chain(pending) {
+        if let Site::Attribute(held) = site {
+            let key = (Arc::as_ptr(&held.file) as usize, held.at);
+            let entry = attrs.entry(key).or_insert((u32::MAX, u32::MAX));
+            if is_ready {
+                entry.0 = entry.0.min(held.path.0);
+            } else {
+                entry.1 = entry.1.min(held.path.0);
+            }
+        }
+    }
+    if attrs.is_empty() {
+        return;
+    }
     let over = |site: &Site| match site {
-        Site::Derive(held) => attrs
-            .iter()
-            .find(|(file, at, path, _)| {
-                Arc::ptr_eq(file, &held.file) && *at == held.at && *path < held.path.0
-            })
-            .map(|entry| entry.3),
+        Site::Derive(held) => {
+            let &(min_ready, min_pending) =
+                attrs.get(&(Arc::as_ptr(&held.file) as usize, held.at))?;
+            if min_ready < held.path.0 {
+                Some(true)
+            } else if min_pending < held.path.0 {
+                Some(false)
+            } else {
+                None
+            }
+        }
         _ => None,
     };
     left.retain(|(_, site)| over(site) != Some(true));
-    let mut at = start;
-    while at < bound.len() {
-        match over(&bound[at].site) {
-            Some(true) => drop(bound.remove(at)),
-            Some(false) => left.push((true, bound.remove(at).site)),
-            None => at += 1,
+    let tail = bound.split_off(start);
+    for call in tail {
+        match over(&call.site) {
+            Some(true) => {}
+            Some(false) => left.push((true, call.site)),
+            None => bound.push(call),
         }
     }
 }

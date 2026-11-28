@@ -253,6 +253,9 @@ fn eval_into(
 ) -> Result<()> {
     let ((item, substs), result) = &reached.list[index];
     let typed = match result {
+        Ok(typed) if typed.is_reach_memo() => {
+            bail!("{}: unmaterialized reach-memo instance", cx.name(*item))
+        }
         Ok(typed) => typed.as_ref(),
         Err(err) => bail!("{}: {err}", cx.name(*item)),
     };

@@ -147,7 +147,7 @@ impl Names {
     }
 
     fn collect(&mut self, outline: &Outline, collected: &mut [bool]) {
-        let symbols = &self.symbols;
+        let mut work = Vec::new();
         for (krate, tree) in outline.crates.iter().enumerate() {
             let entry = &mut self.crates[krate];
             if entry.settled {
@@ -163,6 +163,14 @@ impl Names {
             {
                 continue;
             }
+            work.push((krate, std::mem::take(entry)));
+        }
+        if work.is_empty() {
+            return;
+        }
+        let symbols = &self.symbols;
+        let run_one = |(krate, mut entry): (usize, Crate)| -> (usize, Crate, bool) {
+            let tree = &outline.crates[krate];
             let mut children = vec![Vec::new(); tree.modules.len()];
             for (index, module) in tree.modules.iter().enumerate() {
                 if let Some(parent) = module.parent {
@@ -187,17 +195,28 @@ impl Names {
                     .iter()
                     .map(|&part| (part as u32, None));
                 let files: Vec<(u32, Option<u32>)> = own.into_iter().chain(parts).collect();
-                let found = collect::collect_module(tree, index, &files, &context, entry);
+                let found = collect::collect_module(tree, index, &files, &context, &mut entry);
                 entry.add_pending(found);
                 entry.collected[index] = Some(module.parts.len());
                 changed = true;
             }
             if changed {
-                collected[krate] = true;
                 collect::lift_macro_use(tree, &mut entry.scopes);
                 if let Some(root) = entry.scopes.first() {
                     entry.externs = collect::externs(root);
                 }
+            }
+            (krate, entry, changed)
+        };
+        let done = if work.len() >= 2 && crate::jobs() > 1 {
+            crate::sync::parallel_map(work, run_one)
+        } else {
+            work.into_iter().map(run_one).collect()
+        };
+        for (krate, entry, changed) in done {
+            self.crates[krate] = entry;
+            if changed {
+                collected[krate] = true;
             }
         }
     }

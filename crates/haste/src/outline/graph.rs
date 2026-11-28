@@ -321,7 +321,7 @@ pub fn new(workspace: &Workspace, targets: &Targets, scripts: &[usize]) -> Outli
         roots,
         crates,
         deps,
-        cache: Files::default(),
+        cache: Files::take_kept(),
         procs: HashMap::default(),
         pins,
     }
@@ -466,6 +466,7 @@ fn root_crate(workspace: &Workspace, targets: &Targets, root: &Root, test: bool)
         vars,
         release: workspace.packages[unit.package].sysroot,
         fixed: !workspace.packages[unit.package].local(),
+        fixed_files: Vec::new(),
         test,
         profile_override,
         env_reads: Default::default(),

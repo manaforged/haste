@@ -185,6 +185,26 @@ impl<'a, 'b> RtaCollector<'a, 'b> {
     }
 
     fn visit_typed(&mut self, item: ItemRef, substs: Substs, typed: &'a Typed) {
+        if let crate::sema::infer::LazyTables::ReachMemo(memo) = &typed.tables {
+            for &ty in &memo.vdce_dyn_tys {
+                collect_dyn_tys(
+                    &self.cx.types,
+                    ty,
+                    &mut self.demand.seen_tys,
+                    &mut self.demand.cands,
+                );
+            }
+            for &(callee, c_substs) in &memo.calls {
+                enqueue_instance(
+                    self.reached,
+                    &mut self.visited,
+                    &mut self.work,
+                    callee,
+                    c_substs,
+                );
+            }
+            return;
+        }
         if let Shape::Virtual(slot) = typed.shape {
             self.record_virtual(item, substs, slot);
         }

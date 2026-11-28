@@ -132,7 +132,8 @@ pub(in crate::lower) fn closure_calls_uncached(
     let tables = match &typed.tables {
         crate::sema::infer::LazyTables::Eager(t) => t.as_ref(),
         crate::sema::infer::LazyTables::Poly(p) => p.ensure_tables(&cx.types),
-        crate::sema::infer::LazyTables::CheckOnly(_) => return None,
+        crate::sema::infer::LazyTables::CheckOnly(_)
+        | crate::sema::infer::LazyTables::ReachMemo(_) => return None,
     };
     closure_own_calls(cx, &plan, typed, tables, cb).ok()
 }

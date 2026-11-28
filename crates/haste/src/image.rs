@@ -422,7 +422,7 @@ impl Image {
 
     pub(crate) fn build_aot(
         cx: &mut Context<'_>,
-        reached: &Reached,
+        reached: &mut Reached,
         roots: &[usize],
     ) -> Result<(Image, HashMap<usize, String>)> {
         if crate::compile_target() == haste_codegen::Target::host() {

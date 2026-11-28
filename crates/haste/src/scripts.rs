@@ -14,6 +14,7 @@ use crate::outline::Role;
 
 mod binary;
 mod fast;
+mod sysroot;
 #[cfg(test)]
 mod tests;
 
@@ -290,7 +291,9 @@ fn drain_kept(
             continue;
         }
         let unit_vars = vars(workspace, targets, unit, &state.ran);
-        let Some(kept) = store::kept(workspace, unit, &unit_vars) else {
+        let Some(kept) = store::kept(workspace, unit, &unit_vars)
+            .or_else(|| sysroot::settle_unit(workspace, unit, &unit_vars).map(Ok))
+        else {
             continue;
         };
         match kept {
@@ -618,6 +621,7 @@ fn run(
         if let Err(error) = binaries.keep_detached(workspace, &mut compilation, &rerun, locks) {
             eprintln!("cannot keep the executables of build scripts: {error}");
         }
+        crate::outline::tree::Files::keep_fixed(&compilation.outline.crates);
         Ok(outcome)
     })
 }

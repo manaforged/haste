@@ -189,6 +189,9 @@ fn warmable_callee(cx: &Context<'_>, reached: &Reached, idx: usize) -> bool {
     let Some(((item, _), Ok(typed))) = reached.list.get(idx) else {
         return false;
     };
+    if typed.is_reach_memo() {
+        return false;
+    }
     !cx.foreign(*item)
         && !cx.has_attr(*item, "cold")
         && cx.inline_attr(*item) != Some("never")

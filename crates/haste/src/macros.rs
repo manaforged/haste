@@ -1,6 +1,8 @@
 //! Procedural macros in the image: the calls that name resolution binds are built into one image with haste's `proc_macro` crate, run in a forked child, and their output read back into the outline.
 
 mod expand;
+mod render;
+use render::{item_text, render_tokens};
 #[cfg(test)]
 mod tests;
 
@@ -13,14 +15,14 @@ use crate::names::path::Requests;
 use crate::names::procs::{Bound, Site};
 use crate::names::{ItemRef, Names};
 use crate::outline::Outline;
-use crate::outline::attr::{self, split_commas};
-use crate::outline::item::{Attr, ProcKind};
+use crate::outline::attr::split_commas;
+use crate::outline::item::ProcKind;
 use crate::outline::source::Source;
 use crate::outline::tree::{PROC_MACRO_ROOT, Profile};
 use crate::sema::reach::{Instance, Reached, reach_wave};
 use crate::sema::{Answer, Cache, Context};
 
-use expand::{Call, dep_closure, infer_caller, macro_graph_stamp, push_layer_span, run};
+use expand::{Call, dep_closure, infer_caller, macro_graph_stamp, run};
 
 const ENTRIES: [&str; 2] = ["__haste_expand1", "__haste_expand2"];
 
@@ -30,6 +32,7 @@ pub struct Compilation {
     pub names: Names,
     expander: Option<Expander>,
     substrate: Option<std::sync::Arc<crate::substrate::Substrate>>,
+    substrate_slot: Option<crate::build::substrate::SubstrateSlot>,
     sysroot_heads: Option<std::sync::Arc<HashMap<u32, std::sync::Arc<crate::sema::impls::Index>>>>,
 }
 
@@ -60,6 +63,7 @@ impl Compilation {
             names,
             expander: None,
             substrate: None,
+            substrate_slot: None,
             sysroot_heads: None,
         }
     }
@@ -73,6 +77,10 @@ impl Compilation {
         {
             self.expander = None;
         }
+    }
+
+    pub(crate) fn take_substrate_slot(&mut self) -> Option<crate::build::substrate::SubstrateSlot> {
+        self.substrate_slot.take()
     }
 }
 
@@ -133,6 +141,11 @@ fn load_with_sysroot(
         }
     }
     let cache_deps = deps_miss && crate::substrate::deps_index::can_cache(&outline);
+    let local_member_deps = if !eager_all && scripts.is_empty() {
+        crate::substrate::local_index::member_local_deps(workspace, &outline)
+    } else {
+        vec![false; outline.crates.len()]
+    };
     let selected: Vec<bool> = (0..outline.crates.len())
         .map(|krate| {
             let sysroot = outline.is_sysroot(krate as u32);
@@ -144,10 +157,10 @@ fn load_with_sysroot(
                 (was_miss && sysroot)
                     || (cache_deps && pinned_dep)
                     || (!local_hit
-                        && workspace
-                            .graph
-                            .members
-                            .contains(&workspace.graph.units[outline.roots[krate].unit].package))
+                        && (local_member_deps[krate]
+                            || workspace.graph.members.contains(
+                                &workspace.graph.units[outline.roots[krate].unit].package,
+                            )))
             }
         })
         .collect();
@@ -170,21 +183,30 @@ fn load_with_sysroot(
         names,
         expander: None,
         substrate,
+        substrate_slot: None,
         sysroot_heads: sysroot_heads.take(),
     };
     for (krate, _) in selected.iter().enumerate().filter(|(_, on)| **on) {
         compilation.names.crates[krate].set_eager();
     }
     resolve(&mut compilation)?;
-    if let (Some(slot), Some(expander)) = (macro_slot, &compilation.expander) {
-        crate::with_host_target(|| {
-            crate::build::substrate::save_jit_substrate(
-                &compilation.outline,
-                expander.jit.store(),
-                expander.jit.image(),
-                slot,
-            )
-        });
+    match (macro_slot, &compilation.expander) {
+        (Some(slot), Some(expander)) => {
+            crate::with_host_target(|| {
+                crate::build::substrate::save_jit_substrate(
+                    &compilation.outline,
+                    expander.jit.store(),
+                    expander.jit.image(),
+                    slot,
+                )
+            });
+        }
+        (Some(slot), None)
+            if crate::compile_target().triple == haste_codegen::Target::host().triple =>
+        {
+            compilation.substrate_slot = Some(slot);
+        }
+        _ => {}
     }
     if let Some(key) = sys_key {
         if was_miss
@@ -401,17 +423,21 @@ fn split_ready_bound(outline: &mut Outline, bound: Vec<Bound>) -> Vec<Bound> {
     if bound.len() <= 1 {
         return bound;
     }
-    let mut deps_by_macro: HashMap<usize, Vec<bool>> = HashMap::default();
+    let mut caller_crates: Vec<usize> = bound.iter().map(|c| c.krate).collect();
+    caller_crates.sort_unstable();
+    caller_crates.dedup();
+    let mut defer_macro: HashMap<usize, bool> = HashMap::default();
     let (mut ready, mut deferred) = (Vec::with_capacity(bound.len()), Vec::new());
-    let caller_crates: Vec<usize> = bound.iter().map(|c| c.krate).collect();
     for call in bound {
-        let deps = deps_by_macro
+        let is_deferred = *defer_macro
             .entry(call.run.krate as usize)
-            .or_insert_with(|| dep_closure(outline, &[call.run.krate as usize]).0);
-        if caller_crates
-            .iter()
-            .any(|&k| deps.get(k).copied().unwrap_or(false))
-        {
+            .or_insert_with(|| {
+                let deps = dep_closure(outline, &[call.run.krate as usize]).0;
+                caller_crates
+                    .iter()
+                    .any(|&k| deps.get(k).copied().unwrap_or(false))
+            });
+        if is_deferred {
             deferred.push(call);
         } else {
             ready.push(call);
@@ -663,113 +689,4 @@ pub(crate) fn bang_input(
     open: u32,
 ) -> String {
     render_tokens(Some((deps, krate)), src, open + 1, src.pair(open))
-}
-
-fn push_raw_span(parts: &mut Vec<String>, src: &Source, from: u32, to: u32) {
-    if from >= to {
-        return;
-    }
-    if from < src.offset && to > src.offset {
-        push_layer_span(parts, src, from, src.offset);
-        push_layer_span(parts, src, src.offset, to);
-    } else {
-        push_layer_span(parts, src, from, to);
-    }
-}
-
-fn render_tokens(
-    scope: Option<(&[(String, usize)], usize)>,
-    src: &Source,
-    from: u32,
-    to: u32,
-) -> String {
-    let mut parts = Vec::new();
-    let Some((deps, krate)) = scope else {
-        push_raw_span(&mut parts, src, from, to);
-        return parts.join(" ");
-    };
-    let mut cursor = from;
-    for at in from..to {
-        let Some(path) = src
-            .dollar(at)
-            .filter(|_| at >= cursor && at + 1 < to)
-            .and_then(|named| crate_path(deps, krate, named as usize))
-        else {
-            continue;
-        };
-        push_raw_span(&mut parts, src, cursor, at);
-        parts.push(path);
-        cursor = at + 2;
-    }
-    push_raw_span(&mut parts, src, cursor, to);
-    parts.join(" ")
-}
-
-/// The path that names crate `named` from crate `krate`, whose dependencies are `deps`.
-fn crate_path(deps: &[(String, usize)], krate: usize, named: usize) -> Option<String> {
-    if named == krate {
-        return Some("crate".to_owned());
-    }
-    deps.iter()
-        .find(|(_, dep)| *dep == named)
-        .map(|(name, _)| format!("::{name}"))
-}
-
-/// The text of `item` with the outer attributes whose path starts at a token that `keep` rejects left out, and, as a derive sees it, the fields or variants whose attributes `enabled` rejects.
-fn item_text(
-    src: &Source,
-    item: &crate::outline::item::Item,
-    scope: Option<(&[(String, usize)], usize)>,
-    keep: &dyn Fn(u32) -> bool,
-    enabled: Option<&dyn Fn(&[Attr]) -> bool>,
-) -> String {
-    let mut parts = Vec::new();
-    let mut at = item.lead;
-    while at < item.start && src.text(at) == "#" {
-        let close = src.pair(at + 1);
-        if keep(at + 2) {
-            parts.push(render_tokens(scope, src, at, close + 1));
-        }
-        at = close + 1;
-    }
-    match item
-        .body
-        .zip(enabled)
-        .and_then(|(open, enabled)| Some((open, configured(src, scope, open, enabled)?)))
-    {
-        Some((open, members)) => parts.extend([
-            render_tokens(scope, src, at, open + 1),
-            members,
-            render_tokens(scope, src, src.pair(open), item.end),
-        ]),
-        None => parts.push(render_tokens(scope, src, at, item.end)),
-    }
-    parts.join(" ")
-}
-
-/// The members inside the delimiter that opens at `open` whose attributes `enabled` accepts, or none when it accepts them all.
-fn configured(
-    src: &Source,
-    scope: Option<(&[(String, usize)], usize)>,
-    open: u32,
-    enabled: &dyn Fn(&[Attr]) -> bool,
-) -> Option<String> {
-    let (mut kept, mut dropped) = (Vec::new(), false);
-    for (from, to) in split_commas(src, open + 1, src.pair(open))
-        .into_iter()
-        .filter(|(from, to)| from < to)
-    {
-        let mut attrs = Vec::new();
-        attr::attrs(src, from, false, &mut attrs).ok()?;
-        if enabled(&attrs) {
-            kept.push(if scope.is_some() {
-                render_tokens(scope, src, from, to)
-            } else {
-                src.spelled((from, to))
-            });
-        } else {
-            dropped = true
-        }
-    }
-    dropped.then(|| kept.join(" , "))
 }

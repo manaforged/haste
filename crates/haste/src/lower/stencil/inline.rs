@@ -533,6 +533,9 @@ fn ensure_inline_template_inner(
     let key_low = slots.low_entries();
     let key_compact = inline.host.compact;
     let key_sole = super::super::budget::stable_sole(cx, reached, index);
+    if reached.is_reach_memo(index) {
+        return Ok((None, usize::MAX));
+    }
     let aot_cache = slots.aot_cache();
     if !cyclic
         && quiet.holds(cx, slots)

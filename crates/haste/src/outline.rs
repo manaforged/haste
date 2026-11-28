@@ -90,6 +90,12 @@ impl Outline {
             .is_some_and(tree::Crate::is_fixed)
     }
 
+    pub fn is_fixed_file(&self, krate: u32, file: u32) -> bool {
+        self.crates
+            .get(krate as usize)
+            .is_some_and(|c| c.is_fixed_file(file))
+    }
+
     /// The path that `module_path!` spells for module `at`: the crate name, then each module name from the root down.
     pub fn module_path(&self, at: crate::names::ModRef) -> String {
         let modules = &self.crates[at.krate as usize].modules;
